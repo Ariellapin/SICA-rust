@@ -58,6 +58,7 @@ impl SkillCreator {
 #[async_trait]
 impl Skill for SkillCreator {
     fn name(&self) -> &str { NAME }
+    fn description(&self) -> &str { DESCRIPTION }
     fn positional_args(&self) -> Vec<String> {
         vec!["name".into(), "description".into(), "body".into()]
     }

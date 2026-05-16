@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use protocol::Event;
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 pub trait IdealistEventSink: Send + Sync {
     fn emit(&self, ev: Event);
@@ -57,9 +58,24 @@ impl Idealist {
                 .await
                 {
                     Ok(Some(t)) => t,
-                    _ => break,
+                    _ => {
+                        info!("idealist: trigger bus closed — daemon loop exiting");
+                        break;
+                    }
                 };
 
+                info!(
+                    kind = %trigger.kind,
+                    module = %trigger.module,
+                    "idealist: received trigger"
+                );
+                me.events.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: format!(
+                        "idealist: analyzing trigger kind=`{}` module=`{}`",
+                        trigger.kind, trigger.module
+                    ),
+                });
                 me.events.emit(Event::IdealistStatus {
                     activity: format!("analyzing: {}", trigger.kind),
                     severity: protocol::Severity::Info,
@@ -68,15 +84,48 @@ impl Idealist {
 
                 let src = classify(&trigger);
                 let auto_apply = me.settings.lock().await.auto_apply_be;
+                info!(
+                    source = ?src,
+                    auto_apply,
+                    "idealist: classified trigger"
+                );
+                me.events.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: format!(
+                        "idealist: classified as {:?} (auto_apply_be={})",
+                        src, auto_apply
+                    ),
+                });
+
                 let ticket_path = match src {
                     TriggerSource::Frontend => {
-                        fe_ticket::write_fe_ticket(&trigger).ok()
+                        match fe_ticket::write_fe_ticket(&trigger) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                warn!(error = %e, "idealist: write_fe_ticket failed");
+                                me.events.emit(Event::LogLine {
+                                    level: "ERROR".into(),
+                                    message: format!("idealist: write_fe_ticket failed — {e}"),
+                                });
+                                None
+                            }
+                        }
                     }
                     // SubAgentTool failures share the BE write path: they
                     // produce an Improvement-BE-*.md ticket with the
                     // analyzer's suggested skill swap surfaced inline.
                     _ => {
-                        be_autofix::write_be_ticket(&trigger, auto_apply).ok()
+                        match be_autofix::write_be_ticket(&trigger, auto_apply) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                warn!(error = %e, "idealist: write_be_ticket failed");
+                                me.events.emit(Event::LogLine {
+                                    level: "ERROR".into(),
+                                    message: format!("idealist: write_be_ticket failed — {e}"),
+                                });
+                                None
+                            }
+                        }
                     }
                 };
                 if let Some(path) = ticket_path {
@@ -85,6 +134,11 @@ impl Idealist {
                         _ => protocol::TicketKind::BeFix,
                     };
                     let path_str = path.to_string_lossy().to_string();
+                    info!(path = %path_str, ?kind, "idealist: ticket written");
+                    me.events.emit(Event::LogLine {
+                        level: "INFO".into(),
+                        message: format!("idealist: ticket written ({:?}) → {}", kind, path_str),
+                    });
                     me.events.emit(Event::IdealistTicketWritten {
                         path: path_str.clone(),
                         kind,

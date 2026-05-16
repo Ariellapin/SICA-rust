@@ -20,6 +20,14 @@ pub struct SkillContext {
 pub trait Skill: Send + Sync {
     fn name(&self) -> &str;
 
+    /// One-line human-readable summary used in the system prompt's loaded-
+    /// skill listing. Should fit on a single line; the registry concatenates
+    /// it directly into a Markdown bullet. Default `""` keeps test doubles
+    /// terse — production skills override.
+    fn description(&self) -> &str {
+        ""
+    }
+
     /// Ordered names of the positional arguments this skill accepts in the
     /// natural-language tool-call form. The parser hands the dispatcher a
     /// `ToolCall` carrying a `Vec<String>` of raw positional values; the

@@ -148,6 +148,7 @@ pub struct RunCli;
 #[async_trait]
 impl Skill for RunCli {
     fn name(&self) -> &str { RUN_CLI_NAME }
+    fn description(&self) -> &str { RUN_CLI_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
@@ -195,6 +196,7 @@ pub struct RunPwsh;
 #[async_trait]
 impl Skill for RunPwsh {
     fn name(&self) -> &str { RUN_PWSH_NAME }
+    fn description(&self) -> &str { RUN_PWSH_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
@@ -274,6 +276,7 @@ impl ReadFile {
 #[async_trait]
 impl Skill for ReadFile {
     fn name(&self) -> &str { READ_FILE_NAME }
+    fn description(&self) -> &str { READ_FILE_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["path".into()] }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
@@ -314,6 +317,7 @@ impl WriteFile {
 #[async_trait]
 impl Skill for WriteFile {
     fn name(&self) -> &str { WRITE_FILE_NAME }
+    fn description(&self) -> &str { WRITE_FILE_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["path".into(), "content".into()] }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {

@@ -46,6 +46,10 @@ impl Skill for MarkdownSkill {
         &self.name
     }
 
+    fn description(&self) -> &str {
+        &self.description
+    }
+
     fn positional_args(&self) -> Vec<String> {
         self.positionals.clone()
     }

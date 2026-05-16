@@ -215,7 +215,7 @@ impl ChatHub {
                 // Rebuild history fresh from persisted session messages each
                 // iteration: the previous hop appended both the assistant
                 // call and the tool result, so this picks them up uniformly.
-                let history = build_history(&sessions_map, session_id).await;
+                let history = build_history(&sessions_map, session_id, &skills).await;
                 let turn_id = next_turn.fetch_add(1, Ordering::Relaxed);
 
                 let out = agents::turn::run_turn(
@@ -255,8 +255,24 @@ impl ChatHub {
                     }
                 }
 
-                // Look for a tool call. If none, we're done.
+                // Look for a tool call. If none, we're done — but first
+                // check whether the model *tried* to emit one in an
+                // unrecognised shape (a `tool_call` JSON fence, etc.). That
+                // path used to fail silently and look like "model chose not
+                // to call a tool" in the FE; surface it as a WARN so the
+                // miscall is visible.
                 let Some(call) = agents::extract_tool_call(&out.content) else {
+                    if looks_like_tool_call_attempt(&out.content) {
+                        let msg = "assistant emitted a tool-call-shaped block \
+                                   the parser could not read (malformed JSON \
+                                   inside the ```tool_call fence, or missing \
+                                   `skill`/`args` keys)";
+                        warn!(session_id, "{msg}");
+                        event_sink.emit(Event::LogLine {
+                            level:   "WARN".into(),
+                            message: msg.into(),
+                        });
+                    }
                     break;
                 };
                 if hops >= MAX_TOOL_HOPS {
@@ -354,18 +370,36 @@ impl ChatHub {
 }
 
 /// Rebuild the LLM wire history for `session_id`: prepend `memory.md` (if
-/// present) as a system message, then every persisted message. Tool-role
-/// messages are surfaced to the local server as `user` content so even
-/// llama.cpp builds without OpenAI tool-call awareness can read the result.
+/// present) plus a live `## Loaded skills` listing built from the registry as
+/// a single system message, then every persisted message. The dynamic list
+/// matters because `memory.md` only enumerates the built-ins — without this
+/// step, user-authored skills are callable but invisible to the model.
+/// Tool-role messages are surfaced to the local server as `user` content so
+/// even llama.cpp builds without OpenAI tool-call awareness can read the
+/// result.
 async fn build_history(
     sessions: &Arc<Mutex<HashMap<u64, Session>>>,
     session_id: u64,
+    skills: &SkillRegistry,
 ) -> Vec<llm::client::ChatMessage> {
     let g = sessions.lock().await;
     let Some(session) = g.get(&session_id) else { return Vec::new() };
     let mut out: Vec<llm::client::ChatMessage> = Vec::with_capacity(session.messages.len() + 1);
-    if let Some(mem) = agents::memory::load(&sica_core::paths::memory_file()) {
-        out.push(llm::client::ChatMessage { role: "system".into(), content: mem });
+    let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
+    let catalogue = skills.catalogue_markdown();
+    if !mem.is_empty() || !catalogue.is_empty() {
+        let mut content = mem;
+        if !catalogue.is_empty() {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str("## Loaded skills\n\n");
+            content.push_str(&catalogue);
+        }
+        out.push(llm::client::ChatMessage { role: "system".into(), content });
     }
     for m in &session.messages {
         let role = match m.role {
@@ -408,6 +442,21 @@ async fn append_tool_result(
     if let Err(e) = sessions_store::save(session) {
         warn!(error = %e, session_id, "save session (after tool result) failed");
     }
+}
+
+/// True when `content` contains a shape the model commonly *thinks* is a
+/// tool call but the parser does not accept. Used to surface the silent-
+/// drop case as a `LogLine` — without it, the FE just sees an ordinary
+/// assistant message and the operator has no signal that a tool was meant
+/// to fire. Kept conservative: matches the explicit ```tool_call fence and
+/// the OpenAI-ish `"skill": "..."` + `"args":` JSON pair.
+fn looks_like_tool_call_attempt(content: &str) -> bool {
+    if content.contains("```tool_call") {
+        return true;
+    }
+    let has_skill_key = content.contains("\"skill\"") || content.contains("'skill'");
+    let has_args_key  = content.contains("\"args\"")  || content.contains("'args'");
+    has_skill_key && has_args_key
 }
 
 fn role_to_str(role: Role) -> &'static str {

@@ -30,5 +30,6 @@ futures               = { workspace = true }
 parking_lot           = { workspace = true }
 eframe                = { workspace = true }
 egui                  = { workspace = true }
+egui_commonmark       = { workspace = true }
 notify                = { workspace = true }
 notify-debouncer-mini = { workspace = true }

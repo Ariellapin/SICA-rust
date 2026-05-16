@@ -4,6 +4,7 @@
 //! inset 24px with a left-edge info-blue hairline and italic serif body.
 
 use egui::{Align, Layout, RichText, Rounding, Sense, Stroke, Vec2};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use sica_core::theme::Palette;
 
@@ -54,6 +55,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if !assistant.is_empty() || !finished {
                     draw_assistant(
                         ui,
+                        &mut app.md_cache,
+                        i,
                         if assistant.is_empty() { "…" } else { &assistant },
                         &palette,
                     );
@@ -121,12 +124,36 @@ fn draw_user(ui: &mut egui::Ui, text: &str, p: &Palette) {
 
 // ---------- assistant ----------
 
-fn draw_assistant(ui: &mut egui::Ui, text: &str, p: &Palette) {
+fn draw_assistant(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    turn_idx: usize,
+    text: &str,
+    p: &Palette,
+) {
     caps_label(ui, "ASSISTANT", rgb(p.muted));
     ui.add_space(2.0);
     hairline(ui, p);
     ui.add_space(8.0);
-    ui.label(RichText::new(text).color(rgb(p.ink)));
+    // Render as CommonMark so headings, bold/italic, lists and code
+    // fences come through. The viewer ID has to be unique per turn so
+    // egui_commonmark can keep per-document state straight when the
+    // stream re-renders many of these blocks on the same frame.
+    //
+    // The scoped style swap below is load-bearing: egui_commonmark resolves
+    // `**bold**`, headings and list bullets through `strong_text_color()`,
+    // which reads `widgets.active.fg_stroke.color`. Our theme paints that
+    // with the page background so pressed buttons render inverse text — but
+    // that also makes every strong glyph invisible against the page. We
+    // override it to ink for the duration of the viewer.
+    ui.scope(|ui| {
+        let ink = rgb(p.ink);
+        let v = &mut ui.style_mut().visuals.widgets;
+        v.active.fg_stroke.color = ink;
+        v.noninteractive.fg_stroke.color = ink;
+        let viewer_id = format!("assistant_md_{turn_idx}");
+        CommonMarkViewer::new(viewer_id).show(ui, cache, text);
+    });
 }
 
 // ---------- reasoning ----------

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use protocol::Event;
 use serde_json::Value;
+use tracing::{debug, info, warn};
 
 use llm::client::{ChatMessage, LlmClient};
 
@@ -124,6 +125,22 @@ impl ToolSubAgent {
         let ToolInvocation { skill, args, raw_args, expectation } = inv;
 
         if self.depth >= self.max_depth {
+            warn!(
+                depth = self.depth,
+                max_depth = self.max_depth,
+                skill = skill.name(),
+                parent_id = self.parent_id,
+                "sub-agent depth limit reached — aborting tool call"
+            );
+            self.events.emit(Event::LogLine {
+                level: "WARN".into(),
+                message: format!(
+                    "sub-agent[depth={}] depth limit ({}) reached for skill `{}` — aborting",
+                    self.depth,
+                    self.max_depth,
+                    skill.name()
+                ),
+            });
             return SkillOutcome {
                 ok: false,
                 summary: format!("sub-agent depth limit ({}) reached", self.max_depth),
@@ -132,6 +149,32 @@ impl ToolSubAgent {
 
         let id = next_tool_id();
         let args_preview = parse_tool_call::render(skill.name(), &raw_args);
+        info!(
+            tool_id = id,
+            parent_id = self.parent_id,
+            depth = self.depth,
+            skill = skill.name(),
+            args_preview = %args_preview,
+            expectation = %expectation,
+            "sub-agent: tool call started"
+        );
+        self.events.emit(Event::LogLine {
+            level: "INFO".into(),
+            message: format!(
+                "sub-agent[depth={}, id={}{}] → {}{}",
+                self.depth,
+                id,
+                self.parent_id
+                    .map(|p| format!(", parent={p}"))
+                    .unwrap_or_default(),
+                args_preview,
+                if expectation.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" > {expectation}")
+                },
+            ),
+        });
         self.events.emit(Event::ToolCallStarted {
             id,
             parent_id:    self.parent_id,
@@ -146,14 +189,53 @@ impl ToolSubAgent {
 
         if outcome.ok && !expectation.trim().is_empty() {
             if let Some(client) = &self.summarizer {
-                if let Some(focused) =
-                    summarize(client, skill.name(), &expectation, &outcome.summary).await
-                {
-                    outcome.summary = focused;
+                match summarize(client, skill.name(), &expectation, &outcome.summary).await {
+                    Some(focused) => {
+                        debug!(
+                            tool_id = id,
+                            skill = skill.name(),
+                            "sub-agent: summarizer produced focused answer"
+                        );
+                        outcome.summary = focused;
+                    }
+                    None => {
+                        warn!(
+                            tool_id = id,
+                            skill = skill.name(),
+                            "sub-agent: summarizer returned no answer — keeping raw summary"
+                        );
+                    }
                 }
             }
         }
 
+        if outcome.ok {
+            info!(
+                tool_id = id,
+                depth = self.depth,
+                skill = skill.name(),
+                "sub-agent: tool call finished ok"
+            );
+        } else {
+            warn!(
+                tool_id = id,
+                depth = self.depth,
+                skill = skill.name(),
+                summary = %short(&outcome.summary),
+                "sub-agent: tool call failed"
+            );
+        }
+        self.events.emit(Event::LogLine {
+            level: if outcome.ok { "INFO".into() } else { "WARN".into() },
+            message: format!(
+                "sub-agent[depth={}, id={}] {} `{}` — {}",
+                self.depth,
+                id,
+                if outcome.ok { "ok" } else { "err" },
+                skill.name(),
+                short(&outcome.summary),
+            ),
+        });
         self.events.emit(Event::ToolCallFinished {
             id,
             ok: outcome.ok,
@@ -162,6 +244,12 @@ impl ToolSubAgent {
 
         if !outcome.ok {
             if let Some(sink) = &self.failure_sink {
+                info!(
+                    tool_id = id,
+                    skill = skill.name(),
+                    host_os = std::env::consts::OS,
+                    "sub-agent: forwarding failure to idealist sink"
+                );
                 sink.report(ToolFailureReport {
                     skill:        skill.name().to_string(),
                     args_preview,
@@ -175,6 +263,19 @@ impl ToolSubAgent {
 
         outcome
     }
+}
+
+/// Truncate a string to a single short log-friendly line. Used for log
+/// payloads where multi-line summaries would drown the panel.
+fn short(s: &str) -> String {
+    const CAP: usize = 160;
+    let one_line: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if one_line.chars().count() <= CAP {
+        return one_line;
+    }
+    let mut out: String = one_line.chars().take(CAP).collect();
+    out.push('…');
+    out
 }
 
 /// Best-effort LLM summary. Returns `None` on any transport / network error
@@ -235,13 +336,24 @@ mod tests {
         }
     }
 
+    /// Filter the captured event stream to only `ToolCallStarted` /
+    /// `ToolCallFinished` so tests stay focused on the call lifecycle rather
+    /// than the surrounding `LogLine` instrumentation.
+    fn lifecycle(events: &[Event]) -> Vec<Event> {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::ToolCallStarted { .. } | Event::ToolCallFinished { .. }))
+            .cloned()
+            .collect()
+    }
+
     #[tokio::test]
     async fn child_increments_depth_and_parent() {
         let cap = Arc::new(Capture(Mutex::new(Vec::new())));
         let root = ToolSubAgent::root(cap.clone());
         let outcome = root.run(inv(&Echo)).await;
         assert!(outcome.ok);
-        let events = cap.0.lock().unwrap().clone();
+        let events = lifecycle(&cap.0.lock().unwrap());
         assert_eq!(events.len(), 2);
         if let Event::ToolCallStarted { depth, parent_id, .. } = &events[0] {
             assert_eq!(*depth, 0);
@@ -318,7 +430,7 @@ mod tests {
             expectation: "is the echo working".into(),
         };
         let _ = root.run(invocation).await;
-        let events = cap.0.lock().unwrap().clone();
+        let events = lifecycle(&cap.0.lock().unwrap());
         if let Event::ToolCallStarted { args_preview, expectation, .. } = &events[0] {
             assert_eq!(args_preview, "echo 'hello there'");
             assert_eq!(expectation, "is the echo working");

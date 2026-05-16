@@ -86,6 +86,12 @@ pub struct App {
     /// on. Cached at construction time — `paths::workspace_root()` walks
     /// the parent chain and shouldn't be called per frame.
     pub workspace_name: String,
+
+    /// Shared markdown render cache. One instance is reused across every
+    /// assistant / reasoning body so egui_commonmark can amortise its
+    /// per-document work between frames (streaming deltas re-render the
+    /// same buffer many times per second).
+    pub md_cache: egui_commonmark::CommonMarkCache,
 }
 
 pub struct TokenMeter {
@@ -360,6 +366,7 @@ impl App {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "—".into()),
+            md_cache: egui_commonmark::CommonMarkCache::default(),
         }
     }
 

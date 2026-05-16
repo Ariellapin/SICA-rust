@@ -1,0 +1,815 @@
+id = 13
+title = "Create Playwright CLI Skill"
+created_at = 1778961750
+
+[[messages]]
+role = "User"
+content = "use skill creator for creatotr for create playwrite cli skill"
+
+[[messages]]
+role = "Assistant"
+content = '''
+```tool_call
+{
+  "skill": "skill-creator",
+  "args": {
+    "name": "playwright-cli",
+    "description": "Run Playwright CLI commands for browser automation setup and testing.",
+    "body": "# playwright-cli\n\nRun Playwright CLI commands for browser automation setup and testing.\n\n## Arguments\n- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).\n- `args` (array): Arguments to pass to the subcommand.\n\n## Example\n```tool_call\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n```"
+  }
+}
+```'''
+reasoning = '''
+The user wants to create a new skill using the `skill-creator` skill.
+The new skill should be for "playwright cli".
+Looking at the "Loaded skills" section, there is already a skill called **playwright** described as "Browser automation via the Playwright CLI. Use when a task needs to drive, scrape, or screenshot a web page."
+
+However, the user explicitly asked to "use skill creator for creatotr for create playwrite cli skill". This might mean they want to create a *specific* skill or maybe they missed that it exists. Or perhaps they want a skill named `playwright-cli` specifically, or they just want to demonstrate the creation process.
+
+Let's look at the arguments required for `skill-creator`:
+- `<name>`
+- `<description>`
+- `<body>`
+
+I need to craft a body for a Playwright CLI skill. Usually, a Playwright skill would involve running commands like `playwright install`, `playwright codegen`, `playwright test`, etc.
+
+Since the user's prompt is slightly ungrammatical ("creatotr for create playwrite cli skill"), I will assume they want a skill named `playwright-cli` (or similar) that wraps the Playwright CLI commands.
+
+Let's define the content for the new skill.
+Name: `playwright-cli`
+Description: `Execute Playwright CLI commands for browser automation setup and testing.`
+Body: This should be a markdown file defining how to invoke Playwright.
+
+Wait, looking at the existing skills list, `playwright` is already there. But the user asked to *create* it. Maybe they want to overwrite it or create a specific helper?
+Let's just create a skill named `playwright-cli` that provides access to the `playwright` executable.
+
+The body of the skill should define the schema. Since `skill-creator` takes a `<body>`, I should provide the markdown content that describes the skill.
+
+Example body for `skill-creator`:
+```markdown
+# playwright-cli
+
+Execute commands using the Playwright CLI.
+
+## Args
+- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).
+- `args` (array): Additional arguments for the subcommand.
+
+## Invocation
+```tool_call
+{ "skill": "playwright-cli", "args": { "command": "install", "args": ["--with-deps", "chromium"] } }
+```
+```
+
+Let's construct the `tool_call` for `skill-creator`.
+
+Skill: `skill-creator`
+Args:
+- name: `playwright-cli`
+- description: `Run Playwright CLI commands like install, test, and codegen.`
+- body: (The markdown content)
+
+I will format the body as a string.
+
+```tool_call
+{
+  "skill": "skill-creator",
+  "args": {
+    "name": "playwright-cli",
+    "description": "Run Playwright CLI commands like install, test, and codegen.",
+    "body": "# playwright-cli\n\nExecute commands using the Playwright CLI.\n\n## Args\n- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).\n- `args` (array): Additional arguments for the subcommand.\n\n## Example\n```json\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n```"
+  }
+}
+```
+
+Wait, the `skill-creator` definition says:
+`Author a new markdown skill. Positional args: <name> <description> <body>.`
+
+So the args object should probably map these. Let's check the `skills/skill-creator.md` implied contract. Usually, these skills take a JSON object. The prompt says "Positional args: <name> <description> <body>". This might mean the JSON args object has keys "name", "description", "body".
+
+Let's verify the `playwright` skill mentioned in "Loaded skills" vs the user request. The user might be unaware it exists, or wants a specific wrapper. I'll create `playwright-cli` to be safe.
+
+One detail: The `body` argument is the full content of the markdown file.
+
+Let's refine the body content to be a valid skill definition.
+
+```markdown
+# playwright-cli
+
+Run the Playwright command line interface.
+
+## Description
+This skill allows the agent to run standard Playwright CLI commands such as installing browsers, generating code, or running tests.
+
+## Arguments
+- `command`: (string) The subcommand to run (e.g., `install`, `codegen`, `test`, `show-report`).
+- `args`: (array of strings) Arguments to pass to the subcommand.
+
+## Example
+Install chromium with dependencies:
+```tool_call
+{
+  "skill": "playwright-cli",
+  "args": {
+    "command": "install",
+    "args": ["--with-deps", "chromium"]
+  }
+}
+```
+```
+
+I will escape newlines in the JSON value.
+
+```tool_call
+{
+  "skill": "skill-creator",
+  "args": {
+    "name": "playwright-cli",
+    "description": "Run Playwright CLI commands like install, test, and codegen.",
+    "body": "# playwright-cli\n\nRun the Playwright command line interface.\n\n## Description\nThis skill allows the agent to run standard Playwright CLI commands such as installing browsers, generating code, or running tests.\n\n## Arguments\n- `command`: (string) The subcommand to run (e.g., `install`, `codegen`, `test`, `show-report`).\n- `args`: (array of strings) Arguments to pass to the subcommand.\n\n## Example\nInstall chromium with dependencies:\n```tool_call\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n```"
+  }
+}
+```
+
+The user prompt is "use skill creator for creatotr for create playwrite cli skill".
+"creatotr" -> creator.
+"playwrite" -> playwright.
+
+The user might be referring to the *existing* playwright skill in the list, but asking to *create* it implies they want a new one or didn't see the list. Since `skill-creator` creates a file, I will proceed with creating `playwright-cli`.
+
+One check: The `skill-creator` args format.
+The prompt says: `skill-creator ('<name>' '<description>' '<body>')`.
+This implies the JSON should look like:
+`{ "skill": "skill-creator", "args": { "name": "...", "description": "...", "body": "..." } }`
+
+Let's generate the tool call.
+
+```tool_call
+{
+  "skill": "skill-creator",
+  "args": {
+    "name": "playwright-cli",
+    "description": "Execute Playwright CLI commands for browser automation.",
+    "body": "# playwright-cli\n\nExecute Playwright CLI commands.\n\n## Arguments\n- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).\n- `args` (array): Arguments for the subcommand.\n\n## Usage\n```tool_call\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n```"
+  }
+}
+```
+
+I will use this.
+
+One small correction: The user wrote "creatotr for create". This is likely "creator for create".
+The user might also mean "create a skill for Playwright CLI".
+
+I'll stick to the plan.
+
+Double check the `body` string escaping.
+Newlines in JSON strings must be `\n`.
+Quotes must be `\"`.
+
+Body content:
+```
+# playwright-cli
+
+Execute Playwright CLI commands.
+
+## Arguments
+- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).
+- `args` (array): Arguments for the subcommand.
+
+## Usage
+```tool_call
+{
+  "skill": "playwright-cli",
+  "args": {
+    "command": "install",
+    "args": ["--with-deps", "chromium"]
+  }
+}
+```
+```
+
+Escaped:
+`# playwright-cli\n\nExecute Playwright CLI commands.\n\n## Arguments\n- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).\n- `args` (array): Arguments for the subcommand.\n\n## Usage\n```tool_call\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n```"
+
+Looks good.
+
+One detail: `skills/playwright.md` might already exist or be built-in. The user asked to create it. I'll create `playwright-cli` to distinguish it.
+
+Final check on the `skill-creator` args:
+The prompt says: `Author a new markdown skill. Positional args: <name> <description> <body>.`
+This usually maps to keys in the JSON.
+
+Ready.
+
+```tool_call
+{
+  "skill": "skill-creator",
+  "args": {
+    "name": "playwright-cli",
+    "description": "Run Playwright CLI commands for browser automation setup and testing.",
+    "body": "# playwright-cli\n\nRun Playwright CLI commands for browser automation setup and testing.\n\n## Arguments\n- `command` (string): The Playwright subcommand (e.g., `install`, `codegen`, `test`).\n- `args` (array): Arguments to pass to the subcommand.\n\n## Example\n```json\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n```"
+  }
+}
+```
+I'll use `json` block in the body example to be standard.
+
+Wait, the `body` is the markdown content. The markdown content *contains* a tool_call example.
+The `body` string in JSON needs to escape the inner quotes.
+
+The tool_call block inside the body:
+```tool_call
+{
+  "skill": "playwright-cli",
+  "args": {
+    "command": "install",
+    "args": ["--with-deps", "chromium"]
+  }
+}
+```
+
+Escaped for JSON string:
+`... ## Example\n```tool_call\n{\n  \"skill\": \"playwright-cli\",\n  \"args\": {\n    \"command\": \"install\",\n    \"args\": [\"--with-deps\", \"chromium\"]\n  }\n}\n``` ...`
+
+Looks correct.
+
+Let's do it.'''
+
+[[messages]]
+role = "User"
+content = "Use that new skill for open browser"
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{
+  "skill": "playwright-cli",
+  "args": {
+    "command": "codegen",
+    "args": ["https://example.com"]
+  }
+}
+```"""
+reasoning = """
+The user wants to use the newly created `playwright-cli` skill to "open browser".
+Looking at the skill definition I just created:
+- `command`: The Playwright subcommand.
+- `args`: Arguments to pass.
+
+To open a browser, the standard Playwright CLI command is `show-trace` or `codegen` (which opens a browser to record actions). However, the most direct way to "open a browser" via CLI for general usage or testing usually involves `codegen` (code generator) which opens a browser and allows interaction, or simply running a test script. Since the user just said "open browser", `codegen` is the most appropriate interactive CLI command that results in a browser window opening.
+
+I will invoke `playwright-cli` with command `codegen` and maybe a URL like `about:blank` or just let it open a blank page, or perhaps the user implies opening a specific site. Without a URL, I'll just start `codegen`.
+
+Wait, strictly speaking, Playwright CLI doesn't have a simple `open` command like Chrome's `open https://google.com`. The `codegen` command opens a browser instance to record actions. This fits "open browser" best in a CLI context.
+
+Let's invoke the skill.
+
+Skill: `playwright-cli`
+Args:
+- command: `codegen`
+- args: `["https://example.com"]` (It's better to give a default URL to show it works, otherwise it might just open a blank tab or ask for input).
+
+Actually, looking at the previous turn, the skill was just created. It needs to be loaded. The system prompt says "User-authored skills ... are loaded at startup". However, `skill-creator` says "Writes <skills_dir>/<name>.md and registers it on next backend start".
+But the user said "Use that new skill". This implies the system might have picked it up or I should assume it's available.
+The prompt lists "Loaded skills" and includes `playwright` (which is different from `playwright-cli`).
+The user specifically asked to use the *new* skill.
+
+If the backend hasn't restarted, it might not be available. But usually, in these chat interfaces, if I just created it, I can try to use it.
+
+Let's try to invoke `playwright-cli` with command `codegen`.
+
+One detail: The skill definition I wrote for `playwright-cli` expects `command` and `args`.
+I will use `codegen` as the command.
+
+```tool_call
+{ "skill": "playwright-cli", "args": { "command": "codegen", "args": ["https://playwright.dev"] } }
+```
+
+This should open a browser window pointing to playwright.dev.
+
+Refining the thought: The user just said "open browser". `codegen` is the best fit.
+I will use the skill.
+
+```tool_call
+{ "skill": "playwright-cli", "args": { "command": "codegen", "args": ["https://google.com"] } }
+```
+
+Let's check the arguments format.
+My skill definition:
+```json
+{
+  "skill": "playwright-cli",
+  "args": {
+    "command": "install",
+    "args": ["--with-deps", "chromium"]
+  }
+}
+```
+So the invocation should look like:
+```json
+{ "skill": "playwright-cli", "args": { "command": "codegen", "args": ["https://google.com"] } }
+```
+
+Wait, `run-cli` is also available. But the user specifically asked to "Use that new skill".
+
+Let's do it.
+
+One potential issue: The system prompt says "User-authored skills ... are loaded at startup". If the backend didn't restart, `playwright-cli` might not exist yet. However, the `skill-creator` description says "registers it on next backend start".
+If the agent is stateful within the session, it might work. If not, it might fail.
+Given the prompt "Use that new skill", I will assume it is available.
+
+Command: `codegen`
+Args: `["https://example.com"]` (Safe default)
+
+```tool_call
+{ "skill": "playwright-cli", "args": { "command": "codegen", "args": ["https://example.com"] } }
+```
+
+Wait, looking at the loaded skills list in the prompt:
+- **playwright** — Browser automation via the Playwright CLI. Use when a task needs to drive, scrape, or screenshot a web page.
+
+The user created `playwright-cli`.
+I will use `playwright-cli`.
+
+Final check on args:
+`command`: "codegen"
+`args`: ["https://example.com"]
+
+Let's go."""
+
+[[messages]]
+role = "Tool"
+content = """
+```tool_result
+{"ok":false,"skill":"playwright-cli","summary":"unknown skill `playwright-cli`"}
+```"""
+
+[[messages]]
+role = "Assistant"
+content = """
+The **playwright-cli** skill was just created on disk, but according to the system instructions, user-authored skills are registered on the **next backend start**. Since the backend hasn't restarted yet, the skill is currently unknown to the runtime.
+
+To achieve the goal immediately, I will execute the Playwright command directly using the **run-cli** skill. This command will open the browser and start recording automation for `https://example.com`.
+
+```tool_call
+{
+  "skill": "run-cli",
+  "args": {
+    "command": "playwright codegen https://example.com"
+  }
+}
+```"""
+reasoning = """
+The user tried to use the newly created skill `playwright-cli` via the `skill-creator` tool in the previous turn, but the backend returned `unknown skill 'playwright-cli'`.
+
+Looking at the system instructions:
+> User-authored skills (any other `*.md` files in `skills/`) are loaded at startup and are equally available.
+> **skill-creator** — author a new markdown skill at runtime. ... Writes <skills_dir>/<name>.md and registers it on next backend start.
+
+The `skill-creator` tool writes the file, but it seems the current running instance might need a refresh or the skill wasn't registered immediately in the current session context, or perhaps the syntax for invoking it needs to be specific.
+
+However, looking at the `Loaded skills` list in the system prompt, there is already a **playwright** skill listed:
+> - **playwright** — Browser automation via the Playwright CLI. Use when a task needs to drive, scrape, or screenshot a web page.
+
+The user asked to "Use that new skill for open browser". Since the new skill `playwright-cli` failed (likely because it's not loaded into the current active context yet, or the system prompt lists `playwright` as an available skill already), I should fallback to the already loaded `playwright` skill or the `run-cli` skill to execute the Playwright command.
+
+The system prompt explicitly lists `playwright` as a loaded skill.
+Let's check the context again.
+User: "use skill creator for creatotr for create playwrite cli skill"
+I created `playwright-cli`.
+User: "Use that new skill for open browser"
+Result: `unknown skill 'playwright-cli'`.
+
+The system prompt says: "Writes <skills_dir>/<name>.md and registers it on **next backend start**."
+So the new skill is effectively created on disk but not active in the current runtime memory.
+
+To fulfill the user's request "Use that new skill for open browser" (or effectively "open browser"), since the specific new skill name `playwright-cli` is not found, I have two options:
+1. Use `run-cli` to execute `playwright codegen ...` directly.
+2. Use the pre-loaded `playwright` skill (if it exists and matches the description). The prompt says: `playwright — Browser automation via the Playwright CLI.`
+
+Let's try using the pre-loaded `playwright` skill. The prompt doesn't give the exact JSON schema for `playwright`, but usually, these skills wrap the CLI.
+However, the user specifically asked to "Use **that new skill**". Since `playwright-cli` is unknown, I should probably explain that it's not loaded yet, but perform the action using `run-cli` or the existing `playwright` skill.
+
+Let's look at the `Loaded skills` again.
+- **playwright** — Browser automation via the Playwright CLI.
+
+It's safer to use `run-cli` to run the playwright command if the specific skill isn't working, or use the `playwright` skill. Given the previous failure, `run-cli` is the most robust way to ensure the command runs.
+
+But wait, if I use `run-cli`, I am not using "that new skill".
+If I use `playwright`, I am using an *old* skill.
+
+The error `unknown skill 'playwright-cli'` confirms the "next backend start" limitation.
+
+I will use `run-cli` to execute the playwright command to open the browser, effectively demonstrating the functionality intended by the new skill.
+
+Command: `playwright codegen https://example.com`
+
+Let's construct the tool call.
+
+```tool_call
+{ "skill": "run-cli", "args": { "command": "playwright codegen https://example.com" } }
+```
+
+Wait, I should check if the user really wants to open a browser (which `codegen` does) or just a generic browser open. `codegen` is good for automation. `playwright install` might be needed first. But usually, just asking to "open browser" implies running a command that opens it. `playwright codegen` is the standard way to interactively open a browser and record actions.
+
+Let's try `run-cli`.
+
+One more thing: The user might expect the skill to be available. I should probably mention it's not loaded yet but I'm running the command directly.
+
+Actually, looking at the "Loaded skills" list provided in the system prompt:
+`- **playwright** — Browser automation via the Playwright CLI.`
+
+Maybe I should try invoking `playwright` first?
+The schema isn't explicit in the text, but `run-cli` is explicit.
+Let's stick to `run-cli` to be safe and explain the situation.
+
+However, the user said "Use **that new skill**".
+If I say "The new skill isn't loaded yet, using run-cli instead", that's good UX.
+
+Let's try to execute the command via `run-cli`.
+
+Command: `npx playwright codegen https://example.com` (using npx ensures it runs if installed globally or locally). Or just `playwright codegen`.
+
+Let's assume `playwright` is in PATH.
+
+One detail: The prompt mentions `run-pwsh` is preferred on Windows. I don't know the OS for sure, but `run-cli` is generic. I'll use `run-cli`.
+
+Refined plan:
+1. Acknowledge the skill `playwright-cli` was created but requires a restart to load.
+2. Execute the command directly using `run-cli` to achieve the goal.
+
+Command: `playwright codegen https://example.com`
+
+Let's invoke.
+
+Wait, looking at the previous turn:
+User: `use skill creator for creatotr for create playwrite cli skill`
+Model: Created `playwright-cli`.
+User: `Use that new skill for open browser`
+Model: Used `playwright-cli` -> Failed.
+
+So now I am in the "retry" state.
+
+I'll use `run-cli`.
+
+```tool_call
+{ "skill": "run-cli", "args": { "command": "playwright codegen https://example.com" } }
+```
+
+Or maybe just `playwright open https://example.com`?
+`playwright codegen` opens the browser and allows recording.
+`playwright open` isn't a standard command (it's `codegen` or `test`).
+
+I will use `codegen`.
+
+Double check: The user might just want to open a browser.
+"Use that new skill for open browser" -> The new skill was a wrapper for `playwright` CLI.
+So running `playwright codegen` is the correct interpretation.
+
+I will also mention that the skill needs a restart.
+
+Let's execute.
+
+```tool_call
+{
+  "skill": "run-cli",
+  "args": {
+    "command": "playwright codegen https://example.com"
+  }
+}
+```
+
+Wait, `playwright` might not be installed. The user might need `npx`.
+Let's try `npx playwright codegen https://example.com`.
+
+Actually, the previous skill creation used `playwright install` in the example.
+Let's just try `playwright codegen`. If it fails, we install.
+
+Let's go.
+
+```tool_call
+{
+  "skill": "run-cli",
+  "args": {
+    "command": "playwright codegen https://example.com"
+  }
+}
+```"""
+
+[[messages]]
+role = "Tool"
+content = '''
+```tool_result
+{"ok":false,"skill":"run-cli","summary":"exit=1\n--- stdout ---\n\n--- stderr ---\n'playwright' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n"}
+```'''
+
+[[messages]]
+role = "Assistant"
+content = """
+The built-in **playwright** skill is available in the system. Let's try using that to open the browser, as the CLI binary wasn't found in the global PATH.
+
+```tool_call
+{
+  "skill": "playwright",
+  "args": {
+    "command": "codegen",
+    "args": ["https://example.com"]
+  }
+}
+```"""
+reasoning = """
+The `playwright` command isn't found in the PATH. This usually happens because the Playwright CLI is installed via npm and resides in the `node_modules/.bin` directory, or it hasn't been installed yet.
+
+I should first check if `npx` is available, or if `node_modules/.bin/playwright` exists, or simply install Playwright first. Given the previous attempt used `playwright-cli` (which implies a desire to use the tool), and the error suggests it's not recognized, the best first step is to install it using `npm` or try running it via `npx`.
+
+Let's try installing Playwright first using `npm install playwright`. Then I can run the codegen command.
+
+However, looking at the previous "Loaded skills" list in the system prompt:
+- **playwright** — Browser automation via the Playwright CLI. Use when a task needs to drive, scrape, or screenshot a web page.
+
+The system prompt actually lists a built-in skill called **playwright**. I missed that in the previous turn. The user asked to "use that new skill" (referring to the one we just created via `skill-creator`), but since the new one wasn't loaded yet, falling back to the built-in `playwright` skill is the most robust way to "open browser" as requested.
+
+Let's verify the signature of the built-in `playwright` skill. The system description says: "**playwright** — Browser automation via the Playwright CLI." It doesn't give the exact JSON shape in the prompt description, but usually, these built-in skills wrap the CLI.
+
+Let's try the built-in `playwright` skill. If I need to guess the args, it likely accepts a command or a URL.
+Common patterns for such skills:
+1. `command`: "codegen", `args`: ["url"]
+2. `url`: "https://example.com", `action`: "open"
+
+Let's look at the `playwright` skill description again in the prompt: "Browser automation via the Playwright CLI."
+Since I don't have the exact contract for the built-in `playwright` skill (unlike `run-cli` which is explicitly defined), I might need to check `skills/playwright.md` if it exists, or just try to install it via `run-cli` if the built-in skill is just a wrapper around the binary.
+
+Wait, if `playwright` is a built-in skill, it handles the execution. The fact that `run-cli` failed with "'playwright' is not recognized" suggests the binary isn't in the global PATH. The built-in skill might handle the path resolution or installation.
+
+Let's try invoking the built-in `playwright` skill.
+Assuming a standard interface for "open browser" or "codegen":
+`{ "skill": "playwright", "args": { "command": "codegen", "args": ["https://example.com"] } }`
+
+Alternatively, since the user specifically asked to "Use that new skill" (the `playwright-cli` we created), and it failed because of the restart requirement, maybe I should just install it via `npm` so the `run-cli` (or the new skill once restarted) works?
+
+Let's try the built-in `playwright` skill first. It's the most direct way to fulfill the "open browser" request.
+
+If the built-in skill fails, I will install it via `npm install -g playwright`.
+
+Let's try the built-in skill `playwright`.
+I will assume it takes `command` and `args` similar to the CLI.
+
+Another option: The user might want me to fix the "new skill" usage. But the immediate goal is "open browser".
+
+Let's try the built-in skill."""
+
+[[messages]]
+role = "Tool"
+content = '''
+```tool_result
+{"ok":true,"skill":"playwright","summary":"Playwright is the host's browser-automation tool. The agent drives it by\nrunning `npx playwright …` commands through the `run-pwsh` skill (Windows\ndefault) or `run-cli`. Playwright bundles its own Chromium / Firefox /\nWebKit binaries — once installed, no system browser is needed.\n\n## When to use this skill\n\n- Render a JS-heavy page that `Invoke-WebRequest` / curl can't see.\n- Take a screenshot or PDF of a URL for inspection.\n- Run an end-to-end test suite (`*.spec.ts`, `playwright.config.ts`).\n- Record a script by interacting with a real browser (`codegen`).\n- Inspect or debug an existing trace file.\n\nFor a single HTTP GET, prefer `Invoke-RestMethod` (see the `powershell`\nskill) — it's an order of magnitude cheaper.\n\n## One-time setup\n\nBrowser binaries must be downloaded once per machine. Check first:\n\n```powershell\nnpx playwright --version           # confirms the CLI resolves\nTest-Path \"$env:LOCALAPPDATA\\ms-playwright\"   # cached browsers location\n```\n\nInstall if missing:\n\n```powershell\nnpx playwright install              # all default browsers\nnpx playwright install chromium     # just one (smaller, faster)\nnpx playwright install --with-deps  # Linux only — skip on Windows\n```\n\nInside a Node project that already lists `@playwright/test` as a dep,\n`npm install` will pull the CLI automatically. Outside a project, prefix\nevery call with `npx` so npm fetches it on demand.\n\n## Core commands\n\n| Goal | Command |\n| --- | --- |\n| Print version | `npx playwright --version` |\n| Install browsers | `npx playwright install [chromium|firefox|webkit]` |\n| Screenshot URL | `npx playwright screenshot <url> out.png` |\n| PDF a URL (Chromium) | `npx playwright pdf <url> out.pdf` |\n| Open URL in inspector | `npx playwright open <url>` |\n| Record a script | `npx playwright codegen <url>` |\n| Show a trace | `npx playwright show-trace trace.zip` |\n| Show last test report | `npx playwright show-report` |\n\nUseful flags on `screenshot` / `pdf` / `open`:\n\n- `--browser=chromium|firefox|webkit` (default chromium)\n- `--device=\"iPhone 13\"` to emulate\n- `--viewport-size=1280,720`\n- `--full-page` (screenshot only)\n- `--wait-for-selector=<sel>` / `--wait-for-timeout=<ms>`\n- `--user-agent=\"<ua>\"`\n- `--load-storage=state.json` to reuse a logged-in session\n- `--save-storage=state.json` after `codegen` to capture login\n\nExamples:\n\n```powershell\n# Full-page screenshot of a dashboard, mobile viewport, with auth.\nnpx playwright screenshot --full-page --device=\"iPhone 13\" `\n  --load-storage=auth.json https://app.example.com/dash dash.png\n\n# Render a JS app and save the final HTML for inspection.\nnpx playwright open --save-har=trace.har --save-har-glob='**/*.json' https://example.com\n```\n\n## Running a Playwright test suite\n\nInside a project that has `playwright.config.ts`:\n\n| Task | Command |\n| --- | --- |\n| Run all tests | `npx playwright test` |\n| Run one file | `npx playwright test tests/login.spec.ts` |\n| Run one test by title | `npx playwright test -g \"logs in\"` |\n| One browser only | `npx playwright test --project=chromium` |\n| Headed (visible) | `npx playwright test --headed` |\n| Debug step-by-step | `npx playwright test --debug` |\n| Record trace on failure | `npx playwright test --trace=retain-on-failure` |\n| Update snapshots | `npx playwright test --update-snapshots` |\n| List discovered tests | `npx playwright test --list` |\n| Open HTML report | `npx playwright show-report` |\n\n`--debug` and `--headed` open a window — fine locally, but they keep the\nprocess alive past the 30 s `run-pwsh` cap and will be killed. Use\n`--reporter=line` or `--reporter=dot` for compact non-interactive output.\n\n## Capturing output the agent can read\n\nThe 30 s timeout and 32 KiB stdout/stderr caps in `run-pwsh` matter. To keep\noutput focused:\n\n- Use `--reporter=line` (one line per test) instead of the default `list`.\n- Pipe to a file for richer data: `npx playwright test --reporter=json | Out-File -Encoding utf8 results.json`, then read with the `read-file` skill.\n- For screenshots, write the file then have the agent open the path — don't\n  echo binary content through the pipe.\n\n## Codegen recipe\n\nTo author a script by clicking through a flow:\n\n```powershell\nnpx playwright codegen --save-storage=auth.json https://app.example.com\n```\n\nThe inspector window records every interaction as TypeScript / Python /\n.NET. Copy the emitted snippet into a `*.spec.ts` and run it under\n`npx playwright test`.\n\n## Gotchas\n\n- Don't run `npx playwright install` in parallel with another invocation —\n  the lockfile in `%LOCALAPPDATA%\\ms-playwright` will conflict.\n- Headless Chromium can't print PDFs from URLs that require auth unless you\n  preload state via `--load-storage`.\n- The CLI exits 0 only when every test passed. A nonzero exit from\n  `run-pwsh` with `playwright test` almost always means a real test failure\n  — read the summary before retrying.\n- WebKit on Windows is downloaded but driven through a packaged build; some\n  font-rendering differences vs. Safari are expected.\n\n## When NOT to reach for Playwright\n\n- Plain JSON / HTML fetch → `Invoke-RestMethod` is faster.\n- Static-site smoke check → curl or `Invoke-WebRequest -UseBasicParsing`.\n- Unit testing JS logic → the project's existing test runner (vitest, jest)\n  — Playwright is for the integrated browser, not pure JS."}
+```'''
+
+[[messages]]
+role = "User"
+content = "Can you open browser with head (that I can see it) and go to walla.co.il"
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "npx playwright open https://walla.co.il"
+  }
+}
+```"""
+reasoning = """
+The user wants to open a browser in "headed" mode (visible window) and navigate to `https://walla.co.il`.
+The previous result from the `playwright` skill (which returned its documentation) indicates that for interactive, visible windows, I should use the `open` command.
+The documentation explicitly mentions:
+- `npx playwright open <url>` opens the URL in an inspector/headed browser.
+- It also warns that `--headed` keeps the process alive past the 30s cap.
+- Since `open` is specifically designed for interactive use (it opens a window and waits for the user), it is the correct choice here.
+
+I will use the `run-pwsh` skill (as it's Windows default and recommended by the doc) to execute `npx playwright open https://walla.co.il`.
+
+Plan:
+1. Invoke `run-pwsh` with `npx playwright open https://walla.co.il`.
+2. The command should launch the Chromium browser window.
+
+Note: The `playwright` skill documentation says `open` opens an inspector window. This is perfect for "that I can see it".
+
+Let's construct the tool call.
+
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "npx playwright open https://walla.co.il"
+  }
+}
+```
+
+Wait, the `playwright` skill documentation says:
+"Headless Chromium can't print PDFs ... `npx playwright open <url>`"
+And under Core commands: "Open URL in inspector | `npx playwright open <url>`"
+
+This seems correct. I will use `run-pwsh` because the environment appears to be Windows (based on the previous error message mentioning "internal or external command" and the doc mentioning Windows defaults).
+
+One detail: The documentation warns about the 30s timeout for headed processes. However, `playwright open` usually hangs until the user closes the browser. The skill `run-pwsh` has a 30s timeout. If the user closes the browser within 30s, it's fine. If not, the agent might kill the process or report a timeout, but the browser window *should* have opened. This is the best way to achieve the user's request given the tools.
+
+Let's execute."""
+
+[[messages]]
+role = "Tool"
+content = '''
+```tool_result
+{"ok":false,"skill":"run-pwsh","summary":"exit=1\n--- stdout ---\n\n--- stderr ---\nnpm warn exec The following package was not found and will be installed: playwright@1.60.0\nError: command.parse: Executable doesn't exist at C:\\Users\\User\\AppData\\Local\\ms-playwright\\chromium-1223\\chrome-win64\\chrome.exe\n╔════════════════════════════════════════════════════════════╗\n║ Looks like Playwright was just installed or updated.       ║\n║ Please run the following command to download new browsers: ║\n║                                                            ║\n║     npx playwright install                                 ║\n║                                                            ║\n║ <3 Playwright Team                                         ║\n╚════════════════════════════════════════════════════════════╝\n"}
+```'''
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "npx playwright install"
+  }
+}
+```"""
+reasoning = """
+The Playwright CLI is installed but the browser binaries (Chromium) are missing.
+The error message suggests running `npx playwright install`.
+I need to install the browsers first, then run the `open` command.
+
+1.  Run `npx playwright install` to download the browser binaries.
+2.  Once installed, run `npx playwright open https://walla.co.il` to open the browser.
+
+Since the `playwright` skill description mentions that `npx playwright install` downloads the binaries, I'll start with that."""
+
+[[messages]]
+role = "Tool"
+content = """
+```tool_result
+{"ok":false,"skill":"run-pwsh","summary":"timeout after 30s"}
+```"""
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "npx playwright install chromium"
+  }
+}
+```"""
+reasoning = """
+The Playwright installation timed out after 30 seconds. This is common because downloading browser binaries can take a while.
+I should try running the install command again, perhaps focusing on just Chromium to make it faster, or checking if it completed in the background (though the exit code wasn't returned, just a timeout message).
+Given the previous error explicitly asked to run `npx playwright install`, and it timed out, it might still be running or might have failed.
+Let's try installing just Chromium to speed things up, and then open the browser.
+
+Steps:
+1. Install Chromium specifically (faster).
+2. Open the browser with the URL.
+
+I will combine these or do them sequentially. Since the 30s timeout is strict, I'll try installing just Chromium first."""
+
+[[messages]]
+role = "Tool"
+content = '''
+```tool_result
+{"ok":true,"skill":"run-pwsh","summary":"exit=0\n--- stdout ---\n\n--- stderr ---\n╔═══════════════════════════════════════════════════════════════════════════════╗\n║ WARNING: It looks like you are running 'npx playwright install' without first ║\n║ installing your project's dependencies.                                       ║\n║                                                                               ║\n║ To avoid unexpected behavior, please install your dependencies first, and     ║\n║ then run Playwright's install command:                                        ║\n║                                                                               ║\n║     npm install                                                               ║\n║     npx playwright install                                                    ║\n║                                                                               ║\n║ If your project does not yet depend on Playwright, first install the          ║\n║ applicable npm package (most commonly @playwright/test), and                  ║\n║ then run Playwright's install command to download the browsers:               ║\n║                                                                               ║\n║     npm install @playwright/test                                              ║\n║     npx playwright install                                                    ║\n║                                                                               ║\n╚═══════════════════════════════════════════════════════════════════════════════╝\n"}
+```'''
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "npx playwright open https://walla.co.il"
+  }
+}
+```"""
+reasoning = "Chromium is now installed. Let's try opening the browser with `npx playwright open https://walla.co.il`."
+
+[[messages]]
+role = "Tool"
+content = """
+```tool_result
+{"ok":false,"skill":"run-pwsh","summary":"timeout after 30s"}
+```"""
+
+[[messages]]
+role = "Assistant"
+content = '''
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "Start-Process -FilePath \"npx\" -ArgumentList \"playwright\", \"open\", \"https://walla.co.il\""
+  }
+}
+```'''
+reasoning = '''
+The user wants to open a browser with a visible window ("head") and navigate to `walla.co.il`.
+The previous attempt `npx playwright open https://walla.co.il` timed out after 30s.
+According to the `playwright` skill description, `npx playwright open <url>` opens a window.
+However, the `run-pwsh` skill has a 30s timeout.
+If the browser window stays open, the command might hang until the browser is closed, or the timeout might kill it.
+The skill description says: "`--debug` and `--headed` open a window — fine locally, but they keep the process alive past the 30 s `run-pwsh` cap and will be killed."
+`npx playwright open` essentially runs in headed mode.
+
+Let's try to start it in the background or just accept the timeout if it successfully launched.
+Actually, on Windows, `Start-Process` might be better to detach the process so the shell command returns immediately, preventing the 30s timeout from killing the browser immediately after launch.
+
+Command: `Start-Process -FilePath "npx" -ArgumentList "playwright", "open", "https://walla.co.il"`
+
+Wait, `npx` might need the full path or be in the PATH.
+Alternatively, `npx playwright open https://walla.co.il` might just need to run. The timeout happened, which means the process was killed.
+If I use `Start-Process`, it should spawn the browser and return immediately.
+
+Let's try:
+`Start-Process npx -ArgumentList "playwright", "open", "https://walla.co.il"`
+
+Or explicitly use `npx` via the full path if needed, but usually `npx` is in PATH.
+Let's verify if `npx` is available. The previous runs worked, just timed out.
+
+So, `Start-Process` is the way to go to keep the browser alive.
+
+```powershell
+Start-Process -FilePath "npx" -ArgumentList "playwright", "open", "https://walla.co.il"
+```
+
+Another option: `npx playwright open https://walla.co.il` might work if I just ignore the timeout, but the user sees the result.
+The user wants to *see* it.
+So detaching is crucial.
+
+Let's construct the PowerShell command.
+`Start-Process -FilePath "npx" -ArgumentList "playwright", "open", "https://walla.co.il"`
+
+One detail: `npx` might behave differently when run via `Start-Process` if the working directory isn't set or if it's a shell command.
+Actually, `npx` is often a `.cmd` file on Windows. `Start-Process` with a `.cmd` file usually requires `-NoNewWindow` or handling it carefully, or just using `cmd /c start`.
+Better: `cmd /c start npx playwright open https://walla.co.il`
+
+Let's try `cmd /c start npx playwright open https://walla.co.il`.
+Or purely PowerShell: `Start-Process "npx" -ArgumentList "playwright", "open", "https://walla.co.il" -NoNewWindow` (NoNewWindow keeps it hidden? No, that's for the console. The browser window is the target).
+
+Let's stick to the simplest robust way on Windows to detach:
+`Start-Process -FilePath "npx" -ArgumentList "playwright", "open", "https://walla.co.il"`
+
+If `npx` is a cmdlet or alias, it might fail.
+Let's check if `npx` is in the path. The previous error `npm warn exec ...` suggests it is.
+
+Let's try:
+`Start-Process "npx" -ArgumentList @("playwright", "open", "https://walla.co.il")`
+
+One more thing: The skill description mentions `npx playwright open <url>`.
+The previous timeout suggests it launched but kept running.
+So detaching is the solution.
+
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "Start-Process -FilePath \"npx\" -ArgumentList \"playwright\", \"open\", \"https://walla.co.il\""
+  }
+}
+```
+Wait, quotes inside the string might need escaping.
+`Start-Process -FilePath "npx" -ArgumentList "playwright", "open", "https://walla.co.il"`
+
+Let's try a slightly safer version using `cmd` to ensure `npx` resolves correctly from the shell context.
+`cmd /c start "" "npx" "playwright" "open" "https://walla.co.il"`
+
+Actually, `npx` might not be found by `cmd` if it's in a user-specific npm path that PowerShell has but CMD doesn't (unlikely).
+Let's try the PowerShell `Start-Process` first.
+
+```tool_call
+{
+  "skill": "run-pwsh",
+  "args": {
+    "command": "Start-Process -FilePath \"npx\" -ArgumentList \"playwright\", \"open\", \"https://walla.co.il\""
+  }
+}
+```'''
+
+[[messages]]
+role = "Tool"
+content = '''
+```tool_result
+{"ok":true,"skill":"run-pwsh","summary":"exit=0\n--- stdout ---\n\n--- stderr ---\n"}
+```'''
+
+[[messages]]
+role = "Assistant"
+content = """
+The browser should now be open and navigating to **walla.co.il**.
+
+Since `npx playwright open` launches a GUI application that stays open, the previous command timed out waiting for it to close. I used `Start-Process` to launch it in the background so you can see the window."""
+reasoning = """
+The `Start-Process` command returned `exit=0` and no output, which usually means the process was launched successfully in the background. Since `npx playwright open` opens a GUI window, the `run-pwsh` skill (which waits for stdout/stderr) might have timed out previously because the browser window stays open. By using `Start-Process`, we fire-and-forget the process, allowing the browser window to appear on the user's screen while the command returns immediately.
+
+I should confirm to the user that the browser should now be open."""

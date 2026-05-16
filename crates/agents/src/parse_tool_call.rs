@@ -26,20 +26,34 @@
 //! the first whitespace-separated token and must look like `[a-z][a-z0-9-]*`
 //! — known-skill validation happens later, in the dispatcher.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is not derived because `serde_json::Value` only implements `PartialEq`
+// (`f64` inside `Value::Number` rules out total equality).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub skill:       String,
     pub raw_args:    Vec<String>,
     pub expectation: String,
+    /// When the call was parsed from a ```tool_call``` JSON fence, the raw
+    /// `args` object is preserved here so the registry can dispatch it
+    /// directly without round-tripping through positional inference. `None`
+    /// for the natural-language form, which still relies on the skill's
+    /// declared `positional_args()` to map values to names.
+    pub args_json:   Option<serde_json::Value>,
 }
 
-/// Return the first plausible tool-call line in `text`, if any.
+/// Return the first plausible tool call in `text`, if any.
 ///
-/// "Plausible" = the line splits on the first lone ` > ` separator (a `>`
-/// surrounded by ASCII whitespace) into a left side starting with a
-/// `[a-z][a-z0-9-]*` skill identifier, followed by zero or more quoted
-/// positional arguments. The right side becomes the expectation.
+/// Two shapes are recognised:
+/// 1. **Natural-language** (preferred): a single line `skill 'arg' > expectation`.
+/// 2. **JSON fence** (tolerated): a ```tool_call``` block containing
+///    `{ "skill": "...", "args": { ... }, "expectation": "..." }`. Small local
+///    models frequently emit this shape because it matches the OpenAI tool-call
+///    convention in their training data — the parser accepts it rather than
+///    silently dropping the call (the bug seen in `sessions/10.toml`).
 pub fn extract(text: &str) -> Option<ToolCall> {
+    if let Some(tc) = extract_json_fence(text) {
+        return Some(tc);
+    }
     for line in text.lines() {
         let trimmed = strip_fence_indent(line);
         if let Some(tc) = parse_line(trimmed) {
@@ -47,6 +61,76 @@ pub fn extract(text: &str) -> Option<ToolCall> {
         }
     }
     None
+}
+
+/// Scan `text` for the first ```tool_call``` fenced block and parse its body
+/// as JSON. Returns `None` if no such fence exists, the JSON is malformed,
+/// or the required `skill` / `args` keys are missing.
+fn extract_json_fence(text: &str) -> Option<ToolCall> {
+    let mut rest = text;
+    while let Some(open_idx) = rest.find("```") {
+        let after_ticks = &rest[open_idx + 3..];
+        let (lang, after_lang) = match after_ticks.find('\n') {
+            Some(nl) => (after_ticks[..nl].trim(), &after_ticks[nl + 1..]),
+            None     => return None,
+        };
+        // Only recognise the `tool_call` info-string. Other fences (e.g. a
+        // sample ```json block in a chat reply) are deliberately ignored
+        // so the parser never hijacks unrelated content.
+        if !lang.eq_ignore_ascii_case("tool_call") {
+            rest = after_lang;
+            continue;
+        }
+        let close_idx = after_lang.find("```")?;
+        let body = &after_lang[..close_idx];
+        return parse_json_body(body);
+    }
+    None
+}
+
+fn parse_json_body(body: &str) -> Option<ToolCall> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let obj = value.as_object()?;
+    let skill = obj.get("skill")?.as_str()?.to_string();
+    if !is_valid_skill_name(&skill) {
+        return None;
+    }
+    let args = obj.get("args").cloned().unwrap_or(serde_json::Value::Null);
+    let expectation = obj
+        .get("expectation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // Populate `raw_args` from the args object's *values* (in insertion
+    // order — serde_json's Map preserves it) so the UI's `args_preview`
+    // chip still shows something useful even though the dispatcher will
+    // route via `args_json` instead.
+    let raw_args = args
+        .as_object()
+        .map(|m| {
+            m.values()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ToolCall {
+        skill,
+        raw_args,
+        expectation,
+        args_json: Some(args),
+    })
+}
+
+fn is_valid_skill_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Strip a leading ```tool fence marker and surrounding whitespace; leave
@@ -80,6 +164,7 @@ fn parse_line(line: &str) -> Option<ToolCall> {
         skill,
         raw_args,
         expectation: expectation.trim().to_string(),
+        args_json: None,
     })
 }
 
@@ -304,5 +389,57 @@ mod tests {
     fn round_trip_render() {
         let r = render("write-file", &["a/b".to_string(), "line1\nline2".to_string()]);
         assert_eq!(r, r"write-file 'a/b' 'line1\nline2'");
+    }
+
+    #[test]
+    fn extracts_json_fence_with_args_object() {
+        // Exactly the shape session 11 produced and the natural-language
+        // parser used to silently drop.
+        let s = "```tool_call\n{ \"skill\": \"run-cli\", \"args\": { \"command\": \"curl example.com\" } }\n```";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.skill, "run-cli");
+        assert!(tc.args_json.is_some());
+        let args = tc.args_json.unwrap();
+        assert_eq!(args["command"], "curl example.com");
+        // raw_args mirrors the JSON's *values* for the UI preview.
+        assert_eq!(tc.raw_args, vec!["curl example.com".to_string()]);
+        assert_eq!(tc.expectation, "");
+    }
+
+    #[test]
+    fn json_fence_carries_optional_expectation() {
+        let s = "```tool_call\n{ \"skill\": \"read-file\", \"args\": { \"path\": \"a.md\" }, \"expectation\": \"frontmatter only\" }\n```";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.expectation, "frontmatter only");
+    }
+
+    #[test]
+    fn json_fence_missing_skill_returns_none() {
+        let s = "```tool_call\n{ \"args\": { \"command\": \"x\" } }\n```";
+        assert!(extract(s).is_none());
+    }
+
+    #[test]
+    fn json_fence_rejects_invalid_skill_name() {
+        // Uppercase, slashes, etc. — never a real skill identifier.
+        let s = "```tool_call\n{ \"skill\": \"Run-CLI\", \"args\": {} }\n```";
+        assert!(extract(s).is_none());
+    }
+
+    #[test]
+    fn json_fence_takes_precedence_over_natural_form() {
+        // If both are present, the JSON fence is dispatched (the model is
+        // explicit about its tool choice; the trailing prose is incidental).
+        let s = "```tool_call\n{ \"skill\": \"run-cli\", \"args\": { \"command\": \"a\" } }\n```\nrun-cli 'b' > confirm";
+        let tc = extract(s).unwrap();
+        assert!(tc.args_json.is_some());
+        assert_eq!(tc.args_json.unwrap()["command"], "a");
+    }
+
+    #[test]
+    fn ignores_other_fenced_blocks() {
+        // A plain ```json block is NOT a tool call.
+        let s = "```json\n{ \"skill\": \"run-cli\", \"args\": {} }\n```";
+        assert!(extract(s).is_none());
     }
 }
