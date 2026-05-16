@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -142,11 +142,18 @@ pub enum Event {
     TokenUsage { session_id: u64, used: u32, limit: u32 },
 
     // Tool-call / sub-agent UI events. Nested calls inherit parent_id.
+    //
+    // `args_preview` carries the natural-language rendering of the call as
+    // emitted by the model (e.g. `read-file 'skills/run-cli.md'`), and
+    // `expectation` carries the text after the `>` separator — what the main
+    // agent wants the sub-agent to focus its summary on.
     ToolCallStarted {
         id: u64,
         parent_id: Option<u64>,
         depth: u8,
         name: String,
+        args_preview: String,
+        expectation: String,
     },
     ToolCallFinished {
         id: u64,
@@ -233,6 +240,8 @@ mod tests {
             parent_id: None,
             depth: 0,
             name: "cmd".into(),
+            args_preview: "cmd 'echo hi'".into(),
+            expectation: "confirm it ran".into(),
         });
         let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();

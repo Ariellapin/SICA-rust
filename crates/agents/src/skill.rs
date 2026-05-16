@@ -19,5 +19,20 @@ pub struct SkillContext {
 #[async_trait]
 pub trait Skill: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Ordered names of the positional arguments this skill accepts in the
+    /// natural-language tool-call form. The parser hands the dispatcher a
+    /// `ToolCall` carrying a `Vec<String>` of raw positional values; the
+    /// dispatcher uses these names to assemble the JSON `args` object passed
+    /// to `run`.
+    ///
+    /// Returns owned `String`s so dynamic skills (e.g. `MarkdownSkill`) can
+    /// declare their args from frontmatter. Default `vec![]`: skill takes no
+    /// positional args (any supplied positional values are dropped — usually
+    /// a sign the call was malformed).
+    fn positional_args(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome;
 }

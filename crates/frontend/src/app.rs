@@ -121,6 +121,24 @@ pub struct BeState {
     /// Set when the BE announces a protocol version different from
     /// `protocol::PROTOCOL_VERSION`. Drives a banner that prompts a rebuild.
     pub protocol_mismatch: Option<(u32, u32)>,
+    /// Version reported by the running BE in its most recent `ServerHello`.
+    /// `None` until the first hello arrives.
+    pub running_version: Option<String>,
+    /// Version computed from the on-disk source tree. Refreshed on file-watcher
+    /// events and after a successful rebuild. When it differs from
+    /// `running_version`, the footer surfaces a pulsing "RESTART" button.
+    pub source_version: Option<String>,
+}
+
+impl BeState {
+    /// `true` when the on-disk source no longer matches what the running BE
+    /// was built from. Drives the footer restart button.
+    pub fn restart_pending(&self) -> bool {
+        match (&self.running_version, &self.source_version) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        }
+    }
 }
 
 pub struct IpcState {
@@ -257,13 +275,17 @@ pub struct Turn {
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct ToolChip {
-    pub id:        u64,
-    pub parent_id: Option<u64>,
-    pub depth:     u8,
-    pub name:      String,
-    pub finished:  bool,
-    pub ok:        bool,
-    pub summary:   String,
+    pub id:           u64,
+    pub parent_id:    Option<u64>,
+    pub depth:        u8,
+    pub name:         String,
+    /// Rendered `skill 'arg1' 'arg2'` form for the chip label.
+    pub args_preview: String,
+    /// Text after the `>` separator: what the main agent wanted out of the call.
+    pub expectation:  String,
+    pub finished:     bool,
+    pub ok:           bool,
+    pub summary:      String,
 }
 
 impl App {
@@ -637,7 +659,7 @@ impl App {
             UiEvent::IpcFrame(_) => {
                 // Already handled by the typed event forwarders.
             }
-            UiEvent::ServerHello { protocol_version, .. } => {
+            UiEvent::ServerHello { protocol_version, version, .. } => {
                 let fe_version = protocol::PROTOCOL_VERSION;
                 if protocol_version != fe_version {
                     self.be_state.protocol_mismatch = Some((protocol_version, fe_version));
@@ -651,6 +673,10 @@ impl App {
                 } else {
                     self.be_state.protocol_mismatch = None;
                 }
+                self.be_state.running_version = Some(version);
+                // Recompute the on-disk source version so the restart-pending
+                // comparison is fresh for the just-attached BE.
+                self.be_state.source_version = Some(sica_core::build_id::source_version());
             }
             UiEvent::Heartbeat => {
                 self.ipc_state.last_heartbeat = Some(Instant::now());
@@ -666,6 +692,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.push_log(LogKind::Event, format!("fs: {count} change(s): {sample}"));
+                self.be_state.source_version = Some(sica_core::build_id::source_version());
             }
             UiEvent::LlmStateChanged(state) => {
                 let err = if let LlmState::Error { message } = &state {
@@ -715,10 +742,11 @@ impl App {
                 self.tokens.used.store(used, Ordering::Relaxed);
                 self.tokens.limit.store(limit, Ordering::Relaxed);
             }
-            UiEvent::ToolCallStarted { id, parent_id, depth, name } => {
+            UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
                 if let Some(t) = self.active_turn_mut() {
                     t.tool_chips.push(ToolChip {
                         id, parent_id, depth, name,
+                        args_preview, expectation,
                         finished: false, ok: true, summary: String::new(),
                     });
                 }

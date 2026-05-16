@@ -13,10 +13,10 @@ pub mod subagent;
 pub mod turn;
 
 pub use agent::{EventSink, MainAgent};
-pub use builtins::{ReadFile, RunCli, WriteFile};
+pub use builtins::{ReadFile, RunCli, RunPwsh, WriteFile};
 pub use md_skill::{LoadReport, MarkdownSkill};
 pub use parse_tool_call::{extract as extract_tool_call, ToolCall};
 pub use registry::SkillRegistry;
 pub use skill::{Skill, SkillContext, SkillOutcome};
 pub use skill_creator::SkillCreator;
-pub use subagent::ToolSubAgent;
+pub use subagent::{ToolFailureReport, ToolFailureSink, ToolInvocation, ToolSubAgent};

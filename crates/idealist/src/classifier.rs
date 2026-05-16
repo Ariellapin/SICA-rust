@@ -8,12 +8,20 @@ use crate::trigger_bus::Trigger;
 pub enum TriggerSource {
     Frontend,
     Backend,
+    /// A failed sub-agent tool invocation (e.g. `run-cli`, `read-file`).
+    /// These get the same auto-fix policy as `Backend` triggers but the
+    /// analyzer treats them differently so it can suggest an environment-
+    /// appropriate replacement skill.
+    SubAgentTool,
     Llm,
     Unknown,
 }
 
 pub fn classify(t: &Trigger) -> TriggerSource {
     let m = t.module.as_str();
+    if m.starts_with("agents::tool::") {
+        return TriggerSource::SubAgentTool;
+    }
     if m.starts_with("frontend::") || m.starts_with("crate::ui") || m.starts_with("ui::") {
         return TriggerSource::Frontend;
     }
@@ -65,5 +73,15 @@ mod tests {
     fn unknown_module_falls_back() {
         assert_eq!(classify(&t("???")), TriggerSource::Unknown);
         assert_eq!(classify(&t("")), TriggerSource::Unknown);
+    }
+
+    #[test]
+    fn subagent_tool_module_routes_to_subagenttool() {
+        assert_eq!(classify(&t("agents::tool::run-cli")),  TriggerSource::SubAgentTool);
+        assert_eq!(classify(&t("agents::tool::read-file")), TriggerSource::SubAgentTool);
+        // A trigger from inside the agents crate that *isn't* a tool call
+        // still routes to Backend (so we don't accidentally treat a bug
+        // in `subagent.rs` as a tool failure).
+        assert_eq!(classify(&t("agents::turn")), TriggerSource::Backend);
     }
 }

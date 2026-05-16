@@ -139,6 +139,7 @@ async fn run(args: Args) -> Result<()> {
     let mut skill_registry = agents::SkillRegistry::new();
     skill_registry.register(Arc::new(agents::SkillCreator::new(skills_path.clone())));
     skill_registry.register(Arc::new(agents::RunCli));
+    skill_registry.register(Arc::new(agents::RunPwsh));
     skill_registry.register(Arc::new(agents::ReadFile::new(root.clone())));
     skill_registry.register(Arc::new(agents::WriteFile::new(root.clone())));
     let parse_errors = agents::md_skill::register_all(&mut skill_registry, &skills_path);
@@ -160,13 +161,24 @@ async fn run(args: Args) -> Result<()> {
         }));
     }
 
-    // Chat hub + idealist daemon (use the dispatcher channel as their sink so
-    // every event flows out through the same write task).
-    let chat = ChatHub::new_loaded(out_tx.clone(), skill_registry.clone());
+    // Idealist daemon comes up *before* the chat hub: ChatHub needs the bus
+    // so it can install a `ToolFailureSink` on every sub-agent it spawns.
+    // Every event flows out through the same write task.
     let idealist_sink: Arc<dyn idealist::IdealistEventSink> = Arc::new(OutSink { tx: out_tx.clone() });
     let idealist = Arc::new(idealist::Idealist::new(idealist_sink));
     let idealist_bus = idealist.bus.clone();
     Arc::clone(&idealist).spawn();
+
+    // Bridge: agents::ToolFailureSink → idealist::TriggerBus. Each failed
+    // sub-agent tool call becomes a `Trigger` the idealist daemon picks up.
+    let tool_failure_sink: Arc<dyn agents::ToolFailureSink> =
+        Arc::new(ToolFailureBridge { bus: idealist_bus.clone() });
+
+    let chat = ChatHub::new_loaded(
+        out_tx.clone(),
+        skill_registry.clone(),
+        Some(tool_failure_sink.clone()),
+    );
 
     // Initial broadcasts: ServerHello + initial LLM state so the FE can sync.
     let _ = out_tx.send(Frame {
@@ -174,7 +186,7 @@ async fn run(args: Args) -> Result<()> {
         payload: Payload::ServerHello {
             protocol_version: protocol::PROTOCOL_VERSION,
             pid: std::process::id(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: sica_core::build_id::source_version(),
         },
     });
     let _ = out_tx.send(Frame::event(Event::LlmStateChanged {
@@ -245,5 +257,28 @@ struct OutSink {
 impl idealist::IdealistEventSink for OutSink {
     fn emit(&self, ev: Event) {
         let _ = self.tx.send(Frame::event(ev));
+    }
+}
+
+/// Forwards each sub-agent tool-call failure into the idealist daemon. The
+/// `module` field follows the `agents::tool::<skill-name>` convention so the
+/// idealist `classify` function routes it to `TriggerSource::SubAgentTool`
+/// and the analyzer can suggest an environment-appropriate replacement.
+struct ToolFailureBridge {
+    bus: idealist::TriggerBus,
+}
+
+impl agents::ToolFailureSink for ToolFailureBridge {
+    fn report(&self, r: agents::ToolFailureReport) {
+        let traceback = Some(format!(
+            "host_os={}\nhost_family={}\ndepth={}\nargs={}",
+            r.host_os, r.host_family, r.depth, r.args_preview,
+        ));
+        self.bus.publish(idealist::Trigger {
+            kind:    "tool_failed".into(),
+            module:  format!("agents::tool::{}", r.skill),
+            message: r.summary,
+            traceback,
+        });
     }
 }

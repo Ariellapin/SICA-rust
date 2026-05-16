@@ -15,7 +15,7 @@ use crate::skill::{Skill, SkillContext, SkillOutcome};
 pub const NAME: &str = "skill-creator";
 
 pub const DESCRIPTION: &str =
-    "Author a new markdown skill. Args: { name, description, body, overwrite? }. \
+    "Author a new markdown skill. Positional args: <name> <description> <body>. \
      Writes <skills_dir>/<name>.md and registers it on next backend start.";
 
 /// Default body the seeded `skill-creator.md` carries. Kept in the same
@@ -25,22 +25,21 @@ pub const SEED_MD: &str = r#"---
 name: skill-creator
 description: Author a new markdown skill in the skills/ folder.
 ---
-You are the **skill-creator** tool. When the agent calls you, it must pass
-JSON with the following shape:
+The **skill-creator** tool writes a new `skills/<name>.md` so it becomes a
+live skill on the next backend restart.
 
-```
-{
-  "name":        "my-skill",       // required, becomes the filename stem
-  "description": "one-line summary",
-  "body":        "multi-line skill instructions",
-  "overwrite":   false              // optional, default false
-}
-```
+Invocation (single line — escape newlines inside the body as `\n`):
 
-You write `skills/<name>.md` with a YAML frontmatter block (`name`,
-`description`) followed by the supplied body. The file becomes a live
-skill on the next backend restart. Refuse to overwrite an existing file
-unless `overwrite: true` is set.
+    skill-creator '<name>' '<description>' '<body>' > <what you want confirmed>
+
+Example:
+
+    skill-creator 'fetch-url' 'GET a URL and return the body' 'Use curl -s under run-cli.' > confirm file written
+
+Behaviour:
+- `<name>` must be `[a-z0-9_-]+` (it becomes the filename stem).
+- An existing `skills/<name>.md` is **never** overwritten; pick a fresh name.
+- The new skill is loaded on the next backend start.
 
 To author further skills by hand, drop another `*.md` file with the same
 frontmatter shape into this folder.
@@ -59,6 +58,9 @@ impl SkillCreator {
 #[async_trait]
 impl Skill for SkillCreator {
     fn name(&self) -> &str { NAME }
+    fn positional_args(&self) -> Vec<String> {
+        vec!["name".into(), "description".into(), "body".into()]
+    }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
         match write_skill(&self.skills_dir, &args) {

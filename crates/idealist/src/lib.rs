@@ -72,6 +72,9 @@ impl Idealist {
                     TriggerSource::Frontend => {
                         fe_ticket::write_fe_ticket(&trigger).ok()
                     }
+                    // SubAgentTool failures share the BE write path: they
+                    // produce an Improvement-BE-*.md ticket with the
+                    // analyzer's suggested skill swap surfaced inline.
                     _ => {
                         be_autofix::write_be_ticket(&trigger, auto_apply).ok()
                     }

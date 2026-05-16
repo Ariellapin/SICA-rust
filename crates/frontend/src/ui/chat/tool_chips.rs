@@ -28,9 +28,17 @@ pub fn draw(ui: &mut egui::Ui, chips: &[ToolChip], palette: &Palette) {
                         ("ERR", rgb(palette.danger))
                     };
                     caps_label(ui, verb, color);
-                    // Tool name as a tracked caps label with hairline underline.
+                    // Editorial form of the call: `skill 'arg'` followed by
+                    // `> expectation` so the chip reads like the source line
+                    // the model emitted. We render the natural-language label
+                    // when present and fall back to the bare skill name.
+                    let label = if chip.args_preview.is_empty() {
+                        chip.name.clone()
+                    } else {
+                        chip.args_preview.clone()
+                    };
                     let name_resp = ui.add(
-                        egui::Label::new(caps_job(&chip.name, rgb(palette.ink), 11.0))
+                        egui::Label::new(caps_job(&label, rgb(palette.ink), 11.0))
                             .selectable(false)
                             .sense(Sense::hover()),
                     );
@@ -40,8 +48,22 @@ pub fn draw(ui: &mut egui::Ui, chips: &[ToolChip], palette: &Palette) {
                         rect.bottom() + 1.0,
                         Stroke::new(1.0, rgb(palette.hairline)),
                     );
-                    if !chip.summary.is_empty() {
-                        name_resp.on_hover_text(&chip.summary);
+                    let hover = match (chip.expectation.is_empty(), chip.summary.is_empty()) {
+                        (true,  true)  => String::new(),
+                        (true,  false) => chip.summary.clone(),
+                        (false, true)  => format!("expect: {}", chip.expectation),
+                        (false, false) => format!("expect: {}\n\n{}", chip.expectation, chip.summary),
+                    };
+                    if !hover.is_empty() {
+                        name_resp.on_hover_text(hover);
+                    }
+                    if !chip.expectation.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(" > {}", chip.expectation))
+                                .color(muted)
+                                .size(10.0)
+                                .italics(),
+                        );
                     }
                     if i + 1 < chips.len() {
                         ui.label(egui::RichText::new(" · ").color(muted));

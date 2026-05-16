@@ -56,7 +56,14 @@ pub enum UiEvent {
     TokenUsage { session_id: u64, used: u32, limit: u32 },
 
     // Tool chips.
-    ToolCallStarted { id: u64, parent_id: Option<u64>, depth: u8, name: String },
+    ToolCallStarted {
+        id: u64,
+        parent_id: Option<u64>,
+        depth: u8,
+        name: String,
+        args_preview: String,
+        expectation: String,
+    },
     ToolCallFinished { id: u64, ok: bool, summary: String },
 
     // Session list (forwarded from typed Responses).
@@ -227,8 +234,8 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::TokenUsage { session_id, used, limit } => {
             UiEvent::TokenUsage { session_id, used, limit }
         }
-        Event::ToolCallStarted { id, parent_id, depth, name } => {
-            UiEvent::ToolCallStarted { id, parent_id, depth, name }
+        Event::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
+            UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation }
         }
         Event::ToolCallFinished { id, ok, summary } => {
             UiEvent::ToolCallFinished { id, ok, summary }

@@ -1,10 +1,15 @@
 //! Bottom status strip. A subsystem-specific icon + tracked-caps label naming
 //! the subsystem, middot separators, project folder and active model in the
 //! middle, token meter on the right, and the italic-serif brandmark at the
-//! far edge.
+//! far edge. When the on-disk source has drifted away from what the running
+//! BE was built from, a pulsing "RESTART" button appears in front of the
+//! brandmark; clicking it issues a `RebuildAndRestart`.
+
+use sica_core::theme::tokens::{HAIRLINE, RADIUS_2};
 
 use crate::app::{rgb, App};
-use crate::ui::widgets::{caps_label, display_text, right_aligned, status_icon, StatusKind};
+use crate::supervisor::UiCommand;
+use crate::ui::widgets::{caps_job, caps_label, display_text, right_aligned, status_icon, StatusKind};
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
@@ -77,9 +82,67 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             let used = app.tokens.used.load(std::sync::atomic::Ordering::Relaxed);
             let limit = app.tokens.limit.load(std::sync::atomic::Ordering::Relaxed);
             caps_label(ui, &format!("{used} / {limit}"), muted);
+
+            if app.be_state.restart_pending() {
+                ui.label(egui::RichText::new(" · ").color(muted));
+                draw_restart_button(app, ui);
+            }
         });
     });
     ui.add_space(2.0);
+}
+
+/// Pulsing "RESTART" pill shown when the on-disk source has drifted from the
+/// running BE. Click → `RebuildAndRestart`. Disabled while a build is in
+/// flight so repeated clicks can't stack respawns.
+fn draw_restart_button(app: &mut App, ui: &mut egui::Ui) {
+    let p = app.palette;
+    let busy = app.build_state.in_flight;
+
+    // Pulse — sine wave on a 1.2s period. egui needs a repaint scheduled to
+    // keep the animation moving even when nothing else is invalidating the
+    // frame.
+    let t = ui.input(|i| i.time);
+    let phase = (t as f32 * std::f32::consts::TAU / 1.2).sin() * 0.5 + 0.5;
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+
+    let accent = rgb(p.accent);
+    let subtle = rgb(p.accent_subtle);
+    let on_accent = rgb(p.page_bg);
+    let fill = lerp_color(subtle, accent, phase);
+    let label_color = if busy { rgb(p.muted) } else { on_accent };
+
+    let resp = ui.add_enabled(
+        !busy,
+        egui::Button::new(caps_job("⟳ RESTART", label_color, 11.0))
+            .fill(fill)
+            .stroke(egui::Stroke::new(HAIRLINE, accent))
+            .rounding(egui::Rounding::same(RADIUS_2))
+            .min_size(egui::Vec2::new(0.0, 22.0)),
+    );
+    let resp = resp.on_hover_text(format!(
+        "Source has changed since the BE was built.\nBE: {}\nSrc: {}",
+        app.be_state.running_version.as_deref().unwrap_or("—"),
+        app.be_state.source_version.as_deref().unwrap_or("—"),
+    ));
+    if resp.clicked() {
+        app.send(UiCommand::RebuildAndRestart { release: app.release_profile });
+    }
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| -> u8 {
+        let xf = x as f32;
+        let yf = y as f32;
+        (xf + (yf - xf) * t).round().clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgba_unmultiplied(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+        lerp(a.a(), b.a()),
+    )
 }
 
 fn sep(ui: &mut egui::Ui, color: egui::Color32) {

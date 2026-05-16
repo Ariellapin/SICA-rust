@@ -8,7 +8,7 @@ use protocol::{Event, Frame, LlmState, SessionMeta};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
-use agents::{EventSink, SkillRegistry, ToolSubAgent};
+use agents::{EventSink, SkillRegistry, ToolFailureSink, ToolSubAgent};
 use llm::client::LlmClient;
 use sica_core::message::{Message, Role};
 use sica_core::session::Session;
@@ -29,39 +29,51 @@ pub fn default_title(id: u64) -> String {
 
 #[derive(Clone)]
 pub struct ChatHub {
-    pub sessions:   Arc<Mutex<HashMap<u64, Session>>>,
-    pub next_id:    Arc<AtomicU64>,
-    pub next_turn:  Arc<AtomicU64>,
-    pub llm:        Arc<Mutex<Option<LlmClient>>>,
-    pub llm_state:  Arc<Mutex<LlmState>>,
-    pub out_tx:     mpsc::UnboundedSender<Frame>,
-    pub event_sink: Arc<dyn EventSink>,
+    pub sessions:      Arc<Mutex<HashMap<u64, Session>>>,
+    pub next_id:       Arc<AtomicU64>,
+    pub next_turn:     Arc<AtomicU64>,
+    pub llm:           Arc<Mutex<Option<LlmClient>>>,
+    pub llm_state:     Arc<Mutex<LlmState>>,
+    pub out_tx:        mpsc::UnboundedSender<Frame>,
+    pub event_sink:    Arc<dyn EventSink>,
     /// Skill catalogue used to dispatch `tool_call` blocks parsed from the
     /// assistant's reply. Shared (immutable post-startup) so cloning a hub
     /// does not copy the map.
-    pub skills:     Arc<SkillRegistry>,
+    pub skills:        Arc<SkillRegistry>,
+    /// Forwards each failed sub-agent tool call into the idealist daemon.
+    /// `None` only in test contexts where the daemon isn't running.
+    pub failure_sink:  Option<Arc<dyn ToolFailureSink>>,
 }
 
 impl ChatHub {
-    pub fn new(out_tx: mpsc::UnboundedSender<Frame>, skills: Arc<SkillRegistry>) -> Self {
+    pub fn new(
+        out_tx: mpsc::UnboundedSender<Frame>,
+        skills: Arc<SkillRegistry>,
+        failure_sink: Option<Arc<dyn ToolFailureSink>>,
+    ) -> Self {
         let sink: Arc<dyn EventSink> = Arc::new(OutSink { tx: out_tx.clone() });
         Self {
-            sessions:   Arc::new(Mutex::new(HashMap::new())),
-            next_id:    Arc::new(AtomicU64::new(1)),
-            next_turn:  Arc::new(AtomicU64::new(1)),
-            llm:        Arc::new(Mutex::new(None)),
-            llm_state:  Arc::new(Mutex::new(LlmState::Disconnected)),
+            sessions:     Arc::new(Mutex::new(HashMap::new())),
+            next_id:      Arc::new(AtomicU64::new(1)),
+            next_turn:    Arc::new(AtomicU64::new(1)),
+            llm:          Arc::new(Mutex::new(None)),
+            llm_state:    Arc::new(Mutex::new(LlmState::Disconnected)),
             out_tx,
-            event_sink: sink,
+            event_sink:   sink,
             skills,
+            failure_sink,
         }
     }
 
     /// Build a hub pre-populated with every session it can find on disk.
     /// `next_id` is advanced past the largest existing id so newly minted
     /// sessions never collide with restored ones.
-    pub fn new_loaded(out_tx: mpsc::UnboundedSender<Frame>, skills: Arc<SkillRegistry>) -> Self {
-        let hub = Self::new(out_tx, skills);
+    pub fn new_loaded(
+        out_tx: mpsc::UnboundedSender<Frame>,
+        skills: Arc<SkillRegistry>,
+        failure_sink: Option<Arc<dyn ToolFailureSink>>,
+    ) -> Self {
+        let hub = Self::new(out_tx, skills, failure_sink);
         let loaded = sessions_store::load_all();
         let max_id = loaded.iter().map(|s| s.id).max().unwrap_or(0);
         {
@@ -190,6 +202,7 @@ impl ChatHub {
         let sessions_map = self.sessions.clone();
         let next_turn = self.next_turn.clone();
         let skills = self.skills.clone();
+        let failure_sink = self.failure_sink.clone();
         let title_client = client.clone();
         let event_sink = self.event_sink.clone();
         tokio::spawn(async move {
@@ -257,12 +270,24 @@ impl ChatHub {
                 hops += 1;
 
                 // Dispatch the skill. Unknown skill → record an error result
-                // and let the model recover on the next hop.
-                let outcome = match skills.get(&call.skill) {
-                    Some(skill) => {
-                        ToolSubAgent::root(events.clone())
-                            .run(&*skill, call.args.clone())
-                            .await
+                // and let the model recover on the next hop. Successful
+                // outcomes get post-summarised through the same `client` so
+                // the main agent receives a focused answer instead of the
+                // raw skill output (matches the natural-language contract in
+                // memory.md).
+                let outcome = match skills.resolve(&call) {
+                    Some((skill, args)) => {
+                        let mut sub = ToolSubAgent::root(events.clone())
+                            .with_summarizer(client.clone());
+                        if let Some(fs) = failure_sink.clone() {
+                            sub = sub.with_failure_sink(fs);
+                        }
+                        sub.run(agents::ToolInvocation {
+                            skill: &*skill,
+                            args,
+                            raw_args: call.raw_args.clone(),
+                            expectation: call.expectation.clone(),
+                        }).await
                     }
                     None => agents::SkillOutcome {
                         ok: false,

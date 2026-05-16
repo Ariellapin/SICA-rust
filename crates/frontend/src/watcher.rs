@@ -1,4 +1,7 @@
-//! File watcher: 1s debounced notifications for changes to crates/backend/src.
+//! File watcher: 1s debounced notifications for changes anywhere under
+//! `crates/`. Any workspace crate's source affects the BE binary, so the
+//! watcher signals on the whole tree — `app.rs` recomputes `source_version`
+//! on each event so the footer's restart-pending check stays current.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,7 +21,7 @@ pub struct WatcherHandle {
 
 pub fn start(tx: mpsc::UnboundedSender<Vec<PathBuf>>) -> Result<WatcherHandle> {
     let root = workspace_root()?;
-    let watch_dir = root.join("crates").join("backend").join("src");
+    let watch_dir = root.join("crates");
 
     let mut debouncer = new_debouncer(DEBOUNCE, move |res: notify_debouncer_mini::DebounceEventResult| {
         match res {

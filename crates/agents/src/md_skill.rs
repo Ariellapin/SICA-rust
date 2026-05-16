@@ -34,12 +34,20 @@ pub struct MarkdownSkill {
     pub description: String,
     pub body:        String,
     pub source_path: PathBuf,
+    /// Names of positional args declared in frontmatter (`positional:` key,
+    /// comma- or whitespace-separated). Empty when the skill carries no
+    /// positional inputs.
+    pub positionals: Vec<String>,
 }
 
 #[async_trait]
 impl Skill for MarkdownSkill {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn positional_args(&self) -> Vec<String> {
+        self.positionals.clone()
     }
 
     async fn run(&self, _args: Value, _ctx: SkillContext) -> SkillOutcome {
@@ -84,13 +92,19 @@ pub fn load_dir(dir: &Path) -> LoadReport {
     report
 }
 
-/// Register every skill produced by `load_dir`. Returns the parse-error
-/// list so the caller can decide how to surface them (the BE forwards
-/// them as `LogLine` events).
+/// Register every skill produced by `load_dir`, **only** for names that
+/// aren't already in the registry. The built-in `seed_defaults` writes
+/// markdown contracts like `skills/run-cli.md` so the LLM can read them,
+/// but the file body must not shadow the real `RunCli` Rust skill — doing
+/// so would make `run-cli` invocations return their own documentation
+/// instead of executing the command (the bug seen in `sessions/8.toml`).
+///
+/// Returns the parse-error list so the caller can decide how to surface
+/// them (the BE forwards them as `LogLine` events).
 pub fn register_all(registry: &mut SkillRegistry, dir: &Path) -> Vec<(PathBuf, String)> {
     let report = load_dir(dir);
     for s in report.loaded {
-        registry.register(Arc::new(s));
+        registry.register_if_absent(Arc::new(s));
     }
     report.errors
 }
@@ -113,6 +127,7 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
 
     let mut name        = String::new();
     let mut description = String::new();
+    let mut positionals = Vec::new();
     let mut closed = false;
     for line in lines.by_ref() {
         if line.trim() == "---" {
@@ -123,6 +138,7 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
             match k.as_str() {
                 "name"        => name        = v,
                 "description" => description = v,
+                "positional"  => positionals = split_positionals(&v),
                 _ => {}
             }
         }
@@ -140,7 +156,19 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
         description,
         body: body.trim_start_matches('\n').to_string(),
         source_path: source.to_path_buf(),
+        positionals,
     })
+}
+
+/// Parse a `positional:` frontmatter value into an ordered name list. Accepts
+/// either comma- or whitespace-separated forms (`"path, content"` and
+/// `"path content"` both work). Empty entries are dropped.
+fn split_positionals(v: &str) -> Vec<String> {
+    v.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn split_kv(line: &str) -> Option<(String, String)> {
@@ -197,6 +225,7 @@ mod tests {
             description: "d".into(),
             body: "instructions".into(),
             source_path: dummy(),
+            positionals: Vec::new(),
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let sub = crate::ToolSubAgent::root(cap);
@@ -204,6 +233,14 @@ mod tests {
         let out = s.run(Value::Null, ctx).await;
         assert!(out.ok);
         assert_eq!(out.summary, "instructions");
+    }
+
+    #[test]
+    fn frontmatter_carries_positional_args() {
+        let text = "---\nname: x\npositional: city, units\n---\nbody\n";
+        let s = parse(text, &dummy()).unwrap();
+        assert_eq!(s.positionals, vec!["city".to_string(), "units".to_string()]);
+        assert_eq!(s.positional_args(), vec!["city".to_string(), "units".to_string()]);
     }
 
     struct Sink;

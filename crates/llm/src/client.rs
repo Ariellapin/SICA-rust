@@ -93,6 +93,26 @@ impl LlmClient {
         Ok(list.data.into_iter().map(|m| m.id).collect())
     }
 
+    /// One-shot, non-streaming chat: aggregates every streamed delta into a
+    /// single trimmed string. Used by the sub-agent summarizer where the
+    /// caller doesn't need the live deltas surfaced to the UI.
+    pub async fn chat_once(&self, messages: Vec<ChatMessage>) -> Result<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let this = self.clone();
+        let handle = tokio::spawn(async move {
+            this.chat_stream(messages, tx).await
+        });
+        let mut out = String::new();
+        while let Some(chunk) = rx.recv().await {
+            out.push_str(&chunk.delta_content);
+        }
+        match handle.await {
+            Ok(Ok(())) => Ok(out.trim().to_string()),
+            Ok(Err(e)) => Err(e),
+            Err(e)     => Err(anyhow!("join: {e}")),
+        }
+    }
+
     /// Open a streaming chat completion. Each parsed `StreamChunk` is forwarded
     /// to `tx`. The task returns once the upstream stream closes or errors.
     pub async fn chat_stream(
