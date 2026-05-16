@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -31,28 +31,114 @@ pub enum Payload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
+    // Legacy demo requests (still used in the Communication tab).
     GetCounter,
     IncrementCounter { by: i64 },
     ResetCounter,
     ComputeFib { n: u32 },
     EchoText { text: String },
     Shutdown,
+
+    // Chat / LLM control.
+    SendUserMessage { session_id: u64, text: String },
+    InterruptTurn   { session_id: u64 },
+    NewSession,
+    ListSessions,
+    ConnectLlm    { base_url: String, model: String },
+    DisconnectLlm,
+
+    // Frontend telemetry — feeds the idealist's classifier.
+    ReportFrontendError { module: String, message: String, traceback: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     CounterValue { value: i64 },
-    FibResult { n: u32, value: u128 },
-    Echoed { text: String },
+    FibResult    { n: u32, value: u128 },
+    Echoed       { text: String },
     Ok,
+    Error        { message: String },
+    SessionList    { sessions: Vec<SessionMeta> },
+    SessionCreated { id: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: u64,
+    pub title: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LlmState {
+    Disconnected,
+    Connecting,
+    Ready { model: String, context_window: u32 },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TicketKind {
+    BeFix,
+    FeBug,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     Heartbeat { uptime_secs: u64, counter: i64 },
-    Progress { request_id: u64, percent: u8 },
-    LogLine { level: String, message: String },
+    Progress  { request_id: u64, percent: u8 },
+    LogLine   { level: String, message: String },
+
+    // LLM connection state.
+    LlmStateChanged { state: LlmState },
+
+    // Streaming turn lifecycle.
+    TurnStarted   { session_id: u64, turn_id: u64 },
+    AssistantDelta {
+        session_id: u64,
+        turn_id: u64,
+        content: String,
+        reasoning: String,
+    },
+    TurnFinished {
+        session_id: u64,
+        turn_id: u64,
+        finish_reason: String,
+    },
+
+    // Live token meter (fixes the stale-meter bug from Python).
+    TokenUsage { session_id: u64, used: u32, limit: u32 },
+
+    // Tool-call / sub-agent UI events. Nested calls inherit parent_id.
+    ToolCallStarted {
+        id: u64,
+        parent_id: Option<u64>,
+        depth: u8,
+        name: String,
+    },
+    ToolCallFinished {
+        id: u64,
+        ok: bool,
+        summary: String,
+    },
+
+    // Idealist daemon signals.
+    IdealistStatus {
+        activity: String,
+        severity: Severity,
+        last_ticket: Option<String>,
+    },
+    IdealistTicketWritten {
+        path: String,
+        kind: TicketKind,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -105,5 +191,36 @@ mod tests {
         let back = Frame::decode(&bytes).unwrap();
         assert_eq!(back.id, 0);
         matches!(back.payload, Payload::Event(Event::Heartbeat { .. }));
+    }
+
+    #[test]
+    fn roundtrip_token_usage() {
+        let f = Frame::event(Event::TokenUsage { session_id: 1, used: 1234, limit: 24000 });
+        let bytes = f.encode().unwrap();
+        let back = Frame::decode(&bytes).unwrap();
+        matches!(back.payload, Payload::Event(Event::TokenUsage { .. }));
+    }
+
+    #[test]
+    fn roundtrip_tool_call() {
+        let f = Frame::event(Event::ToolCallStarted {
+            id: 1,
+            parent_id: None,
+            depth: 0,
+            name: "cmd".into(),
+        });
+        let bytes = f.encode().unwrap();
+        let back = Frame::decode(&bytes).unwrap();
+        matches!(back.payload, Payload::Event(Event::ToolCallStarted { .. }));
+    }
+
+    #[test]
+    fn roundtrip_llm_state() {
+        let f = Frame::event(Event::LlmStateChanged {
+            state: LlmState::Ready { model: "qwen".into(), context_window: 24000 },
+        });
+        let bytes = f.encode().unwrap();
+        let back = Frame::decode(&bytes).unwrap();
+        matches!(back.payload, Payload::Event(Event::LlmStateChanged { .. }));
     }
 }

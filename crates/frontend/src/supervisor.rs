@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use protocol::{Frame, Request};
+use protocol::{Event, Frame, LlmState, Request, Severity, TicketKind};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -26,6 +26,7 @@ pub enum UiCommand {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum UiEvent {
     Log(String),
     BeStarted { pid: u32 },
@@ -34,9 +35,29 @@ pub enum UiEvent {
     BuildLine(String),
     BuildFinished { ok: bool, duration_ms: u128 },
     IpcConnected,
-    IpcDisconnected,
+    IpcDisconnected { error: Option<String> },
     IpcFrame(Frame),
+    /// Fired every time the BE heartbeats; the FE uses this for the IPC
+    /// dot-watchdog instead of writing the heartbeat into the user log.
+    Heartbeat,
     FsEvent(Vec<PathBuf>),
+
+    // LLM lifecycle.
+    LlmStateChanged(LlmState),
+
+    // Streaming chat events.
+    TurnStarted { session_id: u64, turn_id: u64 },
+    AssistantDelta { session_id: u64, turn_id: u64, content: String, reasoning: String },
+    TurnFinished { session_id: u64, turn_id: u64, finish_reason: String },
+    TokenUsage { session_id: u64, used: u32, limit: u32 },
+
+    // Tool chips.
+    ToolCallStarted { id: u64, parent_id: Option<u64>, depth: u8, name: String },
+    ToolCallFinished { id: u64, ok: bool, summary: String },
+
+    // Idealist signals.
+    IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
+    IdealistTicketWritten { path: String, kind: TicketKind },
 }
 
 pub struct UiBridge {
@@ -79,8 +100,6 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
     let mut running: Option<Running> = None;
     let mut auto_watch = false;
 
-    // File watcher: lives for the whole supervisor lifetime. The `auto_watch`
-    // flag below decides whether to act on its events.
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let _watcher_handle = match watcher::start(fs_tx) {
         Ok(h) => Some(h),
@@ -90,11 +109,6 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
         }
     };
 
-    // `tokio::select!` is sequential: only one branch body runs at a time.
-    // While a `do_build().await` is in flight, no other branch can fire — events
-    // queue in their channels and are delivered on subsequent loop iterations.
-    // This naturally coalesces rapid FS events through the debouncer plus the
-    // sequencing here.
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -133,8 +147,6 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
                                 Err(e) => bridge.send(UiEvent::Log(format!("respawn failed: {e}"))),
                             }
                         }
-                        // Drain any FS events queued during the build so we don't
-                        // immediately rebuild again.
                         while fs_rx.try_recv().is_ok() {}
                     }
                     UiCommand::SendRequest(req) => {
@@ -181,6 +193,43 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
     info!("supervisor exiting");
 }
 
+/// Forward a protocol `Event` from the BE to the FE's UI event channel. Splits
+/// the typed event into the matching `UiEvent` so the app can render it without
+/// peeking inside the bincode frame.
+pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
+    let ui_ev = match ev {
+        Event::Heartbeat { .. } => UiEvent::Heartbeat,
+        Event::Progress { .. } => return,
+        Event::LogLine { level: _, message } => UiEvent::Log(message),
+        Event::LlmStateChanged { state } => UiEvent::LlmStateChanged(state),
+        Event::TurnStarted { session_id, turn_id } => {
+            UiEvent::TurnStarted { session_id, turn_id }
+        }
+        Event::AssistantDelta { session_id, turn_id, content, reasoning } => {
+            UiEvent::AssistantDelta { session_id, turn_id, content, reasoning }
+        }
+        Event::TurnFinished { session_id, turn_id, finish_reason } => {
+            UiEvent::TurnFinished { session_id, turn_id, finish_reason }
+        }
+        Event::TokenUsage { session_id, used, limit } => {
+            UiEvent::TokenUsage { session_id, used, limit }
+        }
+        Event::ToolCallStarted { id, parent_id, depth, name } => {
+            UiEvent::ToolCallStarted { id, parent_id, depth, name }
+        }
+        Event::ToolCallFinished { id, ok, summary } => {
+            UiEvent::ToolCallFinished { id, ok, summary }
+        }
+        Event::IdealistStatus { activity, severity, last_ticket } => {
+            UiEvent::IdealistStatus { activity, severity, last_ticket }
+        }
+        Event::IdealistTicketWritten { path, kind } => {
+            UiEvent::IdealistTicketWritten { path, kind }
+        }
+    };
+    bridge.send(ui_ev);
+}
+
 async fn start_be(bridge: &Arc<UiBridge>) -> anyhow::Result<Running> {
     start_be_with_profile(bridge, false).await
 }
@@ -201,7 +250,6 @@ async fn start_be_with_profile(bridge: &Arc<UiBridge>, release: bool) -> anyhow:
     let pid = child.pid;
     bridge.send(UiEvent::BeStarted { pid });
 
-    // Connect IPC with retry/backoff.
     let (request_tx, request_rx) = mpsc::unbounded_channel::<Frame>();
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
     ipc_client::spawn(pipe_name.clone(), bridge.clone(), request_rx, kill_rx);
@@ -219,9 +267,7 @@ async fn start_be_with_profile(bridge: &Arc<UiBridge>, release: bool) -> anyhow:
 async fn stop_be(running: Running, bridge: &Arc<UiBridge>) {
     let Running { mut child, ipc_kill, request_tx, .. } = running;
 
-    // 1) cooperative shutdown over IPC
     let _ = request_tx.send(Frame::request(u64::MAX, Request::Shutdown));
-    // Brief grace period
     let waited = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
     match waited {
         Ok(Ok(status)) => {
@@ -233,7 +279,6 @@ async fn stop_be(running: Running, bridge: &Arc<UiBridge>) {
         Err(_) => {}
     }
 
-    // 2) forceful kill
     let _ = child.kill().await;
     match child.wait().await {
         Ok(s) => bridge.send(UiEvent::BeStopped { code: s.code() }),
@@ -256,4 +301,3 @@ async fn do_build(release: bool, bridge: &Arc<UiBridge>) -> bool {
     });
     ok
 }
-

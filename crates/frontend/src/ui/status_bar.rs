@@ -1,55 +1,61 @@
-use crate::app::App;
+//! Bottom status strip. Dots-only — labels and detail appear in hover tooltips.
+//! Three dots: **BE**, **IPC**, **LLM**.
+
+use egui::Color32;
+
+use sica_core::theme as t;
+
+use crate::app::{rgb, App};
+use crate::ui::widgets::status_dot;
+
+const COLOR_OK: Color32 = Color32::from_rgb(0x33, 0xCC, 0x66);  // IDEALIST_GREEN
+const COLOR_ERR: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B); // ERROR_FG
+const COLOR_IDLE: Color32 = Color32::from_rgb(0x5A, 0x60, 0x68); // DIVIDER_FG
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        let be_dot = if app.be_state.running {
-            (egui::Color32::from_rgb(110, 220, 110), "running")
+        // BE dot
+        let (be_color, be_label, be_detail) = if app.be_state.running {
+            (COLOR_OK, format!("BE: running (pid={})", app.be_state.pid.unwrap_or(0)), None)
+        } else if let Some(err) = app.be_state.last_error.clone() {
+            (COLOR_ERR, "BE: stopped".to_string(), Some(err))
         } else {
-            (egui::Color32::from_gray(140), "stopped")
+            (COLOR_IDLE, "BE: stopped".to_string(), None)
         };
-        circle(ui, be_dot.0);
-        ui.label(format!(
-            "BE: {} {}",
-            be_dot.1,
-            app.be_state.pid.map(|p| format!("pid={p}")).unwrap_or_default()
-        ));
-        ui.separator();
+        status_dot(ui, be_color, &be_label, be_detail.as_deref());
+        ui.add_space(8.0);
 
-        let ipc_dot = if app.ipc_state.connected {
-            (egui::Color32::from_rgb(110, 220, 110), "connected")
+        // IPC dot
+        let (ipc_color, ipc_label, ipc_detail) = if app.ipc_state.connected && !app.ipc_state.heartbeat_timeout {
+            (COLOR_OK, "IPC: connected".to_string(), None)
+        } else if app.ipc_state.connected && app.ipc_state.heartbeat_timeout {
+            (COLOR_ERR, "IPC: heartbeat timeout".to_string(), Some("no heartbeat for >5s".to_string()))
+        } else if let Some(err) = app.ipc_state.last_error.clone() {
+            (COLOR_ERR, "IPC: disconnected".to_string(), Some(err))
         } else {
-            (egui::Color32::from_rgb(220, 110, 110), "disconnected")
+            (COLOR_IDLE, "IPC: disconnected".to_string(), None)
         };
-        circle(ui, ipc_dot.0);
-        ui.label(format!("IPC: {}", ipc_dot.1));
-        ui.separator();
+        status_dot(ui, ipc_color, &ipc_label, ipc_detail.as_deref());
+        ui.add_space(8.0);
 
-        match (app.build_state.last_ok, app.build_state.last_duration_ms) {
-            (Some(true), Some(ms)) => {
-                circle(ui, egui::Color32::from_rgb(110, 220, 110));
-                ui.label(format!("last build: ok ({:.2}s)", ms as f64 / 1000.0));
-            }
-            (Some(false), Some(ms)) => {
-                circle(ui, egui::Color32::from_rgb(220, 110, 110));
-                ui.label(format!("last build: FAILED ({:.2}s)", ms as f64 / 1000.0));
-            }
-            _ => {
-                circle(ui, egui::Color32::from_gray(140));
-                ui.label("last build: —");
-            }
-        }
-        if app.build_state.in_flight {
-            ui.spinner();
-            ui.label("building…");
-        }
+        // LLM dot
+        let llm_label = format!("LLM: {}", app.llm_state.label());
+        let (llm_color, llm_detail) = match &app.llm_state.state {
+            protocol::LlmState::Ready { .. } => (COLOR_OK, None),
+            protocol::LlmState::Connecting => (rgb(t::IDEALIST_YELLOW), None),
+            protocol::LlmState::Error { message } => (COLOR_ERR, Some(message.clone())),
+            protocol::LlmState::Disconnected => (COLOR_IDLE, None),
+        };
+        status_dot(ui, llm_color, &llm_label, llm_detail.as_deref());
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(format!("log: {} lines", app.log.len()));
+            let used = app.tokens.used.load(std::sync::atomic::Ordering::Relaxed);
+            let limit = app.tokens.limit.load(std::sync::atomic::Ordering::Relaxed);
+            ui.label(
+                egui::RichText::new(format!("{used} / {limit} tokens"))
+                    .color(rgb(t::TEXT_MUTED))
+                    .monospace(),
+            );
         });
     });
-}
-
-fn circle(ui: &mut egui::Ui, color: egui::Color32) {
-    let r = 5.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(r * 2.5, r * 2.5), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), r, color);
 }

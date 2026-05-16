@@ -1,5 +1,12 @@
 //! IPC client: connect to the BE pipe (with backoff), then run reader+writer
 //! tasks until either side disconnects or `kill_rx` fires.
+//!
+//! Behavior changes vs. the original demo:
+//! - The reader does *not* log a Log mirror line for every frame. Only the
+//!   typed `forward_event` / `IpcFrame` event is dispatched so the chat panel
+//!   stays clean.
+//! - Heartbeats are forwarded as `UiEvent::Heartbeat` (drives the 5s watchdog
+//!   on the IPC dot) instead of being logged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::warn;
 
-use crate::supervisor::{UiBridge, UiEvent};
+use crate::supervisor::{forward_event, UiBridge, UiEvent};
 
 pub fn spawn(
     pipe_name: String,
@@ -34,12 +41,12 @@ pub fn spawn(
         let read_handle = tokio::spawn(read_loop(r, bridge.clone()));
         let write_handle = tokio::spawn(write_loop(w, request_rx, bridge.clone()));
 
-        tokio::select! {
-            _ = kill_rx => {}
-            _ = read_handle => {}
-            _ = write_handle => {}
-        }
-        bridge.send(UiEvent::IpcDisconnected);
+        let disconnect_reason: Option<String> = tokio::select! {
+            _ = kill_rx => None,
+            res = read_handle => res.err().map(|e| e.to_string()),
+            res = write_handle => res.err().map(|e| e.to_string()),
+        };
+        bridge.send(UiEvent::IpcDisconnected { error: disconnect_reason });
     });
 }
 
@@ -77,9 +84,23 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
         match item {
             Ok(bytes) => match Frame::decode(&bytes) {
                 Ok(frame) => {
-                    // Emit a Log mirror for human-readable summary, plus the raw frame.
-                    let summary = summarize(&frame);
-                    bridge.send(UiEvent::Log(summary));
+                    // Dispatch typed Events directly; non-event payloads still
+                    // get a one-line summary in the Communication log panel.
+                    match frame.payload.clone() {
+                        Payload::Event(ev) => forward_event(&bridge, ev),
+                        Payload::ServerHello { protocol_version, pid, version } => {
+                            bridge.send(UiEvent::Log(format!(
+                                "SRV  hello version={version} pid={pid} proto={protocol_version}"
+                            )));
+                        }
+                        Payload::Response(r) => {
+                            bridge.send(UiEvent::Log(format!("RSP#{} {:?}", frame.id, r)));
+                        }
+                        Payload::Pong => {
+                            bridge.send(UiEvent::Log(format!("PONG#{}", frame.id)));
+                        }
+                        other => bridge.send(UiEvent::Log(format!("???  {other:?}"))),
+                    }
                     bridge.send(UiEvent::IpcFrame(frame));
                 }
                 Err(e) => warn!(error = %e, "FE decode error"),
@@ -99,7 +120,6 @@ async fn write_loop(
 ) {
     let mut framed = FramedWrite::new(w, LengthDelimitedCodec::new());
 
-    // ClientHello first.
     let hello = Frame {
         id: 0,
         payload: Payload::ClientHello { protocol_version: protocol::PROTOCOL_VERSION },
@@ -127,16 +147,4 @@ async fn write_loop(
         }
     }
     let _ = framed.get_mut().shutdown().await;
-}
-
-fn summarize(f: &Frame) -> String {
-    match &f.payload {
-        Payload::ServerHello { protocol_version, pid, version } => {
-            format!("SRV  hello version={version} pid={pid} proto={protocol_version}")
-        }
-        Payload::Response(r) => format!("RSP#{} {:?}", f.id, r),
-        Payload::Event(e) => format!("EVT  {:?}", e),
-        Payload::Pong => format!("PONG#{}", f.id),
-        other => format!("???  {:?}", other),
-    }
 }

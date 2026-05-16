@@ -1,0 +1,19 @@
+[package]
+name         = "agents"
+edition      = { workspace = true }
+version      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[dependencies]
+protocol    = { path = "../protocol" }
+sica-core   = { path = "../sica-core" }
+llm         = { path = "../llm" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+futures     = { workspace = true }
+async-trait = { workspace = true }
+once_cell   = { workspace = true }

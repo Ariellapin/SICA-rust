@@ -9,11 +9,13 @@ use tracing::{info, warn};
 use protocol::{Event, Frame, Payload, Request};
 
 mod be_core;
+mod chat;
 mod dispatcher;
 mod ipc;
 mod parent_watch;
 
 use be_core::BeState;
+use chat::ChatHub;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -116,7 +118,15 @@ async fn run(args: Args) -> Result<()> {
     let state = Arc::new(BeState::new());
     let started = Instant::now();
 
-    // Send ServerHello immediately
+    // Chat hub + idealist daemon (use the dispatcher channel as their sink so
+    // every event flows out through the same write task).
+    let chat = ChatHub::new(out_tx.clone());
+    let idealist_sink: Arc<dyn idealist::IdealistEventSink> = Arc::new(OutSink { tx: out_tx.clone() });
+    let idealist = Arc::new(idealist::Idealist::new(idealist_sink));
+    let idealist_bus = idealist.bus.clone();
+    Arc::clone(&idealist).spawn();
+
+    // Initial broadcasts: ServerHello + initial LLM state so the FE can sync.
     let _ = out_tx.send(Frame {
         id: 0,
         payload: Payload::ServerHello {
@@ -125,13 +135,17 @@ async fn run(args: Args) -> Result<()> {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
     });
+    let _ = out_tx.send(Frame::event(Event::LlmStateChanged {
+        state: protocol::LlmState::Disconnected,
+    }));
 
-    // Heartbeat task
+    // Heartbeat task. FE silently consumes these to keep the IPC dot green;
+    // it no longer logs them to the user-visible log panel.
     let hb_state = state.clone();
     let hb_tx = out_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
-        tick.tick().await; // skip immediate
+        tick.tick().await;
         loop {
             tick.tick().await;
             let uptime = started.elapsed().as_secs();
@@ -145,7 +159,7 @@ async fn run(args: Args) -> Result<()> {
         }
     });
 
-    // Dispatcher loop (current task)
+    // Dispatcher loop.
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     loop {
         tokio::select! {
@@ -154,7 +168,7 @@ async fn run(args: Args) -> Result<()> {
                 match frame.payload {
                     Payload::Request(req) => {
                         let is_shutdown = matches!(req, Request::Shutdown);
-                        let resp = dispatcher::handle(req, &state, &shutdown_tx).await;
+                        let resp = dispatcher::handle(req, &state, &chat, &idealist_bus, &shutdown_tx).await;
                         let _ = out_tx.send(Frame::response(frame.id, resp));
                         if is_shutdown { break; }
                     }
@@ -174,13 +188,20 @@ async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // After the dispatcher breaks, close the writer channel and tear down the
-    // I/O tasks. Don't wait on read_task — on Windows named pipes the FE's
-    // shutdown doesn't always propagate as a clean EOF, so we abort instead.
     drop(out_tx);
     heartbeat_task.abort();
     read_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_millis(300), write_task).await;
     info!("backend exiting cleanly");
     Ok(())
+}
+
+struct OutSink {
+    tx: mpsc::UnboundedSender<Frame>,
+}
+
+impl idealist::IdealistEventSink for OutSink {
+    fn emit(&self, ev: Event) {
+        let _ = self.tx.send(Frame::event(ev));
+    }
 }

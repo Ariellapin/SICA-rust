@@ -11,7 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 protocol           = { path = "../protocol" }
+sica-core          = { path = "../sica-core" }
+llm                = { path = "../llm" }
+agents             = { path = "../agents" }
+idealist           = { path = "../idealist" }
 serde              = { workspace = true }
+serde_json         = { workspace = true }
 bincode            = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
@@ -22,6 +27,7 @@ thiserror          = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures            = { workspace = true }
+async-trait        = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

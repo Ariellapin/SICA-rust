@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 protocol              = { path = "../protocol" }
+sica-core             = { path = "../sica-core" }
 serde                 = { workspace = true }
 bincode               = { workspace = true }
 tokio                 = { workspace = true }

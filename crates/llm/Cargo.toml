@@ -1,0 +1,22 @@
+[package]
+name         = "llm"
+edition      = { workspace = true }
+version      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[dependencies]
+protocol           = { path = "../protocol" }
+sica-core          = { path = "../sica-core" }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tokio              = { workspace = true }
+futures            = { workspace = true }
+reqwest            = { workspace = true }
+eventsource-stream = { workspace = true }
+url                = { workspace = true }
+regex              = { workspace = true }
+once_cell          = { workspace = true }
