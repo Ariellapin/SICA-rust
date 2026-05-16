@@ -64,21 +64,45 @@ impl ChatHub {
 
     pub async fn connect_llm(&self, base_url: String, model: String) {
         self.set_llm_state(LlmState::Connecting).await;
-        let client = LlmClient::new(base_url, model.clone());
+        // Push a visible log line so the FE log panel reflects what's happening
+        // — the dot transition can be subtle on first run.
+        self.event_sink.emit(Event::LogLine {
+            level: "INFO".into(),
+            message: format!("LLM: connecting to {base_url} (model={model})"),
+        });
+        let client = LlmClient::new(base_url.clone(), model.clone());
         match client.health().await {
             Ok(()) => {
                 *self.llm.lock().await = Some(client);
                 self.set_llm_state(LlmState::Ready {
-                    model,
+                    model: model.clone(),
                     context_window: 24_000,
                 })
                 .await;
+                self.event_sink.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: format!("LLM: ready ({base_url}, model={model})"),
+                });
             }
             Err(e) => {
-                self.set_llm_state(LlmState::Error { message: format!("{e}") }).await;
+                let msg = format!("{e}");
+                self.set_llm_state(LlmState::Error { message: msg.clone() }).await;
                 warn!(error = %e, "LLM connect failed");
+                self.event_sink.emit(Event::LogLine {
+                    level: "ERROR".into(),
+                    message: format!("LLM: connect failed — {msg}"),
+                });
             }
         }
+    }
+
+    /// Spawn `connect_llm` on the runtime so the dispatcher returns to the
+    /// caller immediately instead of stalling for the full HTTP round-trip.
+    pub fn spawn_connect_llm(&self, base_url: String, model: String) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.connect_llm(base_url, model).await;
+        });
     }
 
     pub async fn disconnect_llm(&self) {

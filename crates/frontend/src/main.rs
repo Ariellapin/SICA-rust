@@ -2,6 +2,7 @@ mod app;
 mod builder;
 mod child;
 mod ipc_client;
+mod settings_store;
 mod supervisor;
 mod ui;
 mod watcher;

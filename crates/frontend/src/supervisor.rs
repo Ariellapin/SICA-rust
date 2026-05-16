@@ -42,6 +42,10 @@ pub enum UiEvent {
     Heartbeat,
     FsEvent(Vec<PathBuf>),
 
+    /// Carries the protocol version the BE announced in its ServerHello so
+    /// the FE can detect a stale BE binary.
+    ServerHello { protocol_version: u32, pid: u32, version: String },
+
     // LLM lifecycle.
     LlmStateChanged(LlmState),
 

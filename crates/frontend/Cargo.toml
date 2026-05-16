@@ -14,6 +14,7 @@ path = "src/main.rs"
 protocol              = { path = "../protocol" }
 sica-core             = { path = "../sica-core" }
 serde                 = { workspace = true }
+serde_json            = { workspace = true }
 bincode               = { workspace = true }
 tokio                 = { workspace = true }
 tokio-util            = { workspace = true }

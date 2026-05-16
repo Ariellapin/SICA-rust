@@ -92,6 +92,11 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                             bridge.send(UiEvent::Log(format!(
                                 "SRV  hello version={version} pid={pid} proto={protocol_version}"
                             )));
+                            bridge.send(UiEvent::ServerHello {
+                                protocol_version,
+                                pid,
+                                version,
+                            });
                         }
                         Payload::Response(r) => {
                             bridge.send(UiEvent::Log(format!("RSP#{} {:?}", frame.id, r)));

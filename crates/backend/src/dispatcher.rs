@@ -44,7 +44,10 @@ pub async fn handle(
             Response::SessionList { sessions }
         }
         Request::ConnectLlm { base_url, model } => {
-            chat.connect_llm(base_url, model).await;
+            // Spawn so the dispatcher can keep handling other requests while
+            // the HTTP round-trip completes. State changes flow back via
+            // `LlmStateChanged` events.
+            chat.spawn_connect_llm(base_url, model);
             Response::Ok
         }
         Request::DisconnectLlm => {

@@ -16,6 +16,11 @@ pub fn raw_llm_log_dir() -> PathBuf {
     workspace_root().join("logs").join("model")
 }
 
+/// JSON file the frontend reads at startup and writes on Apply.
+pub fn settings_file() -> PathBuf {
+    workspace_root().join("sica-settings.json")
+}
+
 fn workspace_root() -> PathBuf {
     // Prefer a sibling of the running BE executable. In dev, that's
     // target/debug/, so walk up to the workspace root.

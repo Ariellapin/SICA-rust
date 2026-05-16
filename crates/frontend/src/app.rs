@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use protocol::{LlmState, Request, Severity};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::settings_store::{self, Settings};
 use crate::supervisor::{self, UiCommand, UiEvent};
 use crate::ui;
 
@@ -55,6 +56,18 @@ pub struct App {
     pub llm_base_url: String,
     pub llm_model:    String,
 
+    // Auto-bootstrap flags.
+    pub auto_start_be:    bool,
+    pub auto_connect_llm: bool,
+    /// Set once we've fired the auto-start (so we don't loop).
+    #[allow(dead_code)]
+    pub did_auto_start_be: bool,
+    /// Set once we've fired ConnectLlm for the current IPC connection.
+    pub did_auto_connect_llm: bool,
+
+    // Toast feedback for the Apply button.
+    pub last_settings_status: Option<(Instant, Result<(), String>)>,
+
     // Chat state.
     pub chat: ChatState,
 
@@ -92,6 +105,9 @@ pub struct BeState {
     pub pid:            Option<u32>,
     pub last_exit_code: Option<i32>,
     pub last_error:     Option<String>,
+    /// Set when the BE announces a protocol version different from
+    /// `protocol::PROTOCOL_VERSION`. Drives a banner that prompts a rebuild.
+    pub protocol_mismatch: Option<(u32, u32)>,
 }
 
 pub struct IpcState {
@@ -238,7 +254,13 @@ impl App {
         let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
         let cmd_tx = supervisor::spawn(&rt, cc.egui_ctx.clone(), ui_tx);
 
-        Self::apply_theme(&cc.egui_ctx, true);
+        let settings = settings_store::load();
+        Self::apply_theme(&cc.egui_ctx, settings.theme_dark);
+
+        let auto_start_be = settings.auto_start_be;
+        if auto_start_be {
+            let _ = cmd_tx.send(UiCommand::StartBe);
+        }
 
         Self {
             rt,
@@ -249,17 +271,22 @@ impl App {
             ipc_state: IpcState::default(),
             llm_state: LlmUiState::default(),
             build_state: BuildState::default(),
-            auto_watch: false,
+            auto_watch: settings.auto_watch,
             request_draft: RequestDraft::default(),
-            release_profile: false,
-            autoscroll: true,
+            release_profile: settings.release_profile,
+            autoscroll: settings.autoscroll,
             view: AppView::Chat,
             settings_tab: SettingsTab::General,
-            theme_dark: true,
-            log_raw_llm: false,
-            idealist_auto_apply_be: false,
-            llm_base_url: "http://localhost:8080".into(),
-            llm_model: "local".into(),
+            theme_dark: settings.theme_dark,
+            log_raw_llm: settings.log_raw_llm,
+            idealist_auto_apply_be: settings.idealist_auto_apply_be,
+            llm_base_url: settings.llm_base_url,
+            llm_model: settings.llm_model,
+            auto_start_be,
+            auto_connect_llm: settings.auto_connect_llm,
+            did_auto_start_be: auto_start_be,
+            did_auto_connect_llm: false,
+            last_settings_status: None,
             chat: ChatState {
                 session_id: 1,
                 next_session: AtomicU64::new(2),
@@ -270,6 +297,38 @@ impl App {
                 limit: AtomicU32::new(24_000),
             }),
         }
+    }
+
+    /// Snapshot the live fields, persist them to disk, and re-apply runtime
+    /// state (theme, auto-watch, LLM endpoint). Surfaced to the user as a
+    /// small status line in the Settings panel.
+    pub fn apply_and_save_settings(&mut self, ctx: &egui::Context) {
+        let snapshot = Settings {
+            theme_dark:             self.theme_dark,
+            log_raw_llm:            self.log_raw_llm,
+            idealist_auto_apply_be: self.idealist_auto_apply_be,
+            llm_base_url:           self.llm_base_url.clone(),
+            llm_model:              self.llm_model.clone(),
+            auto_start_be:          self.auto_start_be,
+            auto_connect_llm:       self.auto_connect_llm,
+            autoscroll:             self.autoscroll,
+            release_profile:        self.release_profile,
+            auto_watch:             self.auto_watch,
+        };
+        let result = settings_store::save(&snapshot).map_err(|e| e.to_string());
+        Self::apply_theme(ctx, self.theme_dark);
+
+        // If the LLM endpoint/model changed, reconnect.
+        if self.ipc_state.connected {
+            self.send(UiCommand::SendRequest(Request::DisconnectLlm));
+            self.send(UiCommand::SendRequest(Request::ConnectLlm {
+                base_url: self.llm_base_url.clone(),
+                model:    self.llm_model.clone(),
+            }));
+        }
+        self.send(UiCommand::SetAutoWatch(self.auto_watch));
+
+        self.last_settings_status = Some((Instant::now(), result));
     }
 
     fn apply_theme(ctx: &egui::Context, dark: bool) {
@@ -362,10 +421,20 @@ impl App {
                 self.ipc_state.last_heartbeat = Some(Instant::now());
                 self.ipc_state.heartbeat_timeout = false;
                 self.push_log(LogKind::Ipc, "IPC connected".into());
+                if self.auto_connect_llm && !self.did_auto_connect_llm {
+                    self.did_auto_connect_llm = true;
+                    self.send(UiCommand::SendRequest(Request::ConnectLlm {
+                        base_url: self.llm_base_url.clone(),
+                        model:    self.llm_model.clone(),
+                    }));
+                }
             }
             UiEvent::IpcDisconnected { error } => {
                 self.ipc_state.connected = false;
                 self.ipc_state.last_error = error.clone();
+                // Reset the LLM auto-connect guard so the next IPC reconnect
+                // retries the LLM connection automatically.
+                self.did_auto_connect_llm = false;
                 self.push_log(
                     LogKind::Ipc,
                     format!("IPC disconnected{}", error.map(|e| format!(": {e}")).unwrap_or_default()),
@@ -373,6 +442,21 @@ impl App {
             }
             UiEvent::IpcFrame(_) => {
                 // Already handled by the typed event forwarders.
+            }
+            UiEvent::ServerHello { protocol_version, .. } => {
+                let fe_version = protocol::PROTOCOL_VERSION;
+                if protocol_version != fe_version {
+                    self.be_state.protocol_mismatch = Some((protocol_version, fe_version));
+                    self.push_log(
+                        LogKind::Error,
+                        format!(
+                            "PROTOCOL MISMATCH: BE reports v{protocol_version}, FE is v{fe_version} \
+                             — rebuild the BE binary (Settings → Communication → Rebuild & Restart)."
+                        ),
+                    );
+                } else {
+                    self.be_state.protocol_mismatch = None;
+                }
             }
             UiEvent::Heartbeat => {
                 self.ipc_state.last_heartbeat = Some(Instant::now());
@@ -395,6 +479,13 @@ impl App {
                 } else {
                     None
                 };
+                let line = match &state {
+                    LlmState::Disconnected => "LLM: disconnected".to_string(),
+                    LlmState::Connecting   => "LLM: connecting…".to_string(),
+                    LlmState::Ready { model, .. } => format!("LLM: ready ({model})"),
+                    LlmState::Error { message } => format!("LLM: error — {message}"),
+                };
+                self.push_log(LogKind::Event, line);
                 self.llm_state = LlmUiState { state, last_error: err };
             }
             UiEvent::TurnStarted { session_id, turn_id } => {
