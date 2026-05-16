@@ -1,0 +1,103 @@
+id = 5
+title = "Tel Aviv Weather Today"
+created_at = 1778947530
+
+[[messages]]
+role = "User"
+content = "Look weather for Tel-aviv today"
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{ "skill": "run-cli", "args": { "command": "curl -s wttr.in/Tel-Aviv?format=3&lang=he" } }
+```"""
+reasoning = """
+The user wants to know the weather in Tel Aviv today.
+I need to check if there is a specific weather skill available.
+The provided list of built-in skills is:
+- run-cli
+- read-file
+- write-file
+- skill-creator
+
+None of these are specifically for weather.
+However, `run-cli` allows me to execute a shell command. I can use a command-line tool like `curl` to fetch weather data from an API or a website if available on the host, or perhaps a tool like `wttr.in`.
+Let's try using `curl` to get the weather from `wttr.in` which is a common command-line weather service.
+
+Command: `curl wttr.in/Tel-Aviv`
+
+I will invoke `run-cli` with this command."""
+
+[[messages]]
+role = "User"
+content = "?"
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{ "skill": "run-cli", "args": { "command": "curl -s 'wttr.in/Tel-Aviv?format=3'" } }
+```"""
+reasoning = """
+The user replied with "?", implying the previous output might have been missing, unclear, or they are waiting for the result of the tool call.
+Since the tool call was just emitted in the previous turn, I need to check the output of that tool call.
+Wait, in the `sica-rust` environment, usually the backend executes the tool and returns the output in the next message or context.
+However, looking at the user's prompt "?", it seems like a direct response to my previous turn.
+
+Let's assume the previous tool call result was:
+```
+Tel-Aviv: ☀️ +24°C
+```
+Or maybe an error if `curl` wasn't available or the network failed.
+
+If I am acting as the AI, and the user says "?", they are likely asking "What happened?" or "What is the weather?".
+Since I don't see the output of the tool call in the immediate context provided in the prompt description (it just shows the skill invocation format), I have to assume the tool execution happened and I need to report the result.
+
+*Self-correction*: The prompt provided to me *now* is just "Look weather for Tel-aviv today" followed by "?".
+Actually, the prompt history provided is:
+1. User: "Look weather for Tel-aviv today"
+2. Model: (Tool call)
+3. User: "?"
+
+This suggests the user might be confused why I just emitted a tool call without showing the result, or the system didn't display it to them yet, or they are just prompting me again.
+
+However, in a standard sica flow, the tool output would be injected.
+Let's look at the "Sica memory" block again. It describes the *skills*.
+The user's input "Look weather for Tel-aviv today" was the first turn.
+My response was the tool call.
+The user's second input is "?".
+
+Maybe the previous tool call failed or returned nothing visible to the user.
+Let's try a different approach. I will try to read a file or run a command that gives more detail, or perhaps the first command didn't work as expected.
+
+Actually, a common issue with `curl wttr.in` is that it might require a browser user-agent or might return HTML if the format isn't parsed correctly, though `?format=3` usually works.
+Let's try a more robust command to get the weather.
+
+Also, I should explain what I am doing.
+
+Let's invoke the `run-cli` skill again with a slightly different command to ensure we get readable text.
+
+```tool_call
+{ "skill": "run-cli", "args": { "command": "curl -s 'wttr.in/Tel-Aviv?format=%C+%t+%h+%w'" } }
+```
+This will give Condition, Temperature, Humidity, Wind.
+
+Let's assume the previous output was empty or the user is just waiting.
+I will execute the command again and print the result.
+
+Wait, if the user sees "?", maybe they want to know what the tool call does?
+No, usually in chat interfaces, the tool output is hidden or processed. If the user sees a raw JSON block, they might be confused. But the prompt implies I am running *inside* the app.
+
+Let's just provide the weather info again using the tool.
+
+Refined plan:
+1. Run `curl` to get weather.
+2. If successful, display it.
+3. If not, explain.
+
+I will use `curl` to `wttr.in`.
+
+```tool_call
+{ "skill": "run-cli", "args": { "command": "curl -s 'wttr.in/Tel-Aviv?format=3'" } }
+```"""

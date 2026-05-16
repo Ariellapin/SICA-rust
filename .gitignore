@@ -10,3 +10,6 @@ Cargo.lock.bak
 # OS
 .DS_Store
 Thumbs.db
+
+# Per-user LLM provider configs — may contain API keys.
+/sica-settings/

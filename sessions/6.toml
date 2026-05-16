@@ -1,0 +1,51 @@
+id = 6
+title = "Listing Skills Directory"
+created_at = 1778947641
+
+[[messages]]
+role = "User"
+content = "what you remember?"
+
+[[messages]]
+role = "Assistant"
+content = """
+```tool_call
+{ "skill": "run-cli", "args": { "command": "ls -la skills/" } }
+```"""
+reasoning = """
+The user is asking "what you remember?", which implies they want to know about the current context or memory available to the Sica agent.
+Looking at the system prompt ("Sica memory"), it lists:
+1.  **Environment**: Running inside the **sica-rust** desktop app.
+2.  **Built-in Skills**: `run-cli`, `read-file`, `write-file`, `skill-creator`.
+3.  **User-authored Skills**: Any other `*.md` files in `skills/` loaded at startup.
+4.  **Invocation Format**: Fenced `tool_call` blocks.
+
+The user's question is vague. It could mean:
+*   "What is your system prompt/memory?"
+*   "What files are in the skills directory?" (since the system prompt mentions user-authored skills are loaded at startup, checking the directory might be relevant to "what you remember/know about available tools").
+*   "What is the current working directory?"
+
+Given the phrasing "what you remember", the most direct interpretation is usually a request to summarize the immediate context (system prompt) or the available tools/skills, as that constitutes the agent's "memory" of the environment.
+
+However, to be more helpful and demonstrate the "memory" of *user-authored* skills (which are loaded at startup but not explicitly listed in the prompt other than "any other *.md files"), I should probably check the `skills/` directory to see what user skills actually exist. This would provide a complete answer: "I remember the built-in skills provided by the system, and I can check the disk to see what user skills I have loaded."
+
+Actually, the prompt says "User-authored skills ... are loaded at startup". This implies the agent *knows* about them if they are loaded. But usually, the system prompt just lists the *built-in* ones explicitly. If the user skills were dynamically injected into the prompt, they would be listed there. Since they aren't explicitly listed in the provided text (only the built-ins are), checking the `skills/` directory is the best way to verify what "user-authored skills" are actually available.
+
+Let's start by listing the built-in skills provided in the prompt, and then use `run-cli` to check the `skills/` directory for any user-created skills to give a comprehensive answer.
+
+Step 1: List the built-in skills mentioned in the system prompt.
+Step 2: Run a command to list the contents of the `skills/` directory to see if there are any user-authored skills.
+
+Plan:
+1.  Acknowledge the built-in skills (`run-cli`, `read-file`, `write-file`, `skill-creator`).
+2.  Use `run-cli` to list the `skills/` directory to identify any user-authored skills.
+
+Let's do the `run-cli` first to see the file system state.
+
+```tool_call
+{ "skill": "run-cli", "args": { "command": "ls -la skills/" } }
+```
+
+Wait, the user might just be asking "What is your memory?" in a conversational sense. But in the context of an agent with tools, showing the tools is the best way to answer.
+
+Let's look at the skills directory."""

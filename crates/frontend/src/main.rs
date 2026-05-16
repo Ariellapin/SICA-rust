@@ -1,7 +1,9 @@
 mod app;
 mod builder;
 mod child;
+mod icon;
 mod ipc_client;
+mod llm_providers;
 mod settings_store;
 mod supervisor;
 mod ui;
@@ -20,7 +22,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("sica-rust"),
+            .with_title("sica-rust")
+            .with_icon(std::sync::Arc::new(icon::generate())),
         ..Default::default()
     };
 

@@ -22,11 +22,21 @@ pub struct TurnInput {
     pub limit:      u32,
 }
 
+/// Final accumulated state of one turn — what the caller needs to write
+/// the assistant message back into session storage. Reasoning is split
+/// out from content because `Message::reasoning` is its own field.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutput {
+    pub content:       String,
+    pub reasoning:     String,
+    pub finish_reason: String,
+}
+
 pub async fn run_turn(
     client: LlmClient,
     events: Arc<dyn EventSink>,
     input: TurnInput,
-) {
+) -> TurnOutput {
     let TurnInput { session_id, turn_id, messages, limit } = input;
 
     events.emit(Event::TurnStarted { session_id, turn_id });
@@ -93,7 +103,13 @@ pub async fn run_turn(
     events.emit(Event::TurnFinished {
         session_id,
         turn_id,
-        finish_reason: final_reason,
+        finish_reason: final_reason.clone(),
     });
     info!(session_id, turn_id, "turn finished");
+
+    TurnOutput {
+        content:       accum_content,
+        reasoning:     accum_reasoning,
+        finish_reason: final_reason,
+    }
 }

@@ -16,7 +16,7 @@ use interprocess::local_socket::{
     tokio::{prelude::*, Stream as IpcStream},
     GenericNamespaced, ToNsName,
 };
-use protocol::{Frame, Payload};
+use protocol::{Frame, Payload, Response};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -100,6 +100,18 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                         }
                         Payload::Response(r) => {
                             bridge.send(UiEvent::Log(format!("RSP#{} {:?}", frame.id, r)));
+                            match r {
+                                Response::SessionList { sessions } => {
+                                    bridge.send(UiEvent::SessionList { sessions });
+                                }
+                                Response::SessionCreated { id } => {
+                                    bridge.send(UiEvent::SessionCreated { id });
+                                }
+                                Response::SessionLoaded { session } => {
+                                    bridge.send(UiEvent::SessionLoaded { session });
+                                }
+                                _ => {}
+                            }
                         }
                         Payload::Pong => {
                             bridge.send(UiEvent::Log(format!("PONG#{}", frame.id)));

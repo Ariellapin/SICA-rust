@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- sica-rust app icon. Design source — the runtime icon is generated
+     procedurally in crates/frontend/src/icon.rs to match these shapes. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Rounded-square dark background -->
+  <rect x="0" y="0" width="256" height="256" rx="40" ry="40" fill="#0E1218"/>
+
+  <!-- Chat bubble silhouette, accent yellow -->
+  <path
+      d="M 56,64
+         L 200,64
+         Q 220,64 220,84
+         L 220,160
+         Q 220,180 200,180
+         L 120,180
+         L 88,212
+         L 96,180
+         L 56,180
+         Q 36,180 36,160
+         L 36,84
+         Q 36,64 56,64
+         Z"
+      fill="#FFD24A"/>
+
+  <!-- Three dots — the chat-bubble idiom -->
+  <circle cx="92"  cy="122" r="11" fill="#0E1218"/>
+  <circle cx="128" cy="122" r="11" fill="#0E1218"/>
+  <circle cx="164" cy="122" r="11" fill="#0E1218"/>
+</svg>

@@ -14,6 +14,7 @@ pub use crate::streaming::StreamChunk;
 pub struct LlmClient {
     pub base_url: String,
     pub model:    String,
+    api_key:      Option<String>,
     http:         reqwest::Client,
 }
 
@@ -42,10 +43,15 @@ struct ModelEntry {
 }
 
 impl LlmClient {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             model:    model.into(),
+            api_key:  api_key.filter(|k| !k.is_empty()),
             http:     reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
@@ -53,21 +59,36 @@ impl LlmClient {
         }
     }
 
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(k) => req.bearer_auth(k),
+            None    => req,
+        }
+    }
+
     /// GET /health — checks the server is reachable. Best-effort; some llama.cpp
     /// builds don't expose /health, in which case we fall back to GET /v1/models.
     pub async fn health(&self) -> Result<()> {
         let url = format!("{}/health", self.base_url.trim_end_matches('/'));
-        if self.http.get(url).send().await.is_ok() {
-            return Ok(());
+        // Treat any non-error transport response as reachable. For providers
+        // that don't expose /health (or return 404), fall back to /v1/models
+        // which also validates the API key when one is present.
+        if let Ok(resp) = self.auth(self.http.get(url)).send().await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
         }
-        // Fallback: list models.
         let _ = self.list_models().await?;
         Ok(())
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
-        let resp = self.http.get(url).send().await?.error_for_status()?;
+        let resp = self
+            .auth(self.http.get(url))
+            .send()
+            .await?
+            .error_for_status()?;
         let list: ModelsList = resp.json().await?;
         Ok(list.data.into_iter().map(|m| m.id).collect())
     }
@@ -87,9 +108,7 @@ impl LlmClient {
             temperature: Some(0.7),
         };
         let resp = self
-            .http
-            .post(url)
-            .json(&body)
+            .auth(self.http.post(url).json(&body))
             .send()
             .await?
             .error_for_status()?;

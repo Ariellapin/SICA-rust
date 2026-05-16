@@ -2,11 +2,10 @@
   "theme_dark": false,
   "log_raw_llm": true,
   "idealist_auto_apply_be": false,
-  "llm_base_url": "http://localhost:8080",
-  "llm_model": "local",
   "auto_start_be": true,
   "auto_connect_llm": true,
   "autoscroll": true,
   "release_profile": false,
-  "auto_watch": false
+  "auto_watch": false,
+  "last_active_provider": "local"
 }

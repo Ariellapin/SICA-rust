@@ -1,61 +1,87 @@
-//! Bottom status strip. Dots-only — labels and detail appear in hover tooltips.
-//! Three dots: **BE**, **IPC**, **LLM**.
-
-use egui::Color32;
-
-use sica_core::theme as t;
+//! Bottom status strip. A subsystem-specific icon + tracked-caps label naming
+//! the subsystem, middot separators, project folder and active model in the
+//! middle, token meter on the right, and the italic-serif brandmark at the
+//! far edge.
 
 use crate::app::{rgb, App};
-use crate::ui::widgets::status_dot;
-
-const COLOR_OK: Color32 = Color32::from_rgb(0x33, 0xCC, 0x66);  // IDEALIST_GREEN
-const COLOR_ERR: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B); // ERROR_FG
-const COLOR_IDLE: Color32 = Color32::from_rgb(0x5A, 0x60, 0x68); // DIVIDER_FG
+use crate::ui::widgets::{caps_label, display_text, right_aligned, status_icon, StatusKind};
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
+    let p = app.palette;
+    let ok_color    = rgb(p.ok);
+    let err_color   = rgb(p.danger);
+    let idle_color  = rgb(p.hairline);
+    let muted       = rgb(p.muted);
+
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
-        // BE dot
-        let (be_color, be_label, be_detail) = if app.be_state.running {
-            (COLOR_OK, format!("BE: running (pid={})", app.be_state.pid.unwrap_or(0)), None)
+        // BE
+        let be_connected = app.be_state.running;
+        let (be_color, be_label, be_detail) = if be_connected {
+            (ok_color, format!("BE  RUNNING (pid {})", app.be_state.pid.unwrap_or(0)), None)
         } else if let Some(err) = app.be_state.last_error.clone() {
-            (COLOR_ERR, "BE: stopped".to_string(), Some(err))
+            (err_color, "BE  STOPPED".to_string(), Some(err))
         } else {
-            (COLOR_IDLE, "BE: stopped".to_string(), None)
+            (idle_color, "BE  STOPPED".to_string(), None)
         };
-        status_dot(ui, be_color, &be_label, be_detail.as_deref());
-        ui.add_space(8.0);
+        status_icon(ui, StatusKind::Be, be_connected, be_color, &be_label, be_detail.as_deref(), err_color);
+        caps_label(ui, "BE", muted);
 
-        // IPC dot
-        let (ipc_color, ipc_label, ipc_detail) = if app.ipc_state.connected && !app.ipc_state.heartbeat_timeout {
-            (COLOR_OK, "IPC: connected".to_string(), None)
+        sep(ui, muted);
+
+        // IPC
+        let ipc_connected = app.ipc_state.connected && !app.ipc_state.heartbeat_timeout;
+        let (ipc_color, ipc_label, ipc_detail) = if ipc_connected {
+            (ok_color, "IPC  CONNECTED".to_string(), None)
         } else if app.ipc_state.connected && app.ipc_state.heartbeat_timeout {
-            (COLOR_ERR, "IPC: heartbeat timeout".to_string(), Some("no heartbeat for >5s".to_string()))
+            (err_color, "IPC  HEARTBEAT TIMEOUT".to_string(), Some("no heartbeat for >5s".to_string()))
         } else if let Some(err) = app.ipc_state.last_error.clone() {
-            (COLOR_ERR, "IPC: disconnected".to_string(), Some(err))
+            (err_color, "IPC  DISCONNECTED".to_string(), Some(err))
         } else {
-            (COLOR_IDLE, "IPC: disconnected".to_string(), None)
+            (idle_color, "IPC  DISCONNECTED".to_string(), None)
         };
-        status_dot(ui, ipc_color, &ipc_label, ipc_detail.as_deref());
-        ui.add_space(8.0);
+        status_icon(ui, StatusKind::Ipc, ipc_connected, ipc_color, &ipc_label, ipc_detail.as_deref(), err_color);
+        caps_label(ui, "IPC", muted);
 
-        // LLM dot
-        let llm_label = format!("LLM: {}", app.llm_state.label());
+        sep(ui, muted);
+
+        // LLM
+        let llm_label = format!("LLM  {}", app.llm_state.label().to_uppercase());
+        let llm_connected = matches!(app.llm_state.state, protocol::LlmState::Ready { .. });
         let (llm_color, llm_detail) = match &app.llm_state.state {
-            protocol::LlmState::Ready { .. } => (COLOR_OK, None),
-            protocol::LlmState::Connecting => (rgb(t::IDEALIST_YELLOW), None),
-            protocol::LlmState::Error { message } => (COLOR_ERR, Some(message.clone())),
-            protocol::LlmState::Disconnected => (COLOR_IDLE, None),
+            protocol::LlmState::Ready { .. }   => (ok_color, None),
+            protocol::LlmState::Connecting     => (rgb(p.warn), None),
+            protocol::LlmState::Error { message } => (err_color, Some(message.clone())),
+            protocol::LlmState::Disconnected   => (idle_color, None),
         };
-        status_dot(ui, llm_color, &llm_label, llm_detail.as_deref());
+        status_icon(ui, StatusKind::Llm, llm_connected, llm_color, &llm_label, llm_detail.as_deref(), err_color);
+        caps_label(ui, "LLM", muted);
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        sep(ui, muted);
+
+        // FOLDER — project the agent is operating on.
+        caps_label(ui, &format!("FOLDER  {}", app.workspace_name.to_uppercase()), muted);
+
+        sep(ui, muted);
+
+        // MODEL — currently connected LLM model id, or "—" when not ready.
+        let model = match &app.llm_state.state {
+            protocol::LlmState::Ready { model, .. } => model.clone(),
+            _ => "—".to_string(),
+        };
+        caps_label(ui, &format!("MODEL  {}", model.to_uppercase()), muted);
+
+        right_aligned(ui, |ui| {
+            ui.label(display_text("sica", 14.0).color(muted));
+            ui.label(egui::RichText::new(" · ").color(muted));
             let used = app.tokens.used.load(std::sync::atomic::Ordering::Relaxed);
             let limit = app.tokens.limit.load(std::sync::atomic::Ordering::Relaxed);
-            ui.label(
-                egui::RichText::new(format!("{used} / {limit} tokens"))
-                    .color(rgb(t::TEXT_MUTED))
-                    .monospace(),
-            );
+            caps_label(ui, &format!("{used} / {limit}"), muted);
         });
     });
+    ui.add_space(2.0);
+}
+
+fn sep(ui: &mut egui::Ui, color: egui::Color32) {
+    ui.label(egui::RichText::new(" · ").color(color));
 }

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p crates/frontend/assets/fonts && ls crates/frontend/assets/fonts/)",
+      "PowerShell($ProgressPreference = 'SilentlyContinue'; $dir = 'crates\\\\frontend\\\\assets\\\\fonts'; $cm = @{ 'CommitMono-Regular.otf' = 'https://github.com/eigilnikolajsen/commit-mono/raw/main/dist/4 OTF \\(recommended\\)/CommitMono-400-Regular.otf'; 'CommitMono-Bold.otf' = 'https://github.com/eigilnikolajsen/commit-mono/raw/main/dist/4 OTF \\(recommended\\)/CommitMono-700-Regular.otf' }; foreach \\($name in $cm.Keys\\) { try { Invoke-WebRequest -Uri $cm[$name] -OutFile \\(Join-Path $dir $name\\) -UseBasicParsing -TimeoutSec 30; $size = \\(Get-Item \\(Join-Path $dir $name\\)\\).Length; \"$name $size bytes\" } catch { \"FAIL $name $\\($_.Exception.Message\\)\" } })"
+    ]
+  }
+}

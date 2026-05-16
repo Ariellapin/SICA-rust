@@ -7,12 +7,15 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use protocol::{Event, Frame, Payload, Request};
+use sica_core::paths::{memory_file, skills_dir, workspace_root};
 
 mod be_core;
 mod chat;
 mod dispatcher;
 mod ipc;
 mod parent_watch;
+mod sessions_store;
+mod title_gen;
 
 use be_core::BeState;
 use chat::ChatHub;
@@ -118,9 +121,48 @@ async fn run(args: Args) -> Result<()> {
     let state = Arc::new(BeState::new());
     let started = Instant::now();
 
+    // Skill registry — seed the built-in skills' markdown contracts and
+    // the workspace `memory.md` index, then scan the folder so any user-
+    // authored `*.md` is loaded alongside them.
+    let skills_path = skills_dir();
+    let root = workspace_root();
+    if let Err(e) = agents::skill_creator::seed_default(&skills_path) {
+        warn!(error = %e, dir = %skills_path.display(), "seed skill-creator.md failed");
+    }
+    if let Err(e) = agents::builtins::seed_defaults(&skills_path) {
+        warn!(error = %e, dir = %skills_path.display(), "seed builtin skill docs failed");
+    }
+    let memory_path = memory_file();
+    if let Err(e) = agents::memory::seed_default(&memory_path) {
+        warn!(error = %e, path = %memory_path.display(), "seed memory.md failed");
+    }
+    let mut skill_registry = agents::SkillRegistry::new();
+    skill_registry.register(Arc::new(agents::SkillCreator::new(skills_path.clone())));
+    skill_registry.register(Arc::new(agents::RunCli));
+    skill_registry.register(Arc::new(agents::ReadFile::new(root.clone())));
+    skill_registry.register(Arc::new(agents::WriteFile::new(root.clone())));
+    let parse_errors = agents::md_skill::register_all(&mut skill_registry, &skills_path);
+    let skill_count = skill_registry.by_name.len();
+    let skill_registry = Arc::new(skill_registry);
+    info!(count = skill_count, dir = %skills_path.display(), "skills loaded");
+    let _ = out_tx.send(Frame::event(Event::LogLine {
+        level: "INFO".into(),
+        message: format!(
+            "skills: {skill_count} loaded from {}",
+            skills_path.display()
+        ),
+    }));
+    for (path, err) in parse_errors {
+        warn!(file = %path.display(), error = %err, "skill parse error");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level: "WARN".into(),
+            message: format!("skill parse error in {}: {err}", path.display()),
+        }));
+    }
+
     // Chat hub + idealist daemon (use the dispatcher channel as their sink so
     // every event flows out through the same write task).
-    let chat = ChatHub::new(out_tx.clone());
+    let chat = ChatHub::new_loaded(out_tx.clone(), skill_registry.clone());
     let idealist_sink: Arc<dyn idealist::IdealistEventSink> = Arc::new(OutSink { tx: out_tx.clone() });
     let idealist = Arc::new(idealist::Idealist::new(idealist_sink));
     let idealist_bus = idealist.bus.clone();

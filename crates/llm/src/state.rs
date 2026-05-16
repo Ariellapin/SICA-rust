@@ -12,7 +12,7 @@ use crate::client::LlmClient;
 
 #[derive(Debug, Clone)]
 pub enum LlmCommand {
-    Connect    { base_url: String, model: String },
+    Connect    { base_url: String, model: String, api_key: Option<String> },
     Disconnect,
 }
 
@@ -45,9 +45,9 @@ impl LlmConnection {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    LlmCommand::Connect { base_url, model } => {
+                    LlmCommand::Connect { base_url, model, api_key } => {
                         Self::set_state(&me, &ev_tx, LlmState::Connecting).await;
-                        let client = LlmClient::new(base_url, model.clone());
+                        let client = LlmClient::new(base_url, model.clone(), api_key);
                         match client.health().await {
                             Ok(()) => {
                                 let ctx_window = 24_000; // models.json default

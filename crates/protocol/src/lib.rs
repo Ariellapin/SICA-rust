@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -44,7 +44,9 @@ pub enum Request {
     InterruptTurn   { session_id: u64 },
     NewSession,
     ListSessions,
-    ConnectLlm    { base_url: String, model: String },
+    LoadSession   { session_id: u64 },
+    DeleteSession { session_id: u64 },
+    ConnectLlm    { base_url: String, model: String, api_key: Option<String> },
     DisconnectLlm,
 
     // Frontend telemetry — feeds the idealist's classifier.
@@ -60,6 +62,7 @@ pub enum Response {
     Error        { message: String },
     SessionList    { sessions: Vec<SessionMeta> },
     SessionCreated { id: u64 },
+    SessionLoaded  { session: SessionDump },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +70,24 @@ pub struct SessionMeta {
     pub id: u64,
     pub title: String,
     pub created_at: i64,
+}
+
+/// Wire-format dump of a full session's history. Kept separate from
+/// `sica_core::session::Session` so the `protocol` crate stays leaf-level
+/// (no dep on `sica-core`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDump {
+    pub id: u64,
+    pub title: String,
+    pub created_at: i64,
+    pub messages: Vec<MessageDump>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDump {
+    pub role: String,
+    pub content: String,
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +133,10 @@ pub enum Event {
         turn_id: u64,
         finish_reason: String,
     },
+
+    /// Emitted after the auto-title agent renames a session. Lets the FE
+    /// sidebar update without polling `ListSessions`.
+    SessionTitleChanged { session_id: u64, title: String },
 
     // Live token meter (fixes the stale-meter bug from Python).
     TokenUsage { session_id: u64, used: u32, limit: u32 },

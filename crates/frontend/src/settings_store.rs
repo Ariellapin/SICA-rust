@@ -11,13 +11,16 @@ pub struct Settings {
     pub theme_dark:             bool,
     pub log_raw_llm:            bool,
     pub idealist_auto_apply_be: bool,
-    pub llm_base_url:           String,
-    pub llm_model:              String,
     pub auto_start_be:          bool,
     pub auto_connect_llm:       bool,
     pub autoscroll:             bool,
     pub release_profile:        bool,
     pub auto_watch:             bool,
+    /// `id` (filename stem) of the provider panel that should auto-connect
+    /// on IPC ready and that "Apply" should reconnect. `None` means "no
+    /// provider was last active" — the app starts disconnected.
+    #[serde(default)]
+    pub last_active_provider:   Option<String>,
 }
 
 impl Default for Settings {
@@ -26,13 +29,12 @@ impl Default for Settings {
             theme_dark:             true,
             log_raw_llm:            false,
             idealist_auto_apply_be: false,
-            llm_base_url:           "http://localhost:8080".into(),
-            llm_model:              "local".into(),
             auto_start_be:          true,
             auto_connect_llm:       true,
             autoscroll:             true,
             release_profile:        false,
             auto_watch:             false,
+            last_active_provider:   None,
         }
     }
 }

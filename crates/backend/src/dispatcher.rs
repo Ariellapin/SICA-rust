@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use protocol::{Request, Response};
+use protocol::{MessageDump, Request, Response, SessionDump};
+use sica_core::message::Role;
 
 use crate::be_core::{fib, BeState};
 use crate::chat::ChatHub;
@@ -43,11 +44,36 @@ pub async fn handle(
             let sessions = chat.list_sessions().await;
             Response::SessionList { sessions }
         }
-        Request::ConnectLlm { base_url, model } => {
+        Request::LoadSession { session_id } => match chat.load_session(session_id).await {
+            Some(session) => Response::SessionLoaded {
+                session: SessionDump {
+                    id: session.id,
+                    title: session.title,
+                    created_at: session.created_at,
+                    messages: session
+                        .messages
+                        .into_iter()
+                        .map(|m| MessageDump {
+                            role: role_str(m.role).into(),
+                            content: m.content,
+                            reasoning: m.reasoning,
+                        })
+                        .collect(),
+                },
+            },
+            None => Response::Error {
+                message: format!("session {session_id} not found"),
+            },
+        },
+        Request::DeleteSession { session_id } => {
+            chat.delete_session(session_id).await;
+            Response::Ok
+        }
+        Request::ConnectLlm { base_url, model, api_key } => {
             // Spawn so the dispatcher can keep handling other requests while
             // the HTTP round-trip completes. State changes flow back via
             // `LlmStateChanged` events.
-            chat.spawn_connect_llm(base_url, model);
+            chat.spawn_connect_llm(base_url, model, api_key);
             Response::Ok
         }
         Request::DisconnectLlm => {
@@ -68,5 +94,14 @@ pub async fn handle(
             });
             Response::Ok
         }
+    }
+}
+
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::Tool => "tool",
     }
 }

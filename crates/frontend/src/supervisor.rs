@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use protocol::{Event, Frame, LlmState, Request, Severity, TicketKind};
+use protocol::{Event, Frame, LlmState, Request, SessionDump, SessionMeta, Severity, TicketKind};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -58,6 +58,12 @@ pub enum UiEvent {
     // Tool chips.
     ToolCallStarted { id: u64, parent_id: Option<u64>, depth: u8, name: String },
     ToolCallFinished { id: u64, ok: bool, summary: String },
+
+    // Session list (forwarded from typed Responses).
+    SessionList { sessions: Vec<SessionMeta> },
+    SessionCreated { id: u64 },
+    SessionLoaded { session: SessionDump },
+    SessionTitleChanged { session_id: u64, title: String },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -214,6 +220,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::TurnFinished { session_id, turn_id, finish_reason } => {
             UiEvent::TurnFinished { session_id, turn_id, finish_reason }
+        }
+        Event::SessionTitleChanged { session_id, title } => {
+            UiEvent::SessionTitleChanged { session_id, title }
         }
         Event::TokenUsage { session_id, used, limit } => {
             UiEvent::TokenUsage { session_id, used, limit }
