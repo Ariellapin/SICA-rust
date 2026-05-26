@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use protocol::{Event, Frame, LlmState, SessionMeta};
+use protocol::{Event, Frame, LlmState, SessionMeta, UserImage};
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use agents::{EventSink, SkillRegistry, ToolFailureSink, ToolSubAgent};
-use llm::client::LlmClient;
+use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
 use sica_core::message::{Message, Role};
 use sica_core::session::Session;
 
@@ -43,6 +44,13 @@ pub struct ChatHub {
     /// Forwards each failed sub-agent tool call into the idealist daemon.
     /// `None` only in test contexts where the daemon isn't running.
     pub failure_sink:  Option<Arc<dyn ToolFailureSink>>,
+    /// One cancellation token per session for the currently-running user
+    /// turn. `InterruptTurn` looks the session's token up and fires it,
+    /// which propagates into `run_turn` / `chat_stream`. The `u64` is a
+    /// monotonically-increasing marker so a finishing turn can avoid
+    /// removing a *later* turn's token from the slot.
+    pub active_turns:  Arc<Mutex<HashMap<u64, (u64, CancellationToken)>>>,
+    pub next_marker:   Arc<AtomicU64>,
 }
 
 impl ChatHub {
@@ -62,6 +70,8 @@ impl ChatHub {
             event_sink:   sink,
             skills,
             failure_sink,
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            next_marker:  Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -175,7 +185,19 @@ impl ChatHub {
         self.set_llm_state(LlmState::Disconnected).await;
     }
 
-    pub async fn send_user_message(&self, session_id: u64, text: String) {
+    /// Cancel the in-flight turn (if any) for `session_id`. Idempotent.
+    pub async fn interrupt_session(&self, session_id: u64) {
+        if let Some((_, tok)) = self.active_turns.lock().await.get(&session_id) {
+            tok.cancel();
+        }
+    }
+
+    pub async fn send_user_message(
+        &self,
+        session_id: u64,
+        text: String,
+        images: Vec<UserImage>,
+    ) {
         let Some(client) = self.llm.lock().await.clone() else {
             self.event_sink.emit(Event::LogLine {
                 level: "WARN".into(),
@@ -192,14 +214,27 @@ impl ChatHub {
             let session = sessions
                 .entry(session_id)
                 .or_insert_with(|| Session::new(session_id, default_title(session_id)));
-            session.messages.push(Message::user(text.clone()));
+            session.messages.push(Message::user_with_images(text.clone(), images.clone()));
             if let Err(e) = sessions_store::save(session) {
                 warn!(error = %e, session_id, "save session (after user msg) failed");
             }
         }
 
+        // Register a cancellation token for this session. If a previous turn
+        // is still in flight (shouldn't normally happen — the FE gates Send
+        // while a turn is unfinished), cancel it before installing the new one.
+        let cancel = CancellationToken::new();
+        let marker = self.next_marker.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = self.active_turns.lock().await;
+            if let Some((_, prev)) = guard.insert(session_id, (marker, cancel.clone())) {
+                prev.cancel();
+            }
+        }
+
         let events = self.event_sink.clone();
         let sessions_map = self.sessions.clone();
+        let active_turns = self.active_turns.clone();
         let next_turn = self.next_turn.clone();
         let skills = self.skills.clone();
         let failure_sink = self.failure_sink.clone();
@@ -226,6 +261,7 @@ impl ChatHub {
                         turn_id,
                         messages: history,
                         limit: 24_000,
+                        cancel: Some(cancel.clone()),
                     },
                 )
                 .await;
@@ -249,10 +285,17 @@ impl ChatHub {
                         role: Role::Assistant,
                         content: out.content.clone(),
                         reasoning,
+                        images: Vec::new(),
                     });
                     if let Err(e) = sessions_store::save(session) {
                         warn!(error = %e, session_id, "save session (after assistant msg) failed");
                     }
+                }
+
+                // If the user hit Esc, drop out before we go shopping for a
+                // tool call on a half-completed assistant reply.
+                if cancel.is_cancelled() {
+                    break;
                 }
 
                 // Look for a tool call. If none, we're done — but first
@@ -321,6 +364,23 @@ impl ChatHub {
                 .await;
             }
 
+            // Release this turn's slot, but only if a *newer* send hasn't
+            // already replaced it (marker comparison avoids clobbering).
+            {
+                let mut guard = active_turns.lock().await;
+                if let Some((slot_marker, _)) = guard.get(&session_id) {
+                    if *slot_marker == marker {
+                        guard.remove(&session_id);
+                    }
+                }
+            }
+
+            // Skip the auto-title work if the user interrupted — a partial
+            // assistant reply isn't a useful title source.
+            if cancel.is_cancelled() {
+                return;
+            }
+
             // Auto-title only fires once, after the first complete exchange
             // (user → assistant final). Count user messages to decide.
             let trigger_title = {
@@ -381,10 +441,10 @@ async fn build_history(
     sessions: &Arc<Mutex<HashMap<u64, Session>>>,
     session_id: u64,
     skills: &SkillRegistry,
-) -> Vec<llm::client::ChatMessage> {
+) -> Vec<ChatMessage> {
     let g = sessions.lock().await;
     let Some(session) = g.get(&session_id) else { return Vec::new() };
-    let mut out: Vec<llm::client::ChatMessage> = Vec::with_capacity(session.messages.len() + 1);
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(session.messages.len() + 1);
     let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
     let catalogue = skills.catalogue_markdown();
     if !mem.is_empty() || !catalogue.is_empty() {
@@ -399,19 +459,42 @@ async fn build_history(
             content.push_str("## Loaded skills\n\n");
             content.push_str(&catalogue);
         }
-        out.push(llm::client::ChatMessage { role: "system".into(), content });
+        out.push(ChatMessage::text("system", content));
     }
     for m in &session.messages {
         let role = match m.role {
             Role::Tool => "user",
             other => role_to_str(other),
         };
-        out.push(llm::client::ChatMessage {
-            role:    role.into(),
-            content: m.content.clone(),
+        out.push(ChatMessage {
+            role: role.into(),
+            content: build_chat_content(&m.content, &m.images),
         });
     }
     out
+}
+
+/// Build the content payload for one persisted `Message`. When no images are
+/// attached we send the plain string (max compatibility with text-only
+/// servers); otherwise we send the OpenAI-vision `Parts` array with each
+/// image inlined as a `data:` URL. Caller should only pass images on user
+/// messages — other roles get empty `Vec`.
+fn build_chat_content(text: &str, images: &[UserImage]) -> ChatContent {
+    if images.is_empty() {
+        return ChatContent::Text(text.to_string());
+    }
+    let mut parts: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(ContentPart::Text { text: text.to_string() });
+    }
+    for img in images {
+        parts.push(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: format!("data:{};base64,{}", img.mime, img.data_base64),
+            },
+        });
+    }
+    ChatContent::Parts(parts)
 }
 
 /// Append the result of one skill invocation as a `Tool` message, formatted
@@ -438,6 +521,7 @@ async fn append_tool_result(
         role: Role::Tool,
         content: block,
         reasoning: None,
+        images: Vec::new(),
     });
     if let Err(e) = sessions_store::save(session) {
         warn!(error = %e, session_id, "save session (after tool result) failed");

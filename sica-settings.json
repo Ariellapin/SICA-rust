@@ -7,5 +7,5 @@
   "autoscroll": true,
   "release_profile": false,
   "auto_watch": false,
-  "last_active_provider": "local"
+  "last_active_provider": "vllm"
 }

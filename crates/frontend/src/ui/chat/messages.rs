@@ -37,8 +37,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         t.reasoning_collapsed,
                     )
                 };
-                if !user.is_empty() {
+                let has_images = !app.chat.turns[i].images.is_empty();
+                if !user.is_empty() || has_images {
                     draw_user(ui, &user, &palette);
+                }
+                if has_images {
+                    draw_user_images(app, ui, i);
                 }
                 if !reasoning_text.is_empty() {
                     if finished && collapsed {
@@ -120,6 +124,45 @@ fn draw_user(ui: &mut egui::Ui, text: &str, p: &Palette) {
         },
     );
     ui.add_space(8.0);
+}
+
+/// Thumbnail strip rendered under a user message that had image attachments.
+/// Right-aligned to match `draw_user`. Lazy texture upload — first frame
+/// after a session load is the one that pays for image decoding.
+fn draw_user_images(app: &mut App, ui: &mut egui::Ui, turn_idx: usize) {
+    const HISTORY_THUMB: f32 = 96.0;
+    let ctx = ui.ctx().clone();
+    let avail = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail, 0.0),
+        Layout::right_to_left(Align::Min),
+        |ui| {
+            // Reverse order: right_to_left places later children further left,
+            // so iterate in normal order and items will read left-to-right.
+            let count = app.chat.turns[turn_idx].images.len();
+            for j in (0..count).rev() {
+                let att = &mut app.chat.turns[turn_idx].images[j];
+                let tex = super::input_bar::ensure_texture(
+                    &ctx,
+                    &mut att.texture,
+                    &att.mime,
+                    &att.data_base64,
+                    turn_idx * 1000 + j,
+                );
+                if let Some(handle) = tex {
+                    let natural = handle.size_vec2();
+                    let size = if natural.x <= 0.0 || natural.y <= 0.0 {
+                        Vec2::new(HISTORY_THUMB, HISTORY_THUMB)
+                    } else {
+                        let scale = (HISTORY_THUMB / natural.x).min(HISTORY_THUMB / natural.y);
+                        Vec2::new(natural.x * scale, natural.y * scale)
+                    };
+                    ui.image((handle.id(), size));
+                }
+            }
+        },
+    );
+    ui.add_space(6.0);
 }
 
 // ---------- assistant ----------

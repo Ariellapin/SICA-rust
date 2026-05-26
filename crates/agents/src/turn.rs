@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use protocol::Event;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use llm::client::{ChatMessage, LlmClient};
@@ -20,6 +21,9 @@ pub struct TurnInput {
     pub turn_id:    u64,
     pub messages:   Vec<ChatMessage>,
     pub limit:      u32,
+    /// Cancelled by `InterruptTurn`. When fired, the stream is dropped and
+    /// the partial response is returned with `finish_reason = "interrupted"`.
+    pub cancel:     Option<CancellationToken>,
 }
 
 /// Final accumulated state of one turn — what the caller needs to write
@@ -37,14 +41,15 @@ pub async fn run_turn(
     events: Arc<dyn EventSink>,
     input: TurnInput,
 ) -> TurnOutput {
-    let TurnInput { session_id, turn_id, messages, limit } = input;
+    let TurnInput { session_id, turn_id, messages, limit, cancel } = input;
 
     events.emit(Event::TurnStarted { session_id, turn_id });
 
-    // Initial token count: try exact, fall back to heuristic.
+    // Initial token count: try exact, fall back to heuristic. Image parts are
+    // skipped — their cost is server-side and opaque to us.
     let prompt_concat = messages
         .iter()
-        .map(|m| m.content.as_str())
+        .map(|m| m.content.text())
         .collect::<Vec<_>>()
         .join("\n");
     let initial = match tokenize_exact(&client.base_url, &prompt_concat).await {
@@ -56,8 +61,12 @@ pub async fn run_turn(
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
     let client_clone = client.clone();
     let messages_for_stream = messages.clone();
+    let stream_cancel = cancel.clone();
     let stream_handle = tokio::spawn(async move {
-        if let Err(e) = client_clone.chat_stream(messages_for_stream, chunk_tx).await {
+        if let Err(e) = client_clone
+            .chat_stream(messages_for_stream, chunk_tx, stream_cancel)
+            .await
+        {
             warn!(error = %e, "chat_stream failed");
         }
     });
@@ -68,7 +77,20 @@ pub async fn run_turn(
     let mut accum_content   = String::new();
     let mut accum_reasoning = String::new();
 
-    while let Some(chunk) = chunk_rx.recv().await {
+    let mut interrupted = false;
+    loop {
+        let next = match &cancel {
+            Some(tok) => tokio::select! {
+                biased;
+                _ = tok.cancelled() => {
+                    interrupted = true;
+                    None
+                }
+                v = chunk_rx.recv() => v,
+            },
+            None => chunk_rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
         if !chunk.delta_content.is_empty() || !chunk.delta_reasoning.is_empty() {
             events.emit(Event::AssistantDelta {
                 session_id,
@@ -91,6 +113,12 @@ pub async fn run_turn(
         }
     }
 
+    if interrupted {
+        final_reason = "interrupted".into();
+        // Drop the receiver so the stream task's `tx.send` returns Err and it
+        // unwinds promptly without us blocking on its handle.
+        drop(chunk_rx);
+    }
     let _ = stream_handle.await;
 
     // Final correction: exact tokenize of full transcript (prompt + assistant).

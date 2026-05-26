@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use protocol::{LlmState, Request, SessionDump, SessionMeta, Severity};
+use protocol::{LlmState, Request, SessionDump, SessionMeta, Severity, UserImage};
 use sica_core::theme::Palette;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -253,6 +253,33 @@ pub struct ChatState {
     /// the egui `stick_to_bottom` heuristic with a hard snap on any new
     /// assistant delta or turn boundary.
     pub scroll_to_bottom: bool,
+    /// Images the user has attached to the next outgoing message. Drained
+    /// into `Request::SendUserMessage` on send; rendered as a thumbnail
+    /// strip above the input bar in the meantime.
+    pub pending_images: Vec<PendingAttachment>,
+}
+
+/// One image the user has attached, ready to send. `texture` is materialised
+/// the first frame a thumbnail is rendered and reused after. `filename` is
+/// best-effort metadata for the chip label.
+#[allow(dead_code)]
+pub struct PendingAttachment {
+    pub mime:        String,
+    pub data_base64: String,
+    pub filename:    String,
+    /// Decoded byte size — surfaced via tooltip / oversize errors. Stays even
+    /// if the chip doesn't currently render it.
+    pub size_bytes:  usize,
+    pub texture:     Option<egui::TextureHandle>,
+}
+
+impl PendingAttachment {
+    pub fn to_user_image(&self) -> UserImage {
+        UserImage {
+            mime: self.mime.clone(),
+            data_base64: self.data_base64.clone(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -276,6 +303,29 @@ pub struct Turn {
     /// (brain icon + `>`). Flipped to `true` when `TurnFinished` arrives, and
     /// historical turns from `SessionLoaded` start collapsed.
     pub reasoning_collapsed: bool,
+    /// Images attached to the user message that opened this turn (empty for
+    /// assistant-only or tool-only turns). Each `Attachment` lazily uploads
+    /// its bytes as an egui texture the first time it's rendered.
+    pub images:             Vec<Attachment>,
+}
+
+/// In-history attachment, owned by a `Turn`. Mirrors `PendingAttachment` but
+/// is rendered indefinitely as part of past chat scrollback, so the texture
+/// caches per turn rather than being drained.
+pub struct Attachment {
+    pub mime:        String,
+    pub data_base64: String,
+    pub texture:     Option<egui::TextureHandle>,
+}
+
+impl Attachment {
+    pub fn from_user_image(img: &UserImage) -> Self {
+        Self {
+            mime: img.mime.clone(),
+            data_base64: img.data_base64.clone(),
+            texture: None,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -727,6 +777,7 @@ impl App {
                     finish_reason: None,
                     tool_chips: Vec::new(),
                     reasoning_collapsed: false,
+                    images: Vec::new(),
                 });
                 self.chat.scroll_to_bottom = true;
             }
@@ -878,6 +929,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     finish_reason: None,
                     tool_chips: Vec::new(),
                     reasoning_collapsed: true,
+                    images: m.images.iter().map(Attachment::from_user_image).collect(),
                 });
             }
             "assistant" => {
@@ -891,6 +943,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     finish_reason: None,
                     tool_chips: Vec::new(),
                     reasoning_collapsed: true,
+                    images: Vec::new(),
                 });
                 slot.assistant = m.content.clone();
                 if let Some(r) = &m.reasoning {

@@ -295,8 +295,8 @@ async fn summarize(
     );
     let user = format!("Expectation: {expectation}\n\nRaw output:\n{raw}");
     let messages = vec![
-        ChatMessage { role: "system".into(), content: system },
-        ChatMessage { role: "user".into(),   content: user   },
+        ChatMessage::text("system", system),
+        ChatMessage::text("user", user),
     ];
     match client.chat_once(messages).await {
         Ok(s) if !s.is_empty() => Some(s),

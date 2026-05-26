@@ -6,7 +6,17 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
+
+/// One image attached to a user message. `data_base64` is the raw image bytes
+/// base64-encoded (no `data:` URL prefix). `mime` is the MIME type, e.g.
+/// `image/png`, `image/jpeg`. Used both on the wire (`SendUserMessage`) and
+/// in persisted session storage (via `sica_core::message::Message`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserImage {
+    pub mime: String,
+    pub data_base64: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -40,7 +50,7 @@ pub enum Request {
     Shutdown,
 
     // Chat / LLM control.
-    SendUserMessage { session_id: u64, text: String },
+    SendUserMessage { session_id: u64, text: String, images: Vec<UserImage> },
     InterruptTurn   { session_id: u64 },
     NewSession,
     ListSessions,
@@ -88,6 +98,8 @@ pub struct MessageDump {
     pub role: String,
     pub content: String,
     pub reasoning: Option<String>,
+    #[serde(default)]
+    pub images: Vec<UserImage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

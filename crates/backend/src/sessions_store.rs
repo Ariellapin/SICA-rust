@@ -65,6 +65,7 @@ mod tests {
                     role: Role::Assistant,
                     content: "hello".into(),
                     reasoning: Some("thinking…".into()),
+                    images: Vec::new(),
                 },
             ],
         };

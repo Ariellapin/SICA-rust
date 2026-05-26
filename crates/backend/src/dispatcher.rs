@@ -57,6 +57,7 @@ pub async fn handle(
                             role: role_str(m.role).into(),
                             content: m.content,
                             reasoning: m.reasoning,
+                            images: m.images,
                         })
                         .collect(),
                 },
@@ -80,11 +81,14 @@ pub async fn handle(
             chat.disconnect_llm().await;
             Response::Ok
         }
-        Request::SendUserMessage { session_id, text } => {
-            chat.send_user_message(session_id, text).await;
+        Request::SendUserMessage { session_id, text, images } => {
+            chat.send_user_message(session_id, text, images).await;
             Response::Ok
         }
-        Request::InterruptTurn { session_id: _ } => Response::Ok,
+        Request::InterruptTurn { session_id } => {
+            chat.interrupt_session(session_id).await;
+            Response::Ok
+        }
         Request::ReportFrontendError { module, message, traceback } => {
             idealist_bus.publish(idealist::Trigger {
                 kind: "fe_panic".into(),

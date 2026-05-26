@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use eventsource_stream::Eventsource;
 
@@ -29,7 +30,66 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role:    String,
-    pub content: String,
+    pub content: ChatContent,
+}
+
+/// OpenAI / vLLM multimodal content field: either a bare string or an array
+/// of typed parts (`{type: "text", ...}` / `{type: "image_url", ...}`).
+/// `#[serde(untagged)]` makes it serialize transparently so vision-capable
+/// servers accept image attachments and text-only servers see plain strings.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+impl ChatContent {
+    /// Concatenation of the textual parts — used for token-count heuristics.
+    /// Image parts contribute nothing to the count; their cost is opaque to us.
+    pub fn text(&self) -> String {
+        match self {
+            ChatContent::Text(s) => s.clone(),
+            ChatContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+impl From<String> for ChatContent {
+    fn from(s: String) -> Self {
+        ChatContent::Text(s)
+    }
+}
+
+impl From<&str> for ChatContent {
+    fn from(s: &str) -> Self {
+        ChatContent::Text(s.to_string())
+    }
+}
+
+impl ChatMessage {
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: role.into(), content: ChatContent::Text(content.into()) }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,7 +160,7 @@ impl LlmClient {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let this = self.clone();
         let handle = tokio::spawn(async move {
-            this.chat_stream(messages, tx).await
+            this.chat_stream(messages, tx, None).await
         });
         let mut out = String::new();
         while let Some(chunk) = rx.recv().await {
@@ -114,11 +174,13 @@ impl LlmClient {
     }
 
     /// Open a streaming chat completion. Each parsed `StreamChunk` is forwarded
-    /// to `tx`. The task returns once the upstream stream closes or errors.
+    /// to `tx`. The task returns once the upstream stream closes, errors, or
+    /// `cancel` fires (used by `InterruptTurn` to stop generation mid-flight).
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatMessage>,
         tx: mpsc::UnboundedSender<StreamChunk>,
+        cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
         let body = ChatRequest {
@@ -127,16 +189,33 @@ impl LlmClient {
             stream: true,
             temperature: Some(0.7),
         };
-        let resp = self
-            .auth(self.http.post(url).json(&body))
-            .send()
-            .await?
-            .error_for_status()?;
+
+        // POST itself is racy against cancellation: if Esc fires before the
+        // server starts streaming, bail without consuming the body.
+        let send_fut = self.auth(self.http.post(url).json(&body)).send();
+        let resp = match &cancel {
+            Some(tok) => tokio::select! {
+                biased;
+                _ = tok.cancelled() => return Ok(()),
+                r = send_fut => r?,
+            },
+            None => send_fut.await?,
+        };
+        let resp = resp.error_for_status()?;
 
         let mut splitter = ThinkSplitter::new();
         let mut events = resp.bytes_stream().eventsource();
 
-        while let Some(item) = events.next().await {
+        loop {
+            let next = match &cancel {
+                Some(tok) => tokio::select! {
+                    biased;
+                    _ = tok.cancelled() => return Ok(()),
+                    item = events.next() => item,
+                },
+                None => events.next().await,
+            };
+            let Some(item) = next else { break };
             let ev = match item {
                 Ok(e) => e,
                 Err(e) => return Err(anyhow!("sse decode: {e}")),

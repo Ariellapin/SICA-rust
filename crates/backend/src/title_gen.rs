@@ -21,13 +21,13 @@ pub async fn summarize(client: &LlmClient, user_msg: &str, assistant_msg: &str) 
         "User said:\n{user_msg}\n\nAssistant replied:\n{assistant_msg}\n\nTitle:"
     );
     let messages = vec![
-        ChatMessage { role: "system".into(), content: SYSTEM_PROMPT.into() },
-        ChatMessage { role: "user".into(), content: prompt },
+        ChatMessage::text("system", SYSTEM_PROMPT),
+        ChatMessage::text("user", prompt),
     ];
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = client.clone();
     let stream_task = tokio::spawn(async move {
-        client.chat_stream(messages, tx).await
+        client.chat_stream(messages, tx, None).await
     });
 
     let mut buf = String::new();
