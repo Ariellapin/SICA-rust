@@ -1,8 +1,13 @@
-//! Composer. Editorial form: no surrounding frame; a hairline rule under
-//! the input field; primary "SEND" button to the right. The token meter
-//! lives in the bottom status bar — there is no duplicate beneath the
-//! composer. When a ticket has been written this turn, the ticket id is
-//! shown on a single tracked-caps line under the field.
+//! Composer. A rounded composer frame holds the 2-row TextEdit; its fill
+//! and stroke shift on hover/focus to flag the surface as tappable. The
+//! primary "SEND" button sits to the right; the token meter lives in the
+//! bottom status bar — there is no duplicate beneath the composer. When
+//! a ticket has been written this turn, the ticket id is shown on a single
+//! tracked-caps line under the field.
+//!
+//! Submission keys: Enter sends, Shift+Enter inserts a newline. Enter is
+//! consumed before the multiline editor sees it so the field doesn't keep
+//! a stray line break.
 //!
 //! Image input:
 //!   * Paperclip button -> native file picker
@@ -14,7 +19,7 @@
 use std::path::Path;
 
 use base64::Engine as _;
-use egui::{Stroke, Vec2};
+use egui::{Rounding, Stroke, Vec2};
 
 use protocol::Request;
 
@@ -25,6 +30,9 @@ use crate::ui::widgets::{caps_label, ghost_button, primary_button_enabled};
 const SEND_BUTTON_W: f32 = 84.0;
 const ATTACH_BUTTON_W: f32 = 36.0;
 const THUMB_SIZE: f32 = 56.0;
+const INPUT_FRAME_RADIUS: f32 = 14.0;
+const INPUT_FRAME_PAD_X: f32 = 12.0;
+const INPUT_FRAME_PAD_Y: f32 = 8.0;
 /// 16 MB raw bytes — guard against accidentally attaching a video file etc.
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -43,12 +51,25 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
 
     let turn_in_flight = last_turn_in_flight(app);
 
+    // Stable id so we can read the focus state from `Memory` *before* the
+    // TextEdit is added — needed so we can consume Enter and suppress the
+    // newline the multiline editor would otherwise insert.
+    let input_id = egui::Id::new("chat_input_field");
+    let input_focused = ui.memory(|m| m.has_focus(input_id));
+    let submit_via_enter = !disabled
+        && input_focused
+        && ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+        });
+
     ui.horizontal(|ui| {
         let spacing = ui.spacing().item_spacing.x;
+        let frame_pad_x = INPUT_FRAME_PAD_X * 2.0;
         let input_w = (ui.available_width()
             - SEND_BUTTON_W
             - ATTACH_BUTTON_W
-            - spacing * 2.0)
+            - spacing * 2.0
+            - frame_pad_x)
             .max(80.0);
 
         // Paperclip button to the left of the input field.
@@ -58,19 +79,42 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
         }
         attach_resp.on_hover_text("Attach image");
 
-        let input = egui::TextEdit::multiline(&mut app.chat.draft)
-            .hint_text(if disabled { "(disabled — connect an LLM)" } else { "Type a message…" })
-            .desired_width(input_w)
-            .desired_rows(2)
-            .frame(false);
-        let resp = ui.add_enabled(!disabled, input);
-
-        // Hairline directly under the input rect — replaces the egui chrome.
-        ui.painter().hline(
-            resp.rect.x_range(),
-            resp.rect.bottom() + 2.0,
-            Stroke::new(1.0, if resp.has_focus() { rgb(p.accent) } else { rgb(p.hairline) }),
+        // Rounded composer frame. Fill and stroke shift on hover/focus so
+        // the field reads as a tappable surface. Uses last-frame hover
+        // state cached on `ChatState` to avoid a second pass.
+        let hovered = app.chat.input_hovered;
+        let active = hovered || input_focused;
+        let fill = if active { rgb(p.surface) } else { rgb(p.surface_sunk) };
+        let stroke = Stroke::new(
+            1.0,
+            if input_focused {
+                rgb(p.accent)
+            } else if hovered {
+                rgb(p.accent_hover)
+            } else {
+                rgb(p.hairline)
+            },
         );
+        let frame_inner = egui::Frame::none()
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(Rounding::same(INPUT_FRAME_RADIUS))
+            .inner_margin(egui::Margin::symmetric(INPUT_FRAME_PAD_X, INPUT_FRAME_PAD_Y))
+            .show(ui, |ui| {
+                let input = egui::TextEdit::multiline(&mut app.chat.draft)
+                    .id(input_id)
+                    .hint_text(if disabled {
+                        "(disabled — connect an LLM)"
+                    } else {
+                        "Type a message…  (Enter to send, Shift+Enter for newline)"
+                    })
+                    .desired_width(input_w)
+                    .desired_rows(2)
+                    .frame(false);
+                ui.add_enabled(!disabled, input)
+            });
+        let _ = frame_inner.inner;
+        app.chat.input_hovered = frame_inner.response.hovered();
 
         // While a turn streams, swap the SEND button for STOP. Same slot so
         // the cursor doesn't have to hunt.
@@ -85,11 +129,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
                 && (!app.chat.draft.trim().is_empty() || !app.chat.pending_images.is_empty());
             let send_resp = primary_button_enabled(ui, &p, "Send", send_enabled);
             let send = send_resp.clicked();
-            let submit_via_keys = !disabled
-                && resp.has_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
-            if (send || submit_via_keys) && send_enabled {
+            if (send || submit_via_enter) && send_enabled {
                 send_message(app);
+                // Re-acquire focus so the user can keep typing.
+                ui.memory_mut(|m| m.request_focus(input_id));
             }
         }
     });

@@ -3,23 +3,44 @@
 //! width below an "ASSISTANT" caps label and a hairline rule; reasoning is
 //! inset 24px with a left-edge info-blue hairline and italic serif body.
 
-use egui::{Align, Layout, RichText, Rounding, Sense, Stroke, Vec2};
+use egui::{
+    Align, Key, Layout, Modifiers, PointerButton, Pos2, Rect, RichText, Rounding, Sense,
+    Shape, Stroke, Vec2,
+};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use sica_core::theme::Palette;
 
 use crate::app::{rgb, App};
 use crate::ui::widgets::{
-    blade_mark, caps_button, caps_label, display_text, hairline,
+    blade_mark, caps_button, caps_job, caps_label, display_text, hairline,
 };
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let height = ui.available_height() - 110.0;
-    let force_scroll = std::mem::take(&mut app.chat.scroll_to_bottom);
-    egui::ScrollArea::vertical()
+    // Reserve extra height when the composer is showing a pending-attachment
+    // strip — otherwise the thumbnails push the input row and Send button off
+    // the bottom of the panel.
+    let attach_reserve = if app.chat.pending_images.is_empty() { 0.0 } else { 96.0 };
+    // 132 accounts for the composer's rounded frame (+16px of vertical
+    // padding on top of the 2-row TextEdit) plus the surrounding spacing
+    // and the slimmed-down footer.
+    let height = ui.available_height() - 132.0 - attach_reserve;
+    // Follow-the-stream only while the user hasn't taken the viewport
+    // (clicked into the transcript / scrolled up). The flag is still drained
+    // every frame so a stale snap doesn't fire when auto-follow resumes.
+    let force_scroll =
+        std::mem::take(&mut app.chat.scroll_to_bottom) && !app.chat.autoscroll_paused;
+    // Screen rect of each rendered assistant body, for Ctrl+A targeting.
+    let mut assistant_rects: Vec<(usize, Rect)> = Vec::new();
+    let selected = app.chat.selected_turn;
+    let output = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
+        .stick_to_bottom(!app.chat.autoscroll_paused)
+        // Disable drag-to-scroll so a click-drag selects text instead of
+        // panning the viewport — otherwise message text can't be highlighted.
+        // Wheel and scrollbar scrolling are unaffected.
+        .drag_to_scroll(false)
         .max_height(height.max(120.0))
         .show(ui, |ui| {
             if app.chat.turns.is_empty() {
@@ -57,13 +78,29 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     }
                 }
                 if !assistant.is_empty() || !finished {
-                    draw_assistant(
-                        ui,
-                        &mut app.md_cache,
-                        i,
-                        if assistant.is_empty() { "…" } else { &assistant },
-                        &palette,
-                    );
+                    let body = ui
+                        .scope(|ui| {
+                            draw_assistant(
+                                ui,
+                                &mut app.md_cache,
+                                i,
+                                if assistant.is_empty() { "…" } else { &assistant },
+                                &palette,
+                            );
+                        })
+                        .response
+                        .rect;
+                    assistant_rects.push((i, body));
+                    // Ctrl+A "selection" — a translucent wash over the whole
+                    // message so the selected state reads like a text
+                    // highlight (Ctrl+C then copies the message source).
+                    if selected == Some(i) {
+                        ui.painter().rect_filled(
+                            body.expand2(egui::vec2(6.0, 4.0)),
+                            2.0,
+                            rgb(palette.accent).linear_multiply(0.14),
+                        );
+                    }
                 }
                 let chips = app.chat.turns[i].tool_chips.clone();
                 if !chips.is_empty() {
@@ -81,6 +118,187 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 anchor.scroll_to_me(Some(Align::BOTTOM));
             }
         });
+    transcript_input(app, ui, &output, &assistant_rects);
+    // The pill is pointless while everything already fits on screen.
+    if output.content_size.y > output.inner_rect.height() {
+        resume_button(app, ui, output.inner_rect);
+    }
+}
+
+// ---------- viewport input: pause/resume, keyboard + middle-click scroll ----------
+
+/// Post-layout input pass over the transcript viewport. Handles:
+///   * pausing auto-follow when the user clicks into the transcript or
+///     scrolls up (mirrored by the floating resume pill);
+///   * ArrowUp/ArrowDown line-scroll and PgUp/PgDn paging when no widget
+///     has keyboard focus (so the composer keeps its own key handling);
+///   * Windows-style middle-click pan: a middle click drops an anchor and
+///     vertical pointer displacement scrolls until any other click / Esc;
+///   * Ctrl+A selecting the hovered (else last) assistant message and
+///     Ctrl+C copying the selected one.
+fn transcript_input(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+    assistant_rects: &[(usize, Rect)],
+) {
+    let ctx = ui.ctx().clone();
+    let rect = output.inner_rect;
+    // Include the scrollbar gutter so grabbing the bar also counts as the
+    // user taking control of the viewport.
+    let hit_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x + 14.0, rect.max.y));
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let pointer_over = pointer.is_some_and(|p| hit_rect.contains(p));
+    let no_focus = ctx.memory(|m| m.focused().is_none());
+
+    // --- pause auto-follow when the user takes the viewport ---
+    let clicked_transcript = pointer_over && ctx.input(|i| i.pointer.primary_pressed());
+    let wheeled_up = pointer_over && ctx.input(|i| i.raw_scroll_delta.y > 0.0);
+    if !app.chat.turns.is_empty() && (clicked_transcript || wheeled_up) {
+        app.chat.autoscroll_paused = true;
+    }
+
+    // --- keyboard scrolling; only when no widget owns the keyboard ---
+    let mut delta = 0.0f32;
+    if no_focus {
+        let line = 48.0;
+        let page = (rect.height() - 24.0).max(48.0);
+        ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                delta -= line;
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                delta += line;
+            }
+            if i.consume_key(Modifiers::NONE, Key::PageUp) {
+                delta -= page;
+            }
+            if i.consume_key(Modifiers::NONE, Key::PageDown) {
+                delta += page;
+            }
+        });
+    }
+
+    // --- middle-click pan: click toggles an anchor, displacement scrolls ---
+    if ctx.input(|i| i.pointer.button_pressed(PointerButton::Middle)) {
+        app.chat.middle_scroll_origin = match app.chat.middle_scroll_origin {
+            Some(_) => None,
+            None if pointer_over => pointer,
+            None => None,
+        };
+    }
+    if ctx.input(|i| {
+        i.pointer.primary_pressed() || i.pointer.secondary_pressed() || i.key_pressed(Key::Escape)
+    }) {
+        app.chat.middle_scroll_origin = None;
+    }
+    if let Some(origin) = app.chat.middle_scroll_origin {
+        if let Some(pos) = pointer {
+            let dy = pos.y - origin.y;
+            const DEAD_ZONE: f32 = 8.0;
+            if dy.abs() > DEAD_ZONE {
+                let dt = ctx.input(|i| i.stable_dt).min(0.1);
+                delta += (dy - DEAD_ZONE * dy.signum()) * 6.0 * dt;
+            }
+        }
+        draw_pan_anchor(&ctx, origin, &app.palette);
+        ctx.request_repaint();
+    }
+
+    if delta != 0.0 {
+        if delta < 0.0 {
+            app.chat.autoscroll_paused = true;
+        }
+        let max_offset = (output.content_size.y - rect.height()).max(0.0);
+        let mut state = output.state;
+        state.offset.y = (state.offset.y + delta).clamp(0.0, max_offset);
+        state.store(&ctx, output.id);
+        ctx.request_repaint();
+    }
+
+    // --- Ctrl+A selects one output, Ctrl+C copies it, click / Esc clears ---
+    if clicked_transcript || ctx.input(|i| i.key_pressed(Key::Escape)) {
+        app.chat.selected_turn = None;
+    }
+    if no_focus && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
+        app.chat.selected_turn = pointer
+            .and_then(|pos| {
+                assistant_rects
+                    .iter()
+                    .find(|(_, r)| r.expand2(egui::vec2(6.0, 4.0)).contains(pos))
+                    .map(|(i, _)| *i)
+            })
+            .or_else(|| assistant_rects.last().map(|(i, _)| *i));
+    }
+    if let Some(sel) = app.chat.selected_turn {
+        // Leave Ctrl+C to egui when a drag-selection exists in some label —
+        // that copy should win over the whole-message copy.
+        let label_selection = egui::text_selection::LabelSelectionState::load(&ctx).has_selection();
+        if no_focus
+            && !label_selection
+            && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::C))
+        {
+            if let Some(turn) = app.chat.turns.get(sel) {
+                ctx.output_mut(|o| o.copied_text = turn.assistant.clone());
+            }
+        }
+    }
+}
+
+/// Floating "resume auto-scroll" pill, shown while auto-follow is paused.
+/// Sits centred just above the composer, over the transcript.
+fn resume_button(app: &mut App, ui: &mut egui::Ui, viewport: Rect) {
+    if !app.chat.autoscroll_paused {
+        return;
+    }
+    let p = app.palette;
+    let ctx = ui.ctx().clone();
+    egui::Area::new(egui::Id::new("chat_autoscroll_resume"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(viewport.center().x - 48.0, viewport.max.y - 36.0))
+        .show(&ctx, |ui| {
+            let resp = egui::Frame::none()
+                .fill(rgb(p.accent))
+                .rounding(Rounding::same(12.0))
+                .inner_margin(egui::Margin::symmetric(12.0, 5.0))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(caps_job("↓ Follow", rgb(p.page_bg), 11.0))
+                            .selectable(false),
+                    );
+                })
+                .response
+                .interact(Sense::click());
+            if resp.on_hover_text("Resume auto-scroll").clicked() {
+                app.chat.autoscroll_paused = false;
+                app.chat.scroll_to_bottom = true;
+            }
+        });
+}
+
+/// Windows-style pan anchor: a circle with up/down arrows at the middle-click
+/// origin, painted on the foreground layer so it rides above the transcript.
+fn draw_pan_anchor(ctx: &egui::Context, origin: Pos2, p: &Palette) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("chat_pan_anchor"),
+    ));
+    painter.circle(origin, 11.0, rgb(p.surface), Stroke::new(1.0, rgb(p.muted)));
+    let ink = rgb(p.ink);
+    for dir in [-1.0f32, 1.0] {
+        let tip = Pos2::new(origin.x, origin.y + dir * 7.0);
+        let base_y = origin.y + dir * 3.0;
+        painter.add(Shape::convex_polygon(
+            vec![
+                tip,
+                Pos2::new(origin.x - 3.5, base_y),
+                Pos2::new(origin.x + 3.5, base_y),
+            ],
+            ink,
+            Stroke::NONE,
+        ));
+    }
+    painter.circle_filled(origin, 1.5, ink);
 }
 
 // ---------- empty state ----------
@@ -119,7 +337,12 @@ fn draw_user(ui: &mut egui::Ui, text: &str, p: &Palette) {
                 .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
                     ui.set_max_width(max_w);
-                    ui.label(RichText::new(text).color(rgb(p.ink)));
+                    // Labels default to "extend" (no wrap) inside a horizontal
+                    // layout like `right_to_left`, so a long message would run
+                    // off-screen to the left. Force wrapping at `max_w`.
+                    ui.add(
+                        egui::Label::new(RichText::new(text).color(rgb(p.ink))).wrap(),
+                    );
                 });
         },
     );
@@ -197,6 +420,21 @@ fn draw_assistant(
         let viewer_id = format!("assistant_md_{turn_idx}");
         CommonMarkViewer::new(viewer_id).show(ui, cache, text);
     });
+    // Copy-to-clipboard affordance, right-aligned under the message body.
+    // CommonMark-rendered text isn't cleanly selectable, so this is the
+    // reliable path to grab the whole response. Hidden while the turn is
+    // still an empty "…" placeholder.
+    if text != "…" {
+        ui.add_space(4.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if caps_button(ui, "Copy", rgb(p.muted))
+                .on_hover_text("Copy response")
+                .clicked()
+            {
+                ui.output_mut(|o| o.copied_text = text.to_owned());
+            }
+        });
+    }
 }
 
 // ---------- reasoning ----------

@@ -121,6 +121,20 @@ pub async fn run_turn(
     }
     let _ = stream_handle.await;
 
+    // Reasoning models that omit the opening `<think>` (it lives in the prompt
+    // template) leak their reasoning into `content` with only a trailing
+    // `</think>`. The streaming splitter can't catch that mid-stream, so peel
+    // it back out of the accumulated text here — keeps the persisted message,
+    // the reasoning chip, and the auto-title agent all seeing the right halves.
+    if accum_reasoning.is_empty() {
+        if let Some((content, reasoning)) =
+            llm::streaming::split_orphan_reasoning(&accum_content)
+        {
+            accum_content = content;
+            accum_reasoning = reasoning;
+        }
+    }
+
     // Final correction: exact tokenize of full transcript (prompt + assistant).
     let full = format!("{prompt_concat}\n{accum_content}\n{accum_reasoning}");
     let final_used = tokenize_exact(&client.base_url, &full)

@@ -13,3 +13,5 @@ Thumbs.db
 
 # Per-user LLM provider configs — may contain API keys.
 /sica-settings/
+idealist_workspace/*.md
+sessions/*.*

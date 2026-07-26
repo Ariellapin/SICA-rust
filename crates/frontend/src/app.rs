@@ -257,6 +257,28 @@ pub struct ChatState {
     /// into `Request::SendUserMessage` on send; rendered as a thumbnail
     /// strip above the input bar in the meantime.
     pub pending_images: Vec<PendingAttachment>,
+    /// Last-frame hover state of the composer frame. Cached so the next
+    /// frame can pick a brighter fill / accented stroke before the Frame
+    /// is painted — egui paints frame chrome up-front and cannot be
+    /// retinted retroactively.
+    pub input_hovered: bool,
+    /// Session id awaiting delete confirmation. The first `×` click arms a
+    /// row (one row at a time); the inline "Delete? / Keep" affordance then
+    /// commits or cancels. Keeps an accidental click from dropping a session.
+    pub pending_delete: Option<u64>,
+    /// `true` once the user has opted out of follow-the-stream autoscroll
+    /// (by clicking into the transcript or scrolling up). While paused, new
+    /// content no longer snaps the viewport to the bottom; a floating
+    /// "resume" pill in the messages view flips this back to `false`.
+    pub autoscroll_paused: bool,
+    /// Turn index whose assistant output is "selected" via Ctrl+A. Rendered
+    /// as a wash over that message; Ctrl+C copies its markdown source.
+    /// Cleared on click / Esc / session switch.
+    pub selected_turn: Option<usize>,
+    /// Anchor of middle-click scroll mode (Windows-style pan): set by a
+    /// middle click over the transcript, cleared by any other click or Esc.
+    /// While set, vertical pointer displacement from the anchor scrolls.
+    pub middle_scroll_origin: Option<egui::Pos2>,
 }
 
 /// One image the user has attached, ready to send. `texture` is materialised
@@ -613,17 +635,22 @@ impl App {
     /// asks the BE for the session's history; the response arrives as
     /// `UiEvent::SessionLoaded` and is rebuilt into `Vec<Turn>`.
     pub fn switch_session(&mut self, id: u64) {
+        self.chat.pending_delete = None;
         if self.chat.session_id == id {
             return;
         }
         self.chat.session_id = id;
         self.chat.turns.clear();
+        self.chat.selected_turn = None;
+        self.chat.autoscroll_paused = false;
+        self.chat.middle_scroll_origin = None;
         self.send(UiCommand::SendRequest(Request::LoadSession { session_id: id }));
     }
 
     /// Ask the BE to drop `id` and remove it from the local list. If the
     /// deleted session was active, fall back to the first remaining session.
     pub fn delete_session(&mut self, id: u64) {
+        self.chat.pending_delete = None;
         if self.chat.sessions.len() <= 1 {
             return;
         }

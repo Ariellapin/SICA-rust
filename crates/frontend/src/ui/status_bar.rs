@@ -9,7 +9,13 @@ use sica_core::theme::tokens::{HAIRLINE, RADIUS_2};
 
 use crate::app::{rgb, App};
 use crate::supervisor::UiCommand;
-use crate::ui::widgets::{caps_job, caps_label, display_text, right_aligned, status_icon, StatusKind};
+use crate::ui::widgets::{caps_job, display_text, right_aligned, status_icon, StatusKind};
+
+const FOOTER_FONT_PT: f32 = 9.0;
+
+fn tiny_caps(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(egui::Label::new(caps_job(text, color, FOOTER_FONT_PT)).selectable(false));
+}
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
@@ -18,7 +24,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let idle_color  = rgb(p.hairline);
     let muted       = rgb(p.muted);
 
-    ui.add_space(2.0);
+    let prev_spacing = ui.spacing().item_spacing;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.spacing_mut().item_spacing.x = 4.0;
     ui.horizontal(|ui| {
         // BE
         let be_connected = app.be_state.running;
@@ -30,7 +38,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             (idle_color, "BE  STOPPED".to_string(), None)
         };
         status_icon(ui, StatusKind::Be, be_connected, be_color, &be_label, be_detail.as_deref(), err_color);
-        caps_label(ui, "BE", muted);
+        tiny_caps(ui, "BE", muted);
 
         sep(ui, muted);
 
@@ -46,7 +54,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             (idle_color, "IPC  DISCONNECTED".to_string(), None)
         };
         status_icon(ui, StatusKind::Ipc, ipc_connected, ipc_color, &ipc_label, ipc_detail.as_deref(), err_color);
-        caps_label(ui, "IPC", muted);
+        tiny_caps(ui, "IPC", muted);
 
         sep(ui, muted);
 
@@ -60,12 +68,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             protocol::LlmState::Disconnected   => (idle_color, None),
         };
         status_icon(ui, StatusKind::Llm, llm_connected, llm_color, &llm_label, llm_detail.as_deref(), err_color);
-        caps_label(ui, "LLM", muted);
+        tiny_caps(ui, "LLM", muted);
 
         sep(ui, muted);
 
         // FOLDER — project the agent is operating on.
-        caps_label(ui, &format!("FOLDER  {}", app.workspace_name.to_uppercase()), muted);
+        tiny_caps(ui, &format!("FOLDER  {}", app.workspace_name.to_uppercase()), muted);
 
         sep(ui, muted);
 
@@ -74,22 +82,22 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             protocol::LlmState::Ready { model, .. } => model.clone(),
             _ => "—".to_string(),
         };
-        caps_label(ui, &format!("MODEL  {}", model.to_uppercase()), muted);
+        tiny_caps(ui, &format!("MODEL  {}", model.to_uppercase()), muted);
 
         right_aligned(ui, |ui| {
-            ui.label(display_text("sica", 14.0).color(muted));
-            ui.label(egui::RichText::new(" · ").color(muted));
+            ui.label(display_text("sica", 11.0).color(muted));
+            ui.label(egui::RichText::new(" · ").color(muted).size(FOOTER_FONT_PT));
             let used = app.tokens.used.load(std::sync::atomic::Ordering::Relaxed);
             let limit = app.tokens.limit.load(std::sync::atomic::Ordering::Relaxed);
-            caps_label(ui, &format!("{used} / {limit}"), muted);
+            tiny_caps(ui, &format!("{used} / {limit}"), muted);
 
             if app.be_state.restart_pending() {
-                ui.label(egui::RichText::new(" · ").color(muted));
+                ui.label(egui::RichText::new(" · ").color(muted).size(FOOTER_FONT_PT));
                 draw_restart_button(app, ui);
             }
         });
     });
-    ui.add_space(2.0);
+    ui.spacing_mut().item_spacing = prev_spacing;
 }
 
 /// Pulsing "RESTART" pill shown when the on-disk source has drifted from the
@@ -114,11 +122,11 @@ fn draw_restart_button(app: &mut App, ui: &mut egui::Ui) {
 
     let resp = ui.add_enabled(
         !busy,
-        egui::Button::new(caps_job("⟳ RESTART", label_color, 11.0))
+        egui::Button::new(caps_job("⟳ RESTART", label_color, 9.0))
             .fill(fill)
             .stroke(egui::Stroke::new(HAIRLINE, accent))
             .rounding(egui::Rounding::same(RADIUS_2))
-            .min_size(egui::Vec2::new(0.0, 22.0)),
+            .min_size(egui::Vec2::new(0.0, 16.0)),
     );
     let resp = resp.on_hover_text(format!(
         "Source has changed since the BE was built.\nBE: {}\nSrc: {}",
@@ -146,5 +154,5 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 }
 
 fn sep(ui: &mut egui::Ui, color: egui::Color32) {
-    ui.label(egui::RichText::new(" · ").color(color));
+    ui.label(egui::RichText::new(" · ").color(color).size(FOOTER_FONT_PT));
 }

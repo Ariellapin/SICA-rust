@@ -48,10 +48,22 @@ pub async fn summarize(client: &LlmClient, user_msg: &str, assistant_msg: &str) 
 }
 
 fn clean(raw: &str) -> String {
-    let trimmed = raw.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == '.');
+    // Defence in depth: if any reasoning leaked through (a stray `</think>`),
+    // keep only what follows it so the title isn't built from chain-of-thought.
+    let body = match raw.rfind("</think>") {
+        Some(idx) => &raw[idx + "</think>".len()..],
+        None => raw,
+    };
+    let trimmed = body
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '.' || c == ':');
     let first_line = trimmed.lines().next().unwrap_or("").trim();
     let truncated: String = first_line.chars().take(MAX_TITLE_LEN).collect();
-    truncated.trim().to_string()
+    truncated
+        .trim()
+        .trim_end_matches(|c: char| c == ':' || c == '.' || c == ',')
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -66,6 +78,16 @@ mod tests {
     #[test]
     fn takes_first_line() {
         assert_eq!(clean("Title One\nIgnored"), "Title One");
+    }
+
+    #[test]
+    fn strips_trailing_colon() {
+        assert_eq!(clean("Image Prompt Request:"), "Image Prompt Request");
+    }
+
+    #[test]
+    fn drops_leaked_reasoning_before_close_tag() {
+        assert_eq!(clean("Here's a thinking process:\n...\n</think>\nSDXL Prompts"), "SDXL Prompts");
     }
 
     #[test]

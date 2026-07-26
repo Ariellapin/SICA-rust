@@ -99,6 +99,29 @@ impl ThinkSplitter {
     }
 }
 
+/// Peel a dangling reasoning prefix out of fully-accumulated `content`.
+///
+/// Some reasoning models stream `reasoning…</think>answer` with the *opening*
+/// `<think>` baked into the prompt template, so it never reaches us — only the
+/// trailing `</think>` does. The streaming [`ThinkSplitter`] only recognises a
+/// *paired* `<think>…</think>`, so that leading reasoning is misclassified as
+/// content (it then leaks into the chat bubble and poisons the auto-title
+/// agent). Call this on the complete content once the turn finishes: if a
+/// closing tag appears with no opening tag before it, everything up to the
+/// first `</think>` is reasoning and the remainder is the real answer.
+///
+/// Returns `None` when the content is already well-formed (no orphan close),
+/// so callers can leave a properly-split turn untouched.
+pub fn split_orphan_reasoning(content: &str) -> Option<(String, String)> {
+    let close = content.find("</think>")?;
+    if content[..close].contains("<think>") {
+        return None; // properly paired — ThinkSplitter already handled it.
+    }
+    let reasoning = content[..close].trim().to_string();
+    let answer = content[close + "</think>".len()..].trim_start().to_string();
+    Some((answer, reasoning))
+}
+
 /// Parse a single `data:` SSE line payload (the JSON envelope), splitting any
 /// embedded `<think>...</think>` reasoning out of `content` and merging it with
 /// any `reasoning_content` field if the server returns one separately.
@@ -141,6 +164,22 @@ mod tests {
         assert_eq!(c, "hello  world");
         assert_eq!(r, "secret");
         assert!(!s.in_think);
+    }
+
+    #[test]
+    fn orphan_reasoning_peeled_when_open_tag_missing() {
+        let raw = "Here's a thinking process:\n1. do x\n</think>\n\nThe real answer.";
+        let (content, reasoning) = super::split_orphan_reasoning(raw).unwrap();
+        assert_eq!(content, "The real answer.");
+        assert_eq!(reasoning, "Here's a thinking process:\n1. do x");
+    }
+
+    #[test]
+    fn orphan_reasoning_left_alone_when_paired_or_absent() {
+        // Properly paired — ThinkSplitter owns this; don't double-handle.
+        assert!(super::split_orphan_reasoning("<think>r</think>answer").is_none());
+        // No reasoning at all.
+        assert!(super::split_orphan_reasoning("just an answer").is_none());
     }
 
     #[test]

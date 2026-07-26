@@ -18,6 +18,15 @@ use crate::app::{App, AppView};
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status")
         .show_separator_line(false)
+        .frame(
+            egui::Frame::none()
+                .inner_margin(egui::Margin {
+                    left: 8.0,
+                    right: 8.0,
+                    top: 0.0,
+                    bottom: 0.0,
+                }),
+        )
         .show(ctx, |ui| status_bar::draw(app, ui));
 
     egui::SidePanel::left("sidebar")

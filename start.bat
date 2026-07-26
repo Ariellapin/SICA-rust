@@ -4,6 +4,8 @@ rem `cargo run` builds first, so this is one command. Pass any extra cargo args.
 
 setlocal
 
+cd /d "%~dp0"
+
 set "CARGO_BIN=%USERPROFILE%\.cargo\bin"
 set "MINGW_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260505-ucrt-x86_64\bin"
 
@@ -20,4 +22,10 @@ if not exist "%MINGW_BIN%" (
 set "PATH=%CARGO_BIN%;%MINGW_BIN%;%PATH%"
 
 cargo.exe run -p frontend %*
-exit /b %ERRORLEVEL%
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" (
+    echo.
+    echo cargo exited with code %RC%. Press any key to close...
+    pause >nul
+)
+exit /b %RC%
