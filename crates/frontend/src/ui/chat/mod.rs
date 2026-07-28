@@ -22,15 +22,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         draw_no_be(app, ui);
         return;
     }
-    if !app.llm_state.is_ready() {
+    let disabled = !app.llm_state.is_ready();
+    // The composer lives in an inner bottom panel: its bottom edge hugs the
+    // window bottom and growth (more draft lines, the attachment strip) pushes
+    // the transcript up instead of pushing the Send button off-screen.
+    egui::TopBottomPanel::bottom(egui::Id::new("chat_composer"))
+        .show_separator_line(false)
+        .frame(egui::Frame::none().inner_margin(egui::Margin {
+            left: 0.0,
+            right: 0.0,
+            top: 8.0,
+            bottom: 2.0,
+        }))
+        .show_inside(ui, |ui| input_bar::draw(app, ui, disabled));
+    if disabled {
         draw_no_llm(app, ui);
-        ui.add_space(8.0);
-        input_bar::draw(app, ui, true);
-        return;
+    } else {
+        messages::draw(app, ui);
     }
-    messages::draw(app, ui);
-    ui.add_space(10.0);
-    input_bar::draw(app, ui, false);
 }
 
 fn draw_protocol_banner(app: &mut App, ui: &mut egui::Ui, be_v: u32, fe_v: u32) {

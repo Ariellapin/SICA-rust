@@ -862,7 +862,8 @@ impl App {
                 self.chat.idealist.last_ticket = Some(path);
             }
             UiEvent::SessionList { mut sessions } => {
-                sessions.sort_by_key(|s| s.created_at);
+                // Newest on top — the list reads most-recent-first.
+                sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at));
                 if sessions.is_empty() {
                     // First-run case: ask the BE to mint a session so the user
                     // has something to type into.
@@ -884,7 +885,8 @@ impl App {
             }
             UiEvent::SessionCreated { id } => {
                 if !self.chat.sessions.iter().any(|s| s.id == id) {
-                    self.chat.sessions.push(SessionMeta {
+                    // Insert at the front — the list is most-recent-first.
+                    self.chat.sessions.insert(0, SessionMeta {
                         id,
                         title: format!("Session {id}"),
                         created_at: 0,

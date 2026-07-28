@@ -1,9 +1,11 @@
-//! Composer. A rounded composer frame holds the 2-row TextEdit; its fill
+//! Composer. A rounded composer frame holds the TextEdit; its fill
 //! and stroke shift on hover/focus to flag the surface as tappable. The
-//! primary "SEND" button sits to the right; the token meter lives in the
-//! bottom status bar — there is no duplicate beneath the composer. When
-//! a ticket has been written this turn, the ticket id is shown on a single
-//! tracked-caps line under the field.
+//! field starts at 2 rows and grows with the draft up to `MAX_INPUT_ROWS`,
+//! after which it scrolls internally so the Send button never leaves the
+//! screen. The primary "SEND" button sits to the right; the token meter
+//! lives in the bottom status bar — there is no duplicate beneath the
+//! composer. When a ticket has been written this turn, the ticket id is
+//! shown on a single tracked-caps line under the field.
 //!
 //! Submission keys: Enter sends, Shift+Enter inserts a newline. Enter is
 //! consumed before the multiline editor sees it so the field doesn't keep
@@ -29,6 +31,8 @@ use crate::ui::widgets::{caps_label, ghost_button, primary_button_enabled};
 
 const SEND_BUTTON_W: f32 = 84.0;
 const ATTACH_BUTTON_W: f32 = 36.0;
+/// Rows after which the field stops growing and scrolls internally.
+const MAX_INPUT_ROWS: usize = 8;
 const THUMB_SIZE: f32 = 56.0;
 const INPUT_FRAME_RADIUS: f32 = 14.0;
 const INPUT_FRAME_PAD_X: f32 = 12.0;
@@ -101,17 +105,35 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
             .rounding(Rounding::same(INPUT_FRAME_RADIUS))
             .inner_margin(egui::Margin::symmetric(INPUT_FRAME_PAD_X, INPUT_FRAME_PAD_Y))
             .show(ui, |ui| {
-                let input = egui::TextEdit::multiline(&mut app.chat.draft)
-                    .id(input_id)
-                    .hint_text(if disabled {
-                        "(disabled — connect an LLM)"
-                    } else {
-                        "Type a message…  (Enter to send, Shift+Enter for newline)"
+                // The TextEdit grows with the draft (desired_rows is only a
+                // minimum); the ScrollArea caps that growth and scrolls the
+                // overflow. TextEdit keeps its own cursor in view.
+                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                let row_h = ui.fonts(|f| f.row_height(&font_id));
+                egui::ScrollArea::vertical()
+                    .id_source("chat_input_scroll")
+                    .max_height(row_h * MAX_INPUT_ROWS as f32 + 4.0)
+                    .show(ui, |ui| {
+                        let input = egui::TextEdit::multiline(&mut app.chat.draft)
+                            .id(input_id)
+                            .hint_text(if disabled {
+                                "(disabled — connect an LLM)"
+                            } else {
+                                "Type a message…  (Enter to send, Shift+Enter for newline)"
+                            })
+                            .desired_width(input_w)
+                            .desired_rows(2)
+                            // egui only inserts a newline for the configured
+                            // return key; plain Enter is consumed above to
+                            // send, so map newline to Shift+Enter.
+                            .return_key(Some(egui::KeyboardShortcut::new(
+                                egui::Modifiers::SHIFT,
+                                egui::Key::Enter,
+                            )))
+                            .frame(false);
+                        ui.add_enabled(!disabled, input)
                     })
-                    .desired_width(input_w)
-                    .desired_rows(2)
-                    .frame(false);
-                ui.add_enabled(!disabled, input)
+                    .inner
             });
         let _ = frame_inner.inner;
         app.chat.input_hovered = frame_inner.response.hovered();
@@ -162,6 +184,13 @@ fn send_message(app: &mut App) {
     }
 
     let session_id = app.chat.session_id;
+    // Most-recent prompt first: bump this session to the top of the list.
+    if let Some(pos) = app.chat.sessions.iter().position(|s| s.id == session_id) {
+        if pos > 0 {
+            let meta = app.chat.sessions.remove(pos);
+            app.chat.sessions.insert(0, meta);
+        }
+    }
     app.chat.turns.push(crate::app::Turn {
         session_id,
         turn_id: 0,

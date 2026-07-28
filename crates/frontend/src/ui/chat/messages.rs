@@ -18,14 +18,9 @@ use crate::ui::widgets::{
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    // Reserve extra height when the composer is showing a pending-attachment
-    // strip — otherwise the thumbnails push the input row and Send button off
-    // the bottom of the panel.
-    let attach_reserve = if app.chat.pending_images.is_empty() { 0.0 } else { 96.0 };
-    // 132 accounts for the composer's rounded frame (+16px of vertical
-    // padding on top of the 2-row TextEdit) plus the surrounding spacing
-    // and the slimmed-down footer.
-    let height = ui.available_height() - 132.0 - attach_reserve;
+    // The composer sits in its own bottom panel, so everything still
+    // available here belongs to the transcript.
+    let height = ui.available_height();
     // Follow-the-stream only while the user hasn't taken the viewport
     // (clicked into the transcript / scrolled up). The flag is still drained
     // every frame so a stale snap doesn't fire when auto-follow resumes.

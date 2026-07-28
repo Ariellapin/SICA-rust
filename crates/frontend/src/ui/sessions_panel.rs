@@ -111,25 +111,41 @@ fn draw_row(
 ) {
     let avail = ui.available_width();
     let row_h = 32.0;
-    let (rect, row_resp) = ui.allocate_exact_size(Vec2::new(avail, row_h), Sense::click());
+    let (rect, mut row_resp) = ui.allocate_exact_size(Vec2::new(avail, row_h), Sense::click());
+
+    // Hover is tested against the row rect, not `row_resp.hovered()`: the
+    // trailing × registers its own interact rect on top of the row, which
+    // steals hover from the row response — keying visibility off the
+    // response would make the × vanish (flicker) the moment the pointer
+    // reaches it, so it could never be clicked.
+    let row_hovered = ui.rect_contains_pointer(rect);
 
     // Active = 2px accent slab on the left edge. Hover = subtle wash (but not
     // while the row is armed — the confirm state owns the row's chrome).
     if is_active {
         let slab = Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height()));
         ui.painter().rect_filled(slab, 0.0, rgb(p.accent));
-    } else if row_resp.hovered() && !is_pending {
+    } else if row_hovered && !is_pending {
         ui.painter().rect_filled(rect, 0.0, rgb(p.accent_subtle));
     }
 
-    // Title — left-anchored mono, ink for active, muted otherwise.
+    // Title — left-anchored mono, ink for active, muted otherwise. Elided to
+    // stop short of the trailing controls (× / confirm words); when elided,
+    // the full title surfaces as a hover tooltip on the row.
     let title_color = if is_active { rgb(p.ink) } else { rgb(p.muted) };
+    let title_font = FontId::new(13.0, FontFamily::Monospace);
+    let controls_reserve = if is_pending { 130.0 } else { 34.0 };
+    let title_max_w = (rect.width() - 12.0 - controls_reserve).max(24.0);
+    let (shown_title, truncated) = elide_to_width(ui, title, &title_font, title_max_w);
+    if truncated && !is_pending {
+        row_resp = row_resp.on_hover_text(title);
+    }
     let title_pos = egui::pos2(rect.min.x + 12.0, rect.center().y);
     ui.painter().text(
         title_pos,
         Align2::LEFT_CENTER,
-        title,
-        FontId::new(13.0, FontFamily::Monospace),
+        shown_title,
+        title_font,
         title_color,
     );
 
@@ -155,7 +171,7 @@ fn draw_row(
 
     // Trailing × — arms the delete. Only on hover or when active, and only if
     // there's more than one session to keep.
-    if allow_delete && (row_resp.hovered() || is_active) {
+    if allow_delete && (row_hovered || is_active) {
         let x_size = 18.0;
         let x_rect = Rect::from_min_size(
             egui::pos2(rect.max.x - x_size - 8.0, rect.center().y - x_size / 2.0),
@@ -188,6 +204,30 @@ fn draw_row(
     } else if row_resp.clicked() {
         on_action(RowAction::Switch(id));
     }
+}
+
+/// Shorten `text` with a trailing `…` so it fits in `max_w` points. Returns
+/// the (possibly elided) string and whether it was cut. Galley layouts are
+/// cached by egui per (text, font), so re-measuring every frame is cheap.
+fn elide_to_width(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> (String, bool) {
+    let width = |s: String| {
+        ui.fonts(|f| f.layout_no_wrap(s, font.clone(), egui::Color32::WHITE).size().x)
+    };
+    if width(text.to_owned()) <= max_w {
+        return (text.to_owned(), false);
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        let mut candidate = out.clone();
+        candidate.push(c);
+        candidate.push('…');
+        if width(candidate) > max_w {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    (out, true)
 }
 
 struct WordHit {
