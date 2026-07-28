@@ -9,12 +9,18 @@ use tokio_util::sync::CancellationToken;
 use eventsource_stream::Eventsource;
 
 use crate::streaming::{parse_sse_event, ThinkSplitter};
-pub use crate::streaming::StreamChunk;
+pub use crate::streaming::{StreamChunk, ToolCallDelta};
 
 #[derive(Clone, Debug)]
 pub struct LlmClient {
     pub base_url: String,
     pub model:    String,
+    /// Sampling temperature sent with every chat request. Agentic turns
+    /// (tool calls, summaries) want this low — high values make small
+    /// local models mis-quote tool output and hallucinate call syntax.
+    pub temperature: f32,
+    /// Per-response completion cap; `None` = server default.
+    pub max_tokens: Option<u32>,
     api_key:      Option<String>,
     http:         reqwest::Client,
 }
@@ -25,12 +31,25 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub stream:   bool,
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// OpenAI-native tool definitions. Omitted entirely when the caller
+    /// uses the text-protocol tool calling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role:    String,
     pub content: ChatContent,
+    /// OpenAI-native `tool_calls` array on assistant messages, forwarded
+    /// verbatim so the server's chat template can replay the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Set on `tool`-role messages to correlate with the assistant call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// OpenAI / vLLM multimodal content field: either a bare string or an array
@@ -88,7 +107,12 @@ impl From<&str> for ChatContent {
 
 impl ChatMessage {
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: ChatContent::Text(content.into()) }
+        Self {
+            role: role.into(),
+            content: ChatContent::Text(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
 }
 
@@ -100,6 +124,25 @@ struct ModelsList {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    /// vLLM exposes the model's context length here.
+    #[serde(default)]
+    max_model_len: Option<u64>,
+    /// llama.cpp exposes `meta.n_ctx_train` instead.
+    #[serde(default)]
+    meta: Option<serde_json::Value>,
+}
+
+impl ModelEntry {
+    fn context_window(&self) -> Option<u32> {
+        if let Some(n) = self.max_model_len {
+            return u32::try_from(n).ok();
+        }
+        self.meta
+            .as_ref()?
+            .get("n_ctx_train")?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+    }
 }
 
 impl LlmClient {
@@ -111,9 +154,16 @@ impl LlmClient {
         Self {
             base_url: base_url.into(),
             model:    model.into(),
+            temperature: 0.2,
+            max_tokens: None,
             api_key:  api_key.filter(|k| !k.is_empty()),
+            // No *total* request timeout: a streaming completion legitimately
+            // runs for many minutes on a local server. `read_timeout` guards
+            // each read instead — a healthy stream resets it on every token,
+            // while a hung server still errors out.
             http:     reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("reqwest client"),
         }
@@ -143,6 +193,10 @@ impl LlmClient {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        Ok(self.fetch_models().await?.into_iter().map(|m| m.id).collect())
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<ModelEntry>> {
         let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
         let resp = self
             .auth(self.http.get(url))
@@ -150,7 +204,19 @@ impl LlmClient {
             .await?
             .error_for_status()?;
         let list: ModelsList = resp.json().await?;
-        Ok(list.data.into_iter().map(|m| m.id).collect())
+        Ok(list.data)
+    }
+
+    /// Best-effort context-window detection from `/v1/models`. Prefers the
+    /// entry matching `self.model`, falls back to the first entry. `None`
+    /// when the server doesn't report a length in any known field.
+    pub async fn detect_context_window(&self) -> Option<u32> {
+        let entries = self.fetch_models().await.ok()?;
+        entries
+            .iter()
+            .find(|e| e.id == self.model)
+            .or_else(|| entries.first())
+            .and_then(ModelEntry::context_window)
     }
 
     /// One-shot, non-streaming chat: aggregates every streamed delta into a
@@ -160,7 +226,7 @@ impl LlmClient {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let this = self.clone();
         let handle = tokio::spawn(async move {
-            this.chat_stream(messages, tx, None).await
+            this.chat_stream(messages, None, tx, None).await
         });
         let mut out = String::new();
         while let Some(chunk) = rx.recv().await {
@@ -176,9 +242,12 @@ impl LlmClient {
     /// Open a streaming chat completion. Each parsed `StreamChunk` is forwarded
     /// to `tx`. The task returns once the upstream stream closes, errors, or
     /// `cancel` fires (used by `InterruptTurn` to stop generation mid-flight).
+    /// `tools` is an optional OpenAI-native tool definition array; pass
+    /// `None` for plain chat / text-protocol tool calling.
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatMessage>,
+        tools: Option<serde_json::Value>,
         tx: mpsc::UnboundedSender<StreamChunk>,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
@@ -187,7 +256,9 @@ impl LlmClient {
             model: self.model.clone(),
             messages,
             stream: true,
-            temperature: Some(0.7),
+            temperature: Some(self.temperature),
+            max_tokens: self.max_tokens,
+            tools,
         };
 
         // POST itself is racy against cancellation: if Esc fires before the

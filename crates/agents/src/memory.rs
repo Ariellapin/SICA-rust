@@ -38,8 +38,7 @@ Emit a single line:
   newlines as `\n`, single-quotes as `\'`, etc.).
 - The `>` token (whitespace on both sides) separates the call from your
   **expectation** — a short phrase saying what you want to know from the
-  result. The sub-agent will run the skill and reply with a focused summary
-  addressing exactly that expectation, not the full raw output.
+  result.
 
 Examples:
 
@@ -47,10 +46,23 @@ Examples:
     run-cli 'cargo --version' > confirm cargo is installed and report the version
     write-file 'notes/x.md' 'hello, world\n' > confirm bytes written
 
-Do **not** use JSON, fenced `tool_call` blocks, or any other shape — the
-parser only recognises the single-line natural-language form above. After
-your final answer, stop emitting tool-call lines: the loop ends when the
-assistant turn contains no more invocations.
+A fenced ```tool_call``` block containing
+`{ "skill": "...", "args": { ... }, "expectation": "..." }` is also
+accepted, but the single-line form above is preferred.
+
+## Rules
+
+- **One tool call per message.** Only the first call in a message is
+  executed; anything after it is ignored. Issue one call, stop, and wait
+  for the ```tool_result``` block before deciding the next step.
+- **Never write a ```tool_result``` block yourself** and never guess or
+  assume what a tool returned. If you did not receive a result, the call
+  did not run.
+- Base every claim about the host system (installed tools, file contents,
+  command output) on an actual tool result from this conversation, not on
+  assumption.
+- When your answer is complete, reply in plain prose with **no** tool-call
+  line — that ends the loop.
 "#;
 
 /// Write `memory.md` if it does not already exist. Never overwrites a file

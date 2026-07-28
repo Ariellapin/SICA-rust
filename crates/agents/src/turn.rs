@@ -20,10 +20,22 @@ pub struct TurnInput {
     pub session_id: u64,
     pub turn_id:    u64,
     pub messages:   Vec<ChatMessage>,
+    /// OpenAI-native tool definitions to send with the request; `None` for
+    /// text-protocol tool calling.
+    pub tools:      Option<serde_json::Value>,
     pub limit:      u32,
     /// Cancelled by `InterruptTurn`. When fired, the stream is dropped and
     /// the partial response is returned with `finish_reason = "interrupted"`.
     pub cancel:     Option<CancellationToken>,
+}
+
+/// One fully-accumulated native tool call from the response stream.
+#[derive(Debug, Clone, Default)]
+pub struct NativeToolCall {
+    pub id:        String,
+    pub name:      String,
+    /// Raw JSON string of the arguments object, exactly as streamed.
+    pub arguments: String,
 }
 
 /// Final accumulated state of one turn — what the caller needs to write
@@ -34,6 +46,8 @@ pub struct TurnOutput {
     pub content:       String,
     pub reasoning:     String,
     pub finish_reason: String,
+    /// Native tool calls emitted this turn (empty in text-protocol mode).
+    pub tool_calls:    Vec<NativeToolCall>,
 }
 
 pub async fn run_turn(
@@ -41,7 +55,7 @@ pub async fn run_turn(
     events: Arc<dyn EventSink>,
     input: TurnInput,
 ) -> TurnOutput {
-    let TurnInput { session_id, turn_id, messages, limit, cancel } = input;
+    let TurnInput { session_id, turn_id, messages, tools, limit, cancel } = input;
 
     events.emit(Event::TurnStarted { session_id, turn_id });
 
@@ -64,7 +78,7 @@ pub async fn run_turn(
     let stream_cancel = cancel.clone();
     let stream_handle = tokio::spawn(async move {
         if let Err(e) = client_clone
-            .chat_stream(messages_for_stream, chunk_tx, stream_cancel)
+            .chat_stream(messages_for_stream, tools, chunk_tx, stream_cancel)
             .await
         {
             warn!(error = %e, "chat_stream failed");
@@ -76,6 +90,9 @@ pub async fn run_turn(
     let mut final_reason = String::from("stop");
     let mut accum_content   = String::new();
     let mut accum_reasoning = String::new();
+    // Native tool calls accumulate by stream index: the first fragment for
+    // an index carries id/name, later fragments append argument text.
+    let mut accum_tools: Vec<NativeToolCall> = Vec::new();
 
     let mut interrupted = false;
     loop {
@@ -103,6 +120,20 @@ pub async fn run_turn(
             running = running.saturating_add(
                 approx_tokens(&chunk.delta_content) + approx_tokens(&chunk.delta_reasoning),
             );
+        }
+        for tc in &chunk.delta_tool_calls {
+            let idx = tc.index as usize;
+            while accum_tools.len() <= idx {
+                accum_tools.push(NativeToolCall::default());
+            }
+            let slot = &mut accum_tools[idx];
+            if let Some(id) = &tc.id {
+                slot.id = id.clone();
+            }
+            if let Some(name) = &tc.name {
+                slot.name.push_str(name);
+            }
+            slot.arguments.push_str(&tc.arguments);
         }
         if let Some(reason) = chunk.finish_reason {
             final_reason = reason;
@@ -149,9 +180,14 @@ pub async fn run_turn(
     });
     info!(session_id, turn_id, "turn finished");
 
+    // Drop empty slots (defensive: a server that skips indices would leave
+    // nameless placeholders behind).
+    accum_tools.retain(|t| !t.name.is_empty());
+
     TurnOutput {
         content:       accum_content,
         reasoning:     accum_reasoning,
         finish_reason: final_reason,
+        tool_calls:    accum_tools,
     }
 }

@@ -187,7 +187,14 @@ impl ToolSubAgent {
         let ctx = SkillContext { sub: self.child(id) };
         let mut outcome = skill.run(args, ctx).await;
 
-        if outcome.ok && !expectation.trim().is_empty() {
+        // Short outputs are passed through verbatim: the raw text is ground
+        // truth, and every LLM rewrite is a chance to misquote it. Only
+        // outputs too big to re-ingest are worth the lossy focused summary.
+        const SUMMARIZE_THRESHOLD: usize = 2000;
+        if outcome.ok
+            && !expectation.trim().is_empty()
+            && outcome.summary.len() > SUMMARIZE_THRESHOLD
+        {
             if let Some(client) = &self.summarizer {
                 match summarize(client, skill.name(), &expectation, &outcome.summary).await {
                     Some(focused) => {
@@ -289,9 +296,12 @@ async fn summarize(
 ) -> Option<String> {
     let system = format!(
         "You summarize the raw output of skill `{skill_name}` for the main agent. \
-         Reply with a concise focused answer (at most ~6 lines) addressing the \
-         expectation below. If the raw output does not contain the answer, say so \
-         plainly. Do not include any preamble or fenced blocks; output only the answer."
+         Reply with a concise focused answer (at most ~10 lines) addressing the \
+         expectation below. Quote exact values — numbers, versions, paths, error \
+         messages — verbatim from the raw output; never infer, round, or guess. \
+         If the raw output does not contain the answer, say exactly that — do not \
+         substitute a plausible answer. Do not include any preamble or fenced \
+         blocks; output only the answer."
     );
     let user = format!("Expectation: {expectation}\n\nRaw output:\n{raw}");
     let messages = vec![

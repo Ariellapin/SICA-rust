@@ -70,11 +70,11 @@ pub async fn handle(
             chat.delete_session(session_id).await;
             Response::Ok
         }
-        Request::ConnectLlm { base_url, model, api_key } => {
+        Request::ConnectLlm { base_url, model, api_key, options } => {
             // Spawn so the dispatcher can keep handling other requests while
             // the HTTP round-trip completes. State changes flow back via
             // `LlmStateChanged` events.
-            chat.spawn_connect_llm(base_url, model, api_key);
+            chat.spawn_connect_llm(base_url, model, api_key, options);
             Response::Ok
         }
         Request::DisconnectLlm => {

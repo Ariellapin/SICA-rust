@@ -8,7 +8,20 @@ use serde::Deserialize;
 pub struct StreamChunk {
     pub delta_content:   String,
     pub delta_reasoning: String,
+    /// OpenAI-native tool-call fragments: `(index, id?, name?, arguments-fragment)`.
+    /// The caller accumulates fragments by index into complete calls.
+    pub delta_tool_calls: Vec<ToolCallDelta>,
     pub finish_reason:   Option<String>,
+}
+
+/// One streamed fragment of a native tool call. The first fragment for an
+/// index usually carries `id` + `name`; later fragments append to `arguments`.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallDelta {
+    pub index:     u32,
+    pub id:        Option<String>,
+    pub name:      Option<String>,
+    pub arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +43,26 @@ struct SseDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<SseToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseToolCallDelta {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<SseToolCallFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// Stateful splitter that pulls reasoning text out of `<think>...</think>` blocks
@@ -142,13 +175,34 @@ pub fn parse_sse_event(json: &str, splitter: &mut ThinkSplitter) -> Option<Strea
             reasoning.push_str(&rc);
         }
     }
+    let delta_tool_calls: Vec<ToolCallDelta> = choice
+        .delta
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tc| ToolCallDelta {
+            index: tc.index,
+            id: tc.id,
+            name: tc.function.as_ref().and_then(|f| f.name.clone()),
+            arguments: tc
+                .function
+                .and_then(|f| f.arguments)
+                .unwrap_or_default(),
+        })
+        .collect();
+
     // Trim leading/trailing newlines on tiny chunks for cleaner display.
-    if content.is_empty() && reasoning.is_empty() && choice.finish_reason.is_none() {
+    if content.is_empty()
+        && reasoning.is_empty()
+        && delta_tool_calls.is_empty()
+        && choice.finish_reason.is_none()
+    {
         return None;
     }
     Some(StreamChunk {
         delta_content: std::mem::take(&mut content),
         delta_reasoning: std::mem::take(&mut reasoning),
+        delta_tool_calls,
         finish_reason: choice.finish_reason,
     })
 }
@@ -180,6 +234,21 @@ mod tests {
         assert!(super::split_orphan_reasoning("<think>r</think>answer").is_none());
         // No reasoning at all.
         assert!(super::split_orphan_reasoning("just an answer").is_none());
+    }
+
+    #[test]
+    fn parses_tool_call_deltas() {
+        let mut s = ThinkSplitter::new();
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"run-cli","arguments":""}}]}}]}"#;
+        let chunk = parse_sse_event(first, &mut s).unwrap();
+        assert_eq!(chunk.delta_tool_calls.len(), 1);
+        assert_eq!(chunk.delta_tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(chunk.delta_tool_calls[0].name.as_deref(), Some("run-cli"));
+
+        let frag = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}"#;
+        let chunk = parse_sse_event(frag, &mut s).unwrap();
+        assert_eq!(chunk.delta_tool_calls[0].arguments, "{\"command\":");
+        assert!(chunk.delta_tool_calls[0].id.is_none());
     }
 
     #[test]

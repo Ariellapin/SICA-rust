@@ -6,7 +6,36 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Tunables the frontend passes along with `ConnectLlm`. Kept as a struct so
+/// adding a knob later is one field, not a new request variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmOptions {
+    /// Sampling temperature for every chat request.
+    pub temperature: f32,
+    /// Per-response completion cap. `None` = let the server decide.
+    pub max_tokens: Option<u32>,
+    /// Prompt-window budget used for history trimming and the token meter.
+    /// `None` = auto-detect from the server (vLLM `max_model_len`,
+    /// llama.cpp `n_ctx_train`), falling back to 24k.
+    pub context_window: Option<u32>,
+    /// Use the OpenAI-native `tools` / `tool_calls` API instead of the
+    /// text-protocol tool calling. Requires a server + template with tool
+    /// support (e.g. vLLM with `--enable-auto-tool-choice`).
+    pub native_tools: bool,
+}
+
+impl Default for LlmOptions {
+    fn default() -> Self {
+        Self {
+            temperature: 0.2,
+            max_tokens: None,
+            context_window: None,
+            native_tools: false,
+        }
+    }
+}
 
 /// One image attached to a user message. `data_base64` is the raw image bytes
 /// base64-encoded (no `data:` URL prefix). `mime` is the MIME type, e.g.
@@ -56,7 +85,7 @@ pub enum Request {
     ListSessions,
     LoadSession   { session_id: u64 },
     DeleteSession { session_id: u64 },
-    ConnectLlm    { base_url: String, model: String, api_key: Option<String> },
+    ConnectLlm    { base_url: String, model: String, api_key: Option<String>, options: LlmOptions },
     DisconnectLlm,
 
     // Frontend telemetry — feeds the idealist's classifier.

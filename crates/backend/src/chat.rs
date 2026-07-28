@@ -1,10 +1,10 @@
 //! Chat session bookkeeping + LLM connection wiring used by the dispatcher.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use protocol::{Event, Frame, LlmState, SessionMeta, UserImage};
+use protocol::{Event, Frame, LlmOptions, LlmState, SessionMeta, UserImage};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -19,7 +19,9 @@ use crate::title_gen;
 
 /// Hard cap on tool hops within one user message. Stops a model from
 /// ping-ponging skill calls forever when it cannot decide a final answer.
-const MAX_TOOL_HOPS: u8 = 6;
+/// Generous because the documented workflow spends hops on `read-file`ing
+/// `skills/*.md` contracts before the real calls.
+const MAX_TOOL_HOPS: u8 = 12;
 
 /// Title given to a freshly minted session. Used both at creation time and
 /// as the trigger for the auto-title agent — if the title still matches
@@ -51,7 +53,14 @@ pub struct ChatHub {
     /// removing a *later* turn's token from the slot.
     pub active_turns:  Arc<Mutex<HashMap<u64, (u64, CancellationToken)>>>,
     pub next_marker:   Arc<AtomicU64>,
+    /// Options the FE sent with the last successful `ConnectLlm`.
+    pub llm_opts:      Arc<Mutex<LlmOptions>>,
+    /// Effective prompt window (configured or auto-detected at connect).
+    pub context_window: Arc<AtomicU32>,
 }
+
+/// Fallback prompt window when neither the user nor the server reports one.
+const DEFAULT_CONTEXT_WINDOW: u32 = 24_000;
 
 impl ChatHub {
     pub fn new(
@@ -72,6 +81,8 @@ impl ChatHub {
             failure_sink,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             next_marker:  Arc::new(AtomicU64::new(1)),
+            llm_opts:     Arc::new(Mutex::new(LlmOptions::default())),
+            context_window: Arc::new(AtomicU32::new(DEFAULT_CONTEXT_WINDOW)),
         }
     }
 
@@ -137,7 +148,13 @@ impl ChatHub {
             .send(Frame::event(Event::LlmStateChanged { state: st }));
     }
 
-    pub async fn connect_llm(&self, base_url: String, model: String, api_key: Option<String>) {
+    pub async fn connect_llm(
+        &self,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        options: LlmOptions,
+    ) {
         self.set_llm_state(LlmState::Connecting).await;
         // Push a visible log line so the FE log panel reflects what's happening
         // — the dot transition can be subtle on first run.
@@ -145,18 +162,40 @@ impl ChatHub {
             level: "INFO".into(),
             message: format!("LLM: connecting to {base_url} (model={model})"),
         });
-        let client = LlmClient::new(base_url.clone(), model.clone(), api_key);
+        let mut client = LlmClient::new(base_url.clone(), model.clone(), api_key);
+        client.temperature = options.temperature;
+        client.max_tokens = options.max_tokens;
         match client.health().await {
             Ok(()) => {
+                // Prompt window: explicit setting wins; otherwise ask the
+                // server (vLLM `max_model_len`, llama.cpp `n_ctx_train`).
+                let window = match options.context_window {
+                    Some(w) if w > 0 => w,
+                    _ => client
+                        .detect_context_window()
+                        .await
+                        .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                };
+                self.context_window.store(window, Ordering::Relaxed);
+                *self.llm_opts.lock().await = options.clone();
                 *self.llm.lock().await = Some(client);
                 self.set_llm_state(LlmState::Ready {
                     model: model.clone(),
-                    context_window: 24_000,
+                    context_window: window,
                 })
                 .await;
                 self.event_sink.emit(Event::LogLine {
                     level: "INFO".into(),
-                    message: format!("LLM: ready ({base_url}, model={model})"),
+                    message: format!(
+                        "LLM: ready ({base_url}, model={model}, ctx={window}, \
+                         temp={}, max_tokens={}, native_tools={})",
+                        options.temperature,
+                        options
+                            .max_tokens
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "server-default".into()),
+                        options.native_tools,
+                    ),
                 });
             }
             Err(e) => {
@@ -173,10 +212,16 @@ impl ChatHub {
 
     /// Spawn `connect_llm` on the runtime so the dispatcher returns to the
     /// caller immediately instead of stalling for the full HTTP round-trip.
-    pub fn spawn_connect_llm(&self, base_url: String, model: String, api_key: Option<String>) {
+    pub fn spawn_connect_llm(
+        &self,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        options: LlmOptions,
+    ) {
         let this = self.clone();
         tokio::spawn(async move {
-            this.connect_llm(base_url, model, api_key).await;
+            this.connect_llm(base_url, model, api_key, options).await;
         });
     }
 
@@ -240,6 +285,11 @@ impl ChatHub {
         let failure_sink = self.failure_sink.clone();
         let title_client = client.clone();
         let event_sink = self.event_sink.clone();
+        let (native_tools, opt_max_tokens) = {
+            let opts = self.llm_opts.lock().await;
+            (opts.native_tools, opts.max_tokens)
+        };
+        let window = self.context_window.load(Ordering::Relaxed);
         tokio::spawn(async move {
             let mut hops: u8 = 0;
             // Always overwritten on the first iteration before the post-loop
@@ -250,17 +300,39 @@ impl ChatHub {
                 // Rebuild history fresh from persisted session messages each
                 // iteration: the previous hop appended both the assistant
                 // call and the tool result, so this picks them up uniformly.
-                let history = build_history(&sessions_map, session_id, &skills).await;
-                let turn_id = next_turn.fetch_add(1, Ordering::Relaxed);
+                let history =
+                    build_history(&sessions_map, session_id, &skills, native_tools).await;
 
+                // Trim to the prompt budget: window minus room for the
+                // response (and a small safety margin for template overhead).
+                let reserve = opt_max_tokens.unwrap_or(4096).saturating_add(512);
+                let budget = window.saturating_sub(reserve).max(1024);
+                let trimmed = agents::context::trim_to_budget(history, budget);
+                if trimmed.dropped > 0 {
+                    event_sink.emit(Event::LogLine {
+                        level: "WARN".into(),
+                        message: format!(
+                            "context: dropped {} oldest message(s) to fit the \
+                             {window}-token window",
+                            trimmed.dropped
+                        ),
+                    });
+                }
+
+                let turn_id = next_turn.fetch_add(1, Ordering::Relaxed);
                 let out = agents::turn::run_turn(
                     client.clone(),
                     events.clone(),
                     agents::turn::TurnInput {
                         session_id,
                         turn_id,
-                        messages: history,
-                        limit: 24_000,
+                        messages: trimmed.messages,
+                        tools: if native_tools {
+                            Some(skills.tools_json())
+                        } else {
+                            None
+                        },
+                        limit: window,
                         cancel: Some(cancel.clone()),
                     },
                 )
@@ -281,11 +353,23 @@ impl ChatHub {
                     } else {
                         Some(out.reasoning.clone())
                     };
+                    // Native tool calls are persisted on the assistant
+                    // message so history replay matches what the server saw.
+                    // Skipped on interrupt: a dangling `tool_calls` with no
+                    // tool responses would poison the next request's
+                    // template.
+                    let tool_calls = if out.tool_calls.is_empty() || cancel.is_cancelled() {
+                        None
+                    } else {
+                        Some(native_calls_to_json(&out.tool_calls))
+                    };
                     session.messages.push(Message {
                         role: Role::Assistant,
                         content: out.content.clone(),
                         reasoning,
                         images: Vec::new(),
+                        tool_calls,
+                        tool_call_id: None,
                     });
                     if let Err(e) = sessions_store::save(session) {
                         warn!(error = %e, session_id, "save session (after assistant msg) failed");
@@ -298,13 +382,65 @@ impl ChatHub {
                     break;
                 }
 
+                // Native tool-calling path: dispatch every call the model
+                // emitted, answer each `tool_call_id`, and loop for the
+                // model's next turn. Raw outcomes are returned verbatim —
+                // no expectation/summarizer indirection in native mode.
+                if native_tools && !out.tool_calls.is_empty() {
+                    let over_limit = hops >= MAX_TOOL_HOPS;
+                    if !over_limit {
+                        hops += 1;
+                    }
+                    for call in &out.tool_calls {
+                        let outcome = if over_limit {
+                            agents::SkillOutcome {
+                                ok: false,
+                                summary: format!(
+                                    "tool-hop limit ({MAX_TOOL_HOPS}) reached — call not executed"
+                                ),
+                            }
+                        } else {
+                            dispatch_native_call(
+                                call,
+                                &skills,
+                                &events,
+                                failure_sink.clone(),
+                            )
+                            .await
+                        };
+                        append_tool_result(
+                            &sessions_map,
+                            session_id,
+                            &call.name,
+                            Some(&call.id),
+                            outcome.ok,
+                            &outcome.summary,
+                        )
+                        .await;
+                    }
+                    if over_limit {
+                        event_sink.emit(Event::LogLine {
+                            level: "WARN".into(),
+                            message: format!(
+                                "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
+                            ),
+                        });
+                        break;
+                    }
+                    continue;
+                }
+
                 // Look for a tool call. If none, we're done — but first
                 // check whether the model *tried* to emit one in an
                 // unrecognised shape (a `tool_call` JSON fence, etc.). That
                 // path used to fail silently and look like "model chose not
                 // to call a tool" in the FE; surface it as a WARN so the
                 // miscall is visible.
-                let Some(call) = agents::extract_tool_call(&out.content) else {
+                let Some(call) =
+                    agents::extract_tool_call_known(&out.content, |name| {
+                        skills.by_name.contains_key(name)
+                    })
+                else {
                     if looks_like_tool_call_attempt(&out.content) {
                         let msg = "assistant emitted a tool-call-shaped block \
                                    the parser could not read (malformed JSON \
@@ -323,7 +459,7 @@ impl ChatHub {
                         "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
                     );
                     event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg.clone() });
-                    append_tool_result(&sessions_map, session_id, &call.skill, false, &msg).await;
+                    append_tool_result(&sessions_map, session_id, &call.skill, None, false, &msg).await;
                     break;
                 }
                 hops += 1;
@@ -358,6 +494,7 @@ impl ChatHub {
                     &sessions_map,
                     session_id,
                     &call.skill,
+                    None,
                     outcome.ok,
                     &outcome.summary,
                 )
@@ -441,13 +578,29 @@ async fn build_history(
     sessions: &Arc<Mutex<HashMap<u64, Session>>>,
     session_id: u64,
     skills: &SkillRegistry,
+    native_tools: bool,
 ) -> Vec<ChatMessage> {
     let g = sessions.lock().await;
     let Some(session) = g.get(&session_id) else { return Vec::new() };
     let mut out: Vec<ChatMessage> = Vec::with_capacity(session.messages.len() + 1);
     let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
     let catalogue = skills.catalogue_markdown();
-    if !mem.is_empty() || !catalogue.is_empty() {
+    // In native mode the tool contract travels in the request's `tools`
+    // array, so the text-protocol invocation brief would only confuse the
+    // model; send just the skill catalogue as orientation.
+    let system_body = if native_tools {
+        if catalogue.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "You are running inside the sica-rust desktop app. Use the \
+                 provided tools (OpenAI function calling) to run commands and \
+                 read/write files when the task needs it. Base every claim \
+                 about the host system on an actual tool result.\n\n\
+                 ## Available skills\n\n{catalogue}"
+            )
+        }
+    } else {
         let mut content = mem;
         if !catalogue.is_empty() {
             if !content.is_empty() && !content.ends_with('\n') {
@@ -459,19 +612,106 @@ async fn build_history(
             content.push_str("## Loaded skills\n\n");
             content.push_str(&catalogue);
         }
-        out.push(ChatMessage::text("system", content));
+        content
+    };
+    if !system_body.is_empty() {
+        out.push(ChatMessage::text("system", system_body));
     }
     for m in &session.messages {
+        // Text-protocol servers may lack a `tool` role in their template, so
+        // tool results are surfaced as `user` there. Native mode keeps the
+        // real `tool` role + correlation id the template expects.
         let role = match m.role {
-            Role::Tool => "user",
+            Role::Tool if !native_tools => "user",
             other => role_to_str(other),
+        };
+        let tool_calls = if native_tools {
+            m.tool_calls
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+        } else {
+            None
+        };
+        let tool_call_id = if native_tools {
+            m.tool_call_id.clone()
+        } else {
+            None
         };
         out.push(ChatMessage {
             role: role.into(),
             content: build_chat_content(&m.content, &m.images),
+            tool_calls,
+            tool_call_id,
         });
     }
     out
+}
+
+/// Serialize accumulated native calls into the OpenAI `tool_calls` array
+/// shape, stored as a JSON string on the persisted assistant message.
+fn native_calls_to_json(calls: &[agents::turn::NativeToolCall]) -> String {
+    let arr: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "type": "function",
+                "function": { "name": c.name, "arguments": c.arguments },
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+/// Dispatch one native tool call through the sub-agent machinery. No
+/// summarizer is attached: native mode returns raw tool output, which is
+/// what the OpenAI tool-call convention (and the model's training) expects.
+async fn dispatch_native_call(
+    call: &agents::turn::NativeToolCall,
+    skills: &SkillRegistry,
+    events: &Arc<dyn EventSink>,
+    failure_sink: Option<Arc<dyn ToolFailureSink>>,
+) -> agents::SkillOutcome {
+    let Some(skill) = skills.get(&call.name) else {
+        return agents::SkillOutcome {
+            ok: false,
+            summary: format!("unknown skill `{}`", call.name),
+        };
+    };
+    let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+        Ok(v) => v,
+        Err(e) => {
+            return agents::SkillOutcome {
+                ok: false,
+                summary: format!(
+                    "invalid JSON in tool-call arguments ({e}); raw: {}",
+                    call.arguments
+                ),
+            };
+        }
+    };
+    let raw_args: Vec<String> = args
+        .as_object()
+        .map(|m| {
+            m.values()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut sub = ToolSubAgent::root(events.clone());
+    if let Some(fs) = failure_sink {
+        sub = sub.with_failure_sink(fs);
+    }
+    sub.run(agents::ToolInvocation {
+        skill: &*skill,
+        args,
+        raw_args,
+        expectation: String::new(),
+    })
+    .await
 }
 
 /// Build the content payload for one persisted `Message`. When no images are
@@ -504,6 +744,7 @@ async fn append_tool_result(
     sessions: &Arc<Mutex<HashMap<u64, Session>>>,
     session_id: u64,
     skill: &str,
+    tool_call_id: Option<&str>,
     ok: bool,
     summary: &str,
 ) {
@@ -522,6 +763,8 @@ async fn append_tool_result(
         content: block,
         reasoning: None,
         images: Vec::new(),
+        tool_calls: None,
+        tool_call_id: tool_call_id.map(str::to_string),
     });
     if let Err(e) = sessions_store::save(session) {
         warn!(error = %e, session_id, "save session (after tool result) failed");

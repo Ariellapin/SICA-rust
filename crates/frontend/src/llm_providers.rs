@@ -19,6 +19,37 @@ pub struct ProviderConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    /// Sampling temperature (0.0–2.0). Low values keep agentic turns precise.
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    /// Completion cap per response. 0 = let the server decide.
+    #[serde(default)]
+    pub max_tokens: u32,
+    /// Prompt-window budget for history trimming. 0 = auto-detect from the
+    /// server (vLLM/llama.cpp report it), falling back to 24k.
+    #[serde(default)]
+    pub context_window: u32,
+    /// Use OpenAI-native tool calling instead of the text protocol.
+    /// Requires server-side tool support (e.g. vLLM `--enable-auto-tool-choice`).
+    #[serde(default)]
+    pub native_tools: bool,
+}
+
+fn default_temperature() -> f32 {
+    0.2
+}
+
+impl ProviderConfig {
+    /// Wire-format options for `ConnectLlm`, mapping the 0-means-auto UI
+    /// convention onto `Option`s.
+    pub fn llm_options(&self) -> protocol::LlmOptions {
+        protocol::LlmOptions {
+            temperature: self.temperature,
+            max_tokens: (self.max_tokens > 0).then_some(self.max_tokens),
+            context_window: (self.context_window > 0).then_some(self.context_window),
+            native_tools: self.native_tools,
+        }
+    }
 }
 
 /// Scan the providers directory and parse every `*.toml` file. Files that
@@ -82,6 +113,19 @@ pub fn seed_defaults_if_empty() -> io::Result<()> {
 }
 
 fn defaults() -> Vec<ProviderConfig> {
+    let base = ProviderConfig {
+        id: String::new(),
+        title: String::new(),
+        description: String::new(),
+        icon: String::new(),
+        base_url: String::new(),
+        model: String::new(),
+        api_key: String::new(),
+        temperature: default_temperature(),
+        max_tokens: 0,
+        context_window: 0,
+        native_tools: false,
+    };
     vec![
         ProviderConfig {
             id: "local".into(),
@@ -90,7 +134,7 @@ fn defaults() -> Vec<ProviderConfig> {
             icon: "🖥".into(),
             base_url: "http://localhost:8080".into(),
             model: "local".into(),
-            api_key: String::new(),
+            ..base.clone()
         },
         ProviderConfig {
             id: "openai".into(),
@@ -99,7 +143,8 @@ fn defaults() -> Vec<ProviderConfig> {
             icon: "🟢".into(),
             base_url: "https://api.openai.com".into(),
             model: "gpt-4o-mini".into(),
-            api_key: String::new(),
+            native_tools: true,
+            ..base.clone()
         },
         ProviderConfig {
             id: "anthropic".into(),
@@ -108,7 +153,8 @@ fn defaults() -> Vec<ProviderConfig> {
             icon: "🟣".into(),
             base_url: "https://api.anthropic.com/v1".into(),
             model: "claude-sonnet-4-6".into(),
-            api_key: String::new(),
+            native_tools: true,
+            ..base
         },
     ]
 }

@@ -62,10 +62,8 @@ mod tests {
             messages: vec![
                 Message::user("hi"),
                 Message {
-                    role: Role::Assistant,
-                    content: "hello".into(),
                     reasoning: Some("thinking…".into()),
-                    images: Vec::new(),
+                    ..Message::assistant("hello")
                 },
             ],
         };

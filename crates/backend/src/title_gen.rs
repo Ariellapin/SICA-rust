@@ -27,7 +27,7 @@ pub async fn summarize(client: &LlmClient, user_msg: &str, assistant_msg: &str) 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = client.clone();
     let stream_task = tokio::spawn(async move {
-        client.chat_stream(messages, tx, None).await
+        client.chat_stream(messages, None, tx, None).await
     });
 
     let mut buf = String::new();

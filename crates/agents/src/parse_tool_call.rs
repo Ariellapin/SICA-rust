@@ -51,13 +51,27 @@ pub struct ToolCall {
 ///    convention in their training data — the parser accepts it rather than
 ///    silently dropping the call (the bug seen in `sessions/10.toml`).
 pub fn extract(text: &str) -> Option<ToolCall> {
+    extract_known(text, |_| true)
+}
+
+/// Like [`extract`], but the permissive natural-language line scan only
+/// accepts skill names for which `is_known` returns true. Without this
+/// filter, ordinary prose like `cargo build > compiles fine` parses as a
+/// tool call to the unknown skill `cargo`, which injects a spurious error
+/// tool-result into the conversation and derails the model. The explicit
+/// ```tool_call``` JSON fence is still accepted regardless — there the
+/// model's intent to call a tool is unambiguous, so an unknown name should
+/// surface as an "unknown skill" error the model can correct.
+pub fn extract_known(text: &str, is_known: impl Fn(&str) -> bool) -> Option<ToolCall> {
     if let Some(tc) = extract_json_fence(text) {
         return Some(tc);
     }
     for line in text.lines() {
         let trimmed = strip_fence_indent(line);
         if let Some(tc) = parse_line(trimmed) {
-            return Some(tc);
+            if is_known(&tc.skill) {
+                return Some(tc);
+            }
         }
     }
     None

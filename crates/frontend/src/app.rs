@@ -507,10 +507,12 @@ impl App {
         // survive across restarts.
         self.persist_settings();
         let api_key = if cfg.api_key.is_empty() { None } else { Some(cfg.api_key.clone()) };
+        let options = cfg.llm_options();
         self.send(UiCommand::SendRequest(Request::ConnectLlm {
             base_url: cfg.base_url,
             model:    cfg.model,
             api_key,
+            options,
         }));
     }
 

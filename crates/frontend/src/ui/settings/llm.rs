@@ -77,6 +77,58 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     field_row(ui, &p, "Model",    &mut cfg.model,    false);
                     field_row(ui, &p, "API key",  &mut cfg.api_key,  true);
 
+                    // Sampling / context tuning. 0 on the token fields means
+                    // "auto" (server default / auto-detect) — see hover text.
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui(Vec2::new(72.0, 22.0), |ui| {
+                            caps_label(ui, "Temp", rgb(p.muted));
+                        });
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.temperature)
+                                .range(0.0..=2.0)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .on_hover_text(
+                            "Sampling temperature. Low (0.1–0.3) keeps tool \
+                             calls and factual answers precise; higher adds \
+                             variety.",
+                        );
+                        ui.add_space(10.0);
+                        caps_label(ui, "Max tok", rgb(p.muted));
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.max_tokens)
+                                .range(0..=262_144)
+                                .speed(64),
+                        )
+                        .on_hover_text(
+                            "Per-response completion cap. 0 = server default.",
+                        );
+                        ui.add_space(10.0);
+                        caps_label(ui, "Ctx", rgb(p.muted));
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.context_window)
+                                .range(0..=1_048_576)
+                                .speed(256),
+                        )
+                        .on_hover_text(
+                            "Prompt-window budget for history trimming. \
+                             0 = auto-detect from the server (falls back to 24k).",
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut cfg.native_tools,
+                        "Native tool calling (OpenAI tools API)",
+                    )
+                    .on_hover_text(
+                        "Send skills as OpenAI `tools` and read `tool_calls` \
+                         from the response instead of the text protocol. \
+                         Requires server-side tool support — e.g. vLLM started \
+                         with --enable-auto-tool-choice and a --tool-call-parser \
+                         matching the model. Takes effect on next Connect.",
+                    );
+
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {

@@ -78,6 +78,42 @@ impl SkillRegistry {
         out
     }
 
+    /// Render the registry as an OpenAI-native `tools` array for servers with
+    /// tool-call support (vLLM `--enable-auto-tool-choice`, etc.). Every
+    /// declared positional arg becomes a required string parameter — the
+    /// same contract `resolve` applies to the text protocol.
+    pub fn tools_json(&self) -> serde_json::Value {
+        let mut names: Vec<&str> = self.by_name.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let tools: Vec<serde_json::Value> = names
+            .iter()
+            .filter_map(|name| {
+                let skill = self.by_name.get(*name)?;
+                let mut props = Map::new();
+                let args = skill.positional_args();
+                for a in &args {
+                    props.insert(
+                        a.clone(),
+                        serde_json::json!({ "type": "string" }),
+                    );
+                }
+                Some(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": skill.name(),
+                        "description": skill.description(),
+                        "parameters": {
+                            "type": "object",
+                            "properties": Value::Object(props),
+                            "required": args,
+                        },
+                    },
+                }))
+            })
+            .collect();
+        Value::Array(tools)
+    }
+
     /// Resolve a parsed `ToolCall` to its skill handle and the JSON `args`
     /// object to pass into `Skill::run`. Returns `None` if no skill with that
     /// name is registered.
@@ -174,6 +210,19 @@ mod tests {
         async fn run(&self, _a: Value, _c: SkillContext) -> SkillOutcome {
             SkillOutcome { ok: true, summary: String::new() }
         }
+    }
+
+    #[test]
+    fn tools_json_declares_string_params() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Described));
+        let tools = reg.tools_json();
+        let f = &tools[0]["function"];
+        assert_eq!(f["name"], "fetch");
+        assert_eq!(f["description"], "Grab a URL and return the body.");
+        assert_eq!(f["parameters"]["properties"]["url"]["type"], "string");
+        assert_eq!(f["parameters"]["required"][0], "url");
+        assert_eq!(tools[0]["type"], "function");
     }
 
     #[test]
