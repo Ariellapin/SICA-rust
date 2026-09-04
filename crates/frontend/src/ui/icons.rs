@@ -35,6 +35,7 @@ pub enum Icon {
     Stop,
     Copy,
     Refresh,
+    Branch,
     // Shell.
     Gear,
     Panel,
@@ -174,6 +175,15 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Copy => {
             rect_stroke(0.30, 0.14, 0.86, 0.70, 0.10);
             poly(&[(0.70, 0.86), (0.14, 0.86), (0.14, 0.30)]);
+        }
+        Icon::Branch => {
+            // Git's fork mark: a trunk with two nodes and an arm reaching a
+            // third — "carry this history into a conversation of its own".
+            painter.circle_stroke(p(0.30, 0.22), 0.10 * w, s);
+            painter.circle_stroke(p(0.30, 0.80), 0.10 * w, s);
+            painter.circle_stroke(p(0.74, 0.30), 0.10 * w, s);
+            line((0.30, 0.32), (0.30, 0.70));
+            poly(&[(0.74, 0.40), (0.74, 0.50), (0.30, 0.58)]);
         }
         Icon::Refresh => {
             // Three-quarter ring with an arrow head.

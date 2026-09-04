@@ -39,3 +39,4 @@ chrono                = { workspace = true }
 rfd                   = { workspace = true }
 arboard               = { workspace = true }
 image                 = { workspace = true }
+ignore                = { workspace = true }

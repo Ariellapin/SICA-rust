@@ -55,7 +55,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 20) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 21) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`).
 
@@ -82,6 +82,13 @@ once per turn-opening message so the transcript can offer the edit on a
 prompt it has only seen live. The FE truncates optimistically and resyncs
 from `Response::Error`, which now reaches the user as a toast rather than
 only a raw line in the log panel.
+
+v21 adds two optional fields to `Event::QuestionAsked`: `detail`, the body
+under the headline, and `multi`, which turns the options into checkboxes.
+`ask-user` gains the matching optional args (`detail`, `multi`); a
+multi-select answer crosses back as the ticked labels joined with `; `, so
+it is still one string and nothing downstream changes. Plan review passes
+neither — it is Approve / Refuse.
 
 v20 adds the Trajectory view's ledger (UI guide §10).
 `LoadSessionEvents { session_id, from_seq, limit }` answers `SessionEvents
@@ -261,7 +268,7 @@ in `chat.rs` opens a fresh turn against it every time the agent goes idle,
 carrying the `<goal_round>` prompt (`round_prompt`) that tells the model the
 workspace — not its own earlier narration — is authoritative. Skills
 `create-goal`, `get-goal`, `update-goal` are harness controls like
-`todo-write`; `/goal [continue|pause|complete|block <why>]` is the human
+`todo-write`; `/goal [continue|pause|complete|block <why>|edit <text>]` is the human
 door.
 
 Four rules bound it, and each answers a specific way autonomy goes wrong:
@@ -328,7 +335,11 @@ Long-running handlers must not block the dispatcher loop — `ConnectLlm` spawns
 - `bincode` (v1) is the **pipe** format: types crossing the pipe must use externally-tagged enums — no `#[serde(tag/content)]`, no `untagged`, no `flatten` with maps. The `untagged`/`tag` attributes on `llm::client::ChatContent` and `ContentPart` are fine because those go out as JSON to the LLM, never over the pipe.
 - Session event logs are JSONL (`serde_json`, internally-tagged enums are fine there — they never cross the pipe); provider configs and eval suites are `toml`; the LLM wire format is `serde_json`. Three serialization formats coexist by design.
 - [docs/deepseek-harness-ideas.md](docs/deepseek-harness-ideas.md) catalogues the agent-harness ideas ported from DeepSeek's `dsh` (event log, step-level retry, tool timeouts, spill-to-file, and the Wave 1 hygiene set: repeat-tool reminder, untrusted-content frame, tool-result pruner, `retain`, `/name` expansion, fallback titles, Job Objects, provider `usage`) and the ones deliberately left for later.
-- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there. [docs/harness-ui-guide.md](docs/harness-ui-guide.md) is the FE counterpart: dsh's web-client design system (tokens, type, geometry, elevation), every shell/transcript/composer/control-plane/settings surface with its concrete values, the egui port for each, the additive protocol changes (v17), and a five-wave UI roadmap. Read it before restyling or adding a frontend surface — all five waves are implemented: **UI-1 (foundation)**, **UI-2 (transcript)**, **UI-3 (composer + control plane)**, **UI-4 (settings modal + session rows)** and **UI-5 (the Trajectory ledger + the event inspector)**. What is left is listed as **Open** in its §12 — produced-file chips and the tail's branch action, `@file` completion, `goal edit`, the question takeover's `detail`/`multi` fields, and the inspector's Schema / System Prompt / Tools tabs, which need a `RequestEnvelope` stored on `TurnStart` before they could show anything truthful.
+- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there. [docs/harness-ui-guide.md](docs/harness-ui-guide.md) is the FE counterpart: dsh's web-client design system (tokens, type, geometry, elevation), every shell/transcript/composer/control-plane/settings surface with its concrete values, the egui port for each, the additive protocol changes (v17), and a five-wave UI roadmap. Read it before restyling or adding a frontend surface — all five waves are implemented: **UI-1 (foundation)**, **UI-2 (transcript)**, **UI-3 (composer + control plane)**, **UI-4 (settings modal + session rows)**, **UI-5 (the Trajectory ledger + the event inspector)** and **UI-6 (the open items: the `@` file picker, produced-file chips and the branch action on the turn tail, `/goal edit`, and the question takeover's `detail`/`multi`)**. What is left is listed as **Open** in its §12 — the composer's ghost hint after a claimed command, and the inspector's Schema / System Prompt / Tools tabs, which need a `RequestEnvelope` stored on `TurnStart` before they could show anything truthful.
+
+The `@` picker ([crates/frontend/src/ui/chat/at_menu.rs](crates/frontend/src/ui/chat/at_menu.rs)) is the frontend's own: `@` names a path in `workspace_root()`, which the FE resolves for itself, so a keystroke never queues behind the dispatcher. It walks with the `ignore` crate (the same one `glob` uses, so the two agree on what is in the tree), re-walks when the index is over 30 s old, opens on an `@` token under the *caret*, and browses into a directory on accept. The path it inserts is plain text — nothing resolves it, and the model reads it as written.
+
+Produced-file chips on the turn tail are derived from the turn's own successful `write-file`/`edit-file` rows rather than collected backend-side, so they cannot disagree with the transcript above them. The tail's branch action is `ForkSession`, offered only on the newest *finished* turn, because that is where `fork_session` actually cuts.
 - **The FE design system is `sica_core::theme` + `ui::kit`.** `theme` holds the
   static ramps and the two semantic alias maps; every widget reads an alias
   through `kit` and no module below it branches on light/dark or names a

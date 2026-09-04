@@ -98,6 +98,19 @@ pub fn is_control_skill(name: &str) -> bool {
 /// literal-minded native model send the array *encoded as a string* — but
 /// most native models send the real array anyway. Accept both rather than
 /// failing the call over the wrapper.
+/// A boolean argument, which arrives as a real JSON bool from a native call
+/// and as a string from the text protocol (`'multi=true'`). Anything else,
+/// absent included, is `false`: a flag the model did not clearly set is off.
+pub fn flag_arg(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+        }
+        _ => false,
+    }
+}
+
 pub fn array_arg(v: &Value) -> Option<Vec<Value>> {
     match v {
         Value::Array(a) => Some(a.clone()),

@@ -225,6 +225,38 @@ pub fn apply(
     Ok(next)
 }
 
+/// Rewrite the objective, keeping the phase, the rounds already spent and
+/// any blocker.
+///
+/// This is a separate door from [`apply`] because it is not a phase change:
+/// editing says "the objective was worded wrong", not "the work has moved
+/// on". Only a person may walk through it — a round that could rewrite its
+/// own objective could declare anything it managed to do a success — so
+/// there is no [`GoalAction`] for it and the caller is the `/goal edit`
+/// command, whose authority is the user typing it.
+pub fn edit(goal: &Goal, revision: u32, objective: &str) -> Result<Goal, GoalRefusal> {
+    if revision != goal.revision {
+        return Err(format!(
+            "revision mismatch: you sent {revision}, the goal is at {}",
+            goal.revision
+        ));
+    }
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Err("editing needs the new objective — say what the goal is now".into());
+    }
+    if goal.phase.is_terminal() {
+        return Err(format!(
+            "the goal is already {} — resume it before rewording it",
+            goal.phase.label()
+        ));
+    }
+    let mut next = goal.clone();
+    next.revision += 1;
+    next.objective = objective.to_string();
+    Ok(next)
+}
+
 /// Record that the driver opened a round. Bumps `revision` like every
 /// other mutation, so a round in flight and a human edit still cannot both
 /// win.
@@ -369,6 +401,29 @@ mod tests {
 
     fn goal() -> Goal {
         Goal::new(1, "make the tests pass".into(), 8)
+    }
+
+    #[test]
+    fn editing_rewords_the_objective_and_keeps_everything_else() {
+        let g = start_round(&goal());
+        let next = edit(&g, g.revision, "  make the tests pass on Windows  ").unwrap();
+        assert_eq!(next.objective, "make the tests pass on Windows");
+        assert_eq!(next.revision, g.revision + 1);
+        assert_eq!((next.phase, next.rounds_started), (g.phase, g.rounds_started));
+    }
+
+    #[test]
+    fn editing_obeys_the_compare_and_set_and_refuses_an_empty_objective() {
+        let g = goal();
+        assert!(edit(&g, g.revision + 1, "something else").is_err());
+        assert!(edit(&g, g.revision, "   ").is_err());
+    }
+
+    #[test]
+    fn a_finished_goal_is_resumed_before_it_is_reworded() {
+        let g = apply(&goal(), 1, GoalAction::Complete, None).unwrap();
+        let err = edit(&g, g.revision, "one more thing").unwrap_err();
+        assert!(err.contains("resume"), "{err}");
     }
 
     #[test]

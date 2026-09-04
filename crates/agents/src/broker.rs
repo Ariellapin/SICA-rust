@@ -76,12 +76,19 @@ impl BrokerSet {
 
     /// Ask the human a question with suggested options. The FE may answer
     /// with an option or free text. `None` on timeout / interrupt.
+    ///
+    /// `detail` is the body under the headline and `multi` says the options
+    /// are checkboxes rather than one-of; both only change how the takeover
+    /// renders, since what comes back is a string either way.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ask_question(
         &self,
         emit: &Arc<dyn EventSink>,
         session_id: u64,
         question: &str,
+        detail: Option<&str>,
         options: &[String],
+        multi: bool,
         cancel: Option<CancellationToken>,
     ) -> Option<String> {
         let id = self.next_id();
@@ -91,7 +98,9 @@ impl BrokerSet {
             id,
             session_id,
             question: question.to_string(),
+            detail: detail.map(str::to_string),
             options: options.to_vec(),
+            multi,
         });
         let answer = wait(rx, QUESTION_TIMEOUT, cancel).await;
         self.questions.lock().await.remove(&id);
@@ -214,7 +223,7 @@ mod tests {
         let emit = sink();
         let options = ["a".to_string(), "b".to_string()];
         let (answer, _) = tokio::join!(
-            b.ask_question(&emit, 7, "which?", &options, None),
+            b.ask_question(&emit, 7, "which?", None, &options, false, None),
             async {
                 for _ in 0..100 {
                     if b.pending_questions().await == 1 {
@@ -235,7 +244,7 @@ mod tests {
         let emit = sink();
         let tok = CancellationToken::new();
         tok.cancel();
-        let ans = b.ask_question(&emit, 7, "q?", &[], Some(tok)).await;
+        let ans = b.ask_question(&emit, 7, "q?", None, &[], false, Some(tok)).await;
         assert!(ans.is_none());
     }
 }

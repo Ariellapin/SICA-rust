@@ -62,7 +62,7 @@ const APP_COMMANDS: &[(&str, &str, AppCommand)] = &[
     ("compact", "Fold older history into a summary now.", AppCommand::CompactNow),
     ("plan", "Toggle plan mode (explore-only until exit-plan-mode).", AppCommand::PlanToggle),
     ("permission", "Switch permission mode: /permission <read-only|workspace-write|danger-full-access>.", AppCommand::PermissionHint),
-    ("goal", "Show or change this session's objective: /goal [continue|pause|complete|block <why>].", AppCommand::GoalHint),
+    ("goal", "Show or change this session's objective: /goal [continue|pause|complete|block <why>|edit <text>].", AppCommand::GoalHint),
     ("clear", "Empty the composer and drop attachments.", AppCommand::ClearDraft),
     ("attach", "Pick an image to send with the next message.", AppCommand::AttachImage),
     ("settings", "Open Settings.", AppCommand::OpenSettings),
@@ -209,7 +209,7 @@ fn rank(row: &Row, query_lower: &str) -> Option<u8> {
 
 /// Subsequence match with dsh's bonuses. `None` when `query` is not a
 /// subsequence of `text` at all.
-fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
+pub(super) fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
     let text: Vec<char> = text.chars().collect();
     let mut score = 0i32;
     let mut ti = 0usize;
@@ -509,7 +509,7 @@ fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
 /// stroke. dsh anchors this in an overlay 4 px above the composer card; here
 /// it sits directly above the card in the same bottom panel, which lands in
 /// the same place on screen without a second layout pass.
-fn frame(t: &sica_core::theme::Theme) -> egui::Frame {
+pub(super) fn frame(t: &sica_core::theme::Theme) -> egui::Frame {
     kit::elevated_frame(
         t,
         kit::Elevation::Prominent,

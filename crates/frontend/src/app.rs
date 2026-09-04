@@ -254,6 +254,10 @@ pub struct App {
     pub jobs: Vec<protocol::JobDump>,
     /// Durable objective of the active session, when it has one.
     pub goal: Option<protocol::GoalDump>,
+    /// The goal bar's inline objective editor, and its draft. `Some` only
+    /// while the field is open; committing sends `/goal edit <text>`, which
+    /// is a compare-and-set on the backend like every other goal mutation.
+    pub goal_edit: Option<String>,
     /// Permission mode of the active session (status-bar pill).
     pub permission_mode: protocol::PermissionMode,
     /// Plan mode of the active session (composer toggle).
@@ -312,7 +316,15 @@ pub struct PendingQuestion {
     pub id: u64,
     pub session_id: u64,
     pub question: String,
+    /// The body under the headline, when the asker sent one.
+    pub detail: Option<String>,
     pub options: Vec<String>,
+    /// The options are checkboxes rather than one-of. The answer is then the
+    /// picked labels joined, so it still crosses back as one string.
+    pub multi: bool,
+    /// Which options are ticked, in `options` order. Only used when `multi`;
+    /// a single-select option answers on the click itself.
+    pub picked: Vec<bool>,
     pub draft: String,
     /// The BE frames a plan review as a question whose text opens with the
     /// plan; the takeover then reads as "Plan review" with Approve / Refuse
@@ -680,6 +692,8 @@ pub struct ChatState {
     pub compacting: bool,
     /// The "/" palette that opens when the draft starts with a slash.
     pub slash: SlashState,
+    /// The "@" file picker, which opens on an `@` token anywhere in the draft.
+    pub at: AtState,
     /// Sessions with a turn in flight. `TurnStarted`/`TurnFinished` carry a
     /// session id, so a background session's dot is live too (§4.1).
     pub running_sessions: std::collections::HashSet<u64>,
@@ -752,6 +766,38 @@ pub struct SlashState {
     /// Set by Esc: hides the list without discarding what was typed. Cleared
     /// as soon as the query changes, so typing brings the list back.
     pub dismissed: bool,
+}
+
+/// State of the "@" file picker (§6.3). Unlike the "/" palette, whose
+/// catalogue arrives over the wire, the file list is walked by the frontend
+/// itself: it is the *frontend's* workspace that `@` names, the walk honours
+/// `.gitignore` through the `ignore` crate, and a keystroke must never wait
+/// on the dispatcher loop.
+#[derive(Default)]
+pub struct AtState {
+    /// Workspace paths, relative and `/`-separated, directories included and
+    /// marked with a trailing slash. Empty until the scan lands.
+    pub entries: Vec<FileEntry>,
+    /// The scan running on its own thread. Taken as soon as it delivers.
+    pub scan: Option<std::sync::mpsc::Receiver<Vec<FileEntry>>>,
+    /// When the last scan landed. A workspace changes under the app, so the
+    /// index is re-walked when the picker opens on one older than
+    /// [`crate::ui::chat::at_menu::INDEX_TTL`]; the stale list keeps serving
+    /// until the new one arrives.
+    pub scanned_at: Option<std::time::Instant>,
+    /// Index of the highlighted row within the *filtered* list.
+    pub selected: usize,
+    /// Query the highlight belongs to (see [`SlashState::last_query`]).
+    pub last_query: String,
+    /// Set by Esc; cleared as soon as the query changes.
+    pub dismissed: bool,
+}
+
+/// One entry of the `@` index.
+pub struct FileEntry {
+    /// Relative, `/`-separated; a directory ends in `/`.
+    pub path:   String,
+    pub is_dir: bool,
 }
 
 /// One image the user has attached, ready to send. `texture` is materialised
@@ -1073,6 +1119,7 @@ impl App {
             todos: Vec::new(),
             jobs: Vec::new(),
             goal: None,
+            goal_edit: None,
             permission_mode: protocol::PermissionMode::default(),
             plan_active: false,
             last_command_session: None,
@@ -1895,6 +1942,9 @@ impl App {
                 // off screen in the frame before it lands.
                 self.jobs.clear();
                 self.goal = None;
+                // An objective half-edited in the session being left must not
+                // be committed against the one being opened.
+                self.goal_edit = None;
             }
             UiEvent::SessionEvents { session_id, events, total, next_seq } => {
                 self.trajectory.loading = false;
@@ -1947,7 +1997,7 @@ impl App {
                     id, session_id, skill, args_preview, reason,
                 });
             }
-            UiEvent::QuestionAsked { id, session_id, question, options } => {
+            UiEvent::QuestionAsked { id, session_id, question, detail, options, multi } => {
                 self.push_log(LogKind::Event, "question asked — answer in the composer".into());
                 // `exit-plan-mode` asks its review as an Approve/Refuse
                 // question; the takeover renders it as a plan review.
@@ -1956,7 +2006,9 @@ impl App {
                     && (lowered.contains("plan") || options.len() <= 3);
                 self.chat.waiting_sessions.insert(session_id);
                 self.pending_question = Some(PendingQuestion {
-                    id, session_id, question, options,
+                    id, session_id, question, detail,
+                    picked: vec![false; options.len()],
+                    options, multi,
                     draft: String::new(),
                     plan_review,
                 });
@@ -1988,6 +2040,10 @@ impl App {
             }
             UiEvent::GoalChanged { session_id, goal } => {
                 if session_id == self.chat.session_id {
+                    // The bar's editor is closed by the change it asked for
+                    // — and by any other change, since the text it holds was
+                    // a rewording of an objective that no longer stands.
+                    self.goal_edit = None;
                     self.goal = goal;
                 }
             }

@@ -24,11 +24,12 @@ use egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use sica_core::theme::{
-    tokens::{RADIUS_BUBBLE, RADIUS_ROW},
+    tokens::{HAIRLINE, RADIUS_BUBBLE, RADIUS_ROW},
     Theme,
 };
 
-use crate::app::{App, Notice, NoticeKind};
+use crate::app::{App, LogKind, Notice, NoticeKind};
+use crate::supervisor::UiCommand;
 use crate::ui::icons::Icon;
 use crate::ui::kit::{self, DotState, Leading, Weight};
 
@@ -589,24 +590,59 @@ fn fmt_duration(ms: u64) -> String {
     }
 }
 
-/// Copy + usage pill + time pill + generation speed, revealed on the newest
-/// turn always and on hover otherwise (§3.5).
+/// Produced-file chips, then copy · branch · usage pill · time pill ·
+/// generation speed — revealed on the newest turn always and on hover
+/// otherwise (§3.5).
 fn turn_tail(app: &mut App, ui: &mut egui::Ui, i: usize, assistant: &str, t: &Theme) {
     if assistant.is_empty() {
         return;
     }
     let newest = i + 1 == app.chat.turns.len();
+    let produced = produced_files(&app.chat.turns[i]);
+    // Hover is tested against the seat the tail is about to occupy rather
+    // than against the rest of the column, so pointing anywhere below an old
+    // turn does not reveal its tail.
+    let seat = ui.available_rect_before_wrap();
+    let tail_h = if produced.is_empty() {
+        TAIL_ROW_H
+    } else {
+        TAIL_ROW_H + CHIP_H + 4.0
+    };
+    let hovered = ui.rect_contains_pointer(egui::Rect::from_min_size(
+        seat.min,
+        Vec2::new(seat.width(), tail_h),
+    ));
+    if !(newest || hovered) {
+        // The seat is held at its full height, chips included, so revealing
+        // a tail does not shove the rest of the transcript downwards.
+        ui.add_space(tail_h);
+        return;
+    }
+    if !produced.is_empty() {
+        produced_row(app, ui, &produced, t);
+    }
     let row = ui.horizontal(|ui| {
-        let hovered = ui.rect_contains_pointer(ui.max_rect());
-        if !(newest || hovered) {
-            ui.add_space(24.0);
-            return;
-        }
         if kit::icon_button(ui, Icon::Copy, 28.0)
             .on_hover_text("Copy response")
             .clicked()
         {
             ui.output_mut(|o| o.copied_text = assistant.to_owned());
+        }
+        // Branching forks the session at its last completed turn, which is
+        // this turn only while it is the newest finished one. On any earlier
+        // turn the button would fork somewhere else than where it sits, so
+        // it is not offered at all.
+        let branchable = newest && app.chat.turns[i].finished;
+        if branchable
+            && kit::icon_button(ui, Icon::Branch, 28.0)
+                .on_hover_text("Branch into a new conversation")
+                .clicked()
+        {
+            let session_id = app.chat.session_id;
+            app.send(UiCommand::SendRequest(protocol::Request::ForkSession {
+                session_id,
+            }));
+            app.send(UiCommand::SendRequest(protocol::Request::ListSessions));
         }
         if let Some(u) = app.chat.turns[i].usage {
             let total = u.prompt.saturating_add(u.completion);
@@ -655,6 +691,108 @@ fn turn_tail(app: &mut App, ui: &mut egui::Ui, i: usize, assistant: &str, t: &Th
         }
     });
     let _ = row;
+}
+
+/// Height of the tail's icon row — also the space an unrevealed tail holds
+/// open, so hovering one does not shift the column under the pointer.
+const TAIL_ROW_H: f32 = 28.0;
+/// Height of a produced-file chip (§3.5: r=6 chips).
+const CHIP_H: f32 = 22.0;
+/// Chips shown before the overflow count takes over.
+const MAX_CHIPS: usize = 6;
+
+/// Files this turn wrote, in call order and deduplicated.
+///
+/// The turn's own successful `write-file` / `edit-file` calls are the record
+/// — the same rows the transcript already renders — so nothing has to be
+/// collected backend-side for the chips to be true. A failed call produced
+/// nothing and is left out.
+fn produced_files(turn: &crate::app::Turn) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for chip in &turn.tool_chips {
+        if !(chip.finished && chip.ok) {
+            continue;
+        }
+        if !matches!(chip.name.as_str(), "write-file" | "edit-file") {
+            continue;
+        }
+        let path = serde_json::from_str::<serde_json::Value>(&chip.args_json)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p.trim().to_owned())
+            })
+            .unwrap_or_default();
+        if path.is_empty() || out.iter().any(|p| p == &path) {
+            continue;
+        }
+        out.push(path);
+    }
+    out
+}
+
+/// `Produced [chip] [chip] + 2 files`. A chip shows the file name and reveals
+/// the file in the OS browser when clicked; the full path is its tooltip.
+fn produced_row(app: &mut App, ui: &mut egui::Ui, files: &[String], t: &Theme) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        kit::label(
+            ui,
+            kit::txt("Produced", 12.0, Weight::Regular, kit::col(t.alias.label[3])),
+        );
+        for path in files.iter().take(MAX_CHIPS) {
+            if file_chip(ui, path, t).on_hover_text(path).clicked() {
+                let full = sica_core::paths::workspace_root().join(path);
+                if let Err(e) = crate::ui::settings::reveal_path(&full) {
+                    app.push_log(LogKind::Warn, format!("could not open {path}: {e}"));
+                }
+            }
+        }
+        if files.len() > MAX_CHIPS {
+            let extra = files.len() - MAX_CHIPS;
+            kit::label(
+                ui,
+                kit::txt(
+                    format!("+ {extra} file{}", if extra == 1 { "" } else { "s" }),
+                    12.0,
+                    Weight::Regular,
+                    kit::col(t.alias.label[3]),
+                ),
+            );
+        }
+    });
+    ui.add_space(4.0);
+}
+
+/// One r=6 chip: the file's own name, on `bg_layer[1]` behind a hairline.
+fn file_chip(ui: &mut egui::Ui, path: &str, t: &Theme) -> egui::Response {
+    let name = super::at_menu::split_path(path).1;
+    let font = kit::font(12.0, Weight::Regular);
+    let galley = ui.fonts(|f| f.layout_no_wrap(name.to_owned(), font.clone(), kit::col(t.alias.label[1])));
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + 16.0, CHIP_H),
+        Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            Rounding::same(6.0),
+            if resp.hovered() {
+                kit::cola(t.alias.hover)
+            } else {
+                kit::col(t.alias.bg_layer[1])
+            },
+            Stroke::new(HAIRLINE, kit::Level::L1.color(t)),
+        );
+        painter.galley(
+            egui::pos2(rect.min.x + 8.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            kit::col(t.alias.label[1]),
+        );
+    }
+    resp
 }
 
 /// Compact display: one full-width 33 px button with a bottom rule

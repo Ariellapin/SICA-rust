@@ -409,7 +409,15 @@ impl ControlState {
             let options = vec!["Approve".to_string(), "Keep planning".to_string()];
             match self
                 .brokers
-                .ask_question(&self.events, session_id, &question, &options, Some(cancel.clone()))
+                .ask_question(
+                    &self.events,
+                    session_id,
+                    &question,
+                    None,
+                    &options,
+                    false,
+                    Some(cancel.clone()),
+                )
                 .await
             {
                 None => (
@@ -1462,7 +1470,7 @@ impl ChatHub {
     }
 
     /// `/goal` — read the objective; `/goal continue | pause | complete |
-    /// block <note>` — change it, on the user's own authority.
+    /// block <note> | edit <text>` — change it, on the user's own authority.
     ///
     /// `continue` is the only way an autonomous loop ever (re)starts:
     /// arming is process-local, so a restored goal, a fork, or a session
@@ -1482,6 +1490,18 @@ impl ChatHub {
         };
         if word.is_empty() {
             return (true, format!("{}\nrounds armed: {armed}", goal.summary()));
+        }
+        // `edit` is not a phase change, so it does not go through `apply`:
+        // it rewords the objective and leaves the phase, the rounds spent
+        // and the arming exactly as they were.
+        if word.eq_ignore_ascii_case("edit") {
+            let next = match agents::goal::edit(&goal, goal.revision, note) {
+                Ok(g) => g,
+                Err(e) => return (false, e),
+            };
+            let summary = next.summary();
+            control.put_goal(&self.sessions, session_id, next).await;
+            return (true, summary);
         }
         let action = match agents::goal::GoalAction::parse(word) {
             Ok(a) => a,

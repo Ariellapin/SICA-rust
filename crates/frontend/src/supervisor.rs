@@ -145,7 +145,14 @@ pub enum UiEvent {
 
     // Wave 3 control plane.
     ApprovalRequested { id: u64, session_id: u64, skill: String, args_preview: String, reason: String },
-    QuestionAsked { id: u64, session_id: u64, question: String, options: Vec<String> },
+    QuestionAsked {
+        id: u64,
+        session_id: u64,
+        question: String,
+        detail: Option<String>,
+        options: Vec<String>,
+        multi: bool,
+    },
     TodosChanged { session_id: u64, items: Vec<protocol::TodoItem> },
     PlanModeChanged { session_id: u64, active: bool },
     PermissionModeChanged { session_id: u64, mode: protocol::PermissionMode },
@@ -356,8 +363,8 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::ApprovalRequested { id, session_id, skill, args_preview, reason } => {
             UiEvent::ApprovalRequested { id, session_id, skill, args_preview, reason }
         }
-        Event::QuestionAsked { id, session_id, question, options } => {
-            UiEvent::QuestionAsked { id, session_id, question, options }
+        Event::QuestionAsked { id, session_id, question, detail, options, multi } => {
+            UiEvent::QuestionAsked { id, session_id, question, detail, options, multi }
         }
         Event::TodosChanged { session_id, items } => {
             UiEvent::TodosChanged { session_id, items }

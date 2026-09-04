@@ -53,13 +53,22 @@ fn card(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
     let input_focused = ui.memory(|m| m.has_focus(input_id));
 
     // The `/` palette owns ↑↓/Enter/Tab/Esc while open, so it runs first.
+    // The `@` picker takes the same keys, and the two are mutually exclusive
+    // — a slash query ends at the first whitespace and an `@` token opens
+    // after one — so it only gets a look once the palette is closed.
     let slash = super::slash_menu::draw(app, ui, input_focused);
-    if !slash.open {
+    let at = if slash.open {
+        super::at_menu::Outcome { open: false }
+    } else {
+        super::at_menu::draw(app, ui, input_focused)
+    };
+    let picker_open = slash.open || at.open;
+    if !picker_open {
         handle_escape(app, ui);
     }
 
     let turn_in_flight = last_turn_in_flight(app);
-    let keys = read_submit_keys(ui, input_focused && !disabled && !slash.open);
+    let keys = read_submit_keys(ui, input_focused && !disabled && !picker_open);
 
     kit::elevated_frame(
         &t,

@@ -172,6 +172,13 @@ fn goal_bar(app: &mut App, ui: &mut egui::Ui) {
     }
     let t = app.theme;
     let mut command: Option<&str> = None;
+    /// One-shot "the objective field has taken focus" flag.
+    const GOAL_FOCUS: &str = "goal_edit_focused";
+    /// Width of the inline objective field. The bar is one row, so the field
+    /// takes a fixed seat rather than eating the controls to its right.
+    const EDIT_FIELD_W: f32 = 360.0;
+    let mut open_edit = false;
+    let mut edit: Option<String> = None;
     // "Paused" covers active-but-disarmed: pressing Stop disarms the driver,
     // and the label must not claim rounds are still opening.
     let (phase, tint) = match goal.phase {
@@ -199,12 +206,35 @@ fn goal_bar(app: &mut App, ui: &mut egui::Ui) {
                         goal.rounds_started, goal.max_rounds
                     ));
                 ui.add_space(8.0);
-                let objective = kit::one_line(&goal.objective, 90);
-                kit::label(
-                    ui,
-                    kit::txt(objective, 13.0, Weight::Regular, kit::col(t.alias.label[1])),
-                )
-                .on_hover_text(&goal.objective);
+                if let Some(mut draft) = app.goal_edit.clone() {
+                    let field = egui::TextEdit::singleline(&mut draft)
+                        .desired_width(EDIT_FIELD_W)
+                        .margin(egui::vec2(6.0, 4.0));
+                    let resp = ui.add(field);
+                    let mut open = true;
+                    if resp.lost_focus() {
+                        // Enter commits; Escape — and any other way of losing
+                        // focus — abandons, rather than rewording the
+                        // objective because the user clicked elsewhere.
+                        if ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                            edit = Some(draft.clone());
+                        }
+                        open = false;
+                    }
+                    let focus = egui::Id::new(GOAL_FOCUS);
+                    if !ui.ctx().data(|d| d.get_temp::<bool>(focus).unwrap_or(false)) {
+                        resp.request_focus();
+                        ui.ctx().data_mut(|d| d.insert_temp(focus, true));
+                    }
+                    app.goal_edit = open.then_some(draft);
+                } else {
+                    let objective = kit::one_line(&goal.objective, 90);
+                    kit::label(
+                        ui,
+                        kit::txt(objective, 13.0, Weight::Regular, kit::col(t.alias.label[1])),
+                    )
+                    .on_hover_text(&goal.objective);
+                }
                 if let Some(b) = &goal.blocker {
                     ui.add_space(6.0);
                     kit::label(
@@ -246,6 +276,14 @@ fn goal_bar(app: &mut App, ui: &mut egui::Ui) {
                         Some(1) => command = Some("block blocked from the UI"),
                         _ => {}
                     }
+                    if app.goal_edit.is_none()
+                        && !goal.phase.is_terminal()
+                        && kit::icon_button(ui, Icon::Edit, 26.0)
+                            .on_hover_text("Reword the objective")
+                            .clicked()
+                    {
+                        open_edit = true;
+                    }
                     if goal.phase == protocol::GoalPhase::Active && goal.armed {
                         if kit::button(ui, "Pause", kit::Variant::Ghost, kit::Size::Sm)
                             .on_hover_text("Stop opening new rounds. The current turn finishes.")
@@ -266,13 +304,27 @@ fn goal_bar(app: &mut App, ui: &mut egui::Ui) {
         });
     ui.add_space(6.0);
 
-    if let Some(input) = command {
+    if open_edit {
+        app.goal_edit = Some(goal.objective.clone());
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(GOAL_FOCUS), false));
+    }
+    // An emptied field is not a deletion — a goal is ended with Complete or
+    // Block — so it simply abandons the edit.
+    let edit = edit.map(|text| text.trim().to_string()).filter(|text| {
+        !text.is_empty() && *text != goal.objective
+    });
+    let input = match (&edit, command) {
+        (Some(text), _) => Some(format!("edit {text}")),
+        (None, Some(word)) => Some(word.to_string()),
+        (None, None) => None,
+    };
+    if let Some(input) = input {
         let session_id = app.chat.session_id;
         app.last_command_session = Some(session_id);
         app.send(UiCommand::SendRequest(Request::RunCommand {
             session_id,
             name: "goal".into(),
-            input: input.into(),
+            input,
         }));
     }
 }

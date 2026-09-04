@@ -336,6 +336,23 @@ pub fn segmented(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option
     picked
 }
 
+/// Show a file *in* the OS file browser, selected, rather than opening it
+/// in whatever application claims its extension. Only Explorer takes a
+/// select flag, so elsewhere this opens the containing folder.
+pub fn reveal_path(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        open_path(path.parent().unwrap_or(path))
+    }
+}
+
 /// Open a path in the OS file browser.
 pub fn open_path(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]

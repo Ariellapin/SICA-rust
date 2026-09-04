@@ -340,13 +340,7 @@ impl Skill for RunCli {
 /// anything unrecognised as "no" — running in the foreground is the safe
 /// misreading, since the caller still gets its output.
 fn wants_background(args: &Value) -> bool {
-    match args.get("background") {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => {
-            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
-        }
-        _ => false,
-    }
+    crate::control::flag_arg(args.get("background"))
 }
 
 /// Start `cmd` under the session's job registry instead of waiting for it.
@@ -895,7 +889,10 @@ impl Skill for Grep {
 /// the unresolved question in its final report instead.
 ///
 /// `options` is an optional JSON array of suggested answers shown as
-/// buttons; the human may always answer in free text.
+/// buttons; the human may always answer in free text. `detail` is the body
+/// under the headline — the context the person needs before choosing — and
+/// `multi=true` makes the options checkboxes, so several can be picked at
+/// once. Whatever the shape, the answer comes back as one string.
 pub struct AskUser;
 
 #[async_trait]
@@ -904,13 +901,13 @@ impl Skill for AskUser {
         crate::control::ASK_USER_NAME
     }
     fn description(&self) -> &str {
-        "Ask the user a question and wait for their answer. Use when blocked on a human decision — never guess."
+        "Ask the user a question and wait for their answer. Use when blocked on a human decision — never guess. Optional named args: detail (context shown under the question), options (a JSON array of suggested answers), multi (`true` lets the user pick several options)."
     }
     fn positional_args(&self) -> Vec<String> {
         vec!["question".into()]
     }
     fn optional_args(&self) -> Vec<String> {
-        vec!["options".into()]
+        vec!["detail".into(), "options".into(), "multi".into()]
     }
     fn prompt_guidance(&self) -> Option<&'static str> {
         Some("When blocked on a decision only the user can make, ask-user with a precise question instead of guessing.")
@@ -936,13 +933,30 @@ impl Skill for AskUser {
                     .collect()
             })
             .unwrap_or_default();
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        // Checkboxes over one option are just a radio with extra steps, so
+        // the flag only means anything once there are options to combine.
+        let multi = crate::control::flag_arg(args.get("multi")) && options.len() > 1;
         let (Some(brokers), Some(session_id)) = (ctx.sub.brokers.clone(), ctx.sub.session_id)
         else {
             return err("cannot ask the user from this context (no broker) — \
                          include the unresolved question in your final report instead");
         };
         match brokers
-            .ask_question(&ctx.sub.events, session_id, &question, &options, ctx.sub.cancel.clone())
+            .ask_question(
+                &ctx.sub.events,
+                session_id,
+                &question,
+                detail.as_deref(),
+                &options,
+                multi,
+                ctx.sub.cancel.clone(),
+            )
             .await
         {
             Some(answer) if !answer.trim().is_empty() => SkillOutcome {

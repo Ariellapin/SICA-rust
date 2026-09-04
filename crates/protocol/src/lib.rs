@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -786,7 +786,16 @@ pub enum Event {
         id: u64,
         session_id: u64,
         question: String,
+        /// The longer body under the headline: what the asker wants the
+        /// person to read before choosing. Kept apart from `question` so the
+        /// takeover can render the two at their own weights instead of the
+        /// asker packing both into one string.
+        detail: Option<String>,
         options: Vec<String>,
+        /// Options are checkboxes rather than one-of: several may be picked,
+        /// and the answer is the picked labels joined. Meaningless with no
+        /// options.
+        multi: bool,
     },
     /// The durable `todo-write` list changed. The FE renders a checklist;
     /// it clears on the next `TurnStarted`.
@@ -1076,7 +1085,8 @@ mod tests {
             },
             Event::QuestionAsked {
                 id: 3, session_id: 2, question: "which?".into(),
-                options: vec!["a".into()],
+                detail: Some("because of x".into()),
+                options: vec!["a".into()], multi: true,
             },
             Event::TodosChanged {
                 session_id: 2,

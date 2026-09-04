@@ -150,7 +150,13 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
     let t = app.theme;
     let plan = q.plan_review;
     let question = q.question.clone();
+    let detail = q.detail.clone();
     let options = q.options.clone();
+    // A plan review is Approve / Refuse; multi-select there would mean
+    // approving and refusing at once.
+    let multi = q.multi && !plan;
+    let mut picked = q.picked.clone();
+    picked.resize(options.len(), false);
     let mut answer: Option<String> = None;
 
     kit::elevated_frame(
@@ -210,6 +216,15 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
                             if plan { Weight::Regular } else { Weight::Medium },
                             kit::col(t.alias.label[0]),
                         )));
+                        if let Some(detail) = &detail {
+                            ui.add_space(6.0);
+                            ui.add(egui::Label::new(kit::txt(
+                                detail,
+                                13.0,
+                                Weight::Regular,
+                                kit::col(t.alias.label[2]),
+                            )));
+                        }
                     });
                 ui.add_space(10.0);
 
@@ -248,7 +263,10 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
                 } else {
                     // Numbered options: a 20 px badge, the label, and a
                     // "Recommended" pill where the model suffixed one — the
-                    // original label is what gets sent back.
+                    // original label is what gets sent back. Under `multi`
+                    // the badge is a checkbox and a click toggles instead of
+                    // answering, because the answer is the whole set.
+                    let mut toggled: Option<usize> = None;
                     for (i, opt) in options.iter().enumerate() {
                         let (label, recommended) = strip_recommended(opt);
                         let (rect, resp) = ui.allocate_exact_size(
@@ -263,15 +281,38 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
                             );
                         }
                         let badge = egui::pos2(rect.min.x + 14.0, rect.center().y);
-                        ui.painter()
-                            .circle_filled(badge, 10.0, kit::cola(t.alias.hover));
-                        ui.painter().text(
-                            badge,
-                            Align2::CENTER_CENTER,
-                            format!("{}", i + 1),
-                            kit::font(12.0, Weight::Medium),
-                            kit::col(t.alias.label[1]),
-                        );
+                        if multi {
+                            let box_rect = egui::Rect::from_center_size(badge, Vec2::splat(16.0));
+                            if picked[i] {
+                                ui.painter().rect_filled(
+                                    box_rect,
+                                    Rounding::same(4.0),
+                                    kit::col(t.alias.business),
+                                );
+                                crate::ui::icons::paint(
+                                    ui.painter(),
+                                    box_rect.shrink(3.0),
+                                    crate::ui::icons::Icon::Check,
+                                    kit::col(t.alias.bg_layer[1]),
+                                );
+                            } else {
+                                ui.painter().rect_stroke(
+                                    box_rect,
+                                    Rounding::same(4.0),
+                                    Stroke::new(1.0, kit::col(t.alias.label[3])),
+                                );
+                            }
+                        } else {
+                            ui.painter()
+                                .circle_filled(badge, 10.0, kit::cola(t.alias.hover));
+                            ui.painter().text(
+                                badge,
+                                Align2::CENTER_CENTER,
+                                format!("{}", i + 1),
+                                kit::font(12.0, Weight::Medium),
+                                kit::col(t.alias.label[1]),
+                            );
+                        }
                         ui.painter().text(
                             egui::pos2(rect.min.x + 32.0, rect.center().y),
                             Align2::LEFT_CENTER,
@@ -298,7 +339,17 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
                             );
                         }
                         if resp.clicked() {
-                            answer = Some(opt.clone());
+                            if multi {
+                                toggled = Some(i);
+                            } else {
+                                answer = Some(opt.clone());
+                            }
+                        }
+                    }
+                    if let Some(i) = toggled {
+                        picked[i] = !picked[i];
+                        if let Some(q) = app.pending_question.as_mut() {
+                            q.picked = picked.clone();
                         }
                     }
                     if !options.is_empty() {
@@ -311,7 +362,11 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
                         .unwrap_or_default();
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut draft)
-                            .hint_text("Type your answer")
+                            .hint_text(if multi {
+                                "Add anything the options miss"
+                            } else {
+                                "Type your answer"
+                            })
                             .desired_width(ui.available_width())
                             .frame(true),
                     );
@@ -321,16 +376,25 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Under `multi` a tick is an answer on its own; a
+                        // single-select question answered on the click, so
+                        // only free text can submit here.
+                        let ready =
+                            !draft.trim().is_empty() || (multi && picked.iter().any(|p| *p));
                         let send = kit::button_enabled(
                             ui,
                             "Submit",
                             kit::Variant::Primary,
                             kit::Size::Md,
-                            !draft.trim().is_empty(),
+                            ready,
                         )
                         .clicked();
-                        if (send || enter) && !draft.trim().is_empty() {
-                            answer = Some(draft.trim().to_string());
+                        if (send || enter) && ready {
+                            answer = Some(if multi {
+                                joined_answer(&options, &picked, &draft)
+                            } else {
+                                draft.trim().to_string()
+                            });
                         }
                     });
                 }
@@ -350,6 +414,24 @@ fn question(app: &mut App, ui: &mut egui::Ui) -> bool {
     true
 }
 
+/// The one string a multi-select answer crosses back as: the ticked labels
+/// in the order they were offered, then whatever was typed. The labels go
+/// back **as the model wrote them** — a "(recommended)" suffix is stripped
+/// for display only.
+fn joined_answer(options: &[String], picked: &[bool], draft: &str) -> String {
+    let mut parts: Vec<String> = options
+        .iter()
+        .zip(picked.iter())
+        .filter(|(_, p)| **p)
+        .map(|(o, _)| o.clone())
+        .collect();
+    let draft = draft.trim();
+    if !draft.is_empty() {
+        parts.push(draft.to_string());
+    }
+    parts.join("; ")
+}
+
 /// `"Rebuild now (recommended)"` → `("Rebuild now", true)`. The badge is
 /// cosmetic: the original string is what travels back, because the model
 /// asked with it.
@@ -366,6 +448,17 @@ fn strip_recommended(label: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_multi_answer_joins_the_ticked_labels_then_the_free_text() {
+        let options = vec!["Rust".to_string(), "Go".to_string(), "Zig".to_string()];
+        assert_eq!(
+            joined_answer(&options, &[true, false, true], "  and Ada  "),
+            "Rust; Zig; and Ada"
+        );
+        assert_eq!(joined_answer(&options, &[false, true, false], ""), "Go");
+        assert_eq!(joined_answer(&options, &[false, false, false], "none"), "none");
+    }
 
     #[test]
     fn recommended_suffix_becomes_a_badge_not_part_of_the_answer() {

@@ -8,6 +8,7 @@
 //! badge, the workspace chip, and the composer, which is *not* remounted
 //! between phases (the `TextEdit` keeps its id, so focus and draft survive).
 
+pub mod at_menu;
 mod composer;
 mod control;
 pub mod details;
