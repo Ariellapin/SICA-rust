@@ -13,12 +13,15 @@ Status legend:
 - **Future** — documented for later; nothing built.
 
 Ordering follows the dsh architecture rather than priority. The *Implemented*
-rows shipped in two batches: the reliability core (event log, step-level
-retry, pipeline tool timeouts, spill-to-file) and Wave 1 of the
+rows shipped in three batches: the reliability core (event log, step-level
+retry, pipeline tool timeouts, spill-to-file), Wave 1 of the
 [implementation guide](harness-implementation-guide.md#15-roadmap) (retain
 library, tool-result pruner, repeat-tool reminder, untrusted-content frame,
 `<skill_content>` framing, `/name` expansion, fallback titles, Job Objects,
-provider `usage`).
+provider `usage`), and Wave 2 (composed system prompt + runtime-context
+snapshot, `AGENTS.md` loader with budget, time context, prefix-preserving
+8-section compaction at 80/16, usage-anchored meter with breakdown, and the
+file tools: line-numbered/ranged `read-file`, `edit-file`, `glob`, `grep`).
 
 ---
 
@@ -227,28 +230,42 @@ such check.
 
 ## 5. System prompt
 
-### 5.1 Composed, ordered prompt sections — **Future**
+### 5.1 Composed, ordered prompt sections — **Implemented**
 
 Named sparse order slots (`HARNESS_IDENTITY: -1000 … TOOL_BASH: 1000 …
 STRUCTURED_OUTPUT: 9900`), per-agent shadowing, ties broken by name for a
 byte-stable prompt; each tool's usage guidance lives in *its own* plugin as a
-one-sentence section, never in the persona. sica-rust concatenates exactly two
-parts (`memory.md` + `## Loaded skills`) in `chat::build_wire_history`, with
-two more hand-built variants in `team.rs` and `model_eval.rs`, and native mode
-drops `memory.md` entirely.
+one-sentence section, never in the persona. sica-rust: [`agents::prompt`](../crates/agents/src/prompt.rs)
+— `Assembly` of named `Section { name, order, text }` sorted by
+`(order, name)`, slots `IDENTITY: -1000`, `MEMORY: 0`, `PLAN_POLICY: 500`,
+`SKILL_GUIDANCE: 1000`, `CATALOGUE: 2000`, `STRUCTURED_OUTPUT: 9900`; one
+builder (`prompt::for_main_agent`) feeds `chat.rs`, `team.rs` (persona
+section at the MEMORY slot) and `model_eval.rs`; `Skill::prompt_guidance()`
+contributes one SKILL_GUIDANCE section per skill (the shell skills carry the
+"base every claim on a tool result" sentence). Native mode keeps `memory.md`;
+only the catalogue section is dropped there because the `tools` array
+carries it.
 
-### 5.2 Strict `{{variable}}` interpolation that throws — **Future**
+### 5.2 Strict `{{variable}}` interpolation that throws — **Implemented**
 
 Unknown or valueless variables fail assembly loudly ("a malformed prompt is
-worse than a loud failure"). sica-rust has no interpolation; `MarkdownSkill`
-ignores its arguments.
+worse than a loud failure"). sica-rust: `prompt::interpolate` scans every
+section and every markdown-skill body; an unregistered `{{name}}` returns
+`PromptError::UnknownVariable`, which fails the main turn with an ERROR
+`LogLine` (or a failed skill outcome for a markdown skill). Registered
+variables: `{{cwd}}`, `{{os}}`, `{{date}}`, `{{model}}`, plus a markdown
+skill's declared positional args by name.
 
-### 5.3 Sections vs runtime-context split — **Future**
+### 5.3 Sections vs runtime-context split — **Implemented**
 
 Static prose goes in the system prompt; volatile facts (sandbox mode, approval
 policy, time) go in a *user-role snapshot message* that "supersedes earlier
 snapshots", so the system-prompt KV prefix is never invalidated by a mode
-change.
+change. sica-rust: `Assembly.context(...)` renders into
+`Rendered.runtime_context`; `chat.rs` persists it as
+`ContextInjected { source: RuntimeContext }` whose `Replace` shadows the
+previous snapshot — one copy is ever model-visible and the system prompt is
+never touched. Refreshed once per turn.
 
 ### 5.4 KV-cache stability as a design constraint — **Partial**
 
@@ -261,30 +278,39 @@ positioned where the folded span began (prefix-friendly). The compaction
 conversation's own prefix, and `memory.md` is re-read every hop (an edit
 mid-session changes the prefix — intentional, so edits apply live).
 
-### 5.5 Workspace instructions (`AGENTS.md`) with a byte budget — **Partial**
+### 5.5 Workspace instructions (`AGENTS.md`) with a byte budget — **Implemented**
 
 dsh loads `AGENTS.md`/`CLAUDE.md` from the home directory plus the project
 chain, wraps them in `<system-reminder>`, enforces a 64 KiB budget (broader
 files omitted before the most specific is truncated), and reconciles nested
-files after fs tool calls. sica-rust's `memory.md` plays this role with no
-budget, no nesting, no framing.
+files after fs tool calls. sica-rust: [`agents::instructions`](../crates/agents/src/instructions.rs)
+walks the cwd → workspace-root chain for `AGENTS.md` / `CLAUDE.md` /
+`.sica/instructions.md`, applies the budget verbatim (broadest omitted first,
+most specific truncated on a char boundary, notice text), renders one
+`<system-reminder>` block (nested closing tags escaped) and lands it as
+`ContextInjected { source: Instructions, surface: Replace{prev,prev} }`.
+Reconciliation runs at turn start and after successful
+`read-file`/`write-file`/`edit-file` — no file watcher. `memory.md` stays
+the root-level tool-syntax spec, exempt from the budget.
 
 ## 6. Context management
 
-### 6.1 Token meter with usage-anchored baseline + delta — **Partial**
+### 6.1 Token meter with usage-anchored baseline + delta — **Implemented**
 
 dsh keeps one replay-aware fold per session: when the last successful call's
 envelope matches, provider-reported usage is the baseline and only the delta
-is priced heuristically. sica-rust emits live `TokenUsage` every ~100 ms
-(exact via llama.cpp `/tokenize` at turn start, `chars/4` in between) and
-logs one durable `TokenUsage` per hop. Requests now ask for
-`stream_options.include_usage`; the provider's `usage` trailer
-(`llm::client::Usage`) is the final `used_tokens` when present and is stored
-on the event as `prompt_tokens`/`completion_tokens`. Still missing: the
-anchored baseline (using the last reported `prompt_tokens` + heuristic delta
-*before* the next request, and for the compaction trigger).
+is priced heuristically. sica-rust: [`agents::meter`](../crates/agents/src/meter.rs)
+— one `TokenMeter` per session on `ChatHub`; after a successful hop whose
+stream carried `usage`, the anchor stores `(envelope_hash(system body +
+tools_json), newest sent surface seq, prompt_tokens)`. Before the next
+request, a matching envelope with a plausible provider count yields
+`anchor.usage_prompt + Σ heuristic(entries since the anchor)` — used for the
+live meter, the compaction trigger and the durable reading; an anchor below
+the heuristic floor is rejected. Live `TokenUsage` events carry a
+`breakdown { system, tools, history }` (protocol v12). Meters clear on
+reconnect.
 
-### 6.2 Compaction with an 8-section checkpoint as a KV-preserving prefix — **Partial**
+### 6.2 Compaction with an 8-section checkpoint as a KV-preserving prefix — **Implemented**
 
 dsh replays the conversation's own system prompt, tools and shadowed messages
 and appends the compaction directive as the *final user message*, so the
@@ -292,10 +318,17 @@ summarisation call is a cache prefix of the last request. The directive
 demands eight fixed sections (Primary Request / Key Technical Concepts /
 Files and Code / Errors and Fixes / Pending Jobs / Current Work / Next Step /
 Critical Context), "(none)" for empty ones, exact identifiers preserved,
-never mention that compaction happened. sica-rust's `compact::SYSTEM_PROMPT`
-asks for four headings (Goal / Decisions / Facts / Open items) via a
-standalone request, keeps a 35 % tail verbatim, triggers at 95 % of budget
-(dsh: 80 %, retain 16 %).
+never mention that compaction happened. sica-rust:
+`agents::compact::summarize_fold` sends the composed system prompt (same
+bytes as the real request) + the folded messages in wire form +
+`COMPACTION_INSTRUCTION` as the final user message, with per-attempt
+`max_tokens` from the connect-time `CompactPolicy { threshold_pct: 80,
+retain_pct: 16, max_tokens: 8192, retries: 1 }` (FE-editable per provider);
+a `finish_reason == "length"` summary is discarded and retried. The landed
+summary keeps `SUMMARY_PREFIX` first (FE marker), then the dsh preamble,
+then a `<compacted-summary>` frame. `split_index` honours `retain_pct` and
+refuses to close the fold on an assistant message with pending native
+`tool_calls`.
 
 ### 6.3 Context-overflow retry — **Future**
 
@@ -303,11 +336,14 @@ After a provider error that indicates overflow, dsh compacts and retries the
 step. sica-rust classifies HTTP 400 as fatal; a context-overflow 400 ends the
 turn rather than compacting.
 
-### 6.4 Time / environment context contributors — **Future**
+### 6.4 Time / environment context contributors — **Partial**
 
 Durable, source-attributed clock readings (with browser time zone and
-elapsed-since-last-message), tmux pane context, `@file` references. None in
-sica-rust.
+elapsed-since-last-message), tmux pane context, `@file` references.
+sica-rust: the runtime-context snapshot carries local time with UTC offset
+(OS clock, source-attributed), elapsed since the previous message, the
+working directory, OS and model name (§5.1). `@file` references and tmux
+context remain future.
 
 ## 7. Skills
 
@@ -509,20 +545,22 @@ effect* — for every plugin. Worth adopting for `skills/*.md` docs.
 
 ## Suggested next ports, in dependency order
 
-Wave 1 of the [implementation guide](harness-implementation-guide.md#15-roadmap)
-is done (§3.2, §3.4, §4.4, §7.1 framing, §7.2, §11, §12.7, plus Job Objects
-and provider `usage`). Next:
+Waves 1 and 2 of the
+[implementation guide](harness-implementation-guide.md#15-roadmap) are done
+(Wave 2: §5.1–5.3 prompt assembly + runtime context, §5.5 instructions
+loader, §9.3 time context, §9.1 prefix-preserving compaction, §4.3
+usage-anchored meter, §6.6 file tools, protocol v12). Next:
 
-1. **Composed system prompt + runtime context** (§5.1–5.3) — unify the three
-   builders; give native mode its `memory.md` back; add the user-role
-   snapshot message (time, permission mode) so mode changes never invalidate
-   the system-prompt prefix. Wave 2, first item.
-2. **Usage-anchored token meter** (§6.1) — the `usage` numbers are now
-   logged; use the last `prompt_tokens` as the baseline for the next
-   request's estimate and for the compaction trigger.
-3. **Prefix-preserving 8-section compaction** (§6.2) — replay the
-   conversation's own prefix and append the directive as the final user
-   message.
-4. **`ToolPolicy` pipeline** (§4.1) — the one M-sized seam every Wave 3
-   feature (approval, plan mode, hooks, read-before-edit) hangs on.
-5. **Log-replay eval harness** (§13.1) — the JSONL logs make this possible now.
+1. **`ToolPolicy` pipeline** (§4.1 / guide §6.1) — the one M-sized seam
+   every control feature hangs on.
+2. **Approval + permission modes** (guide §10.1–10.3) — brokers for
+   `ask-user` and one-shot approvals; `read-only | workspace-write |
+   danger-full-access` as policy first, OS enforcement later.
+3. **Plan mode + `todo-write`** (guide §11) — durable `PlanMode`/`TodoWrite`
+   events, `exit-plan-mode` always registered.
+4. **Read-before-edit** (guide §8.5) — a `ReadBeforeEdit` policy on the
+   pipeline, now that `edit-file` exists.
+5. **`RunCommand` + `/compact` `/plan` `/permission`** (guide §8.4) — the
+   command table over the pipeline.
+6. **Parallel read-only calls** (guide §6.2) — native-mode `join_all` with a
+   per-skill concurrency classification.

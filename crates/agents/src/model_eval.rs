@@ -1424,24 +1424,18 @@ impl Skill for ModelEval {
 }
 
 /// Reproduce `chat.rs::build_history`'s text-protocol system message so the
-/// suite measures the shipped prompt. Kept as a copy rather than shared code
-/// because `agents` sits below `backend`; if the two ever diverge the eval is
-/// measuring a fiction, so the shapes are asserted in `chat.rs`'s neighbours.
+/// suite measures the shipped prompt. Delegates to the same
+/// `agents::prompt` composition the main agent uses — if the two ever
+/// diverge the eval is measuring a fiction, so they share the builder.
 fn live_system_prompt(registry: Option<&SkillRegistry>) -> String {
-    let mut content =
-        crate::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
-    let catalogue = registry.map(SkillRegistry::catalogue_markdown).unwrap_or_default();
-    if !catalogue.is_empty() {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str("## Loaded skills\n\n");
-        content.push_str(&catalogue);
+    let mem = crate::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
+    let empty = SkillRegistry::new();
+    let reg = registry.unwrap_or(&empty);
+    let vars = crate::prompt::standard_vars("");
+    match crate::prompt::for_main_agent(&mem, reg, false, &vars) {
+        Ok(r) => r.system,
+        Err(e) => format!("[prompt assembly failed: {e}]"),
     }
-    content
 }
 
 /// `Some(reason)` when the judge rejects the reply. Inconclusive verdicts

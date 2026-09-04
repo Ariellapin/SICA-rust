@@ -143,6 +143,46 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                          field keep reasoning on. Takes effect on next \
                          Connect.",
                     );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui(Vec2::new(72.0, 22.0), |ui| {
+                            caps_label(ui, "Compact", rgb(p.muted));
+                        });
+                        caps_label(ui, "at", rgb(p.muted));
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.compact_threshold_pct)
+                                .range(0..=99)
+                                .speed(1),
+                        )
+                        .on_hover_text(
+                            "Fold older history into an LLM-written summary \
+                             when the prompt reaches this % of the budget. \
+                             0 = default (80).",
+                        );
+                        ui.add_space(6.0);
+                        caps_label(ui, "keep tail", rgb(p.muted));
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.compact_retain_pct)
+                                .range(0..=90)
+                                .speed(1),
+                        )
+                        .on_hover_text(
+                            "Share of the budget (%) kept verbatim as the \
+                             tail when compacting. 0 = default (16).",
+                        );
+                        ui.add_space(6.0);
+                        caps_label(ui, "sum tok", rgb(p.muted));
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.compact_max_tokens)
+                                .range(0..=65_536)
+                                .speed(64),
+                        )
+                        .on_hover_text(
+                            "Completion cap for the compaction summary. \
+                             A summary cut off by it is discarded and \
+                             retried. 0 = default (8192).",
+                        );
+                    });
 
                     ui.add_space(8.0);
 

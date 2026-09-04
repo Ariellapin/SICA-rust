@@ -1270,7 +1270,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | Wave | Items | Size | Bump |
 | --- | --- | --- | --- |
 | **1 — hygiene** — **done** | Repeat-tool-reminder (§6.4, `agents::guard`) · untrusted frame (§9.4, `Skill::trusted` + `UNTRUSTED_NOTICE`) · tool-result pruner (§9.2, `chat::prune_tool_results`) · `retain` library (§6.10, `sica_core::retain`) · `/name` expansion + `<skill_content>` frame (§8.1–8.2, `agents::invoke`) · `ContextInjected` event + `EventKind::Unknown` · fallback title (§3.4, `title_gen::fallback`) · Job Objects for `run-cli` (§6.8, `agents::proc`) · `usage` on `StreamChunk` (§4.1) | S×8 | no — injected context rides the `"context"` role string on `MessageDump` |
-| **2 — prompt & context** | `agents::prompt` assembly + runtime context (§5.1) · `AGENTS.md` loader with budget (§5.3) · time context (§9.3) · prefix-preserving 8-section compaction + 80/16 policy (§9.1) · usage-anchored meter + breakdown (§4.3) · line-numbered `read-file`, `edit-file`, `glob`, `grep` (§6.6) | M×6 | yes (v12) |
+| **2 — prompt & context** — **done** | `agents::prompt` assembly + runtime context (§5.1) · `AGENTS.md` loader with budget (§5.3, `agents::instructions`) · time context (§9.3) · prefix-preserving 8-section compaction + 80/16 `CompactPolicy` (§9.1) · usage-anchored meter + breakdown (§4.3, `agents::meter`) · line-numbered/ranged `read-file`, `edit-file`, `glob`, `grep` (§6.6) · `Skill::optional_args` · `MessageDump.context_source` | M×6 | yes (v12) — `Event::TokenUsage.breakdown`, `Event::ContextCompacted.pruned`, `LlmOptions.compact`, `MessageDump.context_source` |
 | **3 — control** | `ToolPolicy` pipeline (§6.1) · brokers for `ask-user` and approval (§10.1–10.2) · permission modes (§10.3) · plan mode (§11.1) · `todo-write` (§11.2) · read-before-edit (§8.5) · `RunCommand` + `/compact` `/plan` `/permission` (§8.4) · parallel read-only calls (§6.2) | M×7 | yes (v13) |
 | **4 — delegation** | `run_conversation` + `subagent`/`subagent-fork` (§12.1) · `structured_output` and typed team reports (§12.2) · jobs + background `run-cli` (§12.4) · inbox `followup/steer/inject` (§2.1) · goals + round driver (§12.3) · Ralph (§12.6) | M×6 | yes (v14) |
 | **5 — ecosystem & evals** | hooks (§13.1) · MCP (§13.2) · `web-fetch`/`web-search` (§13.3) · session projections (§3.3) · mock LLM server (§14.2) · replay evals (§14.1) · invariants (§14.3) | M×7 | yes (v15) |
@@ -1305,7 +1305,7 @@ by a newer backend still loads on an older one.
 
 | Wave | `Request` | `Response` / `Event` |
 | --- | --- | --- |
-| 2 | — | `Event::TokenUsage.breakdown`; `Event::ContextCompacted.pruned` |
+| 2 — shipped as v12 | — | `Event::TokenUsage.breakdown`; `Event::ContextCompacted.pruned`; `LlmOptions.compact` (`CompactPolicy`); `MessageDump.context_source` |
 | 3 | `RunCommand`, `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion` | `Response::CommandResult`; `Event::ApprovalRequested`, `QuestionAsked`, `TodosChanged`, `PlanModeChanged`, `PermissionModeChanged` |
 | 4 | `SteerTurn`, `InjectContext` | `Event::JobsChanged`, `GoalChanged` |
 | 5 | `SessionStats`, `ListWorkspaceFiles` | `Response::SessionStats`, `WorkspaceFiles` |

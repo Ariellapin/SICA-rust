@@ -554,16 +554,18 @@ fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
     cancel.as_ref().is_some_and(|t| t.is_cancelled())
 }
 
-/// Role charter fed to one teammate as its system message.
+/// Role charter fed to one teammate as its system message. Rendered through
+/// the shared prompt assembly (persona section at the `MEMORY` slot) so all
+/// three builders in the codebase produce the same skeleton.
 fn teammate_system(mate: &Teammate, spec: &TeamSpec, catalogue: Option<&str>) -> String {
-    let mut out = format!(
+    let mut charter = format!(
         "You are `{}`, one teammate on a small agent team inside the \
          sica-rust desktop app. Work ONLY on your own task; trust your \
          teammates to handle theirs.\n\nTeam roster:\n",
         mate.role
     );
     for m in &spec.teammates {
-        out.push_str(&format!(
+        charter.push_str(&format!(
             "- {}: {}{}\n",
             m.role,
             truncate_chars(&m.task, 120),
@@ -571,10 +573,10 @@ fn teammate_system(mate: &Teammate, spec: &TeamSpec, catalogue: Option<&str>) ->
         ));
     }
     if !spec.shared.trim().is_empty() {
-        out.push_str(&format!("\nShared briefing: {}\n", spec.shared.trim()));
+        charter.push_str(&format!("\nShared briefing: {}\n", spec.shared.trim()));
     }
     if let Some(cat) = catalogue {
-        out.push_str(&format!(
+        charter.push_str(&format!(
             "\nYou may use tools. To call one, reply with a SINGLE line of \
              exactly this form and nothing else:\n\n\
              <skill-name> '<arg1>' '<arg2>' > <what you want to learn>\n\n\
@@ -584,7 +586,7 @@ fn teammate_system(mate: &Teammate, spec: &TeamSpec, catalogue: Option<&str>) ->
              Available skills:\n{cat}"
         ));
     }
-    out.push_str(
+    charter.push_str(
         "\nKeep your final report concise and factual. Quote exact values \
          (numbers, paths, errors) verbatim from tool output. Start directly \
          with content — no preamble.\n\n\
@@ -595,7 +597,13 @@ fn teammate_system(mate: &Teammate, spec: &TeamSpec, catalogue: Option<&str>) ->
          and name the call you would need — never invent output, and never \
          report a file as existing because the name sounds plausible.",
     );
-    out
+    let mut a = crate::prompt::Assembly::new();
+    a.section(crate::prompt::Section::new(
+        "persona",
+        crate::prompt::order::MEMORY,
+        charter.clone(),
+    ));
+    a.render().map(|r| r.system).unwrap_or(charter)
 }
 
 /// The shared board every teammate sees at the start of round `round + 1`.

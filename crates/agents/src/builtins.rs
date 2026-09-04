@@ -1,9 +1,10 @@
-//! Built-in skills implemented in Rust: `run-cli`, `read-file`, `write-file`.
+//! Built-in skills implemented in Rust: `run-cli`, `run-pwsh`, `read-file`,
+//! `write-file`, `edit-file`, `glob`, `grep`.
 //!
-//! Each skill has a companion `skills/<name>.md` describing the JSON
-//! contract for the LLM (seeded on first BE start, see `seed_defaults`).
-//! The Rust impl below is what actually runs when the skill is invoked
-//! through a `ToolSubAgent`.
+//! Each skill has a companion `skills/<name>.md` describing the contract for
+//! the LLM (seeded on first BE start, see `seed_defaults`). The Rust impl
+//! below is what actually runs when the skill is invoked through a
+//! `ToolSubAgent`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,11 +20,18 @@ use crate::skill::{Skill, SkillContext, SkillOutcome};
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT: usize = 32 * 1024;
 const MAX_FILE: u64 = 1024 * 1024;
+/// `glob` returns at most this many paths (newest first).
+const MAX_GLOB: usize = 100;
+/// `grep` reports at most this many matches inline.
+const MAX_GREP_MATCHES: usize = 250;
 
 pub const RUN_CLI_NAME:    &str = "run-cli";
 pub const RUN_PWSH_NAME:   &str = "run-pwsh";
 pub const READ_FILE_NAME:  &str = "read-file";
 pub const WRITE_FILE_NAME: &str = "write-file";
+pub const EDIT_FILE_NAME:  &str = "edit-file";
+pub const GLOB_NAME:       &str = "glob";
+pub const GREP_NAME:       &str = "grep";
 
 pub const RUN_CLI_DESCRIPTION: &str =
     "Execute a shell command. Positional args: <command>. \
@@ -35,12 +43,38 @@ pub const RUN_PWSH_DESCRIPTION: &str =
      capped to 32 KiB output, 30 s timeout.";
 
 pub const READ_FILE_DESCRIPTION: &str =
-    "Read a UTF-8 file. Positional args: <path>. \
+    "Read a UTF-8 file with line numbers. Positional args: <path>. \
+     Optional named args: start, end (1-based line range). \
      Relative paths resolve against the workspace root; up to 1 MiB.";
 
 pub const WRITE_FILE_DESCRIPTION: &str =
     "Write UTF-8 content to a file. Positional args: <path> <content>. \
      Creates parent dirs; refuses `..` traversal in relative paths.";
+
+pub const EDIT_FILE_DESCRIPTION: &str =
+    "Replace exact text in a file. Positional args: <path> <old> <new>. \
+     <old> must occur exactly once; include enough surrounding lines to make \
+     it unique. Returns the changed region with line numbers.";
+
+pub const GLOB_DESCRIPTION: &str =
+    "List files matching a glob pattern (gitignore-aware). \
+     Positional args: <pattern> (e.g. 'src/**/*.rs'). \
+     Returns up to 100 paths, most recently modified first.";
+
+pub const GREP_DESCRIPTION: &str =
+    "Regex search across files. Positional args: <regex> <path> — path is a \
+     file or a directory (searched recursively, gitignore-aware). \
+     Returns `path:line: text` rows, capped at 250 matches.";
+
+/// One-sentence shell guidance composed into the system prompt (the
+/// `SKILL_GUIDANCE` slot) — the "base every claim on a tool result" rule
+/// lives with the tools it concerns, not in a central persona blob.
+pub const SHELL_PROMPT_GUIDANCE: &str =
+    "Check the `exit=N` marker at the top of every run-cli / run-pwsh \
+     result — a non-zero exit means the command failed even when its output \
+     looks plausible. Base every claim about the host system (installed \
+     tools, file contents, command output) on an actual tool result from \
+     this conversation, never on assumption.";
 
 pub const RUN_CLI_SEED_MD: &str = r#"---
 name: run-cli
@@ -61,7 +95,10 @@ Behaviour:
 - Windows: invokes `cmd /C <command>`. Other OSes: `/bin/sh -c <command>`.
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
-- The outcome `ok` mirrors the child exit code (0 = ok).
+- The outcome `ok` mirrors the child exit code (0 = ok), reported as the
+  `exit=N` marker at the top of the result.
+- Optional named arg `cwd` (JSON-fenced / native calls only): sets the
+  working directory for the command.
 
 Use this for build tools, git, package managers, or one-shot scripts.
 
@@ -97,26 +134,37 @@ Behaviour:
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok).
+- Optional named arg `cwd` (JSON-fenced / native calls only): sets the
+  working directory for the command.
 "#;
 
 pub const READ_FILE_SEED_MD: &str = r#"---
 name: read-file
-description: Read a UTF-8 file from disk and return its contents to the agent.
+description: Read a UTF-8 file from disk with line numbers, optionally a line range.
 ---
-Read a file from disk.
+Read a file from disk. The output is line-numbered (`  <n>\t<line>`) so you
+can quote exact lines to `edit-file`.
 
 Invocation (single line):
 
     read-file '<path>' > <what you want to know from the file>
 
-Example:
+Examples:
 
     read-file 'skills/run-cli.md' > what positional args does run-cli accept
+    read-file 'src/main.rs' '1' '80' > the first 80 lines (named start/end args)
 
 Behaviour:
 - Relative paths resolve against the workspace root.
 - Relative paths may not escape the workspace via `..`.
 - Files larger than **1 MiB** are rejected.
+- Optional named args `start` / `end` (1-based, inclusive) select a line
+  range; they are named args, so use the JSON-fenced tool_call form:
+
+      ```tool_call
+      { "skill": "read-file", "args": { "path": "src/main.rs", "start": "1", "end": "80" }, "expectation": "the first 80 lines" }
+      ```
+
 - The raw contents are summarised by the sub-agent against the expectation
   text after `>` before being returned to the main agent.
 "#;
@@ -143,6 +191,71 @@ Behaviour:
 - Returns the number of bytes written in the outcome summary.
 "#;
 
+pub const EDIT_FILE_SEED_MD: &str = r#"---
+name: edit-file
+description: Replace an exact block of text in a file. The block must match exactly once.
+---
+Replace one exact stretch of text in an existing file.
+
+Invocation (JSON-fenced form preferred — the arguments contain newlines):
+
+    ```tool_call
+    { "skill": "edit-file", "args": { "path": "src/main.rs", "old": "let x = 1;", "new": "let x = 2;" }, "expectation": "confirm the replacement" }
+    ```
+
+Behaviour:
+- `old` must match the file **exactly once**, byte for byte (indentation and
+  newlines included). `read-file` first — its line-numbered output tells you
+  the exact text.
+- 0 matches or more than 1 match is an error; include more surrounding lines
+  in `old` to make it unique.
+- The result shows the changed region with line numbers so you can verify it.
+"#;
+
+pub const GLOB_SEED_MD: &str = r#"---
+name: glob
+description: List files matching a glob pattern, most recently modified first.
+---
+Find files by glob pattern. Honours `.gitignore`.
+
+Invocation (single line):
+
+    glob '<pattern>' > <what you want to find>
+
+Examples:
+
+    glob 'src/**/*.rs' > every Rust source file
+    glob '**/*.toml' > all TOML files
+
+Behaviour:
+- `**` matches any number of directories; `*` matches within one path
+  segment. Patterns are relative to the workspace root.
+- Returns at most **100** paths, most recently modified first, one per line.
+- Use `grep` to search file *contents*.
+"#;
+
+pub const GREP_SEED_MD: &str = r#"---
+name: grep
+description: Regex search across files; returns path:line: text rows.
+---
+Search file contents with a regular expression. Honours `.gitignore`.
+
+Invocation (single line):
+
+    grep '<regex>' '<path>' > <what you want to find>
+
+Examples:
+
+    grep 'fn main' '.' > where is main defined
+    grep 'TODO|FIXME' 'src' > outstanding work markers
+
+Behaviour:
+- `path` is a file or a directory (searched recursively).
+- Output rows are `path:line: text`; at most **250** matches are returned.
+- Non-UTF-8 (binary) files are skipped silently.
+- Uses Rust `regex` syntax — no backreferences, no look-around.
+"#;
+
 pub struct RunCli;
 
 #[async_trait]
@@ -150,6 +263,8 @@ impl Skill for RunCli {
     fn name(&self) -> &str { RUN_CLI_NAME }
     fn description(&self) -> &str { RUN_CLI_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
+    fn optional_args(&self) -> Vec<String> { vec!["cwd".into()] }
+    fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
@@ -224,6 +339,8 @@ impl Skill for RunPwsh {
     fn name(&self) -> &str { RUN_PWSH_NAME }
     fn description(&self) -> &str { RUN_PWSH_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
+    fn optional_args(&self) -> Vec<String> { vec!["cwd".into()] }
+    fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
@@ -287,6 +404,7 @@ impl Skill for ReadFile {
     fn name(&self) -> &str { READ_FILE_NAME }
     fn description(&self) -> &str { READ_FILE_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["path".into()] }
+    fn optional_args(&self) -> Vec<String> { vec!["start".into(), "end".into()] }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
         let path = match args.get("path").and_then(|v| v.as_str()) {
@@ -308,11 +426,56 @@ impl Skill for ReadFile {
                 meta.len()
             ));
         }
-        match fs::read_to_string(&resolved) {
-            Ok(text) => SkillOutcome { ok: true, summary: text },
-            Err(e)   => err(&format!("read {}: {e}", resolved.display())),
-        }
+        let text = match fs::read_to_string(&resolved) {
+            Ok(t)  => t,
+            Err(e) => return err(&format!("read {}: {e}", resolved.display())),
+        };
+
+        // Optional 1-based inclusive line range. Accepted as numbers or
+        // numeric strings (the text protocol only carries strings).
+        let start = parse_line_arg(args.get("start"));
+        let end = parse_line_arg(args.get("end"));
+        SkillOutcome { ok: true, summary: numbered_range(&text, start, end) }
     }
+}
+
+fn parse_line_arg(v: Option<&Value>) -> Option<usize> {
+    v.and_then(|v| {
+        v.as_u64()
+            .map(|n| n as usize)
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<usize>().ok()))
+    })
+    .filter(|&n| n >= 1)
+}
+
+/// Line-numbered output (`{n:>5}\t{line}`) over an optional 1-based
+/// inclusive range — the shape that makes `edit-file` targeting reliable.
+/// Out-of-range bounds clamp; an inverted or empty range says so instead of
+/// returning nothing silently.
+fn numbered_range(text: &str, start: Option<usize>, end: Option<usize>) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let (from, to) = match (start, end) {
+        (None, None) => (1, total),
+        (s, e) => {
+            let from = s.unwrap_or(1).max(1);
+            let to = e.unwrap_or(total).min(total);
+            (from, to)
+        }
+    };
+    let mut out = String::new();
+    if start.is_some() || end.is_some() {
+        out.push_str(&format!("[lines {from}-{to} of {total}]\n"));
+    }
+    if from > total {
+        out.push_str(&format!("[line {from} is past the end of the file ({total} lines)]"));
+        return out;
+    }
+    for (i, line) in lines[(from - 1)..to].iter().enumerate() {
+        out.push_str(&format!("{:>5}\t{}\n", from + i, line));
+    }
+    out.pop(); // trailing newline
+    out
 }
 
 pub struct WriteFile {
@@ -368,6 +531,261 @@ impl Skill for WriteFile {
     }
 }
 
+pub struct EditFile {
+    pub root: PathBuf,
+}
+
+impl EditFile {
+    pub fn new(root: PathBuf) -> Self { Self { root } }
+}
+
+#[async_trait]
+impl Skill for EditFile {
+    fn name(&self) -> &str { EDIT_FILE_NAME }
+    fn description(&self) -> &str { EDIT_FILE_DESCRIPTION }
+    fn positional_args(&self) -> Vec<String> {
+        vec!["path".into(), "old".into(), "new".into()]
+    }
+
+    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return err("missing or empty `path` arg"),
+        };
+        let old = match args.get("old").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return err("missing or empty `old` arg"),
+        };
+        let new = match args.get("new").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None    => return err("missing `new` arg"),
+        };
+        let resolved = match resolve(&self.root, path) {
+            Ok(p)  => p,
+            Err(e) => return err(&e),
+        };
+        let text = match fs::read_to_string(&resolved) {
+            Ok(t)  => t,
+            Err(e) => {
+                return err(&format!(
+                    "read {}: {e} — edit-file only edits existing files; use write-file to create one",
+                    resolved.display()
+                ))
+            }
+        };
+
+        // Literal, non-overlapping match count. Exactly one, or the model
+        // gets a specific reason: 0 means the file moved under it, >1 means
+        // the anchor is ambiguous.
+        let count = text.match_indices(&old).count();
+        match count {
+            0 => {
+                return err(
+                    "old text not found — the file may have changed since you read it; \
+                     read it again and copy the exact text (whitespace included)",
+                )
+            }
+            n if n > 1 => {
+                return err(&format!(
+                    "old text matches {n} times — include more surrounding lines to make it unique"
+                ))
+            }
+            _ => {}
+        }
+
+        let at = text.find(&old).expect("counted one match");
+        let updated = format!("{}{}{}", &text[..at], new, &text[at + old.len()..]);
+        if let Err(e) = fs::write(&resolved, updated.as_bytes()) {
+            return err(&format!("write {}: {e}", resolved.display()));
+        }
+
+        // Show the changed region with line numbers (three lines of context
+        // either side) so the model can verify without another read. The
+        // replacement starts on the same line number in the updated file.
+        let before_lines = text[..at].matches('\n').count() + 1;
+        let old_lines = old.matches('\n').count() + 1;
+        let new_lines = new.matches('\n').count() + 1;
+        let end_line = before_lines + old_lines.max(new_lines) - 1;
+        let from = before_lines.saturating_sub(3).max(1);
+        let to = end_line + 3;
+        SkillOutcome {
+            ok: true,
+            summary: format!(
+                "replaced {} bytes with {} bytes in {}\n{}",
+                old.len(),
+                new.len(),
+                resolved.display(),
+                numbered_range(&updated, Some(from), Some(to)),
+            ),
+        }
+    }
+}
+
+pub struct Glob {
+    pub root: PathBuf,
+}
+
+impl Glob {
+    pub fn new(root: PathBuf) -> Self { Self { root } }
+}
+
+#[async_trait]
+impl Skill for Glob {
+    fn name(&self) -> &str { GLOB_NAME }
+    fn description(&self) -> &str { GLOB_DESCRIPTION }
+    fn positional_args(&self) -> Vec<String> { vec!["pattern".into()] }
+
+    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return err("missing or empty `pattern` arg"),
+        };
+        // gitignore-style overrides give us `**` semantics without a second
+        // glob dialect — and the walker already honours .gitignore.
+        let overrides = match ignore::overrides::OverrideBuilder::new(&self.root)
+            .add(pattern)
+            .and_then(|b| b.build())
+        {
+            Ok(o) => o,
+            Err(e) => return err(&format!("bad glob pattern {pattern:?}: {e}")),
+        };
+
+        let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        for entry in ignore::WalkBuilder::new(&self.root).build().flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            // Override semantics are include-flavoured: a path matching the
+            // pattern reports `Whitelist`, everything else `Ignore`.
+            match overrides.matched(entry.path(), false) {
+                ignore::Match::Whitelist(_) => {
+                    hits.push((
+                        entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(std::time::UNIX_EPOCH),
+                        entry.path().to_path_buf(),
+                    ));
+                }
+                ignore::Match::Ignore(_) | ignore::Match::None => {}
+            }
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        let total = hits.len();
+        hits.truncate(MAX_GLOB);
+        if hits.is_empty() {
+            return SkillOutcome {
+                ok: true,
+                summary: format!("no files match {pattern:?}"),
+            };
+        }
+        let mut out = String::new();
+        if total > hits.len() {
+            out.push_str(&format!(
+                "[showing the {} most recently modified of {total} matches]\n",
+                hits.len()
+            ));
+        }
+        for (_, p) in &hits {
+            out.push_str(&display_relative(&self.root, p));
+            out.push('\n');
+        }
+        out.pop();
+        SkillOutcome { ok: true, summary: out }
+    }
+}
+
+pub struct Grep {
+    pub root: PathBuf,
+}
+
+impl Grep {
+    pub fn new(root: PathBuf) -> Self { Self { root } }
+}
+
+#[async_trait]
+impl Skill for Grep {
+    fn name(&self) -> &str { GREP_NAME }
+    fn description(&self) -> &str { GREP_DESCRIPTION }
+    fn positional_args(&self) -> Vec<String> { vec!["pattern".into(), "path".into()] }
+
+    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return err("missing or empty `pattern` arg"),
+        };
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".");
+        let re = match regex::Regex::new(pattern) {
+            Ok(r)  => r,
+            Err(e) => return err(&format!("bad regex {pattern:?}: {e}")),
+        };
+        let start = match resolve(&self.root, path) {
+            Ok(p)  => p,
+            Err(e) => return err(&e),
+        };
+        if !start.exists() {
+            return err(&format!("no such path: {}", start.display()));
+        }
+
+        let mut rows: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        let mut capped = false;
+
+        let mut handle_file = |file: &Path| {
+            let Ok(text) = fs::read_to_string(file) else { return }; // binary → skip
+            for (i, line) in text.lines().enumerate() {
+                if !re.is_match(line) {
+                    continue;
+                }
+                total += 1;
+                if rows.len() < MAX_GREP_MATCHES {
+                    rows.push(format!("{}:{}: {}", display_relative(&self.root, file), i + 1, line));
+                } else {
+                    capped = true;
+                }
+            }
+        };
+
+        if start.is_file() {
+            handle_file(&start);
+        } else {
+            for entry in ignore::WalkBuilder::new(&start).build().flatten() {
+                if entry.file_type().is_some_and(|t| t.is_file()) {
+                    handle_file(entry.path());
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            return SkillOutcome {
+                ok: true,
+                summary: format!("no matches for {pattern:?} under {}", display_relative(&self.root, &start)),
+            };
+        }
+        let mut out = rows.join("\n");
+        if capped {
+            out.push_str(&format!(
+                "\n[{total} matches total — showing the first {MAX_GREP_MATCHES}; \
+                 narrow the pattern or the path]"
+            ));
+        }
+        SkillOutcome { ok: true, summary: out }
+    }
+}
+
+/// Display a path relative to the workspace root when it is under it —
+/// relative paths are what the model should hand back to other skills.
+fn display_relative(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .map(|r| r.display().to_string())
+        .unwrap_or_else(|_| p.display().to_string())
+}
+
 /// Drop `skills/<name>.md` for each built-in skill if absent — the loader
 /// reads them on startup so the LLM sees the contract alongside any user-
 /// authored skills. Never clobbers a file the user already edited.
@@ -383,6 +801,9 @@ pub fn seed_defaults(skills_dir: &Path) -> std::io::Result<()> {
         (RUN_PWSH_NAME,   RUN_PWSH_SEED_MD),
         (READ_FILE_NAME,  READ_FILE_SEED_MD),
         (WRITE_FILE_NAME, WRITE_FILE_SEED_MD),
+        (EDIT_FILE_NAME,  EDIT_FILE_SEED_MD),
+        (GLOB_NAME,       GLOB_SEED_MD),
+        (GREP_NAME,       GREP_SEED_MD),
     ] {
         let path = skills_dir.join(format!("{name}.md"));
         if !path.exists() {
@@ -481,7 +902,23 @@ mod tests {
 
         let out = r.run(json!({ "path": "hello.txt" }), ctx()).await;
         assert!(out.ok);
-        assert_eq!(out.summary, "hi");
+        assert_eq!(out.summary, "    1\thi");
+    }
+
+    #[tokio::test]
+    async fn read_numbers_lines_and_slices_ranges() {
+        let dir = tempdir();
+        std::fs::write(dir.join("f.txt"), "a\nb\nc\nd\ne").unwrap();
+        let r = ReadFile::new(dir.clone());
+        let out = r.run(json!({ "path": "f.txt", "start": "2", "end": "4" }), ctx()).await;
+        assert!(out.ok, "{}", out.summary);
+        assert_eq!(out.summary, "[lines 2-4 of 5]\n    2\tb\n    3\tc\n    4\td");
+        // Clamps rather than erroring.
+        let out = r.run(json!({ "path": "f.txt", "start": 4, "end": 99 }), ctx()).await;
+        assert!(out.summary.ends_with("    5\te"), "{}", out.summary);
+        // Past-the-end is reported, not silent.
+        let out = r.run(json!({ "path": "f.txt", "start": 9, "end": 12 }), ctx()).await;
+        assert!(out.summary.contains("past the end"), "{}", out.summary);
     }
 
     #[tokio::test]
@@ -501,6 +938,72 @@ mod tests {
         let out = r.run(json!({ "path": "nope.txt" }), ctx()).await;
         assert!(!out.ok);
         assert!(out.summary.contains("stat"));
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_exactly_once() {
+        let dir = tempdir();
+        std::fs::write(dir.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let e = EditFile::new(dir.clone());
+        let out = e.run(
+            json!({ "path": "f.txt", "old": "two", "new": "TWO" }),
+            ctx(),
+        ).await;
+        assert!(out.ok, "{}", out.summary);
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "one\nTWO\nthree\n");
+        assert!(out.summary.contains("TWO"), "{}", out.summary);
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_ambiguous_and_missing_anchors() {
+        let dir = tempdir();
+        std::fs::write(dir.join("f.txt"), "x\ny\nx\n").unwrap();
+        let e = EditFile::new(dir.clone());
+        let dup = e.run(json!({ "path": "f.txt", "old": "x", "new": "z" }), ctx()).await;
+        assert!(!dup.ok);
+        assert!(dup.summary.contains("2 times"), "{}", dup.summary);
+        let miss = e.run(json!({ "path": "f.txt", "old": "nope", "new": "z" }), ctx()).await;
+        assert!(!miss.ok);
+        assert!(miss.summary.contains("not found"), "{}", miss.summary);
+        let absent = e.run(json!({ "path": "ghost.txt", "old": "a", "new": "b" }), ctx()).await;
+        assert!(!absent.ok);
+        assert!(absent.summary.contains("write-file"), "{}", absent.summary);
+    }
+
+    #[tokio::test]
+    async fn glob_lists_newest_first_and_caps() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn b() {}").unwrap();
+        std::fs::write(dir.join("README.md"), "# hi").unwrap();
+        let g = Glob::new(dir.clone());
+        let out = g.run(json!({ "pattern": "src/**/*.rs" }), ctx()).await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("a.rs") && out.summary.contains("b.rs"), "{}", out.summary);
+        assert!(!out.summary.contains("README"), "{}", out.summary);
+        let none = g.run(json!({ "pattern": "**/*.zzz" }), ctx()).await;
+        assert!(none.summary.contains("no files match"), "{}", none.summary);
+        let bad = g.run(json!({ "pattern": "[" }), ctx()).await;
+        assert!(!bad.ok, "an invalid glob must be an error");
+    }
+
+    #[tokio::test]
+    async fn grep_finds_matches_with_locations() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn main() {}\nfn helper() {}\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "nothing here\n").unwrap();
+        let g = Grep::new(dir.clone());
+        let out = g.run(json!({ "pattern": "fn \\w+", "path": "src" }), ctx()).await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("a.rs:1: fn main"), "{}", out.summary);
+        assert!(out.summary.contains("a.rs:2: fn helper"), "{}", out.summary);
+        assert!(!out.summary.contains("b.rs"), "{}", out.summary);
+        let none = g.run(json!({ "pattern": "zebra", "path": "." }), ctx()).await;
+        assert!(none.summary.contains("no matches"), "{}", none.summary);
+        let bad = g.run(json!({ "pattern": "(", "path": "." }), ctx()).await;
+        assert!(!bad.ok);
     }
 
     #[tokio::test]
@@ -539,7 +1042,10 @@ mod tests {
     fn seed_defaults_writes_files_once() {
         let dir = tempdir();
         seed_defaults(&dir).unwrap();
-        for name in [RUN_CLI_NAME, RUN_PWSH_NAME, READ_FILE_NAME, WRITE_FILE_NAME] {
+        for name in [
+            RUN_CLI_NAME, RUN_PWSH_NAME, READ_FILE_NAME, WRITE_FILE_NAME,
+            EDIT_FILE_NAME, GLOB_NAME, GREP_NAME,
+        ] {
             let p = dir.join(format!("{name}.md"));
             assert!(p.exists(), "expected {}", p.display());
         }

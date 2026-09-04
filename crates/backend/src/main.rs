@@ -157,6 +157,9 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(Arc::new(agents::RunPwsh));
     skill_registry.register(Arc::new(agents::ReadFile::new(root.clone())));
     skill_registry.register(Arc::new(agents::WriteFile::new(root.clone())));
+    skill_registry.register(Arc::new(agents::EditFile::new(root.clone())));
+    skill_registry.register(Arc::new(agents::Glob::new(root.clone())));
+    skill_registry.register(Arc::new(agents::Grep::new(root.clone())));
     // `model-eval` benchmarks the connected model against a prompt suite. It
     // needs the finished registry (for the live catalogue and the known-skill
     // predicate its tool-call checks use), so it is attached below alongside

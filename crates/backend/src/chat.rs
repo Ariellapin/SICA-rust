@@ -14,9 +14,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use agents::guard::RepeatTracker;
+use agents::meter::TokenMeter;
 use agents::{EventSink, SkillRegistry, ToolFailureSink, ToolSubAgent};
 use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
-use sica_core::event::{ContextSource, EventKind, SurfaceOp};
+use sica_core::event::{ContextSource, EventKind, SurfaceEntry, SurfaceOp};
 use sica_core::message::{Message, Role};
 
 use crate::sessions_store::{self, SessionLog};
@@ -67,6 +68,10 @@ pub struct ChatHub {
     /// Repeat-tool-reminder chain per session (`agents::guard`). Cleared
     /// by every user message; consulted after every dispatched call.
     pub repeat:        Arc<Mutex<HashMap<u64, RepeatTracker>>>,
+    /// Usage-anchored token meter per session (`agents::meter`). Anchored on
+    /// the provider's own `usage` after each successful request; cleared on
+    /// reconnect.
+    pub meters:        Arc<Mutex<HashMap<u64, TokenMeter>>>,
 }
 
 type Repeats = Arc<Mutex<HashMap<u64, RepeatTracker>>>;
@@ -96,6 +101,7 @@ impl ChatHub {
             llm_opts:     Arc::new(Mutex::new(LlmOptions::default())),
             context_window: Arc::new(AtomicU32::new(DEFAULT_CONTEXT_WINDOW)),
             repeat:       Arc::new(Mutex::new(HashMap::new())),
+            meters:       Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -167,6 +173,7 @@ impl ChatHub {
                     tool_ok,
                     tool_args_preview,
                     tool_expectation,
+                    context_source: e.context.as_ref().map(|c| c.label()),
                 }
             })
             .collect();
@@ -235,6 +242,8 @@ impl ChatHub {
                 self.context_window.store(window, Ordering::Relaxed);
                 *self.llm_opts.lock().await = options.clone();
                 *self.llm.lock().await = Some(client);
+                // A new provider invalidates every usage anchor.
+                self.meters.lock().await.clear();
                 self.set_llm_state(LlmState::Ready {
                     model: model.clone(),
                     context_window: window,
@@ -284,6 +293,7 @@ impl ChatHub {
 
     pub async fn disconnect_llm(&self) {
         *self.llm.lock().await = None;
+        self.meters.lock().await.clear();
         self.set_llm_state(LlmState::Disconnected).await;
     }
 
@@ -335,6 +345,17 @@ impl ChatHub {
             let log = sessions
                 .entry(session_id)
                 .or_insert_with(|| SessionLog::new(session_id, default_title(session_id)));
+            // Durable context snapshots for this turn, each shadowing its
+            // predecessor so exactly one copy of each is model-visible:
+            // workspace instructions (AGENTS.md chain) first, then the
+            // runtime snapshot (time, cwd, os, model).
+            if refresh_instructions(log) {
+                self.event_sink.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: "workspace instructions snapshot updated".into(),
+                });
+            }
+            append_runtime_context(log, &client.model);
             if let Some(exp) = expansion {
                 log.append(EventKind::ContextInjected {
                     surface: SurfaceOp::Append,
@@ -391,10 +412,12 @@ impl ChatHub {
         let failure_sink = self.failure_sink.clone();
         let title_client = client.clone();
         let event_sink = self.event_sink.clone();
-        let (native_tools, opt_max_tokens) = {
+        let meters = self.meters.clone();
+        let (native_tools, opt_max_tokens, compact_policy) = {
             let opts = self.llm_opts.lock().await;
-            (opts.native_tools, opts.max_tokens)
+            (opts.native_tools, opts.max_tokens, opts.compact)
         };
+        let model_name = client.model.clone();
         let window = self.context_window.load(Ordering::Relaxed);
         tokio::spawn(async move {
             let mut hops: u8 = 0;
@@ -419,35 +442,84 @@ impl ChatHub {
                 // Derive the history fresh from the event log each iteration:
                 // the previous hop appended both the assistant message and
                 // the tool result, so this picks them up uniformly.
-                let mut history =
-                    build_history(&sessions_map, session_id, &skills, native_tools).await;
+                let mut wh = match build_history(
+                    &sessions_map, session_id, &skills, native_tools, &model_name,
+                ).await {
+                    Ok(Some(wh)) => wh,
+                    Ok(None) => break, // session vanished mid-turn
+                    Err(e) => {
+                        // A malformed prompt fails loud rather than going out
+                        // half-interpolated (dsh's stance).
+                        warn!(session_id, error = %e, "prompt assembly failed");
+                        event_sink.emit(Event::LogLine {
+                            level: "ERROR".into(),
+                            message: format!("prompt assembly failed: {e}"),
+                        });
+                        finish = "error";
+                        break;
+                    }
+                };
 
                 // Prompt budget: window minus room for the response (and a
                 // small safety margin for template overhead).
                 let reserve = opt_max_tokens.unwrap_or(4096).saturating_add(512);
                 let budget = window.saturating_sub(reserve).max(1024);
 
-                // Auto-compaction. Once the assembled prompt fills
-                // COMPACT_TRIGGER_PCT of that budget, fold the older half of
-                // the history into an LLM-written summary. This runs *before*
-                // the trim so compaction is the primary mechanism and the
-                // trimmer stays a backstop — otherwise the trimmer would
-                // silently amputate history long before the meter ever read
-                // 95%, because the budget is already well under the window.
-                let prompt_tokens = agents::compact::approx_total_wire(&history);
+                // Auto-compaction. Once the assembled prompt fills the
+                // policy's threshold share of that budget, fold the older
+                // part of the history into an LLM-written summary. This runs
+                // *before* the trim so compaction is the primary mechanism
+                // and the trimmer stays a backstop — otherwise the trimmer
+                // would silently amputate history long before the meter ever
+                // read the trigger, because the budget is already well under
+                // the window. The usage-anchored meter prices the prompt
+                // when it has an anchor for this exact envelope.
+                // Usage-anchored pricing: the meter prices only what was
+                // added since the last provider-reported envelope; the
+                // heuristic covers the rest.
+                let heuristic = agents::compact::approx_total_wire(&wh.messages);
+                let mut anchored = meters
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(|m| m.estimate(wh.envelope, &wh.entries));
+                let prompt_tokens = anchored.unwrap_or(heuristic);
                 let over = u64::from(prompt_tokens) * 100
-                    >= u64::from(budget) * u64::from(protocol::COMPACT_TRIGGER_PCT);
+                    >= u64::from(budget) * u64::from(compact_policy.threshold_pct);
                 if over
-                    && compact_session(&sessions_map, session_id, &client, &event_sink, budget)
-                        .await
+                    && compact_session(
+                        &sessions_map, session_id, &client, &event_sink, budget,
+                        &compact_policy, &wh, native_tools, &cancel,
+                    )
+                    .await
                 {
-                    history =
-                        build_history(&sessions_map, session_id, &skills, native_tools).await;
+                    wh = match build_history(
+                        &sessions_map, session_id, &skills, native_tools, &model_name,
+                    ).await {
+                        Ok(Some(wh)) => wh,
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!(session_id, error = %e, "prompt assembly failed");
+                            event_sink.emit(Event::LogLine {
+                                level: "ERROR".into(),
+                                message: format!("prompt assembly failed: {e}"),
+                            });
+                            finish = "error";
+                            break;
+                        }
+                    };
+                    // Re-price the rebuilt history — the pre-compaction
+                    // estimate no longer describes what is about to be sent.
+                    anchored = meters
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .and_then(|m| m.estimate(wh.envelope, &wh.entries));
                 }
 
                 // The trimmer's "context notice" marker is wire-only: it is
                 // inserted here and never enters the log.
-                let trimmed = agents::context::trim_to_budget(history, budget);
+                let trimmed = agents::context::trim_to_budget(wh.messages, budget);
                 if trimmed.dropped > 0 {
                     event_sink.emit(Event::LogLine {
                         level: "WARN".into(),
@@ -458,6 +530,12 @@ impl ChatHub {
                         ),
                     });
                 }
+
+                // Seq of the newest surface entry actually sent — the meter
+                // anchor records it. When the trimmer amputated anything the
+                // envelope no longer matches what the anchor priced, so the
+                // anchor is dropped instead.
+                let anchor_seq = wh.entries.last().map(|e| e.seq);
 
                 let turn_id = next_turn.fetch_add(1, Ordering::Relaxed);
                 let out = agents::turn::run_turn(
@@ -475,6 +553,8 @@ impl ChatHub {
                         limit: window,
                         budget,
                         cancel: Some(cancel.clone()),
+                        estimate: anchored,
+                        breakdown: Some(wh.breakdown),
                     },
                 )
                 .await;
@@ -537,6 +617,27 @@ impl ChatHub {
                     break;
                 }
                 retries = 0;
+
+                // Anchor the usage meter on the provider's own count for
+                // this exact envelope — the next request prices only what
+                // was added since. Skipped when the trimmer amputated
+                // anything (the request no longer matches the envelope the
+                // anchor would price).
+                if trimmed.dropped == 0 {
+                    if let (Some(seq), Some(u)) = (anchor_seq, out.usage.as_ref()) {
+                        if u.prompt_tokens > 0 {
+                            meters
+                                .lock()
+                                .await
+                                .entry(session_id)
+                                .or_default()
+                                .record(wh.envelope, seq, u.prompt_tokens);
+                        }
+                    }
+                } else {
+                    meters.lock().await.remove(&session_id);
+                }
+
                 last_assistant = out.content.clone();
 
                 // Persist the assistant message (it includes the tool_call
@@ -650,6 +751,9 @@ impl ChatHub {
                             trusted,
                         )
                         .await;
+                        if outcome.ok && is_fs_skill(&call.name) {
+                            reconcile_instructions_after_fs(&sessions_map, &event_sink, session_id).await;
+                        }
                         let args = serde_json::from_str(&call.arguments)
                             .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
                         observe_repeat(&repeats, &sessions_map, &event_sink, session_id, &call.name, &args)
@@ -761,6 +865,9 @@ impl ChatHub {
                     trusted,
                 )
                 .await;
+                if outcome.ok && is_fs_skill(&call.skill) {
+                    reconcile_instructions_after_fs(&sessions_map, &event_sink, session_id).await;
+                }
                 observe_repeat(&repeats, &sessions_map, &event_sink, session_id, &call.skill, &observed_args)
                     .await;
             }
@@ -849,6 +956,152 @@ async fn append_event(sessions: &Sessions, session_id: u64, kind: EventKind) -> 
     Some(seq)
 }
 
+/// Snapshot the volatile runtime facts (time, cwd, os, model) as a
+/// user-role message. The new snapshot shadows its predecessor at the
+/// position the first one took, so one copy is ever model-visible and the
+/// system-prompt prefix is never touched. Called once per turn — dsh's
+/// refresh throttle. When the predecessor was itself shadowed by a
+/// compaction, the new snapshot appends fresh instead of replacing a span
+/// that is no longer on the surface.
+fn append_runtime_context(log: &mut SessionLog, model: &str) {
+    // Elapsed since the newest surface event, so the model can tell how
+    // stale its own last message is.
+    let entries = log.derive_surface();
+    let last_ts = entries.last().and_then(|e| {
+        log.events
+            .iter()
+            .find(|ev| ev.seq == e.seq)
+            .map(|ev| ev.ts)
+    });
+    let mut vars = agents::prompt::standard_vars(model);
+    if let Some(ts) = last_ts {
+        let secs = (chrono::Utc::now().timestamp_millis() - ts).max(0) / 1000;
+        vars.insert("elapsed".into(), human_elapsed(secs));
+    }
+    let content = agents::prompt::runtime_context_text(&vars);
+    let prev = entries
+        .iter()
+        .rev()
+        .find(|e| matches!(e.context, Some(ContextSource::RuntimeContext)))
+        .map(|e| e.seq);
+    let surface = match prev {
+        Some(seq) => SurfaceOp::Replace { start_seq: seq, end_seq: seq },
+        None      => SurfaceOp::Append,
+    };
+    log.append(EventKind::ContextInjected {
+        surface,
+        source: ContextSource::RuntimeContext,
+        content,
+    });
+}
+
+fn human_elapsed(secs: i64) -> String {
+    if secs < 60 {
+        "less than a minute".into()
+    } else if secs < 3600 {
+        format!("{} minute(s)", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} hour(s)", secs / 3600)
+    } else {
+        format!("{} day(s)", secs / 86_400)
+    }
+}
+
+/// Reconcile the workspace-instruction snapshot with disk (`agents::
+/// instructions`): reload the AGENTS.md/CLAUDE.md chain and, when it differs
+/// from what the session last saw, append a replacement that shadows the
+/// previous snapshot. Returns `true` when a new snapshot landed. No file
+/// watcher — this runs at turn start and after successful filesystem tool
+/// calls, which is when edits matter.
+fn refresh_instructions(log: &mut SessionLog) -> bool {
+    let root = sica_core::paths::workspace_root();
+    let baseline = agents::instructions::load(&root, &root, agents::instructions::MAX_BYTES);
+
+    // Look at the surface, not the raw log: a predecessor shadowed by a
+    // compaction is gone from the model's view and must not be "replaced"
+    // (the replacement would land at a dead position).
+    let entries = log.derive_surface();
+    let prev = entries
+        .iter()
+        .rev()
+        .find(|e| matches!(e.context, Some(ContextSource::Instructions)))
+        .map(|e| e.seq);
+    let prev_content = prev.and_then(|seq| {
+        log.events.iter().find_map(|ev| match &ev.kind {
+            EventKind::ContextInjected {
+                source: ContextSource::Instructions, content, ..
+            } if ev.seq == seq => Some(content.clone()),
+            _ => None,
+        })
+    });
+
+    let content = if baseline.is_empty() {
+        // Only supersede when there is a previous snapshot to supersede.
+        if prev.is_none() {
+            return false;
+        }
+        "<system-reminder>\nWorkspace instruction files previously loaded \
+         are no longer present.\n</system-reminder>"
+            .to_string()
+    } else {
+        agents::instructions::render(&baseline)
+    };
+
+    if prev_content.as_deref() == Some(content.as_str()) {
+        return false;
+    }
+    let surface = match prev {
+        Some(seq) => SurfaceOp::Replace { start_seq: seq, end_seq: seq },
+        None      => SurfaceOp::Append,
+    };
+    log.append(EventKind::ContextInjected {
+        surface,
+        source: ContextSource::Instructions,
+        content,
+    });
+    true
+}
+
+/// After a successful filesystem-touching skill (`read-file`, `write-file`,
+/// `edit-file`), give instruction-file edits a chance to reach the model:
+/// reload the chain and replace the snapshot when it changed. This is the
+/// reconciliation step — no file watcher, changes surface on the next
+/// successful filesystem touch.
+async fn reconcile_instructions_after_fs(
+    sessions: &Sessions,
+    events: &Arc<dyn EventSink>,
+    session_id: u64,
+) {
+    let changed = {
+        let mut g = sessions.lock().await;
+        let Some(log) = g.get_mut(&session_id) else { return };
+        if !refresh_instructions(log) {
+            return;
+        }
+        if let Err(e) = sessions_store::flush(log) {
+            warn!(error = %e, session_id, "flush session (after instructions refresh) failed");
+        }
+        true
+    };
+    if changed {
+        events.emit(Event::LogLine {
+            level: "INFO".into(),
+            message: "workspace instructions changed on disk — snapshot updated".into(),
+        });
+    }
+}
+
+/// Whether a skill touches the filesystem in a way that could change the
+/// workspace-instruction files.
+fn is_fs_skill(name: &str) -> bool {
+    matches!(
+        name,
+        agents::builtins::READ_FILE_NAME
+            | agents::builtins::WRITE_FILE_NAME
+            | agents::builtins::EDIT_FILE_NAME
+    )
+}
+
 /// Feed one dispatched call to the session's repeat-tool chain and, at a
 /// threshold, inject the advisory notice as context for the next step.
 /// Runs for failed and unknown-skill calls too — a model hammering a
@@ -906,6 +1159,10 @@ async fn compact_session(
     client: &LlmClient,
     events: &Arc<dyn EventSink>,
     budget: u32,
+    policy: &protocol::CompactPolicy,
+    wh: &WireHistory,
+    native_tools: bool,
+    cancel: &CancellationToken,
 ) -> bool {
     let (entries, last_seq) = {
         let g = sessions.lock().await;
@@ -913,8 +1170,11 @@ async fn compact_session(
         (log.derive_surface(), log.last_seq())
     };
     let snapshot: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
+    // Everything in the request that is not surface history — the meter's
+    // envelope — added back when judging whether pruning alone sufficed.
+    let overhead = wh.breakdown.system.saturating_add(wh.breakdown.tools);
 
-    let split = agents::compact::split_index(&snapshot, budget);
+    let split = agents::compact::split_index(&snapshot, budget, policy.retain_pct);
     let pruned = prune_tool_results(sessions, session_id, &entries, split, last_seq).await;
     if pruned > 0 {
         events.emit(Event::LogLine {
@@ -928,8 +1188,17 @@ async fn compact_session(
         let entries = log.derive_surface();
         let snapshot: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
         // Enough on its own? Then the summariser round-trip is not needed.
-        let tokens = agents::compact::approx_total(&snapshot);
-        if u64::from(tokens) * 100 < u64::from(budget) * u64::from(protocol::COMPACT_TRIGGER_PCT) {
+        let tokens = agents::compact::approx_total(&snapshot).saturating_add(overhead);
+        if u64::from(tokens) * 100 < u64::from(budget) * u64::from(policy.threshold_pct) {
+            events.emit(Event::ContextCompacted {
+                session_id,
+                ok: true,
+                folded: 0,
+                before_tokens: 0,
+                after_tokens: tokens,
+                summary: String::new(),
+                pruned: pruned as u32,
+            });
             return true;
         }
         (entries, log.last_seq(), snapshot)
@@ -940,7 +1209,7 @@ async fn compact_session(
     // Cheap pre-check: if there is nothing foldable, don't announce a
     // compaction that isn't going to happen (a single enormous message, say —
     // that's the trimmer's problem, not ours).
-    let Some(split) = agents::compact::split_index(&snapshot, budget) else {
+    let Some(split) = agents::compact::split_index(&snapshot, budget, policy.retain_pct) else {
         debug!(session_id, "context over threshold but nothing foldable");
         return pruned > 0;
     };
@@ -952,7 +1221,7 @@ async fn compact_session(
         message: format!(
             "context: prompt reached {}% of the {budget}-token budget — \
              compressing {before_tokens} tokens of history",
-            protocol::COMPACT_TRIGGER_PCT,
+            policy.threshold_pct,
         ),
     });
 
@@ -964,14 +1233,33 @@ async fn compact_session(
             before_tokens,
             after_tokens: before_tokens,
             summary: String::new(),
+            pruned: pruned as u32,
         });
     };
 
-    let Some(summary) = agents::compact::summarize_fold(client, &snapshot[..split]).await else {
+    // Prefix-preserving summarisation: the conversation's own system prompt
+    // (same bytes as the real request) + the folded messages verbatim + the
+    // directive as the final user message, so the provider's cache of the
+    // last real request is reused.
+    let system_wire: Vec<ChatMessage> = if wh.system_body.is_empty() {
+        Vec::new()
+    } else {
+        vec![ChatMessage::text("system", wh.system_body.clone())]
+    };
+    let folded_wire = wire_messages(&snapshot[..split], native_tools);
+    let summary = agents::compact::summarize_fold(
+        client,
+        policy,
+        &system_wire,
+        folded_wire,
+        Some(cancel.clone()),
+    )
+    .await;
+    let Some(summary) = summary else {
         warn!(session_id, "context compaction produced no summary");
         events.emit(Event::LogLine {
             level: "WARN".into(),
-            message: "context: compression failed (summarizer returned nothing) \
+            message: "context: compression failed (summarizer returned nothing usable) \
                       — falling back to trimming the oldest messages"
                 .into(),
         });
@@ -1026,6 +1314,7 @@ async fn compact_session(
         before_tokens,
         after_tokens,
         summary,
+        pruned: pruned as u32,
     });
     true
 }
@@ -1080,68 +1369,91 @@ async fn prune_tool_results(
 }
 
 /// Derive `session_id`'s history from its log and assemble the wire form.
+/// Returns `None` when the session vanished; `Err` when the prompt failed to
+/// assemble (a bad `{{variable}}` reference in `memory.md`), which the
+/// caller must surface loudly instead of sending a malformed prompt.
 async fn build_history(
     sessions: &Sessions,
     session_id: u64,
     skills: &SkillRegistry,
     native_tools: bool,
-) -> Vec<ChatMessage> {
-    let messages = {
+    model: &str,
+) -> Result<Option<WireHistory>, agents::prompt::PromptError> {
+    let entries = {
         let g = sessions.lock().await;
-        let Some(log) = g.get(&session_id) else { return Vec::new() };
-        log.derive_messages()
+        let Some(log) = g.get(&session_id) else { return Ok(None) };
+        log.derive_surface()
     };
-    build_wire_history(&messages, skills, native_tools)
+    let messages: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
+    let mut wh = build_wire_history(&messages, skills, native_tools, model)?;
+    wh.entries = entries;
+    Ok(Some(wh))
 }
 
-/// Assemble the LLM wire history: prepend `memory.md` (if present) plus a
-/// live `## Loaded skills` listing built from the registry as a single
-/// system message, then every derived message. The dynamic list matters
-/// because `memory.md` only enumerates the built-ins — without this step,
-/// user-authored skills are callable but invisible to the model.
-/// Tool-role messages are surfaced to the local server as `user` content so
-/// even llama.cpp builds without OpenAI tool-call awareness can read the
-/// result.
+/// Everything one hop needs from the assembled prompt: the wire messages,
+/// the derived surface they came from (seqs for the meter anchor), and the
+/// envelope facts the usage-anchored meter keys on.
+pub struct WireHistory {
+    pub messages:    Vec<ChatMessage>,
+    pub entries:     Vec<SurfaceEntry>,
+    /// The composed system-prompt body (empty when nothing was composed).
+    pub system_body: String,
+    /// Fingerprint of system body + tools array — the meter's anchor key.
+    pub envelope:    u64,
+    /// Approximate per-part token counts for the status bar.
+    pub breakdown:   protocol::TokenBreakdown,
+}
+
+/// Assemble the LLM wire history: compose the system prompt through
+/// `agents::prompt` (ordered sections, strict interpolation), then map
+/// every derived message to its wire form. Tool-role messages are surfaced
+/// to the local server as `user` content so even llama.cpp builds without
+/// OpenAI tool-call awareness can read the result.
 fn build_wire_history(
     messages: &[Message],
     skills: &SkillRegistry,
     native_tools: bool,
-) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len() + 1);
+    model: &str,
+) -> Result<WireHistory, agents::prompt::PromptError> {
     let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
-    let catalogue = skills.catalogue_markdown();
-    // In native mode the tool contract travels in the request's `tools`
-    // array, so the text-protocol invocation brief would only confuse the
-    // model; send just the skill catalogue as orientation.
-    let system_body = if native_tools {
-        if catalogue.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "You are running inside the sica-rust desktop app. Use the \
-                 provided tools (OpenAI function calling) to run commands and \
-                 read/write files when the task needs it. Base every claim \
-                 about the host system on an actual tool result.\n\n\
-                 ## Available skills\n\n{catalogue}"
-            )
-        }
-    } else {
-        let mut content = mem;
-        if !catalogue.is_empty() {
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str("## Loaded skills\n\n");
-            content.push_str(&catalogue);
-        }
-        content
-    };
-    if !system_body.is_empty() {
-        out.push(ChatMessage::text("system", system_body));
+    let vars = agents::prompt::standard_vars(model);
+    let rendered = agents::prompt::for_main_agent(&mem, skills, native_tools, &vars)?;
+    let tools_json = native_tools.then(|| skills.tools_json());
+
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len() + 1);
+    if !rendered.system.is_empty() {
+        out.push(ChatMessage::text("system", rendered.system.clone()));
     }
+    out.extend(wire_messages(messages, native_tools));
+
+    let breakdown = protocol::TokenBreakdown {
+        system:  llm::tokenize::approx_tokens(&rendered.system),
+        tools:   tools_json
+            .as_ref()
+            .map(|t| llm::tokenize::approx_tokens(&t.to_string()))
+            .unwrap_or(0),
+        history: messages
+            .iter()
+            .map(|m| llm::tokenize::approx_tokens(&m.content) + 4)
+            .sum(),
+    };
+
+    let envelope = agents::meter::envelope_hash(&rendered.system, tools_json.as_ref());
+    Ok(WireHistory {
+        messages: out,
+        entries: Vec::new(), // filled by build_history
+        system_body: rendered.system,
+        envelope,
+        breakdown,
+    })
+}
+
+/// Wire form of derived messages (no system prompt): role mapping for the
+/// text protocol, native `tool_calls` replay in native mode. Shared by the
+/// live request builder and the prefix-preserving compaction call so the
+/// two always agree on what the server sees.
+fn wire_messages(messages: &[Message], native_tools: bool) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         // Text-protocol servers may lack a `tool` role in their template, so
         // tool results are surfaced as `user` there. Native mode keeps the
@@ -1346,7 +1658,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
             },
         ];
-        let wire = build_wire_history(&msgs, &registry(), false);
+        let wire = build_wire_history(&msgs, &registry(), false, "test").unwrap().messages;
         // memory.md may or may not exist on this machine; look at the tail.
         let n = wire.len();
         assert_eq!(wire[n - 2].role, "user");
@@ -1375,7 +1687,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
             },
         ];
-        let wire = build_wire_history(&msgs, &registry(), true);
+        let wire = build_wire_history(&msgs, &registry(), true, "test").unwrap().messages;
         let n = wire.len();
         assert_eq!(wire[n - 2].role, "assistant");
         assert!(wire[n - 2].tool_calls.is_some());
@@ -1389,7 +1701,7 @@ mod tests {
             "look",
             vec![UserImage { mime: "image/png".into(), data_base64: "AAAA".into() }],
         )];
-        let wire = build_wire_history(&msgs, &registry(), false);
+        let wire = build_wire_history(&msgs, &registry(), false, "test").unwrap().messages;
         let last = wire.last().unwrap();
         match &last.content {
             ChatContent::Parts(parts) => {
@@ -1398,6 +1710,75 @@ mod tests {
             }
             other => panic!("expected parts, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wire_history_native_keeps_memory_and_drops_catalogue() {
+        let wire_text = build_wire_history(&[Message::user("hi")], &registry(), false, "test").unwrap();
+        let wire_native = build_wire_history(&[Message::user("hi")], &registry(), true, "test").unwrap();
+        let sys_native = &wire_native.system_body;
+        assert!(sys_native.contains(agents::prompt::NATIVE_IDENTITY), "{sys_native}");
+        assert!(!sys_native.contains("## Loaded skills"), "tools array carries the catalogue");
+        assert!(!wire_text.system_body.contains(agents::prompt::NATIVE_IDENTITY));
+        // The runtime snapshot never leaks into the system body.
+        assert!(!sys_native.contains(agents::prompt::RUNTIME_CONTEXT_HEADER));
+    }
+
+    #[test]
+    fn wire_history_breakdown_covers_all_three_parts() {
+        let wh = build_wire_history(&[Message::user("hi")], &registry(), false, "test").unwrap();
+        assert!(wh.breakdown.history >= 5, "user message priced");
+        assert_eq!(wh.breakdown.tools, 0, "text protocol sends no tools array");
+        assert!(wh.envelope != 0);
+    }
+
+    #[test]
+    fn runtime_snapshot_shadows_its_predecessor() {
+        let mut log = SessionLog::new(1, "t");
+        append_runtime_context(&mut log, "test-model");
+        log.append(EventKind::UserMessage {
+            surface: SurfaceOp::Append,
+            content: "hi".into(),
+            images: Vec::new(),
+        });
+        append_runtime_context(&mut log, "test-model");
+        let entries = log.derive_surface();
+        let snaps: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.context, Some(ContextSource::RuntimeContext)))
+            .collect();
+        assert_eq!(snaps.len(), 1, "one snapshot is ever model-visible");
+        assert!(snaps[0].message.content.contains("Model: test-model"));
+        assert!(snaps[0].message.content.starts_with(agents::prompt::RUNTIME_CONTEXT_HEADER));
+        // It landed where the first one stood — before the user message.
+        assert_eq!(entries.last().unwrap().message.content, "hi");
+    }
+
+    #[test]
+    fn runtime_snapshot_after_compaction_appends_fresh() {
+        let mut log = SessionLog::new(1, "t");
+        append_runtime_context(&mut log, "m"); // seq 2
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u1".into(), images: Vec::new() });
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a1".into(), reasoning: None, tool_calls: None });
+        // Compaction shadows the snapshot along with the early messages.
+        let entries = log.derive_surface();
+        log.append(EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace { start_seq: entries[0].seq, end_seq: entries.last().unwrap().seq },
+            content: agents::compact::summary_message("S"),
+            summary: "S".into(),
+            folded: 3,
+            before_tokens: 0,
+            after_tokens: 0,
+        });
+        append_runtime_context(&mut log, "m");
+        let after = log.derive_surface();
+        let snaps: Vec<_> = after
+            .iter()
+            .filter(|e| matches!(e.context, Some(ContextSource::RuntimeContext)))
+            .collect();
+        assert_eq!(snaps.len(), 1);
+        // Appended fresh (newest entry), not resurrected at the dead span.
+        assert_eq!(after.last().unwrap().seq, snaps[0].seq);
     }
 
     /// The Replace fold must produce exactly what the old in-place splice

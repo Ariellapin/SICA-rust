@@ -94,7 +94,9 @@ impl SkillRegistry {
     /// Render the registry as an OpenAI-native `tools` array for servers with
     /// tool-call support (vLLM `--enable-auto-tool-choice`, etc.). Every
     /// declared positional arg becomes a required string parameter — the
-    /// same contract `resolve` applies to the text protocol.
+    /// same contract `resolve` applies to the text protocol. Optional args
+    /// (`Skill::optional_args`) appear as non-required properties: named
+    /// calls can pass them, but a native call is valid without them.
     pub fn tools_json(&self) -> serde_json::Value {
         let mut names: Vec<&str> = self.by_name.keys().map(String::as_str).collect();
         names.sort_unstable();
@@ -104,7 +106,7 @@ impl SkillRegistry {
                 let skill = self.by_name.get(*name)?;
                 let mut props = Map::new();
                 let args = skill.positional_args();
-                for a in &args {
+                for a in args.iter().chain(&skill.optional_args()) {
                     props.insert(
                         a.clone(),
                         serde_json::json!({ "type": "string" }),
@@ -236,6 +238,27 @@ mod tests {
         assert_eq!(f["parameters"]["properties"]["url"]["type"], "string");
         assert_eq!(f["parameters"]["required"][0], "url");
         assert_eq!(tools[0]["type"], "function");
+    }
+
+    struct WithOptional;
+    #[async_trait]
+    impl Skill for WithOptional {
+        fn name(&self) -> &str { "read-file" }
+        fn positional_args(&self) -> Vec<String> { vec!["path".into()] }
+        fn optional_args(&self) -> Vec<String> { vec!["start".into(), "end".into()] }
+        async fn run(&self, _a: Value, _c: SkillContext) -> SkillOutcome {
+            SkillOutcome { ok: true, summary: String::new() }
+        }
+    }
+
+    #[test]
+    fn tools_json_lists_optional_args_without_requiring_them() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(WithOptional));
+        let f = &reg.tools_json()[0]["function"];
+        assert_eq!(f["parameters"]["properties"]["start"]["type"], "string");
+        assert_eq!(f["parameters"]["properties"]["end"]["type"], "string");
+        assert_eq!(f["parameters"]["required"], serde_json::json!(["path"]));
     }
 
     #[test]

@@ -945,17 +945,26 @@ impl App {
                 );
             }
             UiEvent::ContextCompacted {
-                session_id, ok, folded, before_tokens, after_tokens, summary,
+                session_id, ok, folded, before_tokens, after_tokens, summary, pruned,
             } => {
                 if session_id == self.chat.session_id {
                     self.chat.compacting = false;
                 }
-                let label = if ok {
-                    let saved = before_tokens.saturating_sub(after_tokens);
+                let label = if ok && folded == 0 && pruned > 0 {
                     format!(
+                        "Context pruned · {pruned} oversized older tool result(s) \
+                         trimmed to head/tail windows · no summary needed"
+                    )
+                } else if ok {
+                    let saved = before_tokens.saturating_sub(after_tokens);
+                    let mut l = format!(
                         "Context compressed · {folded} messages → summary · \
                          {before_tokens} → {after_tokens} tokens (−{saved})"
-                    )
+                    );
+                    if pruned > 0 {
+                        l.push_str(&format!(" · {pruned} result(s) pruned"));
+                    }
+                    l
                 } else {
                     "Context compression failed · oldest messages will be trimmed instead"
                         .to_string()

@@ -50,6 +50,15 @@ pub trait Skill: Send + Sync {
         Vec::new()
     }
 
+    /// Ordered names of *optional* named arguments. They appear in the
+    /// native `tools` schema as non-required properties and are honoured in
+    /// JSON-fenced / native calls, but the natural-language positional form
+    /// can never reach them — that stays `positional_args()` territory.
+    /// Default `vec![]`.
+    fn optional_args(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Wall-clock budget `ToolSubAgent` enforces around `run`. When it
     /// elapses the skill future is dropped (a child process survives only
     /// if the skill spawned it without `kill_on_drop`) and the call is
@@ -69,6 +78,14 @@ pub trait Skill: Send + Sync {
     /// instruction (a markdown skill) should return `true`.
     fn trusted(&self) -> bool {
         false
+    }
+
+    /// One-sentence usage guidance composed into the system prompt (the
+    /// `SKILL_GUIDANCE` slot), never into a persona. Tool usage rules live
+    /// with the tool — a new skill brings its own sentence instead of
+    /// editing a central blob. `None` (the default) contributes nothing.
+    fn prompt_guidance(&self) -> Option<&'static str> {
+        None
     }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome;

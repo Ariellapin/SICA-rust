@@ -6,12 +6,15 @@ pub mod builtins;
 pub mod compact;
 pub mod context;
 pub mod guard;
+pub mod instructions;
 pub mod invoke;
 pub mod md_skill;
 pub mod memory;
+pub mod meter;
 pub mod model_eval;
 pub mod parse_tool_call;
 pub mod proc;
+pub mod prompt;
 pub mod registry;
 pub mod skill;
 pub mod skill_creator;
@@ -21,7 +24,7 @@ pub mod team;
 pub mod turn;
 
 pub use agent::{EventSink, MainAgent};
-pub use builtins::{ReadFile, RunCli, RunPwsh, WriteFile};
+pub use builtins::{EditFile, Glob, Grep, ReadFile, RunCli, RunPwsh, WriteFile};
 pub use md_skill::{LoadReport, MarkdownSkill};
 pub use model_eval::ModelEval;
 pub use parse_tool_call::{

@@ -38,6 +38,17 @@ pub struct ProviderConfig {
     /// which llama.cpp/vLLM template away (faster, terser answers).
     #[serde(default = "default_thinking")]
     pub thinking: bool,
+    /// Compact when the prompt reaches this percent of the budget.
+    /// 0 = default (80).
+    #[serde(default)]
+    pub compact_threshold_pct: u32,
+    /// Share of the budget (percent) kept verbatim as the tail when
+    /// compacting. 0 = default (16).
+    #[serde(default)]
+    pub compact_retain_pct: u32,
+    /// Completion cap for the compaction summary. 0 = default (8192).
+    #[serde(default)]
+    pub compact_max_tokens: u32,
 }
 
 fn default_temperature() -> f32 {
@@ -52,12 +63,31 @@ impl ProviderConfig {
     /// Wire-format options for `ConnectLlm`, mapping the 0-means-auto UI
     /// convention onto `Option`s.
     pub fn llm_options(&self) -> protocol::LlmOptions {
+        let d = protocol::CompactPolicy::default();
         protocol::LlmOptions {
             temperature: self.temperature,
             max_tokens: (self.max_tokens > 0).then_some(self.max_tokens),
             context_window: (self.context_window > 0).then_some(self.context_window),
             native_tools: self.native_tools,
             thinking: self.thinking,
+            compact: protocol::CompactPolicy {
+                threshold_pct: if self.compact_threshold_pct > 0 {
+                    self.compact_threshold_pct.min(99)
+                } else {
+                    d.threshold_pct
+                },
+                retain_pct: if self.compact_retain_pct > 0 {
+                    self.compact_retain_pct.min(90)
+                } else {
+                    d.retain_pct
+                },
+                max_tokens: if self.compact_max_tokens > 0 {
+                    self.compact_max_tokens
+                } else {
+                    d.max_tokens
+                },
+                retries: d.retries,
+            },
         }
     }
 }
@@ -136,6 +166,9 @@ fn defaults() -> Vec<ProviderConfig> {
         context_window: 0,
         native_tools: false,
         thinking: true,
+        compact_threshold_pct: 0,
+        compact_retain_pct: 0,
+        compact_max_tokens: 0,
     };
     vec![
         ProviderConfig {

@@ -6,13 +6,36 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
-/// Prompt-budget occupancy (percent) at which the backend folds older history
-/// into an LLM-written summary instead of letting the trimmer amputate it.
-/// Shared so the frontend can tint the status-bar meter at exactly the point
-/// the backend acts.
-pub const COMPACT_TRIGGER_PCT: u32 = 95;
+/// Default prompt-budget occupancy (percent) at which the backend folds older
+/// history into an LLM-written summary instead of letting the trimmer amputate
+/// it. The actual trigger is per-connection [`CompactPolicy::threshold_pct`];
+/// this constant is the default and what the frontend's status-bar meter tints
+/// against when it has not been told otherwise.
+pub const COMPACT_TRIGGER_PCT: u32 = 80;
+
+/// Compaction policy knobs sent with `ConnectLlm`. Mirrors dsh's per-routed-
+/// model compaction config: trigger early enough to leave room for the reply,
+/// keep a verbatim tail, cap the summary, and retry once on a bad summary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactPolicy {
+    /// Fold when the prompt reaches this percent of the budget.
+    pub threshold_pct: u32,
+    /// Share of the budget (percent) kept verbatim as the tail.
+    pub retain_pct: u32,
+    /// Completion cap for the summarisation call.
+    pub max_tokens: u32,
+    /// Extra attempts when the summariser returns nothing usable or is cut
+    /// off by `max_tokens` (a truncated summary is discarded, never kept).
+    pub retries: u32,
+}
+
+impl Default for CompactPolicy {
+    fn default() -> Self {
+        Self { threshold_pct: COMPACT_TRIGGER_PCT, retain_pct: 16, max_tokens: 8192, retries: 1 }
+    }
+}
 
 /// Prefix the backend stamps on the system message that replaces compacted
 /// history. Shared so the frontend can recognise it when rebuilding a
@@ -41,6 +64,10 @@ pub struct LlmOptions {
     /// that template the toggle (llama.cpp, vLLM/Qwen) skip reasoning
     /// entirely — faster replies at some quality cost.
     pub thinking: bool,
+    /// How and when history is folded into an LLM-written summary. Defaults
+    /// to dsh's 80/16 policy; the frontend can override per provider.
+    #[serde(default)]
+    pub compact: CompactPolicy,
 }
 
 impl Default for LlmOptions {
@@ -51,6 +78,7 @@ impl Default for LlmOptions {
             context_window: None,
             native_tools: false,
             thinking: true,
+            compact: CompactPolicy::default(),
         }
     }
 }
@@ -191,6 +219,12 @@ pub struct MessageDump {
     pub tool_args_preview: Option<String>,
     #[serde(default)]
     pub tool_expectation: Option<String>,
+    /// On `context`-role messages: why the harness injected them — the
+    /// `ContextSource` label (`/name`, `instructions`, `runtime context`,
+    /// `tool notice`…). Lets the FE present each kind without re-parsing
+    /// prose.
+    #[serde(default)]
+    pub context_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +233,19 @@ pub enum LlmState {
     Connecting,
     Ready { model: String, context_window: u32 },
     Error { message: String },
+}
+
+/// What the prompt is made of, per [`Event::TokenUsage`]. All counts are
+/// approximate (heuristic or usage-anchored, never both mixed within one
+/// field).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenBreakdown {
+    /// The system prompt (composed sections).
+    pub system: u32,
+    /// The native `tools` array (0 in text-protocol mode).
+    pub tools: u32,
+    /// The derived conversation history.
+    pub history: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,7 +294,15 @@ pub enum Event {
     // window, and `budget` is the slice of that window available to the prompt
     // (window minus the reply reserve) — the denominator auto-compaction
     // measures against, and the one the status-bar percentage uses.
-    TokenUsage { session_id: u64, used: u32, limit: u32, budget: u32 },
+    // `breakdown` says what the prompt is made of (system / tools / history)
+    // when the backend could compute it.
+    TokenUsage {
+        session_id: u64,
+        used: u32,
+        limit: u32,
+        budget: u32,
+        breakdown: Option<TokenBreakdown>,
+    },
 
     /// Auto-compaction started: the assembled prompt crossed
     /// [`COMPACT_TRIGGER_PCT`] of the prompt budget and the older half of the
@@ -267,6 +322,10 @@ pub enum Event {
         after_tokens:  u32,
         /// The summary the compactor wrote; empty when `ok == false`.
         summary:       String,
+        /// Oversized older tool results replaced by head/tail windows during
+        /// this pass (the pruner). `folded == 0` with `pruned > 0` means the
+        /// pruner alone cleared the pressure and no summary was written.
+        pruned:        u32,
     },
 
     // Tool-call / sub-agent UI events. Nested calls inherit parent_id.
@@ -360,10 +419,25 @@ mod tests {
             used: 1234,
             limit: 24000,
             budget: 19392,
+            breakdown: Some(TokenBreakdown { system: 100, tools: 50, history: 1084 }),
         });
         let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();
         matches!(back.payload, Payload::Event(Event::TokenUsage { .. }));
+    }
+
+    #[test]
+    fn compact_policy_defaults_match_dsh() {
+        let p = CompactPolicy::default();
+        assert_eq!(p.threshold_pct, 80);
+        assert_eq!(p.retain_pct, 16);
+        assert_eq!(p.max_tokens, 8192);
+        assert_eq!(p.retries, 1);
+        // Old provider TOMLs / FE builds without the field must still work.
+        let opts: LlmOptions = serde_json::from_str(
+            r#"{"temperature":0.2,"max_tokens":null,"context_window":null,"native_tools":false,"thinking":true}"#,
+        ).unwrap();
+        assert_eq!(opts.compact, CompactPolicy::default());
     }
 
     #[test]

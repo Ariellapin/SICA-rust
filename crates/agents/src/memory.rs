@@ -19,8 +19,11 @@ positional arguments it accepts.
 
 - **run-cli** — execute a shell command on the host. See [skills/run-cli.md](skills/run-cli.md).
 - **run-pwsh** — execute a PowerShell command (preferred on Windows). See [skills/run-pwsh.md](skills/run-pwsh.md).
-- **read-file** — read a UTF-8 file from disk. See [skills/read-file.md](skills/read-file.md).
+- **read-file** — read a UTF-8 file from disk (line-numbered, optional line range). See [skills/read-file.md](skills/read-file.md).
 - **write-file** — write UTF-8 content to a file. See [skills/write-file.md](skills/write-file.md).
+- **edit-file** — replace an exact block of text in an existing file. See [skills/edit-file.md](skills/edit-file.md).
+- **glob** — list files matching a glob pattern. See [skills/glob.md](skills/glob.md).
+- **grep** — regex search across file contents. See [skills/grep.md](skills/grep.md).
 - **skill-creator** — author a new markdown skill at runtime. See [skills/skill-creator.md](skills/skill-creator.md).
 
 User-authored skills (any other `*.md` files in `skills/`) are loaded at
@@ -68,6 +71,9 @@ accepted, but the single-line form above is preferred.
 - If you receive a notice that you have repeated the same call several
   times, do not issue it again: change the arguments, pick another tool,
   or tell the user what is blocking you.
+- Prefer `edit-file` for changes to existing files and reserve `write-file`
+  for new files or full rewrites; before editing, `read-file` the target so
+  your `old` text matches exactly.
 - When your answer is complete, reply in plain prose with **no** tool-call
   line — that ends the loop.
 "#;

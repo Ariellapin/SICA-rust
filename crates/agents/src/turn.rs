@@ -33,6 +33,14 @@ pub struct TurnInput {
     /// Cancelled by `InterruptTurn`. When fired, the stream is dropped and
     /// the partial response is returned with `finish_reason = "interrupted"`.
     pub cancel:     Option<CancellationToken>,
+    /// Usage-anchored meter estimate for the prompt (see `agents::meter`).
+    /// When present it replaces the `/tokenize` round-trip as the initial
+    /// reading: it is anchored on the provider's own count for this exact
+    /// envelope, which the tokenizer on concatenated text cannot match.
+    pub estimate:   Option<u32>,
+    /// What the prompt is made of (system / tools / history), forwarded on
+    /// every live `TokenUsage` event.
+    pub breakdown:  Option<protocol::TokenBreakdown>,
 }
 
 /// One fully-accumulated native tool call from the response stream.
@@ -74,22 +82,30 @@ pub async fn run_turn(
     events: Arc<dyn EventSink>,
     input: TurnInput,
 ) -> TurnOutput {
-    let TurnInput { session_id, turn_id, messages, tools, limit, budget, cancel } = input;
+    let TurnInput {
+        session_id, turn_id, messages, tools, limit, budget, cancel, estimate, breakdown,
+    } = input;
 
     events.emit(Event::TurnStarted { session_id, turn_id });
 
-    // Initial token count: try exact, fall back to heuristic. Image parts are
-    // skipped — their cost is server-side and opaque to us.
-    let prompt_concat = messages
-        .iter()
-        .map(|m| m.content.text())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let initial = match tokenize_exact(&client.base_url, &prompt_concat).await {
-        Ok(n) => n,
-        Err(_) => approx_tokens(&prompt_concat),
+    // Initial token count: the usage-anchored meter estimate wins when the
+    // caller has one; otherwise try exact, fall back to heuristic. Image
+    // parts are skipped — their cost is server-side and opaque to us.
+    let initial = match estimate {
+        Some(n) => n,
+        None => {
+            let prompt_concat = messages
+                .iter()
+                .map(|m| m.content.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            match tokenize_exact(&client.base_url, &prompt_concat).await {
+                Ok(n) => n,
+                Err(_) => approx_tokens(&prompt_concat),
+            }
+        }
     };
-    events.emit(Event::TokenUsage { session_id, used: initial, limit, budget });
+    events.emit(Event::TokenUsage { session_id, used: initial, limit, budget, breakdown });
 
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
     let client_clone = client.clone();
@@ -159,7 +175,7 @@ pub async fn run_turn(
             usage = Some(u);
         }
         if last_emit.elapsed() >= Duration::from_millis(100) {
-            events.emit(Event::TokenUsage { session_id, used: running, limit, budget });
+            events.emit(Event::TokenUsage { session_id, used: running, limit, budget, breakdown });
             last_emit = Instant::now();
         }
     }
@@ -206,13 +222,18 @@ pub async fn run_turn(
     let final_used = match usage {
         Some(u) if u.total() > 0 => u.total(),
         _ => {
+            let prompt_concat = messages
+                .iter()
+                .map(|m| m.content.text())
+                .collect::<Vec<_>>()
+                .join("\n");
             let full = format!("{prompt_concat}\n{accum_content}\n{accum_reasoning}");
             tokenize_exact(&client.base_url, &full)
                 .await
                 .unwrap_or_else(|_| approx_tokens(&full))
         }
     };
-    events.emit(Event::TokenUsage { session_id, used: final_used, limit, budget });
+    events.emit(Event::TokenUsage { session_id, used: final_used, limit, budget, breakdown });
 
     events.emit(Event::TurnFinished {
         session_id,

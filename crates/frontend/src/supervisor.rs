@@ -55,7 +55,15 @@ pub enum UiEvent {
     TurnStarted { session_id: u64, turn_id: u64 },
     AssistantDelta { session_id: u64, turn_id: u64, content: String, reasoning: String },
     TurnFinished { session_id: u64, turn_id: u64, finish_reason: String },
-    TokenUsage { session_id: u64, used: u32, limit: u32, budget: u32 },
+    TokenUsage {
+        session_id: u64,
+        used: u32,
+        limit: u32,
+        budget: u32,
+        /// What the prompt is made of (system / tools / history) when the
+        /// BE could compute it.
+        breakdown: Option<protocol::TokenBreakdown>,
+    },
 
     // Auto-compaction lifecycle.
     ContextCompacting { session_id: u64 },
@@ -66,6 +74,9 @@ pub enum UiEvent {
         before_tokens: u32,
         after_tokens:  u32,
         summary:       String,
+        /// Oversized older tool results replaced by head/tail windows
+        /// during this pass (the pruner; may clear pressure on its own).
+        pruned:        u32,
     },
 
     // Tool chips.
@@ -247,14 +258,14 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::SessionTitleChanged { session_id, title } => {
             UiEvent::SessionTitleChanged { session_id, title }
         }
-        Event::TokenUsage { session_id, used, limit, budget } => {
-            UiEvent::TokenUsage { session_id, used, limit, budget }
+        Event::TokenUsage { session_id, used, limit, budget, breakdown } => {
+            UiEvent::TokenUsage { session_id, used, limit, budget, breakdown }
         }
         Event::ContextCompacting { session_id } => UiEvent::ContextCompacting { session_id },
         Event::ContextCompacted {
-            session_id, ok, folded, before_tokens, after_tokens, summary,
+            session_id, ok, folded, before_tokens, after_tokens, summary, pruned,
         } => UiEvent::ContextCompacted {
-            session_id, ok, folded, before_tokens, after_tokens, summary,
+            session_id, ok, folded, before_tokens, after_tokens, summary, pruned,
         },
         Event::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
             UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation }

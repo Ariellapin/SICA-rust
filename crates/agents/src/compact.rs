@@ -11,21 +11,27 @@
 //! the summarizer round-trip fails).
 //!
 //! The split point is chosen by walking backwards from the newest message
-//! until the preserved tail fills [`TAIL_SHARE`] of the prompt budget. The tail
-//! is never allowed to *open* on a `Tool` message: its originating assistant
-//! message carries the matching `tool_calls`, and an orphaned tool result
-//! breaks native-tool-calling chat templates.
+//! until the preserved tail fills the policy's `retain_pct` of the prompt
+//! budget (dsh's default 16 %). The tail is never allowed to *open* on a
+//! `Tool` message, and the fold is never allowed to *close* on an assistant
+//! message whose native `tool_calls` point into the tail — an orphaned half
+//! of a call/result pair breaks native-tool-calling chat templates.
+//!
+//! **The summarisation call is a KV-cache-preserving prefix.** It replays the
+//! conversation's own system prompt and the folded messages verbatim, then
+//! appends the compaction directive as the *final user message* — so the
+//! provider's prompt cache for the last real request is reused instead of
+//! re-priced from scratch. The directive demands a fixed eight-section
+//! checkpoint (dsh `dsh-compaction-basic`); a summary cut off by `max_tokens`
+//! is discarded, never kept.
 
 use llm::client::{ChatMessage, LlmClient};
 use llm::tokenize::approx_tokens;
 use sica_core::message::{Message, Role};
 use sica_core::retain::{head_tail, notice};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
-
-/// Share of the prompt budget the verbatim tail is allowed to keep. The rest
-/// of the budget is left for the summary plus the growing new conversation.
-const TAIL_SHARE: f32 = 0.35;
 
 /// Floor on the tail budget so a tiny window still keeps a usable tail.
 const MIN_TAIL_TOKENS: f32 = 512.0;
@@ -63,12 +69,9 @@ pub fn prune_summary(summary: &str) -> Option<String> {
 }
 
 /// Per-message cap on what goes into the summarizer prompt. One pathological
-/// tool result (a 200 KB file dump) must not crowd out the rest of the history.
+/// tool result (a 200 KB file dump) must not crowd out the rest of the
+/// history. Applied per message in the folded wire form.
 const MAX_EXCERPT_CHARS: usize = 2_000;
-
-/// Cap on the whole summarizer prompt. Older text is dropped first — a summary
-/// of the recent-but-folded history beats no summary at all.
-const MAX_TRANSCRIPT_CHARS: usize = 48_000;
 
 /// Sanity cap on the summary itself, so a runaway model can't hand back
 /// something larger than what it replaced.
@@ -83,21 +86,42 @@ pub const SUMMARY_PREFIX: &str =
      context window. Treat the briefing below as established fact; do not \
      assume anything beyond it about the discarded messages.";
 
-const SYSTEM_PROMPT: &str = "\
-You compress conversation history for an AI coding agent that is running out of \
-context window. Rewrite the transcript you are given as a dense factual briefing \
-the agent can work from after the original messages are discarded.
+/// Preamble dsh stamps on the landed replacement. Tells the model what to do
+/// with the checkpoint without ever acknowledging it mid-task.
+pub const SUMMARY_PREAMBLE: &str =
+    "Treat the captured context as established background and build on it \
+     without restating it. Continue the task directly from the messages that \
+     follow, without acknowledging this checkpoint.";
 
-Preserve: the user's goals and explicit instructions; decisions taken and the \
-reasons for them; concrete identifiers (file paths, commands, function names, \
-values, error messages); tool results that still matter; and anything left \
-unfinished.
+/// The eight-section checkpoint directive, appended as the final user message
+/// of the summarisation call (dsh `compaction-basic`). Fixed sections, `(none)`
+/// for empty ones, exact identifiers preserved, no mention that compaction is
+/// happening — the summary must read as a neutral briefing.
+pub const COMPACTION_INSTRUCTION: &str = "\
+Summarize the conversation above into a checkpoint the conversation can \
+continue from after the original messages are dropped.
 
-Drop: pleasantries, restated text, superseded attempts, and narration.
+Write terse markdown with EXACTLY these eight headings, in this order:
 
-Answer with terse markdown under exactly these headings: `## Goal`, \
-`## Decisions`, `## Facts`, `## Open items`. Use bullet points. Never invent \
-detail that is not in the transcript, and never address the user directly.";
+## Primary Request and Intent
+## Key Technical Concepts
+## Files and Code
+## Errors and Fixes
+## Pending Jobs
+## Current Work
+## Next Step
+## Critical Context
+
+Rules:
+- Write `(none)` under a heading that has nothing to report.
+- Preserve exact identifiers: file paths, commands, function names, values, \
+error strings, URLs. Never paraphrase them.
+- Capture corrections the user made and decisions taken, with their reasons.
+- If an earlier checkpoint summary appears in the conversation, consolidate \
+it into this one rather than mentioning it.
+- Do not mention that the conversation is being summarized or compressed.
+- Do not call any tools. Do not address the user. Output only the eight \
+sections.";
 
 /// Approximate token cost of one persisted message, matching the accounting
 /// [`crate::context::trim_to_budget`] uses (+4 for per-message role/framing
@@ -113,7 +137,7 @@ pub fn approx_total(messages: &[Message]) -> u32 {
 
 /// Approximate token cost of an assembled wire history (includes the system
 /// preamble `build_history` prepends). This is what the trigger is measured
-/// against, since it is what actually gets sent.
+/// against when no usage anchor exists, since it is what actually gets sent.
 pub fn approx_total_wire(messages: &[ChatMessage]) -> u32 {
     messages
         .iter()
@@ -124,11 +148,15 @@ pub fn approx_total_wire(messages: &[ChatMessage]) -> u32 {
 /// Index at which the verbatim tail begins — everything before it is folded.
 /// `None` when there is nothing worth folding, which the caller must treat as
 /// "do not announce a compaction".
-pub fn split_index(messages: &[Message], budget_tokens: u32) -> Option<usize> {
+///
+/// `retain_pct` is the share of the budget (percent) the tail may fill —
+/// dsh's default is 16.
+pub fn split_index(messages: &[Message], budget_tokens: u32, retain_pct: u32) -> Option<usize> {
     if messages.len() < MIN_FOLD + MIN_TAIL {
         return None;
     }
-    let tail_budget = (budget_tokens as f32 * TAIL_SHARE).max(MIN_TAIL_TOKENS) as u32;
+    let tail_budget =
+        (budget_tokens as f32 * retain_pct.max(1) as f32 / 100.0).max(MIN_TAIL_TOKENS) as u32;
     // Highest split that still leaves MIN_TAIL messages verbatim. `messages`
     // is at least MIN_FOLD + MIN_TAIL long, so this is a valid index.
     let max_split = messages.len() - MIN_TAIL;
@@ -147,9 +175,20 @@ pub fn split_index(messages: &[Message], budget_tokens: u32) -> Option<usize> {
     split = split.min(max_split);
 
     // The tail must not open on a tool result whose assistant message (with
-    // the matching `tool_calls`) is about to be folded. Walking *backwards*
-    // only ever grows the tail, so it can never invalidate the split.
-    while split > 0 && messages[split].role == Role::Tool {
+    // the matching `tool_calls`) is about to be folded, and the fold must
+    // not close on an assistant message whose native `tool_calls` point into
+    // the tail. Walking *backwards* only ever grows the tail, so it can
+    // never invalidate either condition once met.
+    loop {
+        let opens_on_tool = split < messages.len() && messages[split].role == Role::Tool;
+        let closes_on_pending_calls =
+            split > 0 && messages[split - 1].tool_calls.is_some();
+        if !opens_on_tool && !closes_on_pending_calls {
+            break;
+        }
+        if split == 0 {
+            break;
+        }
         split -= 1;
     }
 
@@ -161,50 +200,73 @@ pub fn split_index(messages: &[Message], budget_tokens: u32) -> Option<usize> {
 }
 
 /// Summarise `folded` (the messages about to leave the model's view) into
-/// the bare briefing text. `None` when the summarizer produced nothing
-/// usable — the caller leaves the history untouched and the trimmer takes
-/// over. The caller frames the result with [`summary_message`] and records
-/// it as a `CompactionSummary` event that shadows the folded span.
-pub async fn summarize_fold(client: &LlmClient, folded: &[Message]) -> Option<String> {
-    let transcript = render_transcript(folded);
-    summarize(client, &transcript).await
-}
+/// the bare briefing text. **Prefix-preserving**: the request is the
+/// conversation's own system prompt (`system_wire`, the same bytes the real
+/// request sends) followed by the folded messages verbatim, then
+/// [`COMPACTION_INSTRUCTION`] as the final user message — a cache prefix of
+/// the last routed request.
+///
+/// `None` when every attempt produced nothing usable — the caller leaves the
+/// history untouched and the trimmer takes over. A summary cut off by
+/// `max_tokens` (`finish_reason == "length"`) fails closed and is retried
+/// rather than kept. The caller frames the result with [`summary_message`]
+/// and records it as a `CompactionSummary` event that shadows the folded span.
+pub async fn summarize_fold(
+    client: &LlmClient,
+    policy: &protocol::CompactPolicy,
+    system_wire: &[ChatMessage],
+    folded: Vec<ChatMessage>,
+    cancel: Option<CancellationToken>,
+) -> Option<String> {
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(system_wire.len() + folded.len() + 1);
+    messages.extend_from_slice(system_wire);
+    messages.extend(folded);
+    messages.push(ChatMessage::text("user", COMPACTION_INSTRUCTION));
 
-/// The system-message text a compaction summary is stored and sent as.
-pub fn summary_message(summary: &str) -> String {
-    format!("{SUMMARY_PREFIX}\n\n{summary}")
-}
+    // Per-message excerpt guard: one pathological entry must not crowd out
+    // the rest of the fold. (The directive itself is exempt.)
+    let folded_count = messages.len().saturating_sub(system_wire.len() + 1);
+    for m in messages.iter_mut().skip(system_wire.len()).take(folded_count) {
+        let text = m.content.text();
+        if text.len() > MAX_EXCERPT_CHARS {
+            m.content = llm::client::ChatContent::Text(excerpt(&text, MAX_EXCERPT_CHARS));
+        }
+    }
 
-/// Flatten the folded messages into a plain `ROLE: text` transcript for the
-/// summarizer. Each message is excerpted, and if the whole thing still exceeds
-/// [`MAX_TRANSCRIPT_CHARS`] the *oldest* entries are dropped first.
-fn render_transcript(messages: &[Message]) -> String {
-    let mut entries: Vec<String> = Vec::with_capacity(messages.len());
-    for m in messages {
-        let role = match m.role {
-            Role::User => "USER",
-            Role::Assistant => "ASSISTANT",
-            Role::System => "SYSTEM",
-            Role::Tool => "TOOL RESULT",
+    let mut summarizer = client.clone();
+    if summarizer.max_tokens.is_none() || summarizer.max_tokens.unwrap_or(0) < policy.max_tokens {
+        summarizer.max_tokens = Some(policy.max_tokens);
+    }
+
+    for attempt in 0..=policy.retries {
+        let Some((raw, finish_reason)) = stream_summary(&summarizer, messages.clone(), &cancel).await
+        else {
+            warn!(attempt, "compaction summarizer stream failed");
+            continue;
         };
-        let body = excerpt(m.content.trim(), MAX_EXCERPT_CHARS);
-        if body.is_empty() {
+        if finish_reason.as_deref() == Some("length") {
+            // Truncated summary fails closed: a checkpoint cut mid-sentence is
+            // worse than the raw history it would replace.
+            warn!(attempt, "compaction summary hit max_tokens — discarding");
             continue;
         }
-        let mut entry = format!("{role}: {body}");
-        if !m.images.is_empty() {
-            entry.push_str(&format!("\n[{} image attachment(s)]", m.images.len()));
+        let summary = clean(&raw);
+        if !summary.is_empty() {
+            return Some(summary);
         }
-        entries.push(entry);
+        warn!(attempt, "compaction summarizer returned nothing");
     }
+    None
+}
 
-    let mut total: usize = entries.iter().map(|e| e.len() + 2).sum();
-    let mut start = 0usize;
-    while total > MAX_TRANSCRIPT_CHARS && start + 1 < entries.len() {
-        total -= entries[start].len() + 2;
-        start += 1;
-    }
-    entries[start..].join("\n\n")
+/// The system-message text a compaction summary is stored and sent as: the
+/// recognisable marker first (the FE matches on it), then the preamble, then
+/// the summary in its `<compacted-summary>` frame — which a later compaction
+/// is told to consolidate.
+pub fn summary_message(summary: &str) -> String {
+    format!(
+        "{SUMMARY_PREFIX}\n\n{SUMMARY_PREAMBLE}\n\n<compacted-summary>\n{summary}\n</compacted-summary>"
+    )
 }
 
 /// Middle-truncate so both the head and the tail of a long message survive —
@@ -215,39 +277,55 @@ fn excerpt(text: &str, max_bytes: usize) -> String {
     window.render(&notice(window.omitted, ""))
 }
 
-/// Drive the summarizer over the streaming endpoint (same shape as
-/// `title_gen`) and return the cleaned summary. `None` on any failure so the
-/// caller can fall back to trimming rather than surface an error.
-async fn summarize(client: &LlmClient, transcript: &str) -> Option<String> {
-    let messages = vec![
-        ChatMessage::text("system", SYSTEM_PROMPT),
-        ChatMessage::text(
-            "user",
-            format!("Transcript to compress:\n\n{transcript}\n\nBriefing:"),
-        ),
-    ];
+/// Drive one summarisation attempt over the streaming endpoint. Returns the
+/// accumulated text plus the finish reason, or `None` on a transport failure.
+/// Interruptible: a fired token abandons the attempt.
+async fn stream_summary(
+    client: &LlmClient,
+    messages: Vec<ChatMessage>,
+    cancel: &Option<CancellationToken>,
+) -> Option<(String, Option<String>)> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = client.clone();
-    let stream_task = tokio::spawn(async move { client.chat_stream(messages, None, tx, None).await });
+    let stream_cancel = cancel.clone();
+    let stream_task = tokio::spawn(async move {
+        client.chat_stream(messages, None, tx, stream_cancel).await
+    });
 
     let mut buf = String::new();
-    while let Some(chunk) = rx.recv().await {
+    let mut finish_reason = None;
+    loop {
+        let next = match cancel {
+            Some(tok) => tokio::select! {
+                biased;
+                _ = tok.cancelled() => None,
+                v = rx.recv() => v,
+            },
+            None => rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
         buf.push_str(&chunk.delta_content);
+        if chunk.finish_reason.is_some() {
+            finish_reason = chunk.finish_reason;
+        }
         if buf.len() > MAX_SUMMARY_CHARS * 2 {
             // Runaway model — take what we have and stop waiting.
             break;
         }
     }
-    match stream_task.await {
-        Ok(Ok(())) | Ok(Err(_)) => {}
-        Err(e) => warn!(error = %e, "compaction summarizer task join failed"),
+    if cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+        return None;
     }
-
-    let summary = clean(&buf);
-    if summary.is_empty() {
-        None
-    } else {
-        Some(summary)
+    match stream_task.await {
+        Ok(Ok(())) => Some((buf, finish_reason)),
+        Ok(Err(e)) => {
+            warn!(error = %e, "compaction summarizer request failed");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "compaction summarizer task join failed");
+            None
+        }
     }
 }
 
@@ -257,7 +335,7 @@ async fn summarize(client: &LlmClient, transcript: &str) -> Option<String> {
 fn clean(raw: &str) -> String {
     let body = match raw.rfind("</think>") {
         Some(idx) => &raw[idx + "</think>".len()..],
-        None => raw,
+        None      => raw,
     };
     let trimmed = body.trim();
     if trimmed.chars().count() <= MAX_SUMMARY_CHARS {
@@ -286,6 +364,13 @@ mod tests {
         format!("{tag}{}", "x".repeat(400))
     }
 
+    const POLICY: protocol::CompactPolicy = protocol::CompactPolicy {
+        threshold_pct: 80,
+        retain_pct:    16,
+        max_tokens:    8192,
+        retries:       1,
+    };
+
     #[test]
     fn short_history_is_not_worth_folding() {
         let msgs = vec![
@@ -293,7 +378,7 @@ mod tests {
             msg(Role::Assistant, "hello"),
             msg(Role::User, "bye"),
         ];
-        assert!(split_index(&msgs, 1000).is_none());
+        assert!(split_index(&msgs, 1000, POLICY.retain_pct).is_none());
     }
 
     #[test]
@@ -302,7 +387,7 @@ mod tests {
             .map(|i| msg(Role::User, &format!("m{i}")))
             .collect();
         // The whole history fits inside the tail share, so nothing is folded.
-        assert!(split_index(&msgs, 1_000_000).is_none());
+        assert!(split_index(&msgs, 1_000_000, POLICY.retain_pct).is_none());
     }
 
     #[test]
@@ -310,11 +395,20 @@ mod tests {
         let msgs: Vec<Message> = (0..20)
             .map(|i| msg(Role::User, &long(&format!("m{i}"))))
             .collect();
-        // Tail share of 2000 is 700 tokens ≈ 6 messages.
-        let split = split_index(&msgs, 2000).expect("should fold");
+        let split = split_index(&msgs, 2000, POLICY.retain_pct).expect("should fold");
         assert!(split >= MIN_FOLD, "split {split} folds too little");
         assert!(msgs.len() - split >= MIN_TAIL, "tail too short");
         assert!(split < msgs.len() - MIN_TAIL + 1);
+    }
+
+    #[test]
+    fn larger_retain_keeps_a_larger_tail() {
+        let msgs: Vec<Message> = (0..20)
+            .map(|i| msg(Role::User, &long(&format!("m{i}"))))
+            .collect();
+        let s16 = split_index(&msgs, 2000, 16).unwrap();
+        let s50 = split_index(&msgs, 2000, 50).unwrap();
+        assert!(s50 <= s16, "a bigger retain share folds less");
     }
 
     #[test]
@@ -328,11 +422,33 @@ mod tests {
             msgs.push(msg(Role::Tool, &long(&format!("t{i}"))));
         }
         for budget in [1500u32, 2000, 3000, 4000, 6000] {
-            if let Some(split) = split_index(&msgs, budget) {
+            if let Some(split) = split_index(&msgs, budget, POLICY.retain_pct) {
                 assert_ne!(
                     msgs[split].role,
                     Role::Tool,
                     "budget {budget} split the tail onto an orphaned tool result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_never_closes_on_pending_native_tool_calls() {
+        // An assistant message with tool_calls must stay with its results —
+        // in whichever half the results land.
+        let mut msgs: Vec<Message> = (0..8)
+            .map(|i| msg(Role::User, &long(&format!("m{i}"))))
+            .collect();
+        let mut with_calls = msg(Role::Assistant, &long("call"));
+        with_calls.tool_calls = Some("[{\"id\":\"c1\"}]".into());
+        msgs.push(with_calls);
+        msgs.push(msg(Role::Tool, &long("result")));
+        msgs.push(msg(Role::User, "latest"));
+        for budget in [1500u32, 2000, 2500, 3000, 4000, 8000] {
+            if let Some(split) = split_index(&msgs, budget, POLICY.retain_pct) {
+                assert!(
+                    msgs[split - 1].tool_calls.is_none(),
+                    "budget {budget} closed the fold on an assistant message with pending tool_calls"
                 );
             }
         }
@@ -344,18 +460,45 @@ mod tests {
     }
 
     #[test]
+    fn summary_message_frames_the_checkpoint() {
+        let m = summary_message("## Primary Request and Intent\n- x");
+        assert!(m.starts_with(protocol::CONTEXT_SUMMARY_PREFIX));
+        assert!(m.contains(SUMMARY_PREAMBLE));
+        assert!(m.contains("<compacted-summary>\n## Primary Request"));
+        assert!(m.ends_with("</compacted-summary>"));
+    }
+
+    #[test]
     fn compact_output_starts_with_the_summary_marker() {
         // `summarize_fold` needs a live client, so exercise the assembly
         // the same way `chat.rs` does after it.
         let msgs: Vec<Message> = (0..12)
             .map(|i| msg(Role::User, &long(&format!("m{i}"))))
             .collect();
-        let split = split_index(&msgs, 2000).unwrap();
+        let split = split_index(&msgs, 2000, POLICY.retain_pct).unwrap();
         let mut out = vec![Message::system(summary_message("summary"))];
         out.extend_from_slice(&msgs[split..]);
         assert_eq!(out[0].role, Role::System);
         assert!(out[0].content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX));
         assert_eq!(out.len(), msgs.len() - split + 1);
+    }
+
+    #[test]
+    fn instruction_names_all_eight_sections() {
+        for heading in [
+            "## Primary Request and Intent",
+            "## Key Technical Concepts",
+            "## Files and Code",
+            "## Errors and Fixes",
+            "## Pending Jobs",
+            "## Current Work",
+            "## Next Step",
+            "## Critical Context",
+        ] {
+            assert!(COMPACTION_INSTRUCTION.contains(heading), "missing {heading}");
+        }
+        assert!(COMPACTION_INSTRUCTION.contains("(none)"));
+        assert!(COMPACTION_INSTRUCTION.contains("Do not call any tools"));
     }
 
     #[test]
@@ -378,18 +521,6 @@ mod tests {
         assert!(pruned.contains("pruned to free context"));
         assert!(pruned.len() <= PRUNE_THRESHOLD, "{}", pruned.len());
         assert!(prune_summary(&pruned).is_none(), "a pruned result must not prune again");
-    }
-
-    #[test]
-    fn transcript_drops_oldest_when_oversized() {
-        let msgs: Vec<Message> = (0..200)
-            .map(|i| msg(Role::User, &format!("m{i} {}", "y".repeat(1500))))
-            .collect();
-        let t = render_transcript(&msgs);
-        assert!(t.len() <= MAX_TRANSCRIPT_CHARS + MAX_EXCERPT_CHARS * 2);
-        // The newest entry always survives; the oldest is the one dropped.
-        assert!(t.contains("m199"));
-        assert!(!t.contains("m0 "));
     }
 
     #[test]

@@ -89,6 +89,10 @@ impl SessionLog {
         derive_surface(&self.events)
     }
 
+    /// The derived history as plain messages. Currently only tests call
+    /// this — the live loop works from [`derive_surface`] so it keeps the
+    /// seqs — but it is the store's public replay API.
+    #[allow(dead_code)]
     pub fn derive_messages(&self) -> Vec<Message> {
         self.derive_surface().into_iter().map(|e| e.message).collect()
     }

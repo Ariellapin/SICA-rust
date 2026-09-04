@@ -22,6 +22,8 @@ once_cell   = { workspace = true }
 toml        = { workspace = true }
 regex       = { workspace = true }
 chrono      = { workspace = true }
+# `glob` / `grep`: gitignore-aware walking + gitignore-style glob matching.
+ignore      = { workspace = true }
 
 # `proc`: Job Objects so a killed shell takes its child processes with it.
 [target.'cfg(windows)'.dependencies]

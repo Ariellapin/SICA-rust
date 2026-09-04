@@ -62,11 +62,35 @@ impl Skill for MarkdownSkill {
         true
     }
 
-    async fn run(&self, _args: Value, _ctx: SkillContext) -> SkillOutcome {
-        SkillOutcome {
-            ok:      true,
-            summary: self.render_skill_content(),
+    /// Return the skill body as instructions, framed as `<skill_content>`.
+    /// The body is interpolated first: the skill's declared positional args
+    /// (by name) plus the standard variables (`{{cwd}}`, `{{os}}`,
+    /// `{{date}}`, `{{model}}`). Strict, per the prompt module — a body
+    /// referencing a valueless variable fails the call loudly instead of
+    /// feeding the model a malformed template.
+    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+        let mut vars = crate::prompt::standard_vars("");
+        for name in self.positional_args() {
+            if let Some(v) = args.get(&name) {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    other            => other.to_string(),
+                };
+                vars.insert(name, s);
+            }
         }
+        let source = format!("skills/{}.md", self.name);
+        let body = match crate::prompt::interpolate(&self.body, &vars, &source) {
+            Ok(b)  => b,
+            Err(e) => {
+                return SkillOutcome {
+                    ok:      false,
+                    summary: format!("skill `{}` failed to render: {e}", self.name),
+                }
+            }
+        };
+        let rendered = MarkdownSkill { body, ..self.clone() }.render_skill_content();
+        SkillOutcome { ok: true, summary: rendered }
     }
 }
 
@@ -293,6 +317,42 @@ mod tests {
              <skill_instructions>\ninstructions\n</skill_instructions>\n\
              </skill_content>"
         );
+    }
+
+    #[tokio::test]
+    async fn run_interpolates_positionals_and_standard_vars() {
+        let s = MarkdownSkill {
+            name: "weather".into(),
+            description: "d".into(),
+            body: "Report weather for {{city}} ({{units}}) on {{date}} in {{cwd}}.".into(),
+            source_path: PathBuf::from("skills").join("weather.md"),
+            positionals: vec!["city".into(), "units".into()],
+        };
+        let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
+        let ctx = SkillContext { sub: crate::ToolSubAgent::root(cap) };
+        let out = s.run(
+            serde_json::json!({ "city": "Paris", "units": "metric" }),
+            ctx,
+        ).await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("Report weather for Paris (metric)"), "{}", out.summary);
+        assert!(!out.summary.contains("{{date}}"), "standard vars resolve");
+    }
+
+    #[tokio::test]
+    async fn run_fails_loudly_on_unknown_variable() {
+        let s = MarkdownSkill {
+            name: "broken".into(),
+            description: "d".into(),
+            body: "hello {{nobody}}".into(),
+            source_path: PathBuf::from("skills").join("broken.md"),
+            positionals: Vec::new(),
+        };
+        let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
+        let ctx = SkillContext { sub: crate::ToolSubAgent::root(cap) };
+        let out = s.run(Value::Null, ctx).await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("{{nobody}}"), "{}", out.summary);
     }
 
     #[test]
