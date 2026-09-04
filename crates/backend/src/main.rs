@@ -21,6 +21,7 @@ mod ipc;
 mod parent_watch;
 mod sessions_store;
 mod title_gen;
+mod trajectory;
 
 use be_core::BeState;
 use chat::ChatHub;

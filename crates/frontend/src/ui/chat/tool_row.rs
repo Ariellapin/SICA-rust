@@ -107,9 +107,23 @@ fn draw_one(
 
     if expanded {
         // The body is a sibling of the row, so clicks inside it never toggle.
+        let chip = chip.clone();
+        let mut action = None;
         indented(ui, 22.0, &t, |ui| {
-            body(ui, chip, state);
+            body(ui, &chip, state);
+            action = row_actions(ui, &chip, &t);
         });
+        match action {
+            Some(RowAction::Inspect(seq)) => app.inspect_event(seq),
+            Some(RowAction::Details) => {
+                app.details_call = Some(chip.id);
+                app.trajectory.selected = None;
+                if app.layout.details_w <= 0.0 {
+                    app.layout.details_w = sica_core::theme::tokens::DETAILS_DEFAULT;
+                }
+            }
+            None => {}
+        }
     }
 
     // Children: 22 px indent + a guide line, recursive.
@@ -123,6 +137,48 @@ fn draw_one(
             }
         });
     }
+}
+
+/// What the hover-revealed pills under an expanded body asked for.
+enum RowAction {
+    /// Open the Trajectory view focused on this call's durable event.
+    Inspect(u64),
+    /// Put this call's full payload in the details column.
+    Details,
+}
+
+/// The pill row under an expanded body (§3.4): 0.5 px `border-l3`, r=999,
+/// 11/16.
+///
+/// **Inspect** needs the call's durable `ToolCall` seq. A nested
+/// `SkillContext::sub` call is a live event only — it never reaches the
+/// session log — so on those the pill says why instead of jumping somewhere
+/// arbitrary.
+fn row_actions(
+    ui: &mut egui::Ui,
+    chip: &ToolChip,
+    t: &sica_core::theme::Theme,
+) -> Option<RowAction> {
+    let mut action = None;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if chip.log_seq > 0 {
+            if kit::pill(ui, "Inspect", false).clicked() {
+                action = Some(RowAction::Inspect(chip.log_seq));
+            }
+        } else {
+            kit::label(
+                ui,
+                kit::txt("Inspect", 11.0, kit::Weight::Regular, kit::col(t.alias.label[3])),
+            )
+            .on_hover_text("A nested call is a live event only — it is not in the session log.");
+        }
+        if kit::pill(ui, "Details", false).clicked() {
+            action = Some(RowAction::Details);
+        }
+    });
+    ui.add_space(2.0);
+    action
 }
 
 /// A left-guided, indented column — the nesting chrome for child calls and

@@ -116,6 +116,10 @@ pub enum UiEvent {
         args_preview: String,
         expectation: String,
         args_json: String,
+        /// The durable `ToolCall` seq — the identity the Trajectory view's
+        /// Inspect pill jumps to. `0` for a nested call, which is a live
+        /// event only and never reaches the log.
+        call_seq: u64,
     },
     ToolCallFinished { id: u64, ok: bool, summary: String, output: String, duration_ms: u64 },
 
@@ -123,6 +127,13 @@ pub enum UiEvent {
     SessionList { sessions: Vec<SessionMeta> },
     /// Content-search hits for the sidebar's search field.
     SessionSearch { hits: Vec<protocol::SessionHit> },
+    /// One page of a session's raw event log — the Trajectory ledger (§10).
+    SessionEvents {
+        session_id: u64,
+        events:     Vec<protocol::EventDump>,
+        total:      u32,
+        next_seq:   Option<u64>,
+    },
     SessionCreated { id: u64 },
     SessionLoaded { session: SessionDump },
     SessionTitleChanged { session_id: u64, title: String },
@@ -324,9 +335,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
             session_id, ok, folded, before_tokens, after_tokens, summary, pruned,
         },
         Event::ToolCallStarted {
-            id, parent_id, depth, name, args_preview, expectation, args_json,
+            id, parent_id, depth, name, args_preview, expectation, args_json, call_seq,
         } => UiEvent::ToolCallStarted {
-            id, parent_id, depth, name, args_preview, expectation, args_json,
+            id, parent_id, depth, name, args_preview, expectation, args_json, call_seq,
         },
         Event::ToolCallFinished { id, ok, summary, output, duration_ms } => {
             UiEvent::ToolCallFinished { id, ok, summary, output, duration_ms }

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -253,6 +253,14 @@ pub enum Request {
     /// Substring search over every session's stored messages. Answers
     /// `SessionSearch`.
     SearchSessions { query: String },
+    /// Page through a session's **raw event log** — the ledger the Trajectory
+    /// view draws (UI guide §10). Unlike `LoadSession`, which answers with the
+    /// *derived* surface the model sees, this returns every line the log
+    /// holds, shadowed ones included, so the view can show what the fold threw
+    /// away. Rows come back in seq order from `from_seq` (inclusive), capped
+    /// at `limit` (0, or more than the backend's own cap, takes the cap).
+    /// Answers `SessionEvents`.
+    LoadSessionEvents { session_id: u64, from_seq: u64, limit: u32 },
     ConnectLlm    { base_url: String, model: String, api_key: Option<String>, options: LlmOptions },
     /// Ask a provider what models it serves (`GET /v1/models`). Answered
     /// `Ok` immediately and reported by `ModelsListed` — the guide sketches a
@@ -327,6 +335,115 @@ pub enum Response {
     /// Outcome text of a `RunCommand` (shown in the log panel; never model
     /// history).
     CommandResult  { text: String },
+    /// One page of a session's raw event log (`LoadSessionEvents`).
+    SessionEvents  {
+        session_id: u64,
+        events:     Vec<EventDump>,
+        /// How many events the log holds, so the view can say "200 of 1204"
+        /// without loading the rest.
+        total:      u32,
+        /// Seq to ask for next, or `None` when this page reached the end.
+        next_seq:   Option<u64>,
+    },
+}
+
+/// Which family an [`EventDump`] belongs to — the ledger's tinted kind tag
+/// (UI guide §10). Deliberately coarser than `sica_core::event::EventKind`:
+/// the view groups rows by what they *mean* to a reader, and a kind written
+/// by a newer backend lands in `Other` rather than breaking the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventTag {
+    /// Session lifecycle: created, retitled, archived.
+    System,
+    /// `TurnStart` / `TurnEnd` — the ledger's turn headers.
+    Turn,
+    User,
+    Assistant,
+    /// Harness-injected context (`/name` bodies, instructions, notices).
+    Context,
+    /// A dispatched tool call.
+    Tool,
+    /// Its outcome.
+    ToolResult,
+    /// A compaction summary or a rewind: the two shadowing mechanisms.
+    Compacted,
+    /// A failed LLM attempt that was retried — a *failed* request boundary.
+    Retry,
+    /// Prompt size after a completed hop — the request boundary.
+    Usage,
+    /// A harness command that never made a model message.
+    Command,
+    Approval,
+    Goal,
+    Job,
+    Other,
+}
+
+impl EventTag {
+    /// Short uppercase label for the ledger's tag column.
+    pub fn label(self) -> &'static str {
+        match self {
+            EventTag::System => "SYSTEM",
+            EventTag::Turn => "TURN",
+            EventTag::User => "USER",
+            EventTag::Assistant => "ASSISTANT",
+            EventTag::Context => "CONTEXT",
+            EventTag::Tool => "TOOL",
+            EventTag::ToolResult => "RESULT",
+            EventTag::Compacted => "COMPACTED",
+            EventTag::Retry => "RETRY",
+            EventTag::Usage => "USAGE",
+            EventTag::Command => "COMMAND",
+            EventTag::Approval => "APPROVAL",
+            EventTag::Goal => "GOAL",
+            EventTag::Job => "JOB",
+            EventTag::Other => "OTHER",
+        }
+    }
+}
+
+/// One line of a session's event log, flattened for the wire.
+///
+/// A protocol-safe mirror of `sica_core::event::SessionEvent`: the `protocol`
+/// crate stays leaf-level (no dep on `sica-core`), and the fold's own types
+/// never have to become bincode-safe. Every field is something a ledger row
+/// or the inspector reads — nothing here is re-parsed from prose on the
+/// frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventDump {
+    /// The durable seq — the ledger's `#` column, and the handle the Inspect
+    /// pill on a tool row jumps to.
+    pub seq:        u64,
+    /// Unix time in **milliseconds** (the log's own resolution).
+    pub ts:         i64,
+    pub tag:        EventTag,
+    /// One-line ledger text.
+    pub text:       String,
+    /// The request side, for the inspector: a tool call's resolved arguments,
+    /// a message's full body, a command's input.
+    pub payload:    String,
+    /// The response side: a tool result's summary, a compaction's summary, an
+    /// assistant message's reasoning.
+    pub result:     String,
+    /// The provider's own `usage`, on the events that carry it (`TokenUsage`).
+    pub tokens_in:  u32,
+    pub tokens_out: u32,
+    /// Outcome, where the event has one (tool results, commands, turn ends).
+    pub ok:         Option<bool>,
+    /// `true` when a later `Replace` or `Rewind` shadows this event: it is
+    /// still in the log but the model no longer sees it. Showing these is the
+    /// whole point of the view.
+    pub shadowed:   bool,
+    /// The span a shadowing event covers (`Replace` / `Rewind`), so the row
+    /// can say what it erased.
+    pub shadows:    Option<(u64, u64)>,
+    /// The `ToolCall` seq this row joins to: its own seq on a call, the call
+    /// it answers on a result.
+    pub call_seq:   Option<u64>,
+    /// Turn this row belongs to, from the enclosing `TurnStart`.
+    pub turn_id:    Option<u64>,
+    /// The event as the log stores it — the inspector's Raw tab.
+    pub raw:        String,
 }
 
 /// Which family a [`CatalogEntry`] belongs to. Drives the group headings in
@@ -614,6 +731,16 @@ pub enum Event {
         /// is a one-line rendering and is truncated; this is not.
         #[serde(default)]
         args_json: String,
+        /// Seq of the durable `EventKind::ToolCall` this dispatch logged —
+        /// the handle the Inspect pill (UI guide §3.4) jumps to in the
+        /// Trajectory view, and the same identity a reloaded transcript
+        /// rebuilds its rows from (`MessageDump::tool_call_id`). Without it
+        /// a live row and a reloaded one would carry different ids for the
+        /// same call. `0` when the call was never logged — a nested
+        /// `SkillContext::sub` call, or a standalone sub-agent outside a
+        /// session (teammates, evals).
+        #[serde(default)]
+        call_seq: u64,
     },
     ToolCallFinished {
         id: u64,
@@ -886,6 +1013,7 @@ mod tests {
             args_preview: "cmd 'echo hi'".into(),
             expectation: "confirm it ran".into(),
             args_json: r#"{"command":"echo hi"}"#.into(),
+            call_seq: 7,
         });
         let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();

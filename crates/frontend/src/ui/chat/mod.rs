@@ -16,11 +16,12 @@ mod messages;
 mod meter;
 mod slash_menu;
 mod tool_row;
+pub mod trajectory;
 mod user_text;
 
 use egui::{Align, Align2, Layout, Rect, Sense, Vec2};
 
-use crate::app::App;
+use crate::app::{App, ChatView};
 use crate::supervisor::UiCommand;
 use crate::ui::icons::{self, Icon};
 use crate::ui::kit::{self, Weight};
@@ -37,6 +38,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     if hero {
         hero_view(app, ui, disabled, content_w);
+    } else if app.view == ChatView::Trajectory {
+        // The ledger is full-bleed: no content column, no composer seat.
+        // Sending a message from here would be sending it into a view that
+        // cannot show the reply.
+        header(app, ui);
+        trajectory::draw(app, ui);
     } else {
         header(app, ui);
         egui::TopBottomPanel::bottom(egui::Id::new("composer_seat"))
@@ -105,6 +112,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                     jobs_action(app, ui);
                 });
             });
+            tab_strip(app, ui);
         });
     let rect = ui.min_rect();
     ui.painter().hline(
@@ -115,6 +123,61 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             kit::Level::L3.color(&t),
         ),
     );
+}
+
+/// `Chat · Trajectory` (§2.1): gap 36, 13/16 500, `label[2]`, the active tab
+/// in `business` text over a 2 px r=2 underline.
+///
+/// dsh draws the strip only when more than one view is registered; there are
+/// exactly two here, and the second is the only door onto the event log, so
+/// it is always drawn on a session that has content.
+fn tab_strip(app: &mut App, ui: &mut egui::Ui) {
+    let t = app.theme;
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        for (view, label) in [
+            (ChatView::Chat, "Chat"),
+            (ChatView::Trajectory, "Trajectory"),
+        ] {
+            let active = app.view == view;
+            let font = kit::font(13.0, Weight::Medium);
+            let galley =
+                ui.fonts(|f| f.layout_no_wrap(label.to_string(), font.clone(), egui::Color32::WHITE));
+            let (rect, resp) = ui.allocate_exact_size(
+                Vec2::new(galley.size().x, 22.0),
+                Sense::click(),
+            );
+            let color = if active {
+                kit::col(t.alias.business)
+            } else if resp.hovered() {
+                kit::col(t.alias.label[1])
+            } else {
+                kit::col(t.alias.label[2])
+            };
+            ui.painter()
+                .text(rect.left_top(), Align2::LEFT_TOP, label, font, color);
+            if active {
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(rect.min.x, rect.max.y - 2.0),
+                        Vec2::new(rect.width(), 2.0),
+                    ),
+                    egui::Rounding::same(2.0),
+                    color,
+                );
+            }
+            if resp.clicked() {
+                app.view = view;
+                if view == ChatView::Trajectory {
+                    // Opening the tab is the request: a turn may have run
+                    // since the last look, so this reloads rather than
+                    // showing a page that stops mid-session.
+                    app.load_trajectory(true);
+                }
+            }
+            ui.add_space(36.0 - ui.spacing().item_spacing.x);
+        }
+    });
 }
 
 fn crumb(

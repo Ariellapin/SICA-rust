@@ -104,6 +104,49 @@ impl Default for LayoutState {
     }
 }
 
+/// Which view the conversation column shows. dsh registers views and draws
+/// the tab strip only when more than one exists; there are exactly two here,
+/// so the strip is always drawn on a session that has content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatView {
+    Chat,
+    Trajectory,
+}
+
+/// The Trajectory view's own state (§10): one page of the session's raw
+/// event log plus the toolbar, selection and paging around it.
+///
+/// Deliberately *not* derived from `chat.turns`. The transcript shows the
+/// derived surface — what the model sees — and this shows the log, including
+/// the events the fold shadowed. Building one from the other would lose
+/// exactly the rows the view exists for.
+#[derive(Default)]
+pub struct TrajectoryState {
+    /// Session the rows belong to. A page for another session is dropped,
+    /// the same rule `SessionLoaded` follows.
+    pub session_id: u64,
+    pub rows:       Vec<protocol::EventDump>,
+    /// Events the log holds, so the footer can say "200 of 1204".
+    pub total:      u32,
+    /// Seq to ask for next; `None` when the last page reached the end.
+    pub next_seq:   Option<u64>,
+    /// A page request is in flight — the "Load more" button says so and does
+    /// not fire twice.
+    pub loading:    bool,
+    /// Live search. Non-matching rows dim rather than disappear, so the
+    /// numbering and the turn structure stay readable (dsh's rule).
+    pub search:     String,
+    /// Seq of the row the inspector is showing.
+    pub selected:   Option<u64>,
+    /// Turn ids folded away by the "Turns" collapse-all.
+    pub collapsed:  std::collections::HashSet<u64>,
+    /// Timeline segments sized by real duration rather than equally.
+    pub actual_duration: bool,
+    /// Set when a row should be scrolled into view on the next frame — the
+    /// Inspect pill's jump, and the "Load more" landing.
+    pub scroll_to:  Option<u64>,
+}
+
 pub struct App {
     #[allow(dead_code)]
     pub rt: Arc<tokio::runtime::Runtime>,
@@ -235,6 +278,10 @@ pub struct App {
     pub risk_ack: bool,
     /// Tool call shown in the details column, when it is open.
     pub details_call: Option<u64>,
+    /// Which view the conversation column is showing (§10).
+    pub view: ChatView,
+    /// The Trajectory view's ledger and toolbar state.
+    pub trajectory: TrajectoryState,
     /// The OS light/dark preference eframe reported at startup; what
     /// `ThemeMode::System` resolves to.
     pub system_dark: bool,
@@ -894,6 +941,11 @@ impl Attachment {
 #[derive(Clone)]
 pub struct ToolChip {
     pub id:           u64,
+    /// Seq of the durable `ToolCall` this row is, when it has one — the
+    /// handle the Inspect pill hands the Trajectory view. `0` for a nested
+    /// call, which is a live event only and never reaches the log, and for a
+    /// pre-v13 reloaded row that carried no `tool_call_id`.
+    pub log_seq:      u64,
     pub parent_id:    Option<u64>,
     pub depth:        u8,
     pub name:         String,
@@ -1031,6 +1083,8 @@ impl App {
             risk_gate_open: false,
             risk_ack: false,
             details_call: None,
+            view: ChatView::Chat,
+            trajectory: TrajectoryState::default(),
             system_dark,
         }
     }
@@ -1282,7 +1336,61 @@ impl App {
         self.chat.compacting = false;
         self.chat.editing_turn = None;
         self.chat.edit_draft.clear();
+        // The ledger belongs to the session that was open; drop it rather
+        // than let a page for the old one land on the new one's view.
+        self.trajectory = crate::app::TrajectoryState::default();
+        self.details_call = None;
+        self.layout.details_w = 0.0;
         self.send(UiCommand::SendRequest(Request::LoadSession { session_id: id }));
+    }
+
+    /// Ask for the next page of the active session's event log. Called when
+    /// the Trajectory view opens, when the user reloads it, and when the
+    /// ledger's "Load more" is pressed.
+    ///
+    /// `reset` starts from the top and throws away what is on screen — a
+    /// turn that ran while the tab was open appended events the ledger has
+    /// not seen, and continuing from `next_seq` would show them under a
+    /// stale total.
+    pub fn load_trajectory(&mut self, reset: bool) {
+        if self.trajectory.loading {
+            return;
+        }
+        let session_id = self.chat.session_id;
+        let from_seq = if reset || self.trajectory.session_id != session_id {
+            self.trajectory.rows.clear();
+            self.trajectory.session_id = session_id;
+            self.trajectory.next_seq = None;
+            0
+        } else {
+            match self.trajectory.next_seq {
+                Some(seq) => seq,
+                // Nothing more to fetch; a bare click on Reload is a reset.
+                None if !self.trajectory.rows.is_empty() => return,
+                None => 0,
+            }
+        };
+        self.trajectory.loading = true;
+        self.send(UiCommand::SendRequest(Request::LoadSessionEvents {
+            session_id,
+            from_seq,
+            limit: 0,
+        }));
+    }
+
+    /// Open the Trajectory view focused on one durable event — the Inspect
+    /// pill on a tool row (§3.4). The page may not be loaded yet, so the
+    /// selection is recorded first and the ledger scrolls to it when the row
+    /// arrives.
+    pub fn inspect_event(&mut self, seq: u64) {
+        self.view = ChatView::Trajectory;
+        self.trajectory.selected = Some(seq);
+        self.trajectory.scroll_to = Some(seq);
+        self.details_call = None;
+        self.layout.details_w = sica_core::theme::tokens::DETAILS_DEFAULT;
+        if self.trajectory.session_id != self.chat.session_id || self.trajectory.rows.is_empty() {
+            self.load_trajectory(true);
+        }
     }
 
     /// Rewrite the prompt of turn `idx` and re-run from it. Everything after
@@ -1640,11 +1748,11 @@ impl App {
                 }
             }
             UiEvent::ToolCallStarted {
-                id, parent_id, depth, name, args_preview, expectation, args_json,
+                id, parent_id, depth, name, args_preview, expectation, args_json, call_seq,
             } => {
                 if let Some(t) = self.active_turn_mut() {
                     t.tool_chips.push(ToolChip {
-                        id, parent_id, depth, name,
+                        id, log_seq: call_seq, parent_id, depth, name,
                         args_preview, expectation, args_json,
                         finished: false, ok: true, summary: String::new(),
                         output: String::new(), duration_ms: 0,
@@ -1787,6 +1895,24 @@ impl App {
                 // off screen in the frame before it lands.
                 self.jobs.clear();
                 self.goal = None;
+            }
+            UiEvent::SessionEvents { session_id, events, total, next_seq } => {
+                self.trajectory.loading = false;
+                // A page for a session the user has already left is dropped,
+                // the same rule `SessionLoaded` follows.
+                if session_id != self.chat.session_id {
+                    return;
+                }
+                self.trajectory.session_id = session_id;
+                self.trajectory.total = total;
+                self.trajectory.next_seq = next_seq;
+                if let Some(first) = events.first().map(|e| e.seq) {
+                    // Re-fetching a page that is already on screen (a reload
+                    // after new events landed) replaces from that seq on
+                    // rather than duplicating the rows.
+                    self.trajectory.rows.retain(|r| r.seq < first);
+                }
+                self.trajectory.rows.extend(events);
             }
             UiEvent::Catalog { entries } => {
                 self.push_log(
@@ -1997,6 +2123,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     .unwrap_or(u64::MAX - slot.tool_chips.len() as u64);
                 slot.tool_chips.push(ToolChip {
                     id,
+                    log_seq: m.tool_call_id.unwrap_or(0),
                     parent_id: m.tool_parent_id,
                     depth: m.tool_depth,
                     name: name.clone(),

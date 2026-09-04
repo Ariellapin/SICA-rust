@@ -307,6 +307,7 @@ impl ControlState {
         self.goals.lock().await.insert(session_id, goal);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_control(
         &self,
         sessions: &Sessions,
@@ -315,6 +316,7 @@ impl ControlState {
         args_preview: &str,
         expectation: &str,
         session_id: u64,
+        call_seq: u64,
         cancel: &CancellationToken,
     ) -> (agents::SkillOutcome, bool) {
         let id = agents::subagent::next_tool_id();
@@ -327,6 +329,7 @@ impl ControlState {
             args_preview: args_preview.to_string(),
             expectation: expectation.to_string(),
             args_json: args.to_string(),
+            call_seq,
         });
         let (outcome, conclude) = self
             .handle_control_body(sessions, name, args, session_id, cancel)
@@ -607,7 +610,7 @@ impl ControlState {
             };
             let preview = format!("{} {}", call.name, call.arguments);
             let (outcome, conclude) = self
-                .handle_control(sessions, &call.name, &args, &preview, "", session_id, cancel)
+                .handle_control(sessions, &call.name, &args, &preview, "", session_id, call_seq, cancel)
                 .await;
             append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), outcome.ok, &outcome.summary, true)
                 .await;
@@ -644,7 +647,10 @@ impl ControlState {
                     .collect()
             })
             .unwrap_or_default();
-        let sub = self.sub_agent(sessions, session_id, client, cancel.clone()).await;
+        let sub = self
+            .sub_agent(sessions, session_id, client, cancel.clone())
+            .await
+            .with_log_seq(call_seq);
         let report = sub
             .run_report(agents::ToolInvocation {
                 skill: &*skill,
@@ -813,8 +819,12 @@ impl ControlState {
                 // instances (lock-guarded) and broker, so asks serialize
                 // while read-only bodies overlap.
                 let mut subs = Vec::with_capacity(chunk.len());
-                for _ in chunk {
-                    subs.push(self.sub_agent(sessions, session_id, client, cancel.clone()).await);
+                for &seq in &seqs {
+                    subs.push(
+                        self.sub_agent(sessions, session_id, client, cancel.clone())
+                            .await
+                            .with_log_seq(seq),
+                    );
                 }
                 let futs: Vec<_> = prepared
                     .into_iter()
@@ -985,6 +995,21 @@ impl ChatHub {
     /// outcome text (what the live chip showed), not the fenced block the
     /// model reads. Injected context goes out under the `context` role so
     /// the FE never mistakes it for something the user typed.
+    /// One page of a session's **raw** event log — the Trajectory view's
+    /// ledger (UI guide §10). Deliberately not part of `dump_session`: the
+    /// transcript wants the derived surface, and a long log would otherwise
+    /// ride along on every session switch.
+    pub async fn dump_events(
+        &self,
+        id: u64,
+        from_seq: u64,
+        limit: u32,
+    ) -> Option<(Vec<protocol::EventDump>, u32, Option<u64>)> {
+        let g = self.sessions.lock().await;
+        let log = g.get(&id)?;
+        Some(crate::trajectory::page(log, from_seq, limit))
+    }
+
     pub async fn dump_session(&self, id: u64) -> Option<SessionDump> {
         // Loading a session is the FE switching to it, so push its goal, the
         // jobs it owns and its queue: these are otherwise only emitted on a
@@ -2407,6 +2432,7 @@ impl ChatHub {
                                 &preview,
                                 &call.expectation,
                                 session_id,
+                                call_seq,
                                 &cancel,
                             )
                             .await;
@@ -2414,7 +2440,10 @@ impl ChatHub {
                         (outcome, true)
                     }
                     Some((skill, args)) => {
-                        let sub = control.sub_agent(&sessions_map, session_id, &client, cancel.clone()).await;
+                        let sub = control
+                            .sub_agent(&sessions_map, session_id, &client, cancel.clone())
+                            .await
+                            .with_log_seq(call_seq);
                         let report = sub
                             .run_report(agents::ToolInvocation {
                                 skill: &*skill,
@@ -3791,7 +3820,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let args = serde_json::json!({"items": "[{\"content\": \"a\", \"status\": \"pending\"}]"});
         let (out, conclude) = cs
-            .handle_control(&sessions, "todo-write", &args, "todo-write", "", 1, &cancel)
+            .handle_control(&sessions, "todo-write", &args, "todo-write", "", 1, 0, &cancel)
             .await;
         assert!(out.ok, "{}", out.summary);
         assert!(!conclude);
@@ -3801,7 +3830,7 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e, Event::ToolCallFinished { ok: true, .. })));
         drop(evs);
         let bad = serde_json::json!({"items": "[]"});
-        let (out, _) = cs.handle_control(&sessions, "todo-write", &bad, "", "", 1, &cancel).await;
+        let (out, _) = cs.handle_control(&sessions, "todo-write", &bad, "", "", 1, 0, &cancel).await;
         assert!(!out.ok);
         let g = sessions.lock().await;
         let todos = g[&1].events.iter().filter(|e| matches!(e.kind, EventKind::TodoWrite { .. })).count();
@@ -3847,7 +3876,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let args = serde_json::json!({"plan": "# P"});
         let (out, conclude) = cs
-            .handle_control(&sessions, "exit-plan-mode", &args, "", "", 1, &cancel)
+            .handle_control(&sessions, "exit-plan-mode", &args, "", "", 1, 0, &cancel)
             .await;
         assert!(!out.ok);
         assert!(!conclude);
@@ -3862,7 +3891,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let args = serde_json::json!({"plan": "# P"});
         let (res, _) = tokio::join!(
-            cs.handle_control(&sessions, "exit-plan-mode", &args, "", "", 1, &cancel),
+            cs.handle_control(&sessions, "exit-plan-mode", &args, "", "", 1, 0, &cancel),
             async {
                 for _ in 0..200 {
                     if cs.brokers.answer_question(1, "Approve".into()).await {
@@ -3890,7 +3919,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let args = serde_json::json!({"plan": "# P"});
         let (res, _) = tokio::join!(
-            cs.handle_control(&sessions, "exit-plan-mode", &args, "", "", 1, &cancel),
+            cs.handle_control(&sessions, "exit-plan-mode", &args, "", "", 1, 0, &cancel),
             async {
                 for _ in 0..200 {
                     if cs.brokers.answer_question(1, "needs more detail".into()).await {

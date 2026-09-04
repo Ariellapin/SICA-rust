@@ -166,6 +166,31 @@ async fn main() -> Result<()> {
     assert_eq!(session.id, new_id);
     assert!(session.messages.is_empty(), "fresh session should have no messages");
 
+    // The Trajectory view's ledger (guide §10). A fresh session derives no
+    // messages but its log already holds the `SessionCreated` line, which is
+    // exactly the difference between the two requests: one answers with the
+    // model's view, the other with the log.
+    writer
+        .send(Frame::request(8, Request::LoadSessionEvents { session_id: new_id, from_seq: 0, limit: 0 }).encode()?.into())
+        .await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 8 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionEvents { session_id, events, total, next_seq } = resp else {
+        anyhow::bail!("expected SessionEvents, got {resp:?}");
+    };
+    println!("smoke: load events -> session={session_id} events={} total={total}", events.len());
+    assert_eq!(session_id, new_id);
+    assert_eq!(next_seq, None, "one page should cover a fresh session");
+    assert!(!events.is_empty(), "a session's log always opens with SessionCreated");
+    assert_eq!(events[0].seq, 1);
+    assert!(!events[0].raw.is_empty(), "the inspector's Raw tab has no source");
+
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;
     let _ = writer.get_mut().shutdown().await;

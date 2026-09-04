@@ -99,7 +99,21 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                             });
                         }
                         Payload::Response(r) => {
-                            bridge.send(UiEvent::Log(format!("RSP#{} {:?}", frame.id, r)));
+                            // One page of the event log is hundreds of rows;
+                            // the log panel gets a summary rather than the
+                            // whole ledger printed into it.
+                            match &r {
+                                Response::SessionEvents { session_id, events, total, .. } => {
+                                    bridge.send(UiEvent::Log(format!(
+                                        "RSP#{} SessionEvents {{ session {session_id}, {} of {total} }}",
+                                        frame.id,
+                                        events.len()
+                                    )));
+                                }
+                                other => {
+                                    bridge.send(UiEvent::Log(format!("RSP#{} {other:?}", frame.id)))
+                                }
+                            }
                             match r {
                                 Response::SessionList { sessions } => {
                                     bridge.send(UiEvent::SessionList { sessions });
@@ -118,6 +132,19 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 }
                                 Response::SessionSearch { hits } => {
                                     bridge.send(UiEvent::SessionSearch { hits });
+                                }
+                                Response::SessionEvents {
+                                    session_id,
+                                    events,
+                                    total,
+                                    next_seq,
+                                } => {
+                                    bridge.send(UiEvent::SessionEvents {
+                                        session_id,
+                                        events,
+                                        total,
+                                        next_seq,
+                                    });
                                 }
                                 // A refused request used to reach the user
                                 // only as a raw `RSP#…` line in the log

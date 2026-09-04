@@ -47,7 +47,7 @@ Seven crates, dependency direction strictly downward:
 | `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds). |
 | `idealist` | Classifies failures (`FeBug` vs `BeFix`), writes improvement tickets to `idealist_workspace/`, optional BE auto-patching (off by default). |
 | `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `be_core/` holds the legacy demo state. |
-| `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the surfaces — `kit` (the design-system primitives), `icons`, `sidebar`, `chat/` (transcript, tool rows, composer, dock, control takeovers), `settings/` (a modal). Styling is the dsh port described in [docs/harness-ui-guide.md](docs/harness-ui-guide.md); waves UI-1…UI-4 are in. |
+| `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the surfaces — `kit` (the design-system primitives), `icons`, `sidebar`, `chat/` (transcript, tool rows, composer, dock, control takeovers, `trajectory` (the event-log ledger), `details` (the tool / event inspector)), `settings/` (a modal). Styling is the dsh port described in [docs/harness-ui-guide.md](docs/harness-ui-guide.md); waves UI-1…UI-5 are in. |
 
 ## Wire protocol
 
@@ -55,9 +55,9 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 19) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 20) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
-Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`).
+Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`).
 
 Two v17 events exist purely so the transcript can show what the log already
 records: `LlmRetry` (the retry chain row — the durable `EventKind::LlmRetry`
@@ -82,6 +82,28 @@ once per turn-opening message so the transcript can offer the edit on a
 prompt it has only seen live. The FE truncates optimistically and resyncs
 from `Response::Error`, which now reaches the user as a toast rather than
 only a raw line in the log panel.
+
+v20 adds the Trajectory view's ledger (UI guide §10).
+`LoadSessionEvents { session_id, from_seq, limit }` answers `SessionEvents
+{ events, total, next_seq }` with the session's **raw** log rather than the
+derived surface — `LoadSession` answers with what the model sees, this
+answers with what the log holds, and the difference (the events a compaction
+or a rewind shadowed) is the whole reason the view exists. `EventDump`
+([backend/src/trajectory.rs](crates/backend/src/trajectory.rs)) flattens each
+`SessionEvent`: a coarse `EventTag`, one line of text, the payload/result
+bodies, the provider's own token pair, the `ToolCall` join, the enclosing
+`turn_id`, the event's JSON for the inspector's Raw tab, and the two fields
+the transcript has no way to express — `shadowed` (asked of `derive_surface`
+itself, so the ledger and the fold can never disagree) and `shadows`, the
+span a `Replace` or a `Rewind` covered. Pages are capped at 500 rows and
+`next_seq` says whether more remains.
+
+`Event::ToolCallStarted` also gains `call_seq`: the live event carried only
+the process-local tool id while a reloaded row carried the durable `ToolCall`
+seq, so one call had two identities and the Inspect pill had nothing stable
+to jump to. `ToolSubAgent::with_log_seq` carries it from the dispatch site;
+it is `0` for a nested `SkillContext::sub` call, which is a live event only
+and never reaches the log.
 
 ## The agent loop (the heart of the app)
 
@@ -306,7 +328,7 @@ Long-running handlers must not block the dispatcher loop — `ConnectLlm` spawns
 - `bincode` (v1) is the **pipe** format: types crossing the pipe must use externally-tagged enums — no `#[serde(tag/content)]`, no `untagged`, no `flatten` with maps. The `untagged`/`tag` attributes on `llm::client::ChatContent` and `ContentPart` are fine because those go out as JSON to the LLM, never over the pipe.
 - Session event logs are JSONL (`serde_json`, internally-tagged enums are fine there — they never cross the pipe); provider configs and eval suites are `toml`; the LLM wire format is `serde_json`. Three serialization formats coexist by design.
 - [docs/deepseek-harness-ideas.md](docs/deepseek-harness-ideas.md) catalogues the agent-harness ideas ported from DeepSeek's `dsh` (event log, step-level retry, tool timeouts, spill-to-file, and the Wave 1 hygiene set: repeat-tool reminder, untrusted-content frame, tool-result pruner, `retain`, `/name` expansion, fallback titles, Job Objects, provider `usage`) and the ones deliberately left for later.
-- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there. [docs/harness-ui-guide.md](docs/harness-ui-guide.md) is the FE counterpart: dsh's web-client design system (tokens, type, geometry, elevation), every shell/transcript/composer/control-plane/settings surface with its concrete values, the egui port for each, the additive protocol changes (v17), and a five-wave UI roadmap. Read it before restyling or adding a frontend surface — waves **UI-1 (foundation), UI-2 (transcript) and UI-3 (composer + control plane)** are implemented, along with the UI-4 settings modal and session rows; what is left needs the protocol v17 batch in its §11 (per-turn usage pills, the retry chain, the real queue dock, session verbs) or is the UI-5 trajectory view.
+- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there. [docs/harness-ui-guide.md](docs/harness-ui-guide.md) is the FE counterpart: dsh's web-client design system (tokens, type, geometry, elevation), every shell/transcript/composer/control-plane/settings surface with its concrete values, the egui port for each, the additive protocol changes (v17), and a five-wave UI roadmap. Read it before restyling or adding a frontend surface — all five waves are implemented: **UI-1 (foundation)**, **UI-2 (transcript)**, **UI-3 (composer + control plane)**, **UI-4 (settings modal + session rows)** and **UI-5 (the Trajectory ledger + the event inspector)**. What is left is listed as **Open** in its §12 — produced-file chips and the tail's branch action, `@file` completion, `goal edit`, the question takeover's `detail`/`multi` fields, and the inspector's Schema / System Prompt / Tools tabs, which need a `RequestEnvelope` stored on `TurnStart` before they could show anything truthful.
 - **The FE design system is `sica_core::theme` + `ui::kit`.** `theme` holds the
   static ramps and the two semantic alias maps; every widget reads an alias
   through `kit` and no module below it branches on light/dark or names a

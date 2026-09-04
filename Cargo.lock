@@ -916,6 +916,7 @@ dependencies = [
  "base64",
  "bincode",
  "bytes",
+ "chrono",
  "eframe",
  "egui",
  "egui_commonmark",

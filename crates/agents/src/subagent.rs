@@ -125,6 +125,12 @@ pub struct ToolSubAgent {
     /// turn is excluded by construction, so a fork never inherits a
     /// half-written exchange.
     pub fork_seed:     Option<Arc<Vec<ChatMessage>>>,
+    /// Seq of the durable `ToolCall` the caller logged for *this* dispatch,
+    /// carried onto `Event::ToolCallStarted` so a live tool row and the
+    /// ledger row for the same call share one identity. `None` for a nested
+    /// call and for any sub-agent running outside a session — neither is
+    /// written to a session log, so neither has a seq to give.
+    pub log_seq:       Option<u64>,
 }
 
 impl ToolSubAgent {
@@ -143,7 +149,14 @@ impl ToolSubAgent {
             session_id:   None,
             plan_active:  false,
             fork_seed:    None,
+            log_seq:      None,
         }
+    }
+
+    /// Name the durable `ToolCall` seq this dispatch was logged under.
+    pub fn with_log_seq(mut self, seq: u64) -> Self {
+        self.log_seq = (seq > 0).then_some(seq);
+        self
     }
 
     /// Enable spill-to-file for outputs over `spill::SPILL_THRESHOLD`,
@@ -225,6 +238,9 @@ impl ToolSubAgent {
             session_id:   self.session_id,
             plan_active:  self.plan_active,
             fork_seed:    self.fork_seed.clone(),
+            // A nested call is a live event only — it never reaches the
+            // session log, so it inherits no seq.
+            log_seq:      None,
         }
     }
 
@@ -336,6 +352,7 @@ impl ToolSubAgent {
             args_preview: args_preview.clone(),
             expectation:  expectation.clone(),
             args_json,
+            call_seq:     self.log_seq.unwrap_or(0),
         });
         let mut notices: Vec<String> = Vec::new();
         let mut veto = false;
