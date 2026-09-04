@@ -158,7 +158,9 @@ impl Skill for Subagent {
             task:     task.clone(),
             max_hops: MAX_CHILD_HOPS,
             schema:   None,
-        };
+                    // Fresh conversation each time, so ids start at call-1.
+            call_seq_start: 0,
+};
         info!(
             skill = self.name(),
             seeded = spec.seed.len(),

@@ -275,7 +275,9 @@ impl Skill for Ralph {
                 task:     round_task(&objective, round, max_rounds, handoff.as_ref()),
                 max_hops: MAX_ROUND_HOPS,
                 schema:   Some(schema.clone()),
-            };
+                            // Fresh conversation each time, so ids start at call-1.
+                call_seq_start: 0,
+};
             let mut transcript = runner::seed_transcript(&spec);
             let report = runner::run_conversation(
                 &client, registry.as_ref(), &ctx.sub, &mut transcript, &spec, &cancel,

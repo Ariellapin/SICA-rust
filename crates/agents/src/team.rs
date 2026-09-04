@@ -15,6 +15,7 @@
 //! [`AgentTeam::attach_registry`] — a `Weak` reference, because the registry
 //! also owns this skill and an `Arc` cycle would never free either.
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
@@ -79,6 +80,8 @@ Behaviour:
 - Up to **6** teammates run concurrently, each as its own LLM conversation.
 - Teammates may call any loaded skill (same one-line syntax), up to **4**
   tool calls each per round; their calls appear nested under the team call.
+- Each teammate reports through the `structured-output` tool; that call is
+  the report, not a tool call, and does not use up the budget.
 - `rounds` (1–3, default 1): after each round every teammate sees the shared
   *team board* (everyone's report) and coordinates/refines in the next round.
 - `shared` (optional): briefing text prepended to every teammate's charter.
@@ -86,16 +89,117 @@ Behaviour:
   reports are appended after it.
 - Interrupting the turn stops the whole team immediately.
 
-Grounding: a teammate that made no successful tool call is reported as
-**UNVERIFIED** — its prose is model reasoning, not something checked against
-the machine, and the lead is told not to restate it as fact. If no teammate
-verified anything the whole result carries a warning banner.
-
+Grounding: a teammate does not write prose — it reports a list of **claims**,
+each citing the ids (`call-1`, `call-2`) of the tool results that back it.
+A claim citing nothing, or citing an id that names no successful call, is
+rendered as `unverified:` everywhere it appears, and the lead is told never
+to restate it as fact. A teammate whose claims are all uncited is headed
+**UNVERIFIED**; if no teammate cited anything the whole result carries a
+warning banner.
 **This file is the on/off switch.** The backend registers `agent-team` only
 when `skills/agent-team.md` exists; rename it to `agent-team.md.off` (only
 `*.md` is scanned) or delete it, restart the backend, and the skill vanishes
 from the catalogue. It is not seeded automatically.
 "#;
+
+/// The shape every teammate must report in (guide §12.2).
+///
+/// Prose is the wrong type for a teammate report: "src/lib.rs defines
+/// `Registry`" and "I never opened src/lib.rs" are the same string shape,
+/// so the lead cannot tell them apart and launders both into the
+/// deliverable. Splitting the report into claims that each cite the tool
+/// call backing them makes the difference *checkable* — and because the
+/// cited ids come from [`runner::CallRecord`], a citation is verified
+/// against calls that really ran rather than taken on the model's word.
+pub(crate) fn teammate_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["claims"],
+        "properties": {
+            "claims": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": ["text", "evidence"],
+                    "properties": {
+                        "text": {"type": "string"},
+                        "evidence": {"type": "array", "items": {"type": "string"}}
+                    }
+                }
+            },
+            "open_questions": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+/// Render a validated teammate report as the markdown the board, the lead
+/// and the final summary all read, and count how many claims are actually
+/// backed. A claim citing an id that names no *successful* call in this
+/// run is marked as loudly as one citing nothing at all — a fabricated
+/// citation is worse than a missing one.
+fn render_claims(structured: &Value, ok_ids: &HashSet<&str>) -> (String, usize, usize) {
+    let claims = structured.get("claims").and_then(Value::as_array);
+    let mut out = String::new();
+    let mut total = 0usize;
+    let mut cited = 0usize;
+    for claim in claims.into_iter().flatten() {
+        total += 1;
+        let text = claim.get("text").and_then(Value::as_str).unwrap_or("").trim();
+        let evidence: Vec<&str> = claim
+            .get("evidence")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let good: Vec<&str> = evidence
+            .iter()
+            .copied()
+            .filter(|e| ok_ids.contains(citation_id(e).as_str()))
+            .collect();
+        if good.is_empty() {
+            cited += 0;
+            out.push_str(&format!(
+                "- unverified: {text}  ({})\n",
+                if evidence.is_empty() {
+                    "no evidence cited".to_string()
+                } else {
+                    format!("cites {}, which named no successful tool call", evidence.join(", "))
+                }
+            ));
+        } else {
+            cited += 1;
+            out.push_str(&format!("- {text}  [{}]\n", good.join(", ")));
+        }
+    }
+    let questions: Vec<&str> = structured
+        .get("open_questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|q| !q.trim().is_empty())
+        .collect();
+    if !questions.is_empty() {
+        out.push_str("\nOpen questions:\n");
+        for q in questions {
+            out.push_str(&format!("- {}\n", q.trim()));
+        }
+    }
+    (out, total, cited)
+}
+
+/// Models cite a call as `call-2`, as `` `call-2` ``, or as
+/// `call-2 (read-file)`. Take the id and ignore the decoration rather than
+/// failing an otherwise honest citation.
+fn citation_id(raw: &str) -> String {
+    raw.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .to_string()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Teammate {
@@ -107,28 +211,61 @@ pub(crate) struct Teammate {
 ///
 /// The counts exist because a teammate's prose is indistinguishable from
 /// fact once it reaches the lead: a model that never called `read-file` will
-/// still happily report what a file "contains". `tool_ok == 0` means nothing
-/// in `report` was checked against the machine, and every consumer — the
-/// board, the lead, the final summary — says so out loud.
+/// still happily report what a file "contains". Since Wave 4 the report is
+/// *typed* (`teammate_schema`) so grounding is measured per claim rather
+/// than per teammate — `cited` counts the claims backed by a tool call that
+/// really succeeded — and every consumer (the board, the lead, the final
+/// summary) says so out loud. `structured == false` means the teammate
+/// never delivered a valid report and we fell back to its prose, which is
+/// the weakest outcome there is.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TeammateOutcome {
-    pub report:  String,
-    pub tool_ok: u32,
-    pub tool_err: u32,
+    pub report:     String,
+    pub tool_ok:    u32,
+    pub tool_err:   u32,
+    /// Claims in the typed report, and how many cite a successful call.
+    pub claims:     usize,
+    pub cited:      usize,
+    pub structured: bool,
 }
 
 impl TeammateOutcome {
+    /// Grounded means *something in the report is backed*: at least one
+    /// claim citing a call that ran and succeeded. A prose fallback can
+    /// only fall back to the old, coarser test.
     fn verified(&self) -> bool {
-        self.tool_ok > 0
+        if self.structured {
+            self.cited > 0
+        } else {
+            self.tool_ok > 0
+        }
     }
 
     /// Suffix appended to this teammate's heading wherever the report is
-    /// shown. Empty when at least one tool call succeeded; otherwise it says
-    /// *why* nothing is grounded, since "never tried" and "tried and every
-    /// call errored" call for different scepticism from the reader.
+    /// shown. Empty only when every claim is cited; otherwise it says *why*
+    /// the reader should be sceptical, since "never tried", "tried and every
+    /// call errored", "answered in prose" and "three of five claims cite
+    /// nothing" call for different amounts of it.
     fn provenance(&self) -> String {
-        if self.verified() {
-            String::new()
+        if self.structured {
+            return if self.claims == 0 {
+                " — UNVERIFIED (reported no claims)".to_string()
+            } else if self.cited == self.claims {
+                String::new()
+            } else if self.cited > 0 {
+                format!(
+                    " — PARTLY VERIFIED ({}/{} claims cite a successful tool call)",
+                    self.cited, self.claims
+                )
+            } else {
+                " — UNVERIFIED (no claim cites a successful tool call)".to_string()
+            };
+        }
+        if self.tool_ok > 0 {
+            format!(
+                " — UNSTRUCTURED ({} tool call(s) succeeded, but claims are not cited)",
+                self.tool_ok
+            )
         } else if self.tool_err > 0 {
             format!(
                 " — UNVERIFIED (all {} tool call(s) failed)",
@@ -242,6 +379,10 @@ impl Skill for AgentTeam {
             })
             .collect();
         let mut reports: Vec<Option<TeammateOutcome>> = vec![None; spec.teammates.len()];
+        // Evidence trail per teammate, accumulated across rounds so call ids
+        // stay unique and stay resolvable.
+        let mut trails: Vec<Vec<runner::CallRecord>> =
+            vec![Vec::new(); spec.teammates.len()];
 
         for round in 1..=spec.rounds {
             if runner::is_cancelled(&cancel) {
@@ -256,11 +397,13 @@ impl Skill for AgentTeam {
                             "{board}\n\nAbove is what every teammate produced \
                              last round. Coordinate: avoid duplicating their \
                              work, resolve any conflicts with your own \
-                             findings, and reply with your improved report. \
-                             You may make tool calls first. A heading marked \
-                             UNVERIFIED means that teammate ran no successful \
-                             tool call — treat its claims as guesses and check \
-                             anything you intend to build on."
+                             findings, and report again. You may make tool \
+                             calls first. A line starting `unverified:` was \
+                             not backed by any tool result — treat it as a \
+                             guess and check anything you intend to build on. \
+                             The `[call-N]` ids in another teammate's report \
+                             belong to its conversation, not yours: cite only \
+                             ids from your own tool results."
                         ),
                     ));
                 }
@@ -272,8 +415,17 @@ impl Skill for AgentTeam {
             let round_futs: Vec<_> = transcripts
                 .iter_mut()
                 .zip(spec.teammates.iter())
-                .map(|(transcript, mate)| {
-                    run_teammate(&client, registry.as_ref(), &ctx.sub, mate, transcript, &cancel)
+                .zip(trails.iter_mut())
+                .map(|((transcript, mate), trail)| {
+                    run_teammate(
+                        &client,
+                        registry.as_ref(),
+                        &ctx.sub,
+                        mate,
+                        transcript,
+                        trail,
+                        &cancel,
+                    )
                 })
                 .collect();
             let results = join_all(round_futs).await;
@@ -319,9 +471,10 @@ impl Skill for AgentTeam {
         // banner an all-prose team run reads exactly like a researched one.
         if reports.iter().flatten().all(|r| !r.verified()) {
             out.push_str(
-                "**Warning: no teammate produced a successful tool call — nothing \
-                 below was checked against the machine. Treat every claim about \
-                 files, commands or output as unverified.**\n\n",
+                "**Warning: not one claim below cites a tool result that ran \
+                 successfully — nothing here was checked against the machine. \
+                 Treat every statement about files, commands or output as \
+                 unverified.**\n\n",
             );
         }
         match &synthesis {
@@ -376,24 +529,55 @@ async fn run_teammate(
     sub:        &ToolSubAgent,
     mate:       &Teammate,
     transcript: &mut Vec<ChatMessage>,
+    calls:      &mut Vec<runner::CallRecord>,
     cancel:     &Option<CancellationToken>,
 ) -> Option<TeammateOutcome> {
     // The transcript is already seeded (and carried across rounds), so the
-    // spec only supplies the label and the hop budget.
+    // spec only supplies the label, the hop budget and the schema. `calls`
+    // is the teammate's whole evidence trail so far: ids continue across
+    // rounds, and a round-2 claim may legitimately cite a round-1 result
+    // that is still in this transcript.
     let spec = runner::RunSpec {
-        label:    format!("agent-team `{}`", mate.role),
-        system:   String::new(),
-        seed:     Vec::new(),
-        task:     String::new(),
-        max_hops: MAX_TEAMMATE_HOPS,
-        schema:   None,
+        label:          format!("agent-team `{}`", mate.role),
+        system:         String::new(),
+        seed:           Vec::new(),
+        task:           String::new(),
+        max_hops:       MAX_TEAMMATE_HOPS,
+        schema:         Some(teammate_schema()),
+        call_seq_start: calls.len(),
     };
     let report =
         runner::run_conversation(client, registry, sub, transcript, &spec, cancel).await?;
-    Some(TeammateOutcome {
-        report:   report.text,
-        tool_ok:  report.tool_ok,
-        tool_err: report.tool_err,
+    calls.extend(report.calls.iter().cloned());
+
+    let tool_ok  = calls.iter().filter(|c| c.ok).count() as u32;
+    let tool_err = calls.len() as u32 - tool_ok;
+    let ok_ids: HashSet<&str> =
+        calls.iter().filter(|c| c.ok).map(|c| c.id.as_str()).collect();
+
+    Some(match &report.structured {
+        Some(value) => {
+            let (rendered, claims, cited) = render_claims(value, &ok_ids);
+            TeammateOutcome {
+                report: rendered,
+                tool_ok,
+                tool_err,
+                claims,
+                cited,
+                structured: true,
+            }
+        }
+        // The runner already nudged once; prose here means the teammate
+        // could not produce a typed report at all. Keep the text — it may
+        // still be useful — but never let it pass as a cited report.
+        None => TeammateOutcome {
+            report: report.text,
+            tool_ok,
+            tool_err,
+            claims: 0,
+            cited: 0,
+            structured: false,
+        },
     })
 }
 
@@ -426,7 +610,18 @@ async fn synthesize(
             }
         ));
     }
-    let system = "You are the lead of a small agent team. Merge your                   teammates' reports into ONE coherent deliverable: keep every                   concrete fact (numbers, paths, versions, errors) verbatim,                   drop duplication, and flag any point where two reports                   contradict each other instead of silently picking one.                   A report whose heading says UNVERIFIED is not backed by any                   tool output — it is that teammate's guess. Never restate its                   claims as established fact: either attribute them (\"`role`                   believes …, unverified\") or leave them out.                   Output only the merged result — no preamble.";
+    let system = "You are the lead of a small agent team. Merge your \
+                  teammates' reports into ONE coherent deliverable. Each \
+                  report is a list of claims: a claim ending in a `[call-N]` \
+                  citation was checked against a tool result that really \
+                  ran, and a line starting `unverified:` was not. Keep every \
+                  cited fact (numbers, paths, versions, errors) verbatim, \
+                  drop duplication, and flag any point where two reports \
+                  contradict each other instead of silently picking one. \
+                  Never restate an unverified claim as established fact: \
+                  either attribute it (\"`role` believes …, unverified\") or \
+                  leave it out. Carry open questions through as open \
+                  questions. Output only the merged result — no preamble.";
     let messages = vec![
         ChatMessage::text("system", system),
         ChatMessage::text("user", body),
@@ -462,21 +657,27 @@ fn teammate_system(mate: &Teammate, spec: &TeamSpec, catalogue: Option<&str>) ->
              exactly this form and nothing else:\n\n\
              <skill-name> '<arg1>' '<arg2>' > <what you want to learn>\n\n\
              One tool call per reply, at most {MAX_TEAMMATE_HOPS} per round. \
-             When you have what you need, reply with your final report as \
-             plain text containing no tool-call line.\n\n\
+             Every tool result you receive is labelled with an id like \
+             `[id: call-2]` — quote those ids as the evidence for your \
+             claims.\n\n\
              Available skills:\n{cat}"
         ));
     }
     charter.push_str(
-        "\nKeep your final report concise and factual. Quote exact values \
-         (numbers, paths, errors) verbatim from tool output. Start directly \
-         with content — no preamble.\n\n\
-         Grounding rule, and it is absolute: state a file's contents, a \
+        "\nGrounding rule, and it is absolute: state a file's contents, a \
          command's output, or whether a path exists ONLY if a tool result in \
-         this conversation shows it. You cannot see the disk otherwise. If \
-         you have not run the tool, write `unverified:` in front of the claim \
-         and name the call you would need — never invent output, and never \
-         report a file as existing because the name sounds plausible.",
+         this conversation shows it. You cannot see the disk otherwise. A \
+         claim with no evidence id is reported to the team lead as \
+         unverified, and an evidence id that names no successful tool result \
+         is reported the same way — inventing an id is worse than admitting \
+         you did not check. Quote exact values (numbers, paths, errors) \
+         verbatim from tool output.",
+    );
+    charter.push_str(&crate::runner::structured_directive(&teammate_schema()));
+    charter.push_str(
+        "\n\nOne claim per finding, each with the ids of the tool results \
+         that back it (`\"evidence\": [\"call-1\", \"call-3\"]`). Put anything \
+         you could not check into `open_questions` instead of asserting it.",
     );
     let mut a = crate::prompt::Assembly::new();
     a.section(crate::prompt::Section::new(
@@ -722,9 +923,12 @@ mod tests {
         assert!(sys.contains("critic"));
         assert!(sys.contains("workspace is sica-rust"));
         assert!(sys.contains("run-cli"));
-        // Without a catalogue the tool section must be absent.
+        // Without a catalogue the skills section must be absent — the
+        // reporting contract stays, since `structured-output` is scoped to
+        // the run rather than drawn from the registry.
         let sys = teammate_system(&spec.teammates[1], &spec, None);
-        assert!(!sys.contains("tool call"));
+        assert!(!sys.contains("Available skills"));
+        assert!(sys.contains(runner::STRUCTURED_OUTPUT_NAME));
     }
 
     #[test]
@@ -738,13 +942,24 @@ mod tests {
         // one most likely to invent output.
         for cat in [Some("- **read-file**"), None] {
             let sys = teammate_system(&spec.teammates[0], &spec, cat);
-            assert!(sys.contains("unverified:"), "grounding rule missing");
-            assert!(sys.contains("never invent output"), "grounding rule missing");
+            assert!(sys.contains("unverified"), "grounding rule missing");
+            assert!(
+                sys.contains("inventing an id is worse than admitting"),
+                "grounding rule missing"
+            );
         }
     }
 
-    fn outcome(report: &str, tool_ok: u32) -> TeammateOutcome {
-        TeammateOutcome { report: report.into(), tool_ok, tool_err: 0 }
+    /// A structured teammate outcome with `cited` of `claims` claims backed.
+    fn outcome(report: &str, cited: usize, claims: usize) -> TeammateOutcome {
+        TeammateOutcome {
+            report: report.into(),
+            tool_ok: cited as u32,
+            tool_err: 0,
+            claims,
+            cited,
+            structured: true,
+        }
     }
 
     #[test]
@@ -753,7 +968,7 @@ mod tests {
             Teammate { role: "a".into(), task: "t".into() },
             Teammate { role: "b".into(), task: "t".into() },
         ];
-        let reports = vec![Some(outcome("report A", 1)), None];
+        let reports = vec![Some(outcome("report A", 1, 1)), None];
         let board = render_board(1, &mates, &reports);
         assert!(board.contains("### a"));
         assert!(board.contains("report A"));
@@ -762,20 +977,31 @@ mod tests {
     }
 
     #[test]
-    fn board_marks_reports_with_no_successful_tool_call() {
+    fn board_marks_reports_with_no_cited_claim() {
         let mates = vec![
             Teammate { role: "grounded".into(), task: "t".into() },
             Teammate { role: "guessing".into(), task: "t".into() },
         ];
         let reports = vec![
-            Some(outcome("read it", 1)),
-            Some(outcome("README.md exists and lists the crates", 0)),
+            Some(outcome("read it", 1, 1)),
+            Some(outcome("README.md lists the crates", 0, 2)),
         ];
         let board = render_board(1, &mates, &reports);
-        assert!(board.contains("### grounded\n"), "verified role must not be marked");
+        assert!(board.contains("### grounded\n"), "fully cited role must not be marked");
         assert!(
-            board.contains("### guessing — UNVERIFIED (no tool call made)"),
+            board.contains("### guessing — UNVERIFIED (no claim cites a successful tool call)"),
             "board: {board}"
+        );
+    }
+
+    #[test]
+    fn a_partly_cited_report_says_so_rather_than_passing_as_clean() {
+        let partly = outcome("mixed", 1, 3);
+        assert!(partly.verified(), "one cited claim is still grounded");
+        assert!(
+            partly.provenance().contains("PARTLY VERIFIED (1/3"),
+            "{}",
+            partly.provenance()
         );
     }
 
@@ -788,10 +1014,103 @@ mod tests {
             report:   "the file is present".into(),
             tool_ok:  0,
             tool_err: 2,
+            claims:   0,
+            cited:    0,
+            structured: false,
         };
         assert!(!only_errors.verified());
         assert!(only_errors.provenance().contains("UNVERIFIED"));
-        assert_eq!(outcome("x", 1).provenance(), "");
+        assert_eq!(outcome("x", 1, 1).provenance(), "");
+    }
+
+    #[test]
+    fn a_prose_fallback_is_never_reported_as_cited() {
+        // The runner already nudged once; prose that still arrives is the
+        // weakest outcome and must not look like a clean report.
+        let prose = TeammateOutcome {
+            report:     "I read the file and it defines Registry".into(),
+            tool_ok:    2,
+            tool_err:   0,
+            claims:     0,
+            cited:      0,
+            structured: false,
+        };
+        assert!(prose.verified(), "it did call tools successfully");
+        assert!(prose.provenance().contains("UNSTRUCTURED"), "{}", prose.provenance());
+    }
+
+    #[test]
+    fn claims_render_with_their_citation_and_count_as_cited() {
+        let ok_ids: HashSet<&str> = ["call-1", "call-2"].into_iter().collect();
+        let report = json!({
+            "claims": [
+                {"text": "the workspace has 7 crates", "evidence": ["call-1"]},
+                {"text": "README documents them", "evidence": ["`call-2` (read-file)"]}
+            ],
+            "open_questions": ["is agent-team enabled?"]
+        });
+        let (md, claims, cited) = render_claims(&report, &ok_ids);
+        assert_eq!((claims, cited), (2, 2));
+        assert!(md.contains("- the workspace has 7 crates  [call-1]"), "{md}");
+        assert!(md.contains("[`call-2` (read-file)]"), "decoration is kept in the citation: {md}");
+        assert!(md.contains("Open questions:"));
+        assert!(md.contains("- is agent-team enabled?"));
+    }
+
+    #[test]
+    fn a_claim_citing_nothing_is_marked_unverified() {
+        let ok_ids: HashSet<&str> = ["call-1"].into_iter().collect();
+        let report = json!({"claims": [{"text": "src/lib.rs is empty", "evidence": []}]});
+        let (md, claims, cited) = render_claims(&report, &ok_ids);
+        assert_eq!((claims, cited), (1, 0));
+        assert!(md.contains("- unverified: src/lib.rs is empty  (no evidence cited)"), "{md}");
+    }
+
+    #[test]
+    fn a_claim_citing_an_id_that_never_succeeded_is_marked_too() {
+        // The whole point of checkable citations: a fabricated `call-9`, or
+        // one naming a call that errored, must not read as evidence.
+        let ok_ids: HashSet<&str> = ["call-1"].into_iter().collect();
+        let report = json!({
+            "claims": [{"text": "the build passes", "evidence": ["call-9"]}]
+        });
+        let (md, _, cited) = render_claims(&report, &ok_ids);
+        assert_eq!(cited, 0);
+        assert!(md.contains("cites call-9, which named no successful tool call"), "{md}");
+    }
+
+    #[test]
+    fn citation_ids_survive_the_decoration_models_add() {
+        for raw in ["call-2", "`call-2`", "call-2 (read-file)", " \"call-2\", "] {
+            assert_eq!(citation_id(raw), "call-2", "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn the_teammate_schema_accepts_a_good_report_and_names_a_bad_one() {
+        let schema = teammate_schema();
+        let good = json!({"claims": [{"text": "t", "evidence": ["call-1"]}]});
+        assert!(runner::validate(&good, &schema, "$").is_empty());
+        let bad = json!({"claims": [{"text": "t"}]});
+        let problems = runner::validate(&bad, &schema, "$");
+        assert!(
+            problems.iter().any(|p| p.contains("missing required field `evidence`")),
+            "{problems:?}"
+        );
+        assert!(!runner::validate(&json!({"claims": []}), &schema, "$").is_empty());
+    }
+
+    #[test]
+    fn charter_states_the_typed_reporting_contract() {
+        let spec = TeamSpec {
+            teammates: vec![Teammate { role: "r".into(), task: "t".into() }],
+            shared:    String::new(),
+            rounds:    1,
+        };
+        let sys = teammate_system(&spec.teammates[0], &spec, Some("- **read-file**"));
+        assert!(sys.contains(runner::STRUCTURED_OUTPUT_NAME), "{sys}");
+        assert!(sys.contains("open_questions"));
+        assert!(sys.contains("[id: call-2]"), "the id convention must be explained");
     }
 
     #[tokio::test]

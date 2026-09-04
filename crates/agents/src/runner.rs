@@ -79,6 +79,27 @@ pub struct RunSpec {
     /// When set, the run's result must arrive through `structured-output`
     /// and validate against this JSON Schema subset (see [`validate`]).
     pub schema:   Option<Value>,
+    /// How many calls the child has already seen on this transcript. Ids
+    /// continue from here, so a caller running several rounds over one
+    /// conversation (`agent-team`) never shows `call-1` twice for two
+    /// different calls — a citation from round 2 would otherwise resolve
+    /// against round 1's result.
+    pub call_seq_start: usize,
+}
+
+/// One tool call a run dispatched, as the child sees it.
+///
+/// The `id` is echoed to the child in the tool-result message
+/// (`[id: call-3]`) so a structured report can *cite* the call that backs
+/// each claim. A caller can then check the citation against this list
+/// instead of taking the child's word for it: an id that names no
+/// successful call is a fabricated citation, which is the failure mode
+/// that made prose reports untrustworthy in the first place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallRecord {
+    pub id:    String,
+    pub skill: String,
+    pub ok:    bool,
 }
 
 /// What one delegated conversation produced.
@@ -92,6 +113,9 @@ pub struct Report {
     pub tool_ok:    u32,
     pub tool_err:   u32,
     pub hops:       u8,
+    /// Every tool call this run dispatched, in order, with the ids the
+    /// child was shown.
+    pub calls:      Vec<CallRecord>,
 }
 
 impl Report {
@@ -100,6 +124,25 @@ impl Report {
     /// structured output, failing to deliver it is equally unverified.
     pub fn verified(&self, wanted_schema: bool) -> bool {
         self.tool_ok > 0 && (!wanted_schema || self.structured.is_some())
+    }
+
+    /// Ids of the calls that actually succeeded — the only citations a
+    /// caller should accept as evidence.
+    pub fn ok_ids(&self) -> std::collections::HashSet<&str> {
+        self.calls
+            .iter()
+            .filter(|c| c.ok)
+            .map(|c| c.id.as_str())
+            .collect()
+    }
+
+    /// Human-readable `call-2 read-file (ok)` lines, for a caller that
+    /// wants to show the child's evidence trail.
+    pub fn call_lines(&self) -> Vec<String> {
+        self.calls
+            .iter()
+            .map(|c| format!("{} {} ({})", c.id, c.skill, if c.ok { "ok" } else { "error" }))
+            .collect()
     }
 }
 
@@ -121,7 +164,11 @@ pub fn seed_transcript(spec: &RunSpec) -> Vec<ChatMessage> {
 /// Trailing system-prompt section for a run that owes structured output.
 /// Scoped to the run, exactly like dsh's child-scoped section: the tool
 /// exists only for this conversation, so its contract is stated with it.
-fn structured_directive(schema: &Value) -> String {
+///
+/// Public because a caller that seeds its own transcript rather than using
+/// [`seed_transcript`] (`agent-team`, which carries one conversation across
+/// rounds) still has to state the contract in its system message.
+pub fn structured_directive(schema: &Value) -> String {
     format!(
         "\n\n## Reporting your result\n\
          When you have your final answer you MUST report it by calling the \
@@ -196,6 +243,7 @@ pub async fn run_conversation(
     let mut hops: u8 = 0;
     let mut tool_ok: u32 = 0;
     let mut tool_err: u32 = 0;
+    let mut calls: Vec<CallRecord> = Vec::new();
     let mut nudged = false;
     let mut reminded = false;
 
@@ -252,7 +300,7 @@ pub async fn run_conversation(
                 transcript.push(ChatMessage::text("user", STRUCTURED_REMINDER));
                 continue;
             }
-            return Some(Report { text: reply, structured: None, tool_ok, tool_err, hops });
+            return Some(Report { text: reply, structured: None, tool_ok, tool_err, hops, calls });
         };
 
         // The reporting tool settles the run instead of dispatching.
@@ -267,6 +315,7 @@ pub async fn run_conversation(
                         tool_ok,
                         tool_err,
                         hops,
+                        calls,
                     });
                 }
                 Err(problem) if hops < spec.max_hops => {
@@ -291,6 +340,7 @@ pub async fn run_conversation(
                         tool_ok,
                         tool_err,
                         hops,
+                        calls,
                     });
                 }
             }
@@ -326,12 +376,13 @@ pub async fn run_conversation(
                                 tool_ok,
                                 tool_err,
                                 hops,
+                                calls,
                             });
                         }
                     }
                 }
             }
-            return Some(Report { text: last, structured: None, tool_ok, tool_err, hops });
+            return Some(Report { text: last, structured: None, tool_ok, tool_err, hops, calls });
         }
         hops += 1;
 
@@ -353,10 +404,16 @@ pub async fn run_conversation(
             },
         };
         if outcome.ok { tool_ok += 1 } else { tool_err += 1 }
+        let call_id = format!("call-{}", spec.call_seq_start + calls.len() + 1);
+        calls.push(CallRecord {
+            id:    call_id.clone(),
+            skill: call.skill.clone(),
+            ok:    outcome.ok,
+        });
         transcript.push(ChatMessage::text(
             "user",
             format!(
-                "Tool result for `{}` ({}):\n{}",
+                "Tool result for `{}` ({}) [id: {call_id}]:\n{}",
                 call.skill,
                 if outcome.ok { "ok" } else { "error" },
                 outcome.summary
@@ -581,6 +638,7 @@ mod tests {
             task:     "TASK".into(),
             max_hops: 4,
             schema:   Some(schema()),
+            call_seq_start: 0,
         };
         let t = seed_transcript(&spec);
         assert_eq!(t.len(), 3);
@@ -596,7 +654,7 @@ mod tests {
     fn no_schema_means_no_directive_and_no_extra_tool() {
         let spec = RunSpec {
             label: "c".into(), system: "S".into(), seed: vec![],
-            task: "T".into(), max_hops: 2, schema: None,
+            task: "T".into(), max_hops: 2, schema: None, call_seq_start: 0,
         };
         assert!(!seed_transcript(&spec)[0].content.text().contains(STRUCTURED_OUTPUT_NAME));
         assert!(run_registry(None, None).is_none());
@@ -616,11 +674,36 @@ mod tests {
     #[test]
     fn verified_needs_a_tool_call_and_the_structured_report_when_one_was_owed() {
         let r = |tool_ok, structured| Report {
-            text: String::new(), structured, tool_ok, tool_err: 0, hops: 0,
+            text: String::new(), structured, tool_ok, tool_err: 0, hops: 0, calls: vec![],
         };
         assert!(r(1, None).verified(false));
         assert!(!r(0, None).verified(false), "no successful tool call");
         assert!(!r(1, None).verified(true), "owed a structured report, gave none");
         assert!(r(1, Some(json!({}))).verified(true));
+    }
+
+    #[test]
+    fn call_ids_continue_from_the_caller_s_offset() {
+        // Two runs over one transcript must not both hand out `call-1`:
+        // a claim citing `call-1` in round 2 would otherwise resolve
+        // against round 1's result.
+        let id = |start: usize, nth: usize| format!("call-{}", start + nth + 1);
+        assert_eq!(id(0, 0), "call-1");
+        assert_eq!(id(3, 0), "call-4");
+    }
+
+    #[test]
+    fn ok_ids_lists_only_successful_calls() {
+        let r = Report {
+            text: String::new(), structured: None, tool_ok: 1, tool_err: 1, hops: 2,
+            calls: vec![
+                CallRecord { id: "call-1".into(), skill: "read-file".into(), ok: true },
+                CallRecord { id: "call-2".into(), skill: "grep".into(), ok: false },
+            ],
+        };
+        let ids = r.ok_ids();
+        assert!(ids.contains("call-1"));
+        assert!(!ids.contains("call-2"), "a failed call is not evidence");
+        assert_eq!(r.call_lines(), vec!["call-1 read-file (ok)", "call-2 grep (error)"]);
     }
 }
