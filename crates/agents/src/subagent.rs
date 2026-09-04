@@ -119,6 +119,12 @@ pub struct ToolSubAgent {
     /// Whether the owning session is in plan mode. Read by control skills;
     /// inherited by children.
     pub plan_active:   bool,
+    /// The parent session's *completed* turns, as wire messages — what
+    /// `subagent-fork` seeds its child with (Wave 4, §12.1). Built once per
+    /// dispatch by `ChatHub`; `None` outside a live session. The in-flight
+    /// turn is excluded by construction, so a fork never inherits a
+    /// half-written exchange.
+    pub fork_seed:     Option<Arc<Vec<ChatMessage>>>,
 }
 
 impl ToolSubAgent {
@@ -136,6 +142,7 @@ impl ToolSubAgent {
             brokers:      None,
             session_id:   None,
             plan_active:  false,
+            fork_seed:    None,
         }
     }
 
@@ -192,6 +199,13 @@ impl ToolSubAgent {
         self
     }
 
+    /// Attach the parent session's completed turns for `subagent-fork`.
+    /// Inherited by `child()`.
+    pub fn with_fork_seed(mut self, seed: Arc<Vec<ChatMessage>>) -> Self {
+        self.fork_seed = Some(seed);
+        self
+    }
+
     /// Build a child sub-agent rooted at the call id `parent_id`. Used by
     /// `SkillContext` so a skill can spawn further sub-agents. Inherits the
     /// failure sink, summarizer and cancellation token so nested calls share
@@ -210,6 +224,7 @@ impl ToolSubAgent {
             brokers:      self.brokers.clone(),
             session_id:   self.session_id,
             plan_active:  self.plan_active,
+            fork_seed:    self.fork_seed.clone(),
         }
     }
 

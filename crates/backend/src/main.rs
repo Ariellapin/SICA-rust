@@ -180,6 +180,17 @@ async fn run(args: Args) -> Result<()> {
     // parse-only — so a suite is safe to run unattended.
     let model_eval = Arc::new(agents::ModelEval::new(root.clone()));
     skill_registry.register(model_eval.clone());
+    // Delegation (Wave 4, guide §12.1, §12.6): `subagent` runs one bounded
+    // task in a fresh conversation, `subagent-fork` in one seeded with this
+    // session's completed turns, and `ralph` runs fresh rounds against a
+    // fixed objective. All three drive full LLM conversations, so like
+    // `agent-team` they need the finished registry — attached below.
+    let subagent = Arc::new(agents::Subagent::fresh());
+    let subagent_fork = Arc::new(agents::Subagent::forking());
+    let ralph = Arc::new(agents::Ralph::new());
+    skill_registry.register(subagent.clone());
+    skill_registry.register(subagent_fork.clone());
+    skill_registry.register(ralph.clone());
     // `agent-team` is opt-in: it registers only when the user has put
     // `skills/agent-team.md` on disk. A team is N full LLM conversations per
     // call and its teammates are the least reliable output in the app on a
@@ -204,6 +215,9 @@ async fn run(args: Args) -> Result<()> {
         team.attach_registry(&skill_registry);
     }
     model_eval.attach_registry(&skill_registry);
+    subagent.attach_registry(&skill_registry);
+    subagent_fork.attach_registry(&skill_registry);
+    ralph.attach_registry(&skill_registry);
     info!(
         count = skill_count,
         dir = %skills_path.display(),

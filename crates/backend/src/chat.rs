@@ -139,6 +139,7 @@ impl ControlState {
     /// broker rendezvous, and the usual summarizer / cancel / spill / sink.
     async fn sub_agent(
         &self,
+        sessions: &Sessions,
         session_id: u64,
         client: &LlmClient,
         cancel: CancellationToken,
@@ -163,6 +164,12 @@ impl ControlState {
             ]);
         if let Some(fs) = self.failure_sink.clone() {
             sub = sub.with_failure_sink(fs);
+        }
+        // `subagent-fork` seeds its child from this; absent on a session
+        // whose first turn has not finished yet, and the skill says so
+        // rather than silently running a fresh child.
+        if let Some(seed) = fork_seed(sessions, session_id).await {
+            sub = sub.with_fork_seed(seed);
         }
         sub
     }
@@ -420,7 +427,7 @@ impl ControlState {
                     .collect()
             })
             .unwrap_or_default();
-        let sub = self.sub_agent(session_id, client, cancel.clone()).await;
+        let sub = self.sub_agent(sessions, session_id, client, cancel.clone()).await;
         let report = sub
             .run_report(agents::ToolInvocation {
                 skill: &*skill,
@@ -588,7 +595,7 @@ impl ControlState {
                 // while read-only bodies overlap.
                 let mut subs = Vec::with_capacity(chunk.len());
                 for _ in chunk {
-                    subs.push(self.sub_agent(session_id, client, cancel.clone()).await);
+                    subs.push(self.sub_agent(sessions, session_id, client, cancel.clone()).await);
                 }
                 let futs: Vec<_> = prepared
                     .into_iter()
@@ -1588,7 +1595,7 @@ impl ChatHub {
                         (outcome, true)
                     }
                     Some((skill, args)) => {
-                        let sub = control.sub_agent(session_id, &client, cancel.clone()).await;
+                        let sub = control.sub_agent(&sessions_map, session_id, &client, cancel.clone()).await;
                         let report = sub
                             .run_report(agents::ToolInvocation {
                                 skill: &*skill,
@@ -1887,6 +1894,27 @@ fn plan_policy_text() -> String {
         sica_core::paths::skills_dir().join(agents::control::PLAN_MODE_DOC),
     )
     .unwrap_or_else(|_| agents::control::PLAN_MODE_SEED.to_string())
+}
+
+/// The parent session's *completed* turns as wire messages — the seed
+/// `subagent-fork` hands its child (Wave 4, §12.1).
+///
+/// Cut at the last `TurnEnd`, so the in-flight turn never crosses: forking
+/// mid-turn would hand the child an assistant message whose tool results
+/// have not landed yet. The child converses in the text protocol whatever
+/// the parent uses, so tool roles are downgraded here too.
+async fn fork_seed(sessions: &Sessions, session_id: u64) -> Option<Arc<Vec<ChatMessage>>> {
+    let g = sessions.lock().await;
+    let log = g.get(&session_id)?;
+    let cut = log
+        .events
+        .iter()
+        .rposition(|e| matches!(e.kind, EventKind::TurnEnd { .. }))?;
+    let messages = sica_core::event::derive_messages(&log.events[..=cut]);
+    if messages.is_empty() {
+        return None;
+    }
+    Some(Arc::new(wire_messages(&messages, false)))
 }
 
 /// Whether a skill touches the filesystem in a way that could change the

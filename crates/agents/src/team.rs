@@ -22,14 +22,14 @@ use futures::future::join_all;
 use protocol::Event;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use llm::client::{ChatMessage, LlmClient};
 
-use crate::parse_tool_call;
 use crate::registry::SkillRegistry;
+use crate::runner;
 use crate::skill::{Skill, SkillContext, SkillOutcome};
-use crate::subagent::{ToolInvocation, ToolSubAgent};
+use crate::subagent::ToolSubAgent;
 
 pub const AGENT_TEAM_NAME: &str = "agent-team";
 
@@ -202,10 +202,10 @@ impl Skill for AgentTeam {
         // rewrite the todo list, exit the parent's plan, or spawn its own
         // team — those needs arrive via its final report instead.
         let registry =
-            registry.map(|r| Arc::new(r.excluding(crate::control::TEAMMATE_EXCLUDED)));
+            registry.map(|r| Arc::new(r.excluding(crate::control::CHILD_EXCLUDED)));
         let catalogue = registry
             .as_ref()
-            .map(|r| r.catalogue_markdown_excluding(crate::control::TEAMMATE_EXCLUDED))
+            .map(|r| r.catalogue_markdown_excluding(crate::control::CHILD_EXCLUDED))
             .filter(|c| !c.is_empty());
         let cancel = ctx.sub.cancel.clone();
 
@@ -244,7 +244,7 @@ impl Skill for AgentTeam {
         let mut reports: Vec<Option<TeammateOutcome>> = vec![None; spec.teammates.len()];
 
         for round in 1..=spec.rounds {
-            if is_cancelled(&cancel) {
+            if runner::is_cancelled(&cancel) {
                 break;
             }
             if round > 1 {
@@ -295,7 +295,7 @@ impl Skill for AgentTeam {
             });
         }
 
-        if is_cancelled(&cancel) {
+        if runner::is_cancelled(&cancel) {
             return fail("agent-team interrupted".into());
         }
         if reports.iter().all(Option::is_none) {
@@ -359,18 +359,17 @@ impl Skill for AgentTeam {
     }
 }
 
-/// One teammate's turn within a round: chat, dispatch at most
-/// `MAX_TEAMMATE_HOPS` tool calls, and return the final report together with
-/// its tool-call tally. `None` means every LLM call failed (or the turn was
-/// interrupted) — the caller keeps whatever report the previous round
-/// produced.
+/// One teammate's turn within a round, delegated to the shared conversation
+/// runner (`agents::runner`): chat, dispatch at most `MAX_TEAMMATE_HOPS`
+/// tool calls, and return the final report with its tool-call tally.
+/// `None` means every LLM call failed (or the turn was interrupted) — the
+/// caller keeps whatever report the previous round produced.
 ///
-/// A reply with no parsable tool call used to be accepted as the final
-/// report unconditionally. That silently promoted *botched* calls —
-/// `read-file 'README.md'` with no ` > ` clause, an unreadable
-/// ```tool_call fence — into confident prose about a file the teammate
-/// never opened. Such a reply now costs the teammate one corrective nudge
-/// before it is accepted, and the acceptance is recorded as unverified.
+/// The runner owns the grounding rules a teammate needs (one corrective
+/// nudge for a botched tool call before its reply is accepted, and the
+/// unverified tally), because `subagent` and `ralph` need exactly the same
+/// ones. Everything team-specific — the roster, the board, the lead pass —
+/// stays here.
 async fn run_teammate(
     client:     &LlmClient,
     registry:   Option<&Arc<SkillRegistry>>,
@@ -379,114 +378,24 @@ async fn run_teammate(
     transcript: &mut Vec<ChatMessage>,
     cancel:     &Option<CancellationToken>,
 ) -> Option<TeammateOutcome> {
-    let mut hops: u8 = 0;
-    let mut tool_ok:  u32 = 0;
-    let mut tool_err: u32 = 0;
-    let mut nudged = false;
-    loop {
-        let reply = llm_call(client, cancel, transcript.clone()).await?;
-        transcript.push(ChatMessage::text("assistant", reply.clone()));
-
-        let call = registry.and_then(|reg| {
-            parse_tool_call::extract_known(&reply, |n| reg.by_name.contains_key(n))
-        });
-        let Some(call) = call else {
-            let rejected = registry.and_then(|reg| {
-                parse_tool_call::rejected_attempt(&reply, |n| reg.by_name.contains_key(n))
-            });
-            if let Some(reason) = rejected {
-                warn!(
-                    role = %mate.role,
-                    reason = %reason,
-                    nudged,
-                    "agent-team: teammate emitted an unparsable tool call"
-                );
-                sub.events.emit(Event::LogLine {
-                    level:   "WARN".into(),
-                    message: format!(
-                        "agent-team: `{}` emitted {reason} — {}",
-                        mate.role,
-                        if nudged || hops >= MAX_TEAMMATE_HOPS {
-                            "accepting its reply as an UNVERIFIED report"
-                        } else {
-                            "asking it to retry with the correct syntax"
-                        }
-                    ),
-                });
-                if !nudged && hops < MAX_TEAMMATE_HOPS {
-                    nudged = true;
-                    transcript.push(ChatMessage::text("user", SYNTAX_CORRECTION.to_string()));
-                    continue;
-                }
-            }
-            return Some(TeammateOutcome { report: reply, tool_ok, tool_err });
-        };
-
-        if hops >= MAX_TEAMMATE_HOPS {
-            transcript.push(ChatMessage::text(
-                "user",
-                format!(
-                    "Tool budget ({MAX_TEAMMATE_HOPS}) exhausted for this round \
-                     — reply with your final report now, using what you \
-                     already have."
-                ),
-            ));
-            let final_reply = llm_call(client, cancel, transcript.clone()).await?;
-            transcript.push(ChatMessage::text("assistant", final_reply.clone()));
-            return Some(TeammateOutcome { report: final_reply, tool_ok, tool_err });
-        }
-        hops += 1;
-
-        // `registry` is Some here — `call` only exists when it was.
-        let reg = registry.expect("tool call parsed without a registry");
-        let outcome = match reg.resolve(&call) {
-            Some((skill, args)) => {
-                sub.run(ToolInvocation {
-                    skill:       &*skill,
-                    args,
-                    raw_args:    call.raw_args.clone(),
-                    expectation: call.expectation.clone(),
-                })
-                .await
-            }
-            None => SkillOutcome {
-                ok:      false,
-                summary: format!("unknown skill `{}`", call.skill),
-            },
-        };
-        if outcome.ok { tool_ok += 1 } else { tool_err += 1 }
-        transcript.push(ChatMessage::text(
-            "user",
-            format!(
-                "Tool result for `{}` ({}):\n{}",
-                call.skill,
-                if outcome.ok { "ok" } else { "error" },
-                outcome.summary
-            ),
-        ));
-        info!(
-            role = %mate.role,
-            skill = %call.skill,
-            ok = outcome.ok,
-            hop = hops,
-            "agent-team: teammate tool call"
-        );
-    }
+    // The transcript is already seeded (and carried across rounds), so the
+    // spec only supplies the label and the hop budget.
+    let spec = runner::RunSpec {
+        label:    format!("agent-team `{}`", mate.role),
+        system:   String::new(),
+        seed:     Vec::new(),
+        task:     String::new(),
+        max_hops: MAX_TEAMMATE_HOPS,
+        schema:   None,
+    };
+    let report =
+        runner::run_conversation(client, registry, sub, transcript, &spec, cancel).await?;
+    Some(TeammateOutcome {
+        report:   report.text,
+        tool_ok:  report.tool_ok,
+        tool_err: report.tool_err,
+    })
 }
-
-/// Sent to a teammate that emitted something tool-call-shaped the parser
-/// could not read. Restates the contract and — the part that matters —
-/// forbids the fallback the model would otherwise take: writing up the
-/// output it *expected* the tool to produce.
-const SYNTAX_CORRECTION: &str = "\
-That was not a valid tool call, so NOTHING ran and you received no output. \
-To call a tool, reply with exactly one line and nothing else:\n\n\
-    <skill-name> '<arg1>' '<arg2>' > <what you want to learn>\n\n\
-Every argument must be quoted and the ` > <expectation>` part is required. \
-Retry the call now if you still need it. If you do not, reply with your \
-report — but do NOT describe file contents, command output, or whether a \
-path exists unless a tool result above actually shows it; say plainly that \
-you could not verify it instead.";
 
 /// Team-lead pass: merge every report into one deliverable. Best-effort —
 /// `None` on any LLM failure, and the caller falls back to raw reports.
@@ -498,11 +407,16 @@ async fn synthesize(
 ) -> Option<String> {
     let mut body = String::new();
     if !spec.shared.trim().is_empty() {
-        body.push_str(&format!("Team briefing: {}\n\n", spec.shared.trim()));
+        body.push_str(&format!("Team briefing: {}
+
+", spec.shared.trim()));
     }
     for (mate, report) in spec.teammates.iter().zip(reports) {
         body.push_str(&format!(
-            "## Report from `{}`{} (task: {})\n{}\n\n",
+            "## Report from `{}`{} (task: {})
+{}
+
+",
             mate.role,
             report.as_ref().map(TeammateOutcome::provenance).unwrap_or_default(),
             truncate_chars(&mate.task, 200),
@@ -512,51 +426,14 @@ async fn synthesize(
             }
         ));
     }
-    let system = "You are the lead of a small agent team. Merge your \
-                  teammates' reports into ONE coherent deliverable: keep every \
-                  concrete fact (numbers, paths, versions, errors) verbatim, \
-                  drop duplication, and flag any point where two reports \
-                  contradict each other instead of silently picking one. \
-                  A report whose heading says UNVERIFIED is not backed by any \
-                  tool output — it is that teammate's guess. Never restate its \
-                  claims as established fact: either attribute them (\"`role` \
-                  believes …, unverified\") or leave them out. \
-                  Output only the merged result — no preamble.";
+    let system = "You are the lead of a small agent team. Merge your                   teammates' reports into ONE coherent deliverable: keep every                   concrete fact (numbers, paths, versions, errors) verbatim,                   drop duplication, and flag any point where two reports                   contradict each other instead of silently picking one.                   A report whose heading says UNVERIFIED is not backed by any                   tool output — it is that teammate's guess. Never restate its                   claims as established fact: either attribute them (\"`role`                   believes …, unverified\") or leave them out.                   Output only the merged result — no preamble.";
     let messages = vec![
         ChatMessage::text("system", system),
         ChatMessage::text("user", body),
     ];
-    llm_call(client, cancel, messages).await
+    runner::llm_call(client, cancel, messages).await
 }
 
-/// One non-streaming chat round-trip raced against the turn's cancellation
-/// token. `None` on cancel, transport error, or an empty reply.
-async fn llm_call(
-    client:   &LlmClient,
-    cancel:   &Option<CancellationToken>,
-    messages: Vec<ChatMessage>,
-) -> Option<String> {
-    let res = match cancel {
-        Some(token) => tokio::select! {
-            biased;
-            _ = token.cancelled() => return None,
-            r = client.chat_once(messages) => r,
-        },
-        None => client.chat_once(messages).await,
-    };
-    match res {
-        Ok(s) if !s.trim().is_empty() => Some(s),
-        Ok(_) => None,
-        Err(e) => {
-            warn!(error = %e, "agent-team: LLM call failed");
-            None
-        }
-    }
-}
-
-fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
-    cancel.as_ref().is_some_and(|t| t.is_cancelled())
-}
 
 /// Role charter fed to one teammate as its system message. Rendered through
 /// the shared prompt assembly (persona section at the `MEMORY` slot) so all
@@ -718,7 +595,7 @@ fn finish_spec(mut teammates: Vec<Teammate>, shared: String, rounds: u8) -> Resu
 }
 
 /// Char-boundary-safe truncation with an ellipsis marker.
-fn truncate_chars(s: &str, cap: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, cap: usize) -> String {
     if s.chars().count() <= cap {
         return s.to_string();
     }

@@ -7,6 +7,7 @@ pub mod builtins;
 pub mod compact;
 pub mod context;
 pub mod control;
+pub mod delegate;
 pub mod guard;
 pub mod instructions;
 pub mod invoke;
@@ -18,7 +19,9 @@ pub mod parse_tool_call;
 pub mod pipeline;
 pub mod proc;
 pub mod prompt;
+pub mod ralph;
 pub mod registry;
+pub mod runner;
 pub mod skill;
 pub mod skill_creator;
 pub mod spill;
@@ -29,7 +32,9 @@ pub mod turn;
 pub use agent::{EventSink, MainAgent};
 pub use broker::BrokerSet;
 pub use builtins::{AskUser, EditFile, Glob, Grep, ReadFile, RunCli, RunPwsh, WriteFile};
+pub use delegate::Subagent;
 pub use md_skill::{LoadReport, MarkdownSkill};
+pub use ralph::Ralph;
 pub use model_eval::ModelEval;
 pub use parse_tool_call::{
     extract as extract_tool_call, extract_known as extract_tool_call_known, ToolCall,

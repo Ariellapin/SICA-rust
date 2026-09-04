@@ -23,12 +23,20 @@ pub const TODO_WRITE_NAME: &str = "todo-write";
 pub const EXIT_PLAN_MODE_NAME: &str = "exit-plan-mode";
 pub const ASK_USER_NAME: &str = "ask-user";
 
-/// Skills a teammate must never see: harness controls plus the team itself.
-/// A runtime-owned child cannot ask the user, rewrite the harness todo
-/// list, exit the parent's plan mode, or spawn its own team — anything it
-/// needs from those must arrive in its final report instead.
-pub const TEAMMATE_EXCLUDED: &[&str] = &[
+/// Skills a runtime-owned child (an `agent-team` teammate, a `subagent`,
+/// a Ralph round) must never see: the harness controls, and every form of
+/// further delegation.
+///
+/// A child cannot ask the user, rewrite the harness todo list or exit the
+/// parent's plan mode — anything it needs from those must arrive in its
+/// final report instead. It cannot delegate onward either: nested
+/// delegation only unwinds at `ToolSubAgent::max_depth`, having spent a
+/// whole LLM conversation at every level on the way down.
+pub const CHILD_EXCLUDED: &[&str] = &[
     crate::team::AGENT_TEAM_NAME,
+    crate::delegate::SUBAGENT_NAME,
+    crate::delegate::SUBAGENT_FORK_NAME,
+    crate::ralph::RALPH_NAME,
     ASK_USER_NAME,
     TODO_WRITE_NAME,
     EXIT_PLAN_MODE_NAME,

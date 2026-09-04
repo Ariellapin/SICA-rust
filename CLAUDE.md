@@ -44,7 +44,7 @@ Seven crates, dependency direction strictly downward:
 | `protocol` | Wire types only (`Frame`, `Request`, `Response`, `Event`) + `PROTOCOL_VERSION`. No I/O, no dep on `sica-core`. Shared by both binaries — changes here force rebuilding both. |
 | `sica-core` | Shared utilities: `paths` (every on-disk surface), `event` (the append-only session log + `derive_surface` fold), `retain` (UTF-8-safe head/tail windows + the one omission sentence every cut uses), `message`/`session` (chat message types; `Session` survives only for legacy TOML migration), `build_id`, `theme`. |
 | `llm` | HTTP client for OpenAI-compatible `/v1/chat/completions` (llama.cpp, vLLM, OpenAI, Anthropic-compat), SSE streaming + `<think>` splitting, connection state machine, token counting. |
-| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`. |
+| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds). |
 | `idealist` | Classifies failures (`FeBug` vs `BeFix`), writes improvement tickets to `idealist_workspace/`, optional BE auto-patching (off by default). |
 | `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `be_core/` holds the legacy demo state. |
 | `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the panels. |
@@ -85,7 +85,7 @@ Parsing is deliberately conservative. `extract_tool_call_known` only accepts nat
 `Skill` is an async trait (`name`, `description`, `positional_args`, `run`). Registration happens once at BE startup ([crates/backend/src/main.rs](crates/backend/src/main.rs)):
 
 1. Seed `skills/*.md` docs and `memory.md` if absent (**never overwritten** — those files are the user's once on disk). `skills/plan-mode.md` is seeded the same way but excluded from the skill scan by name — it is the plan-mode policy config, not a callable skill.
-2. `register` the Rust built-ins: `skill-creator`, `run-cli`, `run-pwsh`, `read-file` (line-numbered, optional `start`/`end`), `write-file`, `edit-file` (literal single-match replace), `glob` (gitignore-aware, newest first, cap 100), `grep` (regex over files, cap 250 matches), `model-eval`, `ask-user` (blocks on the broker for a human answer), plus the `todo-write` / `exit-plan-mode` stubs — catalogue entries whose bodies run in `chat.rs` (session-log mutation + turn control), intercepted before any sub-agent spins up.
+2. `register` the Rust built-ins: `skill-creator`, `run-cli`, `run-pwsh`, `read-file` (line-numbered, optional `start`/`end`), `write-file`, `edit-file` (literal single-match replace), `glob` (gitignore-aware, newest first, cap 100), `grep` (regex over files, cap 250 matches), `model-eval`, `ask-user` (blocks on the broker for a human answer), the Wave-4 delegation set (`subagent`, `subagent-fork`, `ralph` — all three need the finished registry, so they are attached after the markdown scan like `agent-team`), plus the `todo-write` / `exit-plan-mode` stubs — catalogue entries whose bodies run in `chat.rs` (session-log mutation + turn control), intercepted before any sub-agent spins up.
 3. `agent-team` (`agents::team`) registers **only if `skills/agent-team.md` exists** — that file is the feature's on/off switch and is deliberately *not* seeded in step 1. A team is N concurrent LLM conversations per call and its teammates are the least reliable output in the app, so it stays out of the catalogue until someone puts the doc there. Rename it to `agent-team.md.off` (only `*.md` is scanned) and restart the BE to turn it off.
 4. `md_skill::register_all` scans `skills/*.md` and uses **`register_if_absent`** so a markdown file can't shadow a built-in of the same name. This matters: the seeded `skills/run-cli.md` is documentation *for* `RunCli`, and shadowing it would make `run-cli` return its own docs instead of executing anything.
 
@@ -106,6 +106,53 @@ Permission modes (`read-only | workspace-write | danger-full-access`, policy lev
 - `TeammateOutcome` counts successful tool calls per teammate. `tool_ok == 0` tags the report **UNVERIFIED** everywhere it appears — inter-round board, lead prompt, final summary — and the lead is instructed to attribute or drop those claims, never restate them as fact. If *no* teammate verified anything the whole outcome gets a warning banner, because that string is all the main agent ever sees.
 - A reply with no parsable tool call is checked with `parse_tool_call::rejected_attempt`. A botched call (`read-file 'README.md'` with no ` > ` clause) buys one `SYNTAX_CORRECTION` retry plus a WARN `LogLine`; previously it was silently accepted as the teammate's final answer, which is exactly how "the file exists" reached the user for a file that didn't.
 - Teammates see the catalogue via `catalogue_markdown_excluding(&[AGENT_TEAM_NAME])` — a teammate spawning its own team only unwinds at the depth limit.
+
+### Delegation (Wave 4)
+
+`agents::runner::run_conversation` is the one place a *child conversation*
+runs: its own system prompt, its own transcript, a bounded hop loop over
+`ToolSubAgent::child`, and one report crossing back. `agent-team`'s
+teammates, `subagent`/`subagent-fork` and every `ralph` round go through it,
+so the two grounding rules live once instead of three times — a run with
+zero successful tool calls is reported **UNVERIFIED**, and a reply that
+looks like a tool call but does not parse (`parse_tool_call::rejected_attempt`)
+buys one `SYNTAX_CORRECTION` retry before it is accepted as an answer.
+
+**Structured output.** `RunSpec.schema` registers a *child-scoped*
+`structured-output` skill (present only in that run's registry view) and
+appends its contract to the child's system prompt: only a call to it counts
+as the result. The argument is validated against a JSON Schema subset
+implemented in `runner::validate` — `type`, `properties`, `required`,
+`items`, `enum`, `minItems`, with unknown keywords deliberately ignored
+rather than rejected. There is no `jsonschema` dependency: every schema in
+the workspace is authored in this crate and stays inside that subset. A
+rejected argument is fed back as a tool error and retried within the hop
+budget; prose where a schema was demanded buys one reminder and is then
+reported unverified.
+
+- **`subagent 'task'`** — fresh child, empty conversation, so the task must
+  be self-contained. **`subagent-fork 'task'`** — child seeded with the
+  parent session's *completed* turns (`chat::fork_seed` cuts at the last
+  `TurnEnd`; the in-flight turn never crosses, since its tool results have
+  not landed). The two descriptions differ deliberately: the description is
+  what tells the model how to write the task. A fork with nothing to
+  inherit fails loudly rather than silently running as `subagent`.
+- **`ralph 'objective' 'max_rounds'`** — up to `MAX_ROUNDS` (64, default 8)
+  brand-new agents against one immutable objective. A round sees no parent
+  transcript and no earlier round — only the workspace (the stated source of
+  truth) and the previous round's bounded 16 KiB report. Each round must
+  report `{status, summary, evidence, next_steps, blocker}` through
+  `structured-output`; `ralph::check_report` then enforces the cross-field
+  rules the schema cannot express (`complete` needs evidence and no
+  `next_steps`; `continue` needs a `next_step` and no blocker; `blocked`
+  needs a concrete blocker). The loop stops on complete / blocked / round
+  limit / a round that fails to report. The portable idea is the one to
+  keep: *only a small validated struct crosses a context boundary.*
+
+Every delegated child runs on `registry.excluding(control::CHILD_EXCLUDED)`
+— no harness controls (`ask-user`, `todo-write`, `exit-plan-mode`) and no
+further delegation, since nested delegation would otherwise only unwind at
+`ToolSubAgent::max_depth` after spending a whole conversation per level.
 
 ### model-eval (measuring the prompt configuration)
 
