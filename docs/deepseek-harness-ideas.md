@@ -593,22 +593,32 @@ effect* — for every plugin. Worth adopting for `skills/*.md` docs.
 
 ## Suggested next ports, in dependency order
 
-Waves 1–3 of the
-[implementation guide](harness-implementation-guide.md#15-roadmap) are done
-(Wave 3: `ToolPolicy` pipeline + brokers, approval + permission modes,
-plan mode + `todo-write`, read-before-edit, `RunCommand` + `/compact`
-`/plan` `/permission`, parallel read-only calls, protocol v13). Next, in
-dependency order (Wave 4 — delegation):
+Waves 1–4 of the
+[implementation guide](harness-implementation-guide.md#15-roadmap) are done.
+Wave 4 landed as `run_conversation` + `subagent`/`subagent-fork` and Ralph
+(§12.1, §12.6), `structured_output` and typed `agent-team` reports whose
+claims cite checkable `[id: call-N]` tool results (§12.2), the
+`followup`/`steer`/`inject` inbox (§2.1, protocol v14), background jobs with
+`job-output`/`job-list`/`job-kill` and pushed completion (§12.4, v15), and
+goals with the round driver, compare-and-set revisions and process-local
+arming (§12.3, v16).
 
-1. **`run_conversation` + `subagent`/`subagent-fork`** (guide §12.1) —
-   extract the teammate runner so a task can delegate to a fresh
-   conversation, seeded empty or forked from the parent's completed turns.
-2. **`structured_output` and typed team reports** (§12.2) — schema-shaped
-   teammate answers instead of free-form prose with an UNVERIFIED tag.
-3. **Jobs + background `run-cli`** (§12.4) — `job_output` / `job_list` /
-   `job_kill` over every background kind, completion pushed not polled.
-4. **Inbox `followup`/`steer`/`inject`** (§2.1) — a message sent mid-turn
-   queues instead of cancelling.
-5. **Goals + round driver** (§12.3) — one durable objective per session
-   with compare-and-set revisions and process-local arming.
-6. **Ralph** (§12.6) — fresh-agent rounds with a small validated handoff.
+Next, in dependency order (Wave 5 — ecosystem and evals):
+
+1. **Hooks** (guide §13.1) — a shell-command protocol around the tool
+   pipeline, so a workspace can veto or rewrite a call without a rebuild.
+   The `pre_step` seat and the `ToolPolicy` pipeline are both already there.
+2. **MCP client** (§13.2) — third-party tools as ordinary `Skill`s. The
+   registry already takes dynamic skills (`md_skill`), so this is transport
+   plus a schema translation.
+3. **`web-fetch` / `web-search`** (§13.3) — the untrusted-content frame
+   (`Skill::trusted`) exists for exactly this and has no real user yet.
+4. **Session projections** (§3.3) — derive todo / goal / job views from the
+   log rather than keeping parallel maps on `ChatHub`.
+5. **Mock LLM server** (§14.2) and **replay evals** (§14.1) — a scripted
+   fault server, then recorded-session snapshots. The retry classifier and
+   the compaction trigger are the parts that most need a deterministic
+   harness; `model-eval` covers prompt quality but not loop behaviour.
+6. **Runtime invariants** (§14.3) — assert the properties this codebase now
+   states in prose (one visible snapshot per `ContextSource`, no dangling
+   native `tool_calls`, a goal round only from an armed goal).

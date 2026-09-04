@@ -1272,7 +1272,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | **1 — hygiene** — **done** | Repeat-tool-reminder (§6.4, `agents::guard`) · untrusted frame (§9.4, `Skill::trusted` + `UNTRUSTED_NOTICE`) · tool-result pruner (§9.2, `chat::prune_tool_results`) · `retain` library (§6.10, `sica_core::retain`) · `/name` expansion + `<skill_content>` frame (§8.1–8.2, `agents::invoke`) · `ContextInjected` event + `EventKind::Unknown` · fallback title (§3.4, `title_gen::fallback`) · Job Objects for `run-cli` (§6.8, `agents::proc`) · `usage` on `StreamChunk` (§4.1) | S×8 | no — injected context rides the `"context"` role string on `MessageDump` |
 | **2 — prompt & context** — **done** | `agents::prompt` assembly + runtime context (§5.1) · `AGENTS.md` loader with budget (§5.3, `agents::instructions`) · time context (§9.3) · prefix-preserving 8-section compaction + 80/16 `CompactPolicy` (§9.1) · usage-anchored meter + breakdown (§4.3, `agents::meter`) · line-numbered/ranged `read-file`, `edit-file`, `glob`, `grep` (§6.6) · `Skill::optional_args` · `MessageDump.context_source` | M×6 | yes (v12) — `Event::TokenUsage.breakdown`, `Event::ContextCompacted.pruned`, `LlmOptions.compact`, `MessageDump.context_source` |
 | **3 — control** — **done** (protocol v13) | `ToolPolicy` pipeline (§6.1) · brokers for `ask-user` and approval (§10.1–10.2) · permission modes (§10.3) · plan mode (§11.1) · `todo-write` (§11.2) · read-before-edit (§8.5) · `RunCommand` + `/compact` `/plan` `/permission` (§8.4) · parallel read-only calls (§6.2) | M×7 | yes (v13) |
-| **4 — delegation** — *partly done* | **done, no bump:** `agents::runner::run_conversation` + `subagent`/`subagent-fork` (§12.1) · `structured_output` machinery — child-scoped `structured-output` tool + `runner::validate` (§12.2) · Ralph (§12.6). **remaining:** typed team reports (§12.2, applying the schema to `agent-team`) · jobs + background `run-cli` (§12.4) · inbox `followup/steer/inject` (§2.1) · goals + round driver (§12.3) | M×6 | yes (v14) — *the done half needed none; the remaining half does* |
+| **4 — delegation** — **done** | `agents::runner::run_conversation` + `subagent`/`subagent-fork` (§12.1) · `structured_output` — child-scoped `structured-output` tool + `runner::validate` (§12.2) · Ralph (§12.6) · typed `agent-team` reports with checkable `[id: call-N]` citations (§12.2) · inbox `followup`/`steer`/`inject` (§2.1) · background jobs + `job-output`/`job-list`/`job-kill` (§12.4) · goals + round driver (§12.3) | M×7 | yes — shipped as three bumps, one per shape change: v14 (inbox), v15 (jobs), v16 (goals) |
 | **5 — ecosystem & evals** | hooks (§13.1) · MCP (§13.2) · `web-fetch`/`web-search` (§13.3) · session projections (§3.3) · mock LLM server (§14.2) · replay evals (§14.1) · invariants (§14.3) | M×7 | yes (v15) |
 | **later** | PTC / `run_code` (§7) · workflow scripts (§12.5) · Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · agent presets from `agents/*.md` (§5.2) | L/XL | — |
 
@@ -1284,14 +1284,14 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | --- | --- | --- |
 | `ContextInjected { surface, source: ContextSource, content }` — `source ∈ {Instructions, SkillInvocation(name), FileReference, ToolNotice, JobNotice, GoalRound, RuntimeContext}` | user-role | §2.1, §5.1, §5.3, §6.4, §8.2, §9.5, §12.4 |
 | `ToolResult.pruned: bool` + `ToolResult.parent_seq: Option<u64>` + `ToolResult.trusted: bool` | (existing) | §9.2, §7/§12.6, §9.4 |
-| `TurnStart.source: TurnSource { Human, GoalRound, Followup }` | (existing) | §12.3 |
+| `TurnStart.source: TurnSource { Human, GoalRound, Followup }` — **done** (Wave 4) | (existing) | §12.3 |
 | `Command { name, input, ok }` | no | §8.4 |
 | `Approval { skill, args_preview, decision }` | no | §10.2 |
 | `PermissionMode { mode }` | no | §10.3 |
 | `PlanMode { active }` | no | §11.1 |
 | `TodoWrite { items }` | no | §11.2 |
-| `GoalChange { goal_id, revision, objective, phase, rounds_started, max_rounds, blocker }` | no | §12.3 |
-| `JobFinished { id, status, exit_code }` | no | §12.4 |
+| `GoalChange { goal_id, revision, objective, phase, rounds_started, max_rounds, blocker }` — **done** (Wave 4) | no | §12.3 |
+| `JobFinished { id, status, exit_code }` — **done** (Wave 4) | no | §12.4 |
 | `Hook { event, command, decision, exit_code }` | no | §13.1 |
 | `AgentPreset { name }` | no | §5.2 |
 | `MessageFeedback { seq_ref, rating, note }` | no | §3.7 |
@@ -1307,7 +1307,7 @@ by a newer backend still loads on an older one.
 | --- | --- | --- |
 | 2 — shipped as v12 | — | `Event::TokenUsage.breakdown`; `Event::ContextCompacted.pruned`; `LlmOptions.compact` (`CompactPolicy`); `MessageDump.context_source` |
 | 3 | `RunCommand`, `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion` | `Response::CommandResult`; `Event::ApprovalRequested`, `QuestionAsked`, `TodosChanged`, `PlanModeChanged`, `PermissionModeChanged` |
-| 4 | `SteerTurn`, `InjectContext` | `Event::JobsChanged`, `GoalChanged` |
+| 4 — shipped as v14, v15, v16 | `SteerTurn`, `InjectContext` (v14) | `Event::InboxChanged` (v14); `Event::JobsChanged` + `JobDump` (v15); `Event::GoalChanged` + `GoalDump`/`GoalPhase` (v16). Log-only: `ContextSource::Injected`, `EventKind::JobFinished`, `EventKind::GoalChange`, `TurnStart.source` (`TurnSource`) |
 | 5 | `SessionStats`, `ListWorkspaceFiles` | `Response::SessionStats`, `WorkspaceFiles` |
 
 Every bump: `.\run.ps1 build --workspace`, restart the GUI, run

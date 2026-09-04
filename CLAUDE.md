@@ -55,9 +55,9 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 13) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 16) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
-Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`).
+Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, and the Wave-4 inbox pair `SteerTurn`/`InjectContext`).
 
 ## The agent loop (the heart of the app)
 
@@ -85,7 +85,7 @@ Parsing is deliberately conservative. `extract_tool_call_known` only accepts nat
 `Skill` is an async trait (`name`, `description`, `positional_args`, `run`). Registration happens once at BE startup ([crates/backend/src/main.rs](crates/backend/src/main.rs)):
 
 1. Seed `skills/*.md` docs and `memory.md` if absent (**never overwritten** — those files are the user's once on disk). `skills/plan-mode.md` is seeded the same way but excluded from the skill scan by name — it is the plan-mode policy config, not a callable skill.
-2. `register` the Rust built-ins: `skill-creator`, `run-cli`, `run-pwsh`, `read-file` (line-numbered, optional `start`/`end`), `write-file`, `edit-file` (literal single-match replace), `glob` (gitignore-aware, newest first, cap 100), `grep` (regex over files, cap 250 matches), `model-eval`, `ask-user` (blocks on the broker for a human answer), the Wave-4 delegation set (`subagent`, `subagent-fork`, `ralph` — all three need the finished registry, so they are attached after the markdown scan like `agent-team`), plus the `todo-write` / `exit-plan-mode` stubs — catalogue entries whose bodies run in `chat.rs` (session-log mutation + turn control), intercepted before any sub-agent spins up.
+2. `register` the Rust built-ins: `skill-creator`, `run-cli`, `run-pwsh`, `read-file` (line-numbered, optional `start`/`end`), `write-file`, `edit-file` (literal single-match replace), `glob` (gitignore-aware, newest first, cap 100), `grep` (regex over files, cap 250 matches), `model-eval`, `ask-user` (blocks on the broker for a human answer), the Wave-4 delegation set (`subagent`, `subagent-fork`, `ralph` — all three need the finished registry, so they are attached after the markdown scan like `agent-team`), the Wave-4 job trio (`job-output`, `job-list`, `job-kill`), plus the `todo-write` / `exit-plan-mode` / `create-goal` / `get-goal` / `update-goal` stubs — catalogue entries whose bodies run in `chat.rs` (session-log mutation + turn control), intercepted before any sub-agent spins up.
 3. `agent-team` (`agents::team`) registers **only if `skills/agent-team.md` exists** — that file is the feature's on/off switch and is deliberately *not* seeded in step 1. A team is N concurrent LLM conversations per call and its teammates are the least reliable output in the app, so it stays out of the catalogue until someone puts the doc there. Rename it to `agent-team.md.off` (only `*.md` is scanned) and restart the BE to turn it off.
 4. `md_skill::register_all` scans `skills/*.md` and uses **`register_if_absent`** so a markdown file can't shadow a built-in of the same name. This matters: the seeded `skills/run-cli.md` is documentation *for* `RunCli`, and shadowing it would make `run-cli` return its own docs instead of executing anything.
 
@@ -103,7 +103,7 @@ Permission modes (`read-only | workspace-write | danger-full-access`, policy lev
 
 `ToolSubAgent` wraps one tool call; `agents::team::AgentTeam` (opt-in, above) instead runs up to 6 *LLM* teammates concurrently, each with its own transcript, and merges their reports through a lead pass. Its failure mode is the opposite of a skill's: a teammate that calls nothing still writes fluent prose about files it never opened, and the lead launders that into the deliverable. Three guards, all in [crates/agents/src/team.rs](crates/agents/src/team.rs):
 
-- `TeammateOutcome` counts successful tool calls per teammate. `tool_ok == 0` tags the report **UNVERIFIED** everywhere it appears — inter-round board, lead prompt, final summary — and the lead is instructed to attribute or drop those claims, never restate them as fact. If *no* teammate verified anything the whole outcome gets a warning banner, because that string is all the main agent ever sees.
+- **Reports are typed** (`teammate_schema`, Wave 4): a teammate reports through the child-scoped `structured-output` tool as a list of claims, each citing the ids of the tool results that back it. The citations are checkable, not asserted — `runner` gives every dispatched call a stable id, echoes it to the child (`[id: call-2]`) and returns the trail on `Report.calls`, and `RunSpec.call_seq_start` keeps ids unique across the rounds a team runs over one transcript. A claim citing nothing, or citing an id that named no *successful* call, renders as `unverified:` in the board, the lead prompt and the final summary; a teammate with no cited claim is headed **UNVERIFIED**, a partly-cited one says so rather than passing as clean, and if nothing anywhere is cited the whole outcome gets a warning banner — that string is all the main agent ever sees.
 - A reply with no parsable tool call is checked with `parse_tool_call::rejected_attempt`. A botched call (`read-file 'README.md'` with no ` > ` clause) buys one `SYNTAX_CORRECTION` retry plus a WARN `LogLine`; previously it was silently accepted as the teammate's final answer, which is exactly how "the file exists" reached the user for a file that didn't.
 - Teammates see the catalogue via `catalogue_markdown_excluding(&[AGENT_TEAM_NAME])` — a teammate spawning its own team only unwinds at the depth limit.
 
@@ -153,6 +153,74 @@ Every delegated child runs on `registry.excluding(control::CHILD_EXCLUDED)`
 — no harness controls (`ask-user`, `todo-write`, `exit-plan-mode`) and no
 further delegation, since nested delegation would otherwise only unwind at
 `ToolSubAgent::max_depth` after spending a whole conversation per level.
+
+### The inbox (Wave 4)
+
+`ChatHub.inbox` ([crates/backend/src/inbox.rs](crates/backend/src/inbox.rs))
+is where input waits when the loop is busy, and the loop claims from it at
+two points: **at the top of every hop** it drains `Steer` (user text) and
+`Inject` (runtime context) into the log *before* `build_history`, so they
+ride the very next request; **at the end of the turn** it claims one
+`Followup` and starts the next turn itself. A `SendUserMessage` while a
+turn is running therefore queues instead of cancelling that turn;
+`SteerTurn` and `InjectContext` are the other two doors. `start_turn` is
+split from `send_user_message` for the handoff: the slot stays *reserved*
+across the gap (so a send arriving mid-handoff still queues), and going
+back through the queue gate while holding it would re-queue the followup it
+just claimed. Interrupting drops steers and injects aimed at the dying turn
+but keeps queued user messages — sending a message and then pressing Stop
+is how a user says "do this instead". In the FE the composer stays live
+during a turn: Enter queues (rendered as "queued"), Ctrl+Enter steers.
+
+### Background jobs (Wave 4)
+
+`run-cli` / `run-pwsh` with `background=true` start a job under
+`agents::jobs::JobRegistry` instead of waiting out the 30 s foreground cap,
+and return `started job cli-3`. Three generic tools cover it from then on —
+`job-output` (everything since the last read, ending in `[status: …]`),
+`job-list`, `job-kill` — so a PTY or a detached subagent would need no new
+controls. Jobs are per session (ids are invisible to any other) and die
+with the process; 10 running per session, 256 KiB of retained output each,
+and a read that lost bytes to that cap says so. Completion is **pushed**:
+`backend::jobs_bridge` turns a finished job into a durable `JobFinished`
+line plus a `ContextInjected { source: JobNotice }` in that session's
+inbox, so the model is told at its next step whether or not it thought to
+ask. It never wakes an idle session — that is the goal driver's job.
+
+Note the enabling change in `SkillRegistry::resolve`: a surplus positional
+of the form `key=value` binds to a **declared** optional arg. Without it
+the text protocol could not reach `background` or `cwd` at all — the value
+was dropped and the call quietly did something other than what it said.
+
+### Goals and the round driver (Wave 4)
+
+One durable objective per session (`agents::goal`, `EventKind::GoalChange`).
+While a goal is `Active` **and armed** and under its round cap, the driver
+in `chat.rs` opens a fresh turn against it every time the agent goes idle,
+carrying the `<goal_round>` prompt (`round_prompt`) that tells the model the
+workspace — not its own earlier narration — is authoritative. Skills
+`create-goal`, `get-goal`, `update-goal` are harness controls like
+`todo-write`; `/goal [continue|pause|complete|block <why>]` is the human
+door.
+
+Four rules bound it, and each answers a specific way autonomy goes wrong:
+
+- **Compare-and-set on `revision`.** A round superseded by a human edit is
+  refused, not silently applied over it.
+- **Authority at execution.** Create / pause / resume need a direct human
+  turn — which is what `TurnStart.source` (`sica_core::event::TurnSource`)
+  records. A queued followup still carries human authority; a goal round
+  does not. Complete / block also accept the current round.
+- **`BLOCKED_AFTER_CONSECUTIVE_ROUNDS`.** A round may not declare the goal
+  blocked in its first three attempts; a human may at any time.
+- **Arming is process-local and never persisted.** A restored active goal
+  comes back disarmed and waits for `/goal continue`, and pressing Stop
+  disarms — otherwise the Stop button would be a lie.
+
+The round is recorded *before* it runs, so an objective that crashes every
+time still exhausts its budget. At turn end the continuation — queued
+followup, goal round, or idle — is decided under one `active_turns` lock;
+a queued human message wins, because the person is here now.
 
 ### model-eval (measuring the prompt configuration)
 
