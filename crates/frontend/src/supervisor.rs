@@ -60,6 +60,11 @@ pub enum UiEvent {
 
     // Streaming chat events.
     TurnStarted { session_id: u64, turn_id: u64 },
+    /// A prompt landed in the session log at `seq` — the durable handle the
+    /// transcript needs to offer `Request::EditUserMessage` on it.
+    UserMessageStored { session_id: u64, seq: u64 },
+    /// The backend refused a request (`Response::Error`).
+    RequestFailed { message: String },
     AssistantDelta { session_id: u64, turn_id: u64, content: String, reasoning: String },
     TurnFinished { session_id: u64, turn_id: u64, finish_reason: String },
     TokenUsage {
@@ -138,6 +143,10 @@ pub enum UiEvent {
     // rather than cancelling it (`accepted` is "queued" | "steered" |
     // "injected" | "running").
     InboxChanged { session_id: u64, queued: u32, accepted: String },
+    /// The queued messages themselves, in run order — what the composer's
+    /// queue dock draws. Always arrives right after the `InboxChanged` for
+    /// the same moment, and is pushed on session load too.
+    QueueChanged { session_id: u64, rows: Vec<protocol::QueuedDump> },
     /// A session's background jobs changed (started, finished, killed).
     JobsChanged { session_id: u64, jobs: Vec<protocol::JobDump> },
     /// The session's durable objective changed (`None` = no goal).
@@ -293,6 +302,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::TurnStarted { session_id, turn_id } => {
             UiEvent::TurnStarted { session_id, turn_id }
         }
+        Event::UserMessageStored { session_id, seq } => {
+            UiEvent::UserMessageStored { session_id, seq }
+        }
         Event::AssistantDelta { session_id, turn_id, content, reasoning } => {
             UiEvent::AssistantDelta { session_id, turn_id, content, reasoning }
         }
@@ -347,6 +359,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::InboxChanged { session_id, queued, accepted } => {
             UiEvent::InboxChanged { session_id, queued, accepted }
+        }
+        Event::QueueChanged { session_id, rows } => {
+            UiEvent::QueueChanged { session_id, rows }
         }
         Event::JobsChanged { session_id, jobs } => {
             UiEvent::JobsChanged { session_id, jobs }

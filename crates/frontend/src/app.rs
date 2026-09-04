@@ -218,6 +218,10 @@ pub struct App {
     /// Session the last composer `/command` targeted — its `CommandResult`
     /// reloads that session, since compaction rewrites history.
     pub last_command_session: Option<u64>,
+    /// Session whose prompt edit is awaiting an answer. The transcript is
+    /// truncated optimistically when the edit goes out, so a refusal has to
+    /// pull the real history back — this says which session to reload.
+    pub pending_edit_session: Option<u64>,
     /// Permission mode for freshly minted sessions (Settings JSON).
     pub default_permission_mode: String,
     /// Last prompt composition the BE reported — the context ring's panel is
@@ -636,9 +640,15 @@ pub struct ChatState {
     pub waiting_sessions: std::collections::HashSet<u64>,
     /// Sessions that completed a turn while not on screen; cleared on open.
     pub unseen_sessions: std::collections::HashSet<u64>,
-    /// Queued-but-not-started messages, newest last — the queue dock. Until
-    /// the BE exposes its inbox (§11) this mirrors what the FE itself sent.
-    pub queued: Vec<String>,
+    /// Queued-but-not-started messages, in the order they will run — the
+    /// composer's queue dock. Authoritative once `QueueChanged` lands; until
+    /// then it holds this frontend's own local echoes.
+    pub queued: Vec<QueuedRow>,
+    /// Queue row open for inline editing, and the draft. Keyed by row id
+    /// rather than by position: the loop claims rows while the field is
+    /// open, and an index would then name the wrong message.
+    pub queue_edit: Option<u64>,
+    pub queue_edit_draft: String,
     /// Session id whose row menu is open, and the row's screen rect.
     pub row_menu: Option<(u64, egui::Rect)>,
     /// Sidebar search (§4.2): the header icon expands into a field. Title
@@ -655,6 +665,27 @@ pub struct ChatState {
     /// same discipline as the armed delete.
     pub renaming: Option<u64>,
     pub rename_draft: String,
+    /// Turn whose prompt is open for editing, and the draft text. One at a
+    /// time, like the inline rename. Cleared on send, on Escape, on a turn
+    /// starting and on a session switch — the transcript underneath it can
+    /// change, and an editor anchored to a stale index would rewrite the
+    /// wrong message.
+    pub editing_turn: Option<usize>,
+    pub edit_draft: String,
+}
+
+/// One message waiting in the backend's inbox, as the queue dock draws it.
+///
+/// `id` is the handle `EditQueued` / `RemoveQueued` / `SteerQueued` address.
+/// `None` marks a **local echo**: the send has gone out but no
+/// `QueueChanged` has come back yet, so there is nothing to address and the
+/// row draws inert — dsh shows those rows too rather than making the queue
+/// flicker in a frame late.
+#[derive(Clone)]
+pub struct QueuedRow {
+    pub id:     Option<u64>,
+    pub text:   String,
+    pub images: u32,
 }
 
 /// State of the "/" palette in the composer. The catalogue is pulled once per
@@ -740,6 +771,13 @@ pub struct Turn {
     /// This turn's own accounting, once `TurnUsage` lands. Drives the tail's
     /// usage and time pills.
     pub usage:              Option<TurnUsage>,
+    /// Seq of the log event holding this turn's user message — the handle
+    /// `Request::EditUserMessage` addresses. Filled from the session dump on
+    /// reload and from `UserMessageStored` on a live send; `None` on a turn
+    /// with no prompt of its own (an assistant-only hop) and on a send the
+    /// backend has not acknowledged yet, which is exactly when editing must
+    /// not be offered.
+    pub user_seq:           Option<u64>,
 }
 
 /// One step-level retry inside a turn: the backend classified an LLM failure
@@ -785,6 +823,7 @@ impl Turn {
             queued: false,
             retries: Vec::new(),
             usage: None,
+            user_seq: None,
         }
     }
 
@@ -985,6 +1024,7 @@ impl App {
             permission_mode: protocol::PermissionMode::default(),
             plan_active: false,
             last_command_session: None,
+            pending_edit_session: None,
             default_permission_mode: settings.default_permission_mode.clone(),
             token_breakdown: None,
             menu_open: MenuOpen::default(),
@@ -1232,13 +1272,61 @@ impl App {
         self.chat.unseen_sessions.remove(&id);
         self.chat.row_menu = None;
         self.chat.queued.clear();
+        self.chat.queue_edit = None;
+        self.chat.queue_edit_draft.clear();
         self.chat.turns.clear();
         self.chat.selected_turn = None;
         self.chat.autoscroll_paused = false;
         self.chat.middle_scroll_origin = None;
         self.chat.interrupt_requested = false;
         self.chat.compacting = false;
+        self.chat.editing_turn = None;
+        self.chat.edit_draft.clear();
         self.send(UiCommand::SendRequest(Request::LoadSession { session_id: id }));
+    }
+
+    /// Rewrite the prompt of turn `idx` and re-run from it. Everything after
+    /// it leaves the conversation, so the transcript is truncated here and a
+    /// fresh turn pushed in its place — the same optimistic shape a send
+    /// takes, and it matches the rewind the backend records.
+    pub fn edit_user_message(&mut self, idx: usize, text: String) {
+        self.chat.editing_turn = None;
+        self.chat.edit_draft.clear();
+        let text = text.trim().to_string();
+        let session_id = self.chat.session_id;
+        let Some(turn) = self.chat.turns.get(idx) else { return };
+        let Some(seq) = turn.user_seq else { return };
+        if text.is_empty() || text == turn.user {
+            return;
+        }
+        // The attachments carry over — this edits what the user said, not
+        // what they attached — but their textures are re-uploaded for the
+        // new turn rather than shared with the one it replaces.
+        let images: Vec<Attachment> = turn
+            .images
+            .iter()
+            .map(|a| Attachment {
+                mime: a.mime.clone(),
+                data_base64: a.data_base64.clone(),
+                texture: None,
+            })
+            .collect();
+        self.chat.turns.truncate(idx);
+        self.chat.turns.push(Turn {
+            user: text.clone(),
+            images,
+            user_seq: None,
+            ..Turn::new(session_id, 0)
+        });
+        self.chat.selected_turn = None;
+        self.chat.scroll_to_bottom = true;
+        self.chat.interrupt_requested = false;
+        self.pending_edit_session = Some(session_id);
+        self.send(UiCommand::SendRequest(Request::EditUserMessage {
+            session_id,
+            seq,
+            text,
+        }));
     }
 
     /// Ask the BE to drop `id` and remove it from the local list. If the
@@ -1427,16 +1515,51 @@ impl App {
                 self.gen_speed.on_turn_started();
                 self.chat.running_sessions.insert(session_id);
                 self.chat.unseen_sessions.remove(&session_id);
-                if session_id == self.chat.session_id && !self.chat.queued.is_empty() {
-                    self.chat.queued.remove(0);
-                }
                 // A new turn retires the checklist (the projection clears
                 // on turn start; the log keeps the audit).
                 if session_id == self.chat.session_id {
                     self.todos.clear();
                 }
+                // An editor left open while the conversation moves under it
+                // is anchored to an index that no longer means what it did.
+                if session_id == self.chat.session_id {
+                    self.chat.editing_turn = None;
+                }
                 self.chat.turns.push(Turn::new(session_id, turn_id));
                 self.chat.scroll_to_bottom = true;
+            }
+            // The prompt that just landed is the *oldest* one this session
+            // has on screen without a seq: the composer pushes its bubble
+            // optimistically on send, and a queued followup keeps that
+            // bubble until the loop claims it, so unaddressed bubbles retire
+            // in the order they were sent.
+            UiEvent::UserMessageStored { session_id, seq } => {
+                self.pending_edit_session = None;
+                if session_id != self.chat.session_id {
+                    return;
+                }
+                // Messages are stored in the order they were sent, so the
+                // oldest prompt still missing its handle is this one.
+                if let Some(t) = self.chat.turns.iter_mut().find(|t| {
+                    t.notice.is_none()
+                        && t.user_seq.is_none()
+                        && !(t.user.is_empty() && t.images.is_empty())
+                }) {
+                    t.user_seq = Some(seq);
+                }
+            }
+            UiEvent::RequestFailed { message } => {
+                self.show_toast(crate::ui::icons::Icon::Warning, message.clone(), 6000);
+                self.push_log(LogKind::Error, message);
+                // An edit truncated the transcript before the backend had
+                // agreed to it. Pull the real history back.
+                if let Some(id) = self.pending_edit_session.take() {
+                    if id == self.chat.session_id {
+                        self.send(UiCommand::SendRequest(Request::LoadSession {
+                            session_id: id,
+                        }));
+                    }
+                }
             }
             UiEvent::AssistantDelta { content, reasoning, .. } => {
                 if let Some(t) = self.active_turn_mut() {
@@ -1779,6 +1902,26 @@ impl App {
                     format!("message {accepted} ({queued} queued)"),
                 );
             }
+            UiEvent::QueueChanged { session_id, rows } => {
+                if session_id != self.chat.session_id {
+                    return;
+                }
+                // The backend's list supersedes every local echo: a row it
+                // does not list either ran or was dropped, and keeping the
+                // echo would offer actions against a message that is gone.
+                self.chat.queued = rows
+                    .into_iter()
+                    .map(|r| QueuedRow { id: Some(r.id), text: r.text, images: r.images })
+                    .collect();
+                // An open editor whose row left the queue has nothing to
+                // save to.
+                if let Some(id) = self.chat.queue_edit {
+                    if !self.chat.queued.iter().any(|r| r.id == Some(id)) {
+                        self.chat.queue_edit = None;
+                        self.chat.queue_edit_draft.clear();
+                    }
+                }
+            }
         }
     }
 
@@ -1823,6 +1966,9 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     finished: true,
                     reasoning_collapsed: true,
                     images: m.images.iter().map(Attachment::from_user_image).collect(),
+                    // A dump from a backend older than the field carries 0,
+                    // which is not a seq — such a turn simply offers no edit.
+                    user_seq: (m.seq > 0).then_some(m.seq),
                     ..Turn::new(session.id, turns.len() as u64 + 1)
                 });
             }

@@ -986,9 +986,17 @@ impl ChatHub {
     /// model reads. Injected context goes out under the `context` role so
     /// the FE never mistakes it for something the user typed.
     pub async fn dump_session(&self, id: u64) -> Option<SessionDump> {
-        // Loading a session is the FE switching to it, so push its goal and
-        // the jobs it owns: `JobsChanged` is otherwise only emitted on a change, and a
-        // session with a build already running would show an empty strip.
+        // Loading a session is the FE switching to it, so push its goal, the
+        // jobs it owns and its queue: these are otherwise only emitted on a
+        // change, and a session with a build already running — or a message
+        // still waiting behind a turn — would show an empty strip.
+        // `QueueChanged` alone here: nothing was *accepted*, so pairing it
+        // with an `InboxChanged` would put "message loaded" in the log every
+        // time the user clicks a session.
+        self.event_sink.emit(Event::QueueChanged {
+            session_id: id,
+            rows:       self.inbox.rows(id).await,
+        });
         self.event_sink.emit(Event::JobsChanged {
             session_id: id,
             jobs: self
@@ -1030,6 +1038,7 @@ impl ChatHub {
                     None => e.message.content,
                 };
                 MessageDump {
+                    seq: e.seq,
                     role: role.into(),
                     content,
                     reasoning: e.message.reasoning,
@@ -1581,9 +1590,68 @@ impl ChatHub {
     /// Enqueue one inbox item and tell the FE what it became.
     async fn enqueue(&self, session_id: u64, item: Inbound) -> u32 {
         let accepted = item.accepted().to_string();
-        let queued = self.inbox.push(session_id, item).await;
-        self.event_sink.emit(Event::InboxChanged { session_id, queued, accepted });
-        queued
+        let rows = self.inbox.push(session_id, item).await;
+        publish_queue(&self.event_sink, session_id, rows, &accepted)
+    }
+
+    /// Rewrite a message still waiting in the queue.
+    ///
+    /// The id has to still name a waiting row: the loop may have claimed it
+    /// between the frontend drawing the dock and the user pressing Enter,
+    /// and an edit that quietly landed nowhere is indistinguishable from one
+    /// that worked.
+    pub async fn edit_queued(&self, session_id: u64, id: u64, text: String) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("a queued message cannot be emptied — remove it instead".into());
+        }
+        if !self.inbox.edit(session_id, id, text).await {
+            return Err("that message already left the queue".into());
+        }
+        let rows = self.inbox.rows(session_id).await;
+        publish_queue(&self.event_sink, session_id, rows, "edited");
+        Ok(())
+    }
+
+    /// Drop a queued message before it ever runs.
+    pub async fn remove_queued(&self, session_id: u64, id: u64) -> Result<(), String> {
+        if self.inbox.remove(session_id, id).await.is_none() {
+            return Err("that message already left the queue".into());
+        }
+        let rows = self.inbox.rows(session_id).await;
+        publish_queue(&self.event_sink, session_id, rows, "removed");
+        Ok(())
+    }
+
+    /// Promote a queued message into a steer on the running turn: it leaves
+    /// the queue and joins that turn at its next hop instead of waiting for
+    /// one of its own.
+    pub async fn steer_queued(&self, session_id: u64, id: u64) -> Result<(), String> {
+        if !self.active_turns.lock().await.contains_key(&session_id) {
+            return Err("nothing is running to steer".into());
+        }
+        // Checked before the row is taken rather than after: a steer is
+        // text, and a message whose images a steer would drop is better left
+        // queued, where they still reach the model.
+        if self
+            .inbox
+            .rows(session_id)
+            .await
+            .iter()
+            .any(|r| r.id == id && r.images > 0)
+        {
+            return Err("a queued message with images cannot be steered".into());
+        }
+        let Some(Inbound::Followup { text, .. }) = self.inbox.remove(session_id, id).await else {
+            return Err("that message already left the queue".into());
+        };
+        self.inbox.push(session_id, Inbound::Steer { text }).await;
+        let rows = self.inbox.rows(session_id).await;
+        publish_queue(&self.event_sink, session_id, rows, "steered");
+        self.event_sink.emit(Event::LogLine {
+            level:   "INFO".into(),
+            message: "steering the running turn — the message lands at its next step".into(),
+        });
+        Ok(())
     }
 
     /// Splice user text into the running turn at its next hop. With no turn
@@ -1593,7 +1661,7 @@ impl ChatHub {
             return;
         }
         if !self.active_turns.lock().await.contains_key(&session_id) {
-            self.start_turn(session_id, text, Vec::new(), TurnSource::Human).await;
+            self.start_turn(session_id, text, Vec::new(), TurnSource::Human, None).await;
             return;
         }
         self.enqueue(session_id, Inbound::Steer { text }).await;
@@ -1629,7 +1697,7 @@ impl ChatHub {
         source: TurnSource,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let hub = self.clone();
-        Box::pin(async move { hub.start_turn(session_id, text, images, source).await })
+        Box::pin(async move { hub.start_turn(session_id, text, images, source, None).await })
     }
 
     /// Accept a user message: queue it when a turn is already running,
@@ -1660,7 +1728,50 @@ impl ChatHub {
                 return;
             }
         }
-        self.start_turn(session_id, text, images, TurnSource::Human).await;
+        self.start_turn(session_id, text, images, TurnSource::Human, None).await;
+    }
+
+    /// Rewrite an earlier prompt and re-run the conversation from it.
+    ///
+    /// The edited message keeps the original's images — this is an edit of
+    /// what the user *said*, not of what they attached — and runs as an
+    /// ordinary human turn once the span it supersedes has left the model's
+    /// view. Errors are returned rather than logged so the dispatcher can
+    /// answer the frontend with the reason.
+    pub async fn edit_user_message(
+        &self,
+        session_id: u64,
+        seq: u64,
+        text: String,
+    ) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("an edited prompt cannot be empty".into());
+        }
+        // A rewind while the loop is appending would race its own history.
+        // The FE hides the affordance during a turn; this is the backstop.
+        if self.active_turns.lock().await.contains_key(&session_id) {
+            return Err("a turn is running — stop it before editing a prompt".into());
+        }
+        let images = {
+            let g = self.sessions.lock().await;
+            let log = g.get(&session_id).ok_or("no such session")?;
+            // The message has to still be *visible*: one already folded away
+            // by a compaction has no span left to rewind to.
+            if !log.derive_surface().iter().any(|e| e.seq == seq) {
+                return Err(
+                    "that message is no longer part of the conversation \
+                     (compacted away)"
+                        .into(),
+                );
+            }
+            match log.events.iter().find(|e| e.seq == seq).map(|e| &e.kind) {
+                Some(EventKind::UserMessage { images, .. }) => images.clone(),
+                Some(_) => return Err("only a user message can be edited".into()),
+                None => return Err("no such message in this session".into()),
+            }
+        };
+        self.start_turn(session_id, text, images, TurnSource::Human, Some(seq)).await;
+        Ok(())
     }
 
     /// Run one user message as a turn, unconditionally.
@@ -1669,12 +1780,19 @@ impl ChatHub {
     /// it to start a queued followup while still *holding* the session's
     /// slot: going back through the queue gate there would see that slot,
     /// re-queue the message it had just claimed, and strand it.
+    ///
+    /// `rewind` is the seq of a prompt being re-run after an edit: the span
+    /// from it to the end of the log leaves the derived history *before*
+    /// this turn's own snapshots are appended, so the instructions and
+    /// runtime-context entries this turn writes are not swept away with it
+    /// and the message order stays exactly what an ordinary send produces.
     async fn start_turn(
         &self,
         session_id: u64,
         text: String,
         images: Vec<UserImage>,
         source: TurnSource,
+        rewind: Option<u64>,
     ) {
         let Some(client) = self.llm.lock().await.clone() else {
             // A followup handed this call a *reserved* slot. Nothing is
@@ -1721,11 +1839,19 @@ impl ChatHub {
         // The placeholder-or-fallback title this send leaves behind, so the
         // LLM titler later knows the title is still automatic.
         let provisional_title;
+        let user_seq;
         {
             let mut sessions = self.sessions.lock().await;
             let log = sessions
                 .entry(session_id)
                 .or_insert_with(|| SessionLog::new(session_id, default_title(session_id)));
+            // The rewind goes first, before this turn's own snapshots exist:
+            // it names the whole tail of the log, and anything appended
+            // ahead of it would be inside the span it erases.
+            if let Some(start_seq) = rewind {
+                let end_seq = log.last_seq();
+                log.append(EventKind::Rewind { start_seq, end_seq });
+            }
             // Durable context snapshots for this turn, each shadowing its
             // predecessor so exactly one copy of each is model-visible:
             // workspace instructions (AGENTS.md chain) first, then the
@@ -1744,7 +1870,7 @@ impl ChatHub {
                     content: exp.content,
                 });
             }
-            log.append(EventKind::UserMessage {
+            user_seq = log.append(EventKind::UserMessage {
                 surface: SurfaceOp::Append,
                 content: text.clone(),
                 images: images.clone(),
@@ -1771,6 +1897,9 @@ impl ChatHub {
                 warn!(error = %e, session_id, "flush session (after user msg) failed");
             }
         }
+        // The durable handle for this prompt, so the transcript can offer an
+        // edit on it without first reloading the session from disk.
+        self.event_sink.emit(Event::UserMessageStored { session_id, seq: user_seq });
 
         // Register a cancellation token for this session. If a previous turn
         // is still in flight (shouldn't normally happen — the FE gates Send
@@ -2407,12 +2536,8 @@ impl ChatHub {
 
             match next {
                 Next::Followup(next_text, next_images) => {
-                    let queued = inbox.queued(session_id).await;
-                    event_sink.emit(Event::InboxChanged {
-                        session_id,
-                        queued,
-                        accepted: "running".into(),
-                    });
+                    let rows = inbox.rows(session_id).await;
+                    let queued = publish_queue(&event_sink, session_id, rows, "running");
                     event_sink.emit(Event::LogLine {
                         level:   "INFO".into(),
                         message: format!("running queued message ({queued} still waiting)"),
@@ -2503,6 +2628,30 @@ impl ChatHub {
             }
         });
     }
+}
+
+/// The two events a queue change produces, and the depth it settled at.
+///
+/// `InboxChanged` carries the depth and the word for what the frontend just
+/// optimistically rendered; `QueueChanged` carries the rows the composer's
+/// queue dock draws. They always go out together and in this order, so the
+/// dock and the count can never disagree about the same moment. A free
+/// function because the turn task publishes from its own `event_sink`
+/// clone, long after it stopped holding a `&ChatHub`.
+fn publish_queue(
+    sink: &Arc<dyn EventSink>,
+    session_id: u64,
+    rows: Vec<protocol::QueuedDump>,
+    accepted: &str,
+) -> u32 {
+    let queued = rows.len() as u32;
+    sink.emit(Event::InboxChanged {
+        session_id,
+        queued,
+        accepted: accepted.to_string(),
+    });
+    sink.emit(Event::QueueChanged { session_id, rows });
+    queued
 }
 
 /// One-line, length-capped preview of user text for a log line.
@@ -3112,8 +3261,18 @@ fn wire_messages(messages: &[Message], native_tools: bool) -> Vec<ChatMessage> {
         // Text-protocol servers may lack a `tool` role in their template, so
         // tool results are surfaced as `user` there. Native mode keeps the
         // real `tool` role + correlation id the template expects.
+        //
+        // A derived `system` message — today only a `CompactionSummary` —
+        // is downgraded to `user` unconditionally. Every caller splices this
+        // output *after* the composed system prompt, so such a message can
+        // never be the first on the wire, and several chat templates
+        // (Qwen/GLM-family among them) hard-raise "System message must be at
+        // the beginning" rather than tolerating a second one. The summary is
+        // still recognisable by its `CONTEXT_SUMMARY_PREFIX` marker, and it
+        // is stored as `system` in the log either way.
         let role = match m.role {
             Role::Tool if !native_tools => "user",
+            Role::System => "user",
             other => role_to_str(other),
         };
         let tool_calls = if native_tools {
@@ -3239,6 +3398,45 @@ mod tests {
         SkillRegistry::new()
     }
 
+    /// The ordering rule `start_turn` depends on when re-running an edited
+    /// prompt: the rewind is appended *before* the turn's own snapshots, so
+    /// the fresh runtime context is not swept away with the span — and it
+    /// still lands ahead of the edited message, exactly where an ordinary
+    /// send would put it.
+    #[test]
+    fn a_rewind_keeps_this_turn_s_runtime_context_ahead_of_the_prompt() {
+        let mut log = SessionLog::new(1, "t");
+        append_runtime_context(&mut log, "m1", PermissionMode::default(), false);
+        let edited = log.append(EventKind::UserMessage {
+            surface: SurfaceOp::Append,
+            content: "first draft".into(),
+            images: Vec::new(),
+        });
+        log.append(EventKind::AssistantMessage {
+            surface: SurfaceOp::Append,
+            content: "a reply".into(),
+            reasoning: None,
+            tool_calls: None,
+        });
+
+        // What `start_turn` does for `rewind: Some(edited)`.
+        log.append(EventKind::Rewind { start_seq: edited, end_seq: log.last_seq() });
+        append_runtime_context(&mut log, "m1", PermissionMode::default(), false);
+        log.append(EventKind::UserMessage {
+            surface: SurfaceOp::Append,
+            content: "second draft".into(),
+            images: Vec::new(),
+        });
+
+        let surface = log.derive_surface();
+        assert_eq!(surface.len(), 2, "the first draft and its reply are gone");
+        assert!(matches!(
+            surface[0].context,
+            Some(ContextSource::RuntimeContext)
+        ));
+        assert_eq!(surface[1].message.content, "second draft");
+    }
+
     #[test]
     fn wire_history_downgrades_tool_role_in_text_mode() {
         let msgs = vec![
@@ -3259,6 +3457,33 @@ mod tests {
         assert_eq!(wire[n - 1].role, "user");
         assert!(wire[n - 1].tool_call_id.is_none());
         assert!(wire[n - 1].tool_calls.is_none());
+    }
+
+    /// A compaction summary derives as a `system` message and is always
+    /// spliced after the composed system prompt, so it must not go out as a
+    /// second `system` — templates that require the system message to lead
+    /// reject the whole request with a 400.
+    #[test]
+    fn wire_history_never_emits_a_second_system_message() {
+        let msgs = vec![
+            Message::system(agents::compact::summary_message("folded")),
+            Message::user("continue"),
+        ];
+        for native in [false, true] {
+            let wire = build_wire_history(&msgs, &registry(), native, "test", None)
+                .unwrap()
+                .messages;
+            assert!(
+                wire.iter().skip(1).all(|m| m.role != "system"),
+                "native={native}: a non-leading system message reached the wire"
+            );
+            let n = wire.len();
+            assert_eq!(wire[n - 2].role, "user");
+            assert!(wire[n - 2]
+                .content
+                .text()
+                .starts_with(protocol::CONTEXT_SUMMARY_PREFIX));
+        }
     }
 
     #[test]

@@ -55,9 +55,9 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 17) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 19) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
-Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext`, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`).
+Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`).
 
 Two v17 events exist purely so the transcript can show what the log already
 records: `LlmRetry` (the retry chain row — the durable `EventKind::LlmRetry`
@@ -66,6 +66,22 @@ time totals, emitted at `TurnEnd`, distinct from the cumulative per-session
 `TokenUsage` meter). `ListModels` answers `Ok` and reports through
 `ModelsListed`, because the dispatcher loop is serial and a slow provider
 must not stall it.
+
+v18 adds prompt editing. `EditUserMessage { session_id, seq, text }` re-runs
+the conversation from an earlier prompt: the backend appends
+`EventKind::Rewind { start_seq, end_seq }` — the log's second shadowing
+mechanism, and the only one that contributes no message of its own, so it
+cannot be a `SurfaceOp::Replace` — and then runs an ordinary human turn
+carrying the original message's images. The superseded turns stay in the log.
+The rewind is appended *before* the turn's own instruction and
+runtime-context snapshots, since it names the whole tail and anything written
+ahead of it would fall inside the span it erases. It is refused while a turn
+is running. Two additions carry the handle it addresses: `MessageDump.seq`
+(every dumped message's durable id) and `Event::UserMessageStored`, pushed
+once per turn-opening message so the transcript can offer the edit on a
+prompt it has only seen live. The FE truncates optimistically and resyncs
+from `Response::Error`, which now reaches the user as a toast rather than
+only a raw line in the log panel.
 
 ## The agent loop (the heart of the app)
 
@@ -177,7 +193,20 @@ across the gap (so a send arriving mid-handoff still queues), and going
 back through the queue gate while holding it would re-queue the followup it
 just claimed. Interrupting drops steers and injects aimed at the dying turn
 but keeps queued user messages — sending a message and then pressing Stop
-is how a user says "do this instead". In the FE the composer stays live during a
+is how a user says "do this instead".
+
+What waits there is visible and addressable: every change publishes
+`InboxChanged` (the depth) and `QueueChanged` (the rows) together, and the
+composer's queue dock renders the rows with Edit · Remove · Steer.
+`Inbox` mints a stable id per item for this — a *position* stops naming the
+same message the moment the loop claims one, so an edit racing a claim would
+rewrite the wrong text. A verb whose id no longer names a waiting row is
+answered with an error rather than a silent no-op, because "the loop already
+took it" is a normal outcome the user has to see. Only followups are rows: a
+steer or inject is spent at the next hop, so there is never a moment to edit
+one. Steering a queued message is a promotion — it leaves the queue and joins
+the running turn — and is refused for a message carrying images, which a
+steer cannot take. In the FE the composer stays live during a
 turn: plain Enter follows the Settings > General "Enter behavior while busy"
 preference (Queue by default, so a send queues and shows in the queue dock)
 and Ctrl+Enter always does the other one - dsh's accelerated submit.

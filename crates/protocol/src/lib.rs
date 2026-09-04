@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -225,6 +225,16 @@ pub enum Request {
 
     // Chat / LLM control.
     SendUserMessage { session_id: u64, text: String, images: Vec<UserImage> },
+    /// Rewrite an earlier prompt and re-run the conversation from it. `seq`
+    /// is the [`MessageDump::seq`] of the user message being edited (also
+    /// pushed live by [`Event::UserMessageStored`]); everything from it
+    /// onwards leaves the model's view — durably, by a shadowing record, so
+    /// the superseded turns stay in the log — and the edited text runs as a
+    /// fresh turn carrying the original message's images.
+    ///
+    /// Refused while a turn is running: the rewind would race the loop's own
+    /// appends. Answers `Ok`, or `Error` with the reason.
+    EditUserMessage { session_id: u64, seq: u64, text: String },
     InterruptTurn   { session_id: u64 },
     NewSession,
     ListSessions,
@@ -283,6 +293,19 @@ pub enum Request {
     /// start of the next turn when idle). Injected content is model-visible
     /// but never attributed to the user.
     InjectContext { session_id: u64, text: String },
+
+    /// Rewrite a message still waiting in the queue. Addressed by the
+    /// [`QueuedDump::id`] the last `QueueChanged` carried; a row already
+    /// claimed by the loop is gone and the edit is answered with an error,
+    /// because silently editing nothing looks identical to success.
+    EditQueued { session_id: u64, id: u64, text: String },
+    /// Drop a message from the queue before it ever runs.
+    RemoveQueued { session_id: u64, id: u64 },
+    /// Promote a queued message into a steer: it leaves the queue and joins
+    /// the *running* turn at its next hop instead of waiting for one of its
+    /// own. Meaningless with nothing running, and answered with an error
+    /// then — the FE disables the action rather than sending it.
+    SteerQueued { session_id: u64, id: u64 },
 
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
@@ -379,6 +402,11 @@ pub struct SessionDump {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDump {
+    /// Seq of the log event that produced this entry — the durable handle a
+    /// message keeps across restarts. [`Request::EditUserMessage`] addresses
+    /// a prompt by it. `0` in dumps written before the field existed.
+    #[serde(default)]
+    pub seq: u64,
     pub role: String,
     pub content: String,
     pub reasoning: Option<String>,
@@ -464,6 +492,12 @@ pub enum Event {
 
     // Streaming turn lifecycle.
     TurnStarted   { session_id: u64, turn_id: u64 },
+    /// A user message reached the session log, with the seq it landed at.
+    /// Emitted once per turn-opening message (never for a steer), so the
+    /// frontend can offer [`Request::EditUserMessage`] on a prompt it has
+    /// only ever seen live — without it, editing would work solely on a
+    /// transcript reloaded from disk.
+    UserMessageStored { session_id: u64, seq: u64 },
     AssistantDelta {
         session_id: u64,
         turn_id: u64,
@@ -653,6 +687,15 @@ pub enum Event {
         queued: u32,
         accepted: String,
     },
+    /// The queued user messages themselves, in the order they will run.
+    /// `InboxChanged` says *how many* are waiting; this says *what* they
+    /// are, which is what the composer's queue dock renders. Carries the
+    /// whole list so the frontend never reconciles deltas, and is pushed on
+    /// session load as well as on every change.
+    QueueChanged {
+        session_id: u64,
+        rows: Vec<QueuedDump>,
+    },
     /// A session's background jobs changed — one started, finished or was
     /// killed. Carries the whole list so the FE never has to reconcile
     /// deltas.
@@ -724,6 +767,21 @@ pub struct GoalDump {
     /// back disarmed, so a reboot can never resume an autonomous loop the
     /// user has not asked for again.
     pub armed:          bool,
+}
+
+/// One user message waiting in a session's inbox (`Event::QueueChanged`).
+///
+/// `id` is stable for as long as the row waits, which is what makes
+/// [`Request::EditQueued`] and its siblings addressable; it is *not* a log
+/// seq, because a queued message has not been logged yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedDump {
+    pub id:     u64,
+    pub text:   String,
+    /// How many images ride with it. The bytes stay in the backend — the
+    /// dock only needs to say the row carries some, and a row that does
+    /// cannot be steered (a steer is text).
+    pub images: u32,
 }
 
 /// One background job as the FE sees it (`agents::jobs::JobSummary` over

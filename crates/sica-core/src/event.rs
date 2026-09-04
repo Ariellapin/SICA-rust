@@ -149,6 +149,16 @@ pub enum EventKind {
         before_tokens: u32,
         after_tokens: u32,
     },
+    /// The user edited an earlier prompt and re-ran from there: every
+    /// surface entry with `start_seq <= seq <= end_seq` leaves the model's
+    /// view, and the edited message is appended after this as an ordinary
+    /// `UserMessage`.
+    ///
+    /// Like a compaction this only *shadows* — the superseded turns stay in
+    /// the log, so the original conversation is still replayable — but
+    /// unlike a compaction it contributes no message of its own, which is
+    /// why it cannot be expressed as a [`SurfaceOp::Replace`].
+    Rewind { start_seq: u64, end_seq: u64 },
     /// A failed LLM attempt that will be re-run. Durable so the log shows
     /// why a turn took as long as it did.
     LlmRetry { attempt: u32, max: u32, delay_ms: u64, reason: String },
@@ -376,6 +386,12 @@ pub fn derive_surface(events: &[SessionEvent]) -> Vec<SurfaceEntry> {
                 calls.insert(ev.seq, (name, args_preview, expectation, args_json.as_deref()));
                 continue;
             }
+            // Pure removal: the span leaves the derived view and nothing
+            // takes its place. The events themselves stay in the log.
+            EventKind::Rewind { start_seq, end_seq } => {
+                out.retain(|e| e.seq < *start_seq || e.seq > *end_seq);
+                continue;
+            }
             EventKind::UserMessage { surface, content, images } => (
                 surface,
                 Message::user_with_images(content.clone(), images.clone()),
@@ -521,6 +537,39 @@ mod tests {
         assert_eq!(s[0].message.content, "[summary] ab");
         assert_eq!(s[1].message.content, "c");
         assert_eq!(s[2].message.content, "d");
+    }
+
+    /// Editing the second prompt: the rewind drops that message and
+    /// everything after it, and the edited message appends in its place.
+    #[test]
+    fn rewind_drops_a_span_and_adds_nothing() {
+        let mut log = vec![user(1, "a"), assistant(2, "b"), user(3, "c"), assistant(4, "d")];
+        log.push(ev(5, EventKind::Rewind { start_seq: 3, end_seq: 4 }));
+        let msgs = derive_messages(&log);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "a");
+        assert_eq!(msgs[1].content, "b");
+
+        log.push(user(6, "c-edited"));
+        let msgs = derive_messages(&log);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].content, "c-edited");
+    }
+
+    /// A rewind and a compaction are the same shadowing mechanism seen from
+    /// two sides: a summary that folded a span is itself removable, and a
+    /// span already gone is not resurrected by naming it again.
+    #[test]
+    fn rewind_and_compaction_compose() {
+        let mut log = vec![user(1, "a"), assistant(2, "b"), user(3, "c"), assistant(4, "d")];
+        log.push(ev(5, EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace { start_seq: 1, end_seq: 2 },
+            content: "S1".into(), summary: "S1".into(), folded: 2, before_tokens: 0, after_tokens: 0,
+        }));
+        // Rewinding to the very first message covers the summary that
+        // shadowed it as well.
+        log.push(ev(6, EventKind::Rewind { start_seq: 1, end_seq: 5 }));
+        assert!(derive_messages(&log).is_empty());
     }
 
     #[test]

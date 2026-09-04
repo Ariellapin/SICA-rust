@@ -3,9 +3,10 @@
 //! **Goal** (10), **Queue** (20) — plus the stats line under the card.
 //!
 //! The queue dock is tucked 3 px under the composer so the two read as one
-//! surface. Until the backend exposes its inbox (§11 `QueueChanged`) the rows
-//! mirror what this frontend itself queued, which is the common case: the
-//! user typing while a turn runs.
+//! surface. Its rows are the backend's own inbox (`Event::QueueChanged`), so
+//! Edit / Remove / Steer address the message the loop will actually run —
+//! and a row this frontend has sent but not yet heard back about renders
+//! beside them as an inert local echo.
 
 use egui::{Align, Align2, Layout, Rect, Rounding, Sense, Stroke, Vec2};
 
@@ -280,12 +281,24 @@ fn goal_bar(app: &mut App, ui: &mut egui::Ui) {
 // Queue
 // ---------------------------------------------------------------------------
 
+/// What a row's controls asked for, applied after the frame so the row loop
+/// never mutates the list it is iterating.
+enum QueueAct {
+    Open(u64),
+    Save(u64),
+    Cancel,
+    Remove(u64),
+    Steer(u64),
+}
+
 fn queue_dock(app: &mut App, ui: &mut egui::Ui) {
     if app.chat.queued.is_empty() {
         return;
     }
     let t = app.theme;
     let rows = app.chat.queued.clone();
+    let running = app.chat.running_sessions.contains(&app.chat.session_id);
+    let mut act: Option<QueueAct> = None;
     let id = ui.id().with("queue_open");
     let mut open: bool = ui.ctx().data(|d| d.get_temp(id).unwrap_or(rows.len() == 1));
     egui::Frame::none()
@@ -339,32 +352,166 @@ fn queue_dock(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
             if open || rows.len() == 1 {
-                let mut remove: Option<usize> = None;
-                for (i, text) in rows.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(kit::txt(
-                            kit::one_line(text, 90),
-                            13.0,
-                            Weight::Regular,
-                            kit::col(t.alias.label[1]),
-                        )));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if kit::icon_button(ui, Icon::Close, 22.0)
-                                .on_hover_text("Remove from the queue (local echo only)")
-                                .clicked()
-                            {
-                                remove = Some(i);
-                            }
-                        });
-                    });
-                }
-                if let Some(i) = remove {
-                    app.chat.queued.remove(i);
+                for row in &rows {
+                    queue_row(app, ui, row, running, &mut act);
                 }
             }
         });
     // Tuck the dock under the composer card so they read as one surface.
     ui.add_space(-3.0);
+
+    let session_id = app.chat.session_id;
+    match act {
+        Some(QueueAct::Open(id)) => {
+            app.chat.queue_edit_draft = rows
+                .iter()
+                .find(|r| r.id == Some(id))
+                .map(|r| r.text.clone())
+                .unwrap_or_default();
+            app.chat.queue_edit = Some(id);
+            // Re-arm the one-shot focus claim for this row's field.
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(queue_focus_id(id), false));
+        }
+        Some(QueueAct::Cancel) => {
+            app.chat.queue_edit = None;
+            app.chat.queue_edit_draft.clear();
+        }
+        Some(QueueAct::Save(id)) => {
+            let text = app.chat.queue_edit_draft.trim().to_string();
+            app.chat.queue_edit = None;
+            app.chat.queue_edit_draft.clear();
+            // An emptied row is a removal in disguise; the backend refuses
+            // it, so say what was meant instead of showing an error.
+            if text.is_empty() {
+                app.send(UiCommand::SendRequest(Request::RemoveQueued { session_id, id }));
+            } else if rows.iter().any(|r| r.id == Some(id) && r.text != text) {
+                app.send(UiCommand::SendRequest(Request::EditQueued { session_id, id, text }));
+            }
+        }
+        Some(QueueAct::Remove(id)) => {
+            app.send(UiCommand::SendRequest(Request::RemoveQueued { session_id, id }));
+        }
+        Some(QueueAct::Steer(id)) => {
+            app.send(UiCommand::SendRequest(Request::SteerQueued { session_id, id }));
+        }
+        None => {}
+    }
+}
+
+/// The one-shot "this field has taken focus" flag for a row's editor.
+fn queue_focus_id(id: u64) -> egui::Id {
+    egui::Id::new("queue_edit_focused").with(id)
+}
+
+/// One queued message: its preview and, on hover, Steer · Edit · Remove.
+///
+/// A local echo (no id yet) draws dimmed with no actions — there is nothing
+/// to address until the backend answers, and offering a button that would
+/// silently do nothing is worse than not offering it.
+fn queue_row(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    row: &crate::app::QueuedRow,
+    running: bool,
+    act: &mut Option<QueueAct>,
+) {
+    let t = app.theme;
+    let Some(id) = row.id else {
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(kit::txt(
+                kit::one_line(&row.text, 90),
+                13.0,
+                Weight::Regular,
+                kit::col(t.alias.label[3]),
+            )))
+            .on_hover_text("sending…");
+        });
+        return;
+    };
+
+    if app.chat.queue_edit == Some(id) {
+        ui.horizontal(|ui| {
+            let field = egui::TextEdit::singleline(&mut app.chat.queue_edit_draft)
+                .desired_width(ui.available_width())
+                .margin(egui::vec2(6.0, 4.0));
+            let resp = ui.add(field);
+            if resp.lost_focus() {
+                // Enter saves, Escape abandons, and losing focus any other
+                // way (a click elsewhere) abandons too rather than committing
+                // an edit the user may not have meant to finish.
+                if ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                    *act = Some(QueueAct::Save(id));
+                } else {
+                    *act = Some(QueueAct::Cancel);
+                }
+            }
+            let focus = queue_focus_id(id);
+            if !ui.ctx().data(|d| d.get_temp::<bool>(focus).unwrap_or(false)) {
+                resp.request_focus();
+                ui.ctx().data_mut(|d| d.insert_temp(focus, true));
+            }
+        });
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        let hot = ui.rect_contains_pointer(ui.max_rect());
+        ui.add(egui::Label::new(kit::txt(
+            kit::one_line(&row.text, 90),
+            13.0,
+            Weight::Regular,
+            kit::col(t.alias.label[1]),
+        )));
+        if row.images > 0 {
+            kit::label(
+                ui,
+                kit::txt(
+                    format!("· {} image{}", row.images, if row.images == 1 { "" } else { "s" }),
+                    12.0,
+                    Weight::Regular,
+                    kit::col(t.alias.label[2]),
+                ),
+            );
+        }
+        if !hot {
+            return;
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if kit::icon_button(ui, Icon::Close, 22.0)
+                .on_hover_text("Remove from the queue")
+                .clicked()
+            {
+                *act = Some(QueueAct::Remove(id));
+            }
+            if kit::icon_button(ui, Icon::Edit, 22.0)
+                .on_hover_text("Edit this message")
+                .clicked()
+            {
+                *act = Some(QueueAct::Open(id));
+            }
+            // Steering means joining the turn that is running now — with
+            // nothing running there is no turn to join, and a message
+            // carrying images cannot become a steer at all.
+            let can_steer = running && row.images == 0;
+            let steer = kit::icon_button_tinted(
+                ui,
+                Icon::Inject,
+                22.0,
+                (!can_steer).then(|| kit::col(t.alias.label[3])),
+            );
+            let steer = if can_steer {
+                steer.on_hover_text("Steer: join the running turn at its next step")
+            } else if row.images > 0 {
+                steer.on_hover_text("A message with images cannot be steered")
+            } else {
+                steer.on_hover_text("Nothing is running to steer")
+            };
+            if can_steer && steer.clicked() {
+                *act = Some(QueueAct::Steer(id));
+            }
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------

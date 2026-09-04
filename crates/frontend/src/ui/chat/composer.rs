@@ -592,13 +592,18 @@ fn read_submit_keys(ui: &mut egui::Ui, active: bool) -> SubmitKeys {
     })
 }
 
+/// Ctrl+Enter on an empty draft with rows waiting: every queued message
+/// joins the running turn at its next hop instead of waiting for one of its
+/// own (§5.1).
+///
+/// The rows are not cleared here — the backend answers each promotion with a
+/// `QueueChanged`, and that is what empties the dock. A row it refuses (one
+/// carrying images, which a steer cannot take) stays, which is the point.
 fn steer_queue(app: &mut App) {
     let session_id = app.chat.session_id;
-    for text in std::mem::take(&mut app.chat.queued) {
-        app.send(UiCommand::SendRequest(Request::SteerTurn {
-            session_id,
-            text,
-        }));
+    let ids: Vec<u64> = app.chat.queued.iter().filter_map(|r| r.id).collect();
+    for id in ids {
+        app.send(UiCommand::SendRequest(Request::SteerQueued { session_id, id }));
     }
 }
 
@@ -676,9 +681,13 @@ fn send_message(app: &mut App, steer: bool) {
         }
     }
     if last_turn_in_flight(app) {
-        // Optimistic queue row; `InboxChanged { accepted: "running" }` is
-        // when it becomes a turn.
-        app.chat.queued.push(kit::one_line(&text, 200));
+        // Optimistic local echo, inert until the backend's `QueueChanged`
+        // replaces it with the addressable row.
+        app.chat.queued.push(crate::app::QueuedRow {
+            id:     None,
+            text:   text.clone(),
+            images: images.len() as u32,
+        });
     }
     app.chat.turns.push(crate::app::Turn {
         user: text.clone(),

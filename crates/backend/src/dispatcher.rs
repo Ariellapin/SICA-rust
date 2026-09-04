@@ -97,6 +97,12 @@ pub async fn handle(
             chat.send_user_message(session_id, text, images).await;
             Response::Ok
         }
+        Request::EditUserMessage { session_id, seq, text } => {
+            match chat.edit_user_message(session_id, seq, text).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
         Request::InterruptTurn { session_id } => {
             chat.interrupt_session(session_id).await;
             Response::Ok
@@ -134,6 +140,27 @@ pub async fn handle(
         Request::InjectContext { session_id, text } => {
             chat.inject_context(session_id, text).await;
             Response::Ok
+        }
+        // The queue verbs report a row that is already gone as an error
+        // rather than as success: the loop claims rows on its own schedule,
+        // so "it was not there" is a normal outcome the user has to see.
+        Request::EditQueued { session_id, id, text } => {
+            match chat.edit_queued(session_id, id, text).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::RemoveQueued { session_id, id } => {
+            match chat.remove_queued(session_id, id).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::SteerQueued { session_id, id } => {
+            match chat.steer_queued(session_id, id).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
         }
         Request::ReportFrontendError { module, message, traceback } => {
             idealist_bus.publish(idealist::Trigger {

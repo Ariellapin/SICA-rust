@@ -98,7 +98,7 @@ fn draw_turn(
     };
     let has_images = !app.chat.turns[i].images.is_empty();
     if !user.is_empty() || has_images {
-        draw_user(ui, i, &user, t);
+        draw_user(app, ui, i, &user, t);
     }
     if has_images {
         draw_user_images(app, ui, i);
@@ -188,16 +188,38 @@ fn draw_turn(
 // User
 // ---------------------------------------------------------------------------
 
-fn draw_user(ui: &mut egui::Ui, i: usize, text: &str, t: &Theme) {
+fn draw_user(app: &mut App, ui: &mut egui::Ui, i: usize, text: &str, t: &Theme) {
+    if app.chat.editing_turn == Some(i) {
+        draw_user_editor(app, ui, i, t);
+        return;
+    }
+    // A prompt can be rewritten once the backend has told us where it landed
+    // (`user_seq`) and while nothing is running — a rewind mid-turn would
+    // race the loop's own appends, and the backend refuses it anyway.
+    let editable = app.chat.turns[i].user_seq.is_some()
+        && !app.chat.running_sessions.contains(&app.chat.session_id)
+        && app.pending_approval.is_none()
+        && app.pending_question.is_none();
+    // The reveal area is last frame's bubble, widened to cover the button
+    // that appears beside it — otherwise moving onto the button would take
+    // the pointer out of the hover rect and the button would blink away.
+    let hover_id = ui.id().with(("user_row", i));
+    let hovered = ui
+        .ctx()
+        .data(|d| d.get_temp::<Rect>(hover_id))
+        .is_some_and(|r| ui.rect_contains_pointer(r));
+
     let avail = ui.available_width();
     let max_w = (avail * 0.70).max(180.0);
     // The frame's own horizontal margin is not available to the text.
     let text_w = (max_w - 2.0 * BUBBLE_PAD_X).max(80.0);
+    let mut bubble = Rect::NOTHING;
+    let mut open_editor = false;
     ui.allocate_ui_with_layout(
         Vec2::new(avail, 0.0),
         Layout::right_to_left(Align::Min),
         |ui| {
-            egui::Frame::none()
+            let framed = egui::Frame::none()
                 .fill(kit::col(t.alias.bubble))
                 .rounding(Rounding::same(RADIUS_BUBBLE))
                 .inner_margin(egui::Margin::symmetric(BUBBLE_PAD_X, 10.0))
@@ -235,8 +257,106 @@ fn draw_user(ui: &mut egui::Ui, i: usize, text: &str, t: &Theme) {
                         );
                     }
                 });
+            bubble = framed.response.rect;
+            // Right-to-left: the bubble is placed first and keeps the right
+            // edge, so showing this only on hover never shifts it.
+            if editable && hovered {
+                ui.add_space(4.0);
+                open_editor = kit::icon_button(ui, Icon::Edit, 28.0)
+                    .on_hover_text("Edit this prompt and run again")
+                    .clicked();
+            }
         },
     );
+    if bubble.is_positive() {
+        let hit = Rect::from_min_max(
+            Pos2::new(bubble.min.x - 40.0, bubble.min.y),
+            bubble.max,
+        );
+        ui.ctx().data_mut(|d| d.insert_temp(hover_id, hit));
+    }
+    if open_editor {
+        app.chat.editing_turn = Some(i);
+        app.chat.edit_draft = text.to_owned();
+        // Re-arm the one-shot focus claim for this turn's field.
+        let focus_id = ui.id().with(("edit_prompt", i)).with("focused");
+        ui.ctx().data_mut(|d| d.insert_temp(focus_id, false));
+    }
+    ui.add_space(8.0);
+}
+
+/// The user bubble with its text open for rewriting: Enter (or "Run again")
+/// re-runs the conversation from here, Esc (or "Cancel") leaves it alone.
+fn draw_user_editor(app: &mut App, ui: &mut egui::Ui, i: usize, t: &Theme) {
+    let avail = ui.available_width();
+    let box_w = (avail * 0.70).max(240.0);
+    let field_id = ui.id().with(("edit_prompt", i));
+    // Consumed before the editor sees them: Shift+Enter is the newline (the
+    // composer's own split), so plain Enter is free to mean "run". Only
+    // while the field itself holds focus — the composer stays usable with an
+    // editor open, and its Enter must still be its own.
+    let submit = ui.memory(|m| m.has_focus(field_id))
+        && ui.input_mut(|inp| inp.consume_key(Modifiers::NONE, Key::Enter));
+    // Escape closes the editor wherever focus sits. Nothing else wants it
+    // here: the composer's Escape interrupts a running turn, and a running
+    // turn is exactly when the editor cannot be open.
+    let cancel = ui.input_mut(|inp| inp.consume_key(Modifiers::NONE, Key::Escape));
+    let mut run = false;
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail, 0.0),
+        Layout::right_to_left(Align::Min),
+        |ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(box_w, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    // Focus is claimed once, on the frame the editor opens —
+                    // re-requesting it every frame would tear it back from
+                    // anything else the user clicked.
+                    let focus_id = field_id.with("focused");
+                    let first = !ui.ctx().data(|d| d.get_temp(focus_id).unwrap_or(false));
+                    egui::Frame::none()
+                        .fill(kit::col(t.alias.bubble))
+                        .rounding(Rounding::same(RADIUS_BUBBLE))
+                        .inner_margin(egui::Margin::symmetric(BUBBLE_PAD_X, 10.0))
+                        .show(ui, |ui| {
+                            let field = egui::TextEdit::multiline(&mut app.chat.edit_draft)
+                                .id(field_id)
+                                .desired_width(ui.available_width())
+                                .font(kit::font(t.content_px as f32, Weight::Regular))
+                                .return_key(Some(egui::KeyboardShortcut::new(
+                                    Modifiers::SHIFT,
+                                    Key::Enter,
+                                )))
+                                .frame(false);
+                            let resp = ui.add(field);
+                            if first {
+                                resp.request_focus();
+                                ui.ctx().data_mut(|d| d.insert_temp(focus_id, true));
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        run = kit::button(ui, "Run again", kit::Variant::Primary, kit::Size::Sm)
+                            .clicked();
+                        if kit::button(ui, "Cancel", kit::Variant::Ghost, kit::Size::Sm).clicked() {
+                            app.chat.editing_turn = None;
+                        }
+                    });
+                    kit::footnote(ui, "the reply and everything after it is replaced");
+                },
+            );
+        },
+    );
+    if cancel {
+        app.chat.editing_turn = None;
+        app.chat.edit_draft.clear();
+        return;
+    }
+    if run || submit {
+        let text = app.chat.edit_draft.clone();
+        app.edit_user_message(i, text);
+    }
     ui.add_space(8.0);
 }
 

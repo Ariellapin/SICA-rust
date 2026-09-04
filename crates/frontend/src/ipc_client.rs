@@ -119,6 +119,14 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 Response::SessionSearch { hits } => {
                                     bridge.send(UiEvent::SessionSearch { hits });
                                 }
+                                // A refused request used to reach the user
+                                // only as a raw `RSP#…` line in the log
+                                // panel. It is an error the operator has to
+                                // see, so it goes through the same channel a
+                                // backend ERROR does.
+                                Response::Error { message } => {
+                                    bridge.send(UiEvent::RequestFailed { message });
+                                }
                                 _ => {}
                             }
                         }
