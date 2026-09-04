@@ -46,6 +46,7 @@ pub enum AppCommand {
     CompactNow,
     PlanToggle,
     PermissionHint,
+    GoalHint,
     ClearDraft,
     OpenSettings,
     OpenLlmSettings,
@@ -60,6 +61,7 @@ const APP_COMMANDS: &[(&str, &str, AppCommand)] = &[
     ("compact", "Fold older history into a summary now.", AppCommand::CompactNow),
     ("plan", "Toggle plan mode (explore-only until exit-plan-mode).", AppCommand::PlanToggle),
     ("permission", "Switch permission mode: /permission <read-only|workspace-write|danger-full-access>.", AppCommand::PermissionHint),
+    ("goal", "Show or change this session's objective: /goal [continue|pause|complete|block <why>].", AppCommand::GoalHint),
     ("clear", "Empty the composer and drop attachments.", AppCommand::ClearDraft),
     ("settings", "Open the Settings view.", AppCommand::OpenSettings),
     ("llm", "Open Settings → LLM to pick a provider.", AppCommand::OpenLlmSettings),
@@ -431,9 +433,10 @@ fn frame(p: &sica_core::theme::Palette) -> egui::Frame {
 /// Commit the highlighted row: run app commands, insert everything else.
 fn accept(app: &mut App, ui: &mut egui::Ui, row: &Row) {
     match row.action {
-        // `/permission` needs an argument — complete the prefix in the
-        // draft like a catalogue entry instead of firing immediately.
-        Some(AppCommand::PermissionHint) | None => {
+        // `/permission` needs an argument and `/goal` takes an optional
+        // one — complete the prefix in the draft like a catalogue entry
+        // instead of firing immediately.
+        Some(AppCommand::PermissionHint) | Some(AppCommand::GoalHint) | None => {
             // Trailing space: it separates the name from its arguments *and*
             // closes the palette (whitespace ends a slash query).
             app.chat.draft = format!("/{} ", row.name);
@@ -479,6 +482,9 @@ fn run_app_command(app: &mut App, cmd: AppCommand) {
             // Reached only programmatically — the palette completes the
             // prefix instead (see `accept`).
             app.chat.draft = "/permission ".to_string();
+        }
+        AppCommand::GoalHint => {
+            app.chat.draft = "/goal ".to_string();
         }
         AppCommand::ClearDraft => {
             app.chat.draft.clear();

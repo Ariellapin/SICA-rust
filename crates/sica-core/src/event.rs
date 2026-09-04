@@ -63,7 +63,15 @@ pub enum EventKind {
     /// Rename (auto-title or, later, manual). Latest wins.
     SessionTitle { title: String },
     /// One user message opens a turn; `turn_id` groups the hops under it.
-    TurnStart { turn_id: u64 },
+    /// `source` says who opened it — a human, a goal round, or a queued
+    /// followup — which is what the goal skills' authority check reads:
+    /// creating or pausing a goal requires a direct human turn, so an
+    /// autonomous round cannot rewrite its own objective.
+    TurnStart {
+        turn_id: u64,
+        #[serde(default)]
+        source: TurnSource,
+    },
     TurnEnd { turn_id: u64, finish_reason: String, hops: u8 },
     UserMessage {
         surface: SurfaceOp,
@@ -166,6 +174,21 @@ pub enum EventKind {
     /// Full-replacement todo list. Latest wins; never surfaced (the FE
     /// renders the checklist from the pushed event).
     TodoWrite { items: Vec<protocol::TodoItem> },
+    /// The session's durable objective changed (guide §12.3). Latest wins;
+    /// every mutation is a compare-and-set on `revision`, so a stale writer
+    /// (a round that has been superseded by a human edit) is refused rather
+    /// than silently overwriting. Never surfaced — the model reads the goal
+    /// through `get-goal` and through the `<goal_round>` prompt.
+    GoalChange {
+        goal_id: u64,
+        revision: u32,
+        objective: String,
+        phase: protocol::GoalPhase,
+        rounds_started: u32,
+        max_rounds: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocker: Option<String>,
+    },
     /// A background job ended. Durable audit only — what the model reads is
     /// the `ContextInjected { source: JobNotice }` that accompanies it, so
     /// the notice is part of the derived history and this is not.
@@ -183,6 +206,38 @@ pub enum EventKind {
 
 fn default_true() -> bool {
     true
+}
+
+/// Who opened a turn. Defaults to [`TurnSource::Human`] so a log written
+/// before the field existed reads as what it was.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSource {
+    /// A person sent a message.
+    #[default]
+    Human,
+    /// The goal round driver opened it.
+    GoalRound,
+    /// A user message that had been queued behind a running turn. Still a
+    /// human's words, but it did not arrive at the moment it ran.
+    Followup,
+}
+
+impl TurnSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            TurnSource::Human => "human",
+            TurnSource::GoalRound => "goal round",
+            TurnSource::Followup => "followup",
+        }
+    }
+
+    /// Whether this turn carries a human's direct authority. A followup is
+    /// a person's own message, so it does; a goal round is the machine
+    /// continuing on its own, so it does not.
+    pub fn is_human(&self) -> bool {
+        matches!(self, TurnSource::Human | TurnSource::Followup)
+    }
 }
 
 /// Why a [`EventKind::ContextInjected`] message exists.
@@ -417,7 +472,7 @@ mod tests {
     fn append_preserves_order_and_skips_bookkeeping() {
         let log = vec![
             ev(1, EventKind::SessionCreated { id: 7, title: "t".into(), created_at: 0 }),
-            ev(2, EventKind::TurnStart { turn_id: 1 }),
+            ev(2, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
             user(3, "hi"),
             assistant(4, "hello"),
             ev(5, EventKind::TokenUsage { used: 1, limit: 2, budget: 3, prompt_tokens: None, completion_tokens: None }),
@@ -622,7 +677,7 @@ mod tests {
         let kinds = vec![
             EventKind::SessionCreated { id: 1, title: "t".into(), created_at: 5 },
             EventKind::SessionTitle { title: "new".into() },
-            EventKind::TurnStart { turn_id: 3 },
+            EventKind::TurnStart { turn_id: 3, source: TurnSource::Human },
             EventKind::TurnEnd { turn_id: 3, finish_reason: "done".into(), hops: 2 },
             EventKind::UserMessage { surface: SurfaceOp::Append, content: "hi".into(), images: Vec::new() },
             EventKind::AssistantMessage {

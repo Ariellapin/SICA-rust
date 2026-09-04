@@ -40,6 +40,9 @@ pub const CHILD_EXCLUDED: &[&str] = &[
     ASK_USER_NAME,
     TODO_WRITE_NAME,
     EXIT_PLAN_MODE_NAME,
+    crate::goal::CREATE_GOAL_NAME,
+    crate::goal::GET_GOAL_NAME,
+    crate::goal::UPDATE_GOAL_NAME,
 ];
 
 /// User-editable plan-mode policy, seeded once into `skills/` (never
@@ -87,7 +90,7 @@ pub fn is_policy_doc(path: &Path) -> bool {
 /// they mutate the session log and (for `exit-plan-mode`) conclude the
 /// turn. The dispatcher intercepts them before any sub-agent spins up.
 pub fn is_control_skill(name: &str) -> bool {
-    name == TODO_WRITE_NAME || name == EXIT_PLAN_MODE_NAME
+    name == TODO_WRITE_NAME || name == EXIT_PLAN_MODE_NAME || crate::goal::is_goal_skill(name)
 }
 
 /// Coerce an argument that should be a JSON array into one. The tool

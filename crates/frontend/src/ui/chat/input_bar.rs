@@ -260,6 +260,7 @@ fn parse_harness_command(text: &str) -> Option<(String, String)> {
         "/compact" => "compact",
         "/plan" => "plan",
         "/permission" => "permission",
+        "/goal" => "goal",
         _ => return None,
     };
     let input = text[head.len()..].trim().to_string();

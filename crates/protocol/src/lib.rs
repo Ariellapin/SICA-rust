@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -547,6 +547,70 @@ pub enum Event {
         session_id: u64,
         jobs: Vec<JobDump>,
     },
+    /// A session's durable goal changed — created, edited, a round started,
+    /// paused, completed or blocked. `None` means the session has no goal.
+    GoalChanged {
+        session_id: u64,
+        goal: Option<GoalDump>,
+    },
+}
+
+/// Where a session's durable objective stands (guide §12.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoalPhase {
+    /// Rounds may run.
+    Active,
+    /// Held by a human; rounds do not run until resumed.
+    Paused,
+    /// Reached. Terminal.
+    Completed,
+    /// Stopped on something the agent cannot resolve. Terminal until a
+    /// human edits the goal.
+    Blocked,
+}
+
+impl GoalPhase {
+    pub fn label(&self) -> &'static str {
+        match self {
+            GoalPhase::Active => "active",
+            GoalPhase::Paused => "paused",
+            GoalPhase::Completed => "completed",
+            GoalPhase::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "active" => Some(GoalPhase::Active),
+            "paused" => Some(GoalPhase::Paused),
+            "completed" => Some(GoalPhase::Completed),
+            "blocked" => Some(GoalPhase::Blocked),
+            _ => None,
+        }
+    }
+
+    /// Terminal phases never run another round, whatever the round budget
+    /// says.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, GoalPhase::Completed | GoalPhase::Blocked)
+    }
+}
+
+/// A session's goal as the FE sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalDump {
+    pub id:             u64,
+    pub revision:       u32,
+    pub objective:      String,
+    pub phase:          GoalPhase,
+    pub rounds_started: u32,
+    pub max_rounds:     u32,
+    pub blocker:        Option<String>,
+    /// Whether the round driver will actually start rounds. Process-local
+    /// and never persisted: after a backend restart an active goal comes
+    /// back disarmed, so a reboot can never resume an autonomous loop the
+    /// user has not asked for again.
+    pub armed:          bool,
 }
 
 /// One background job as the FE sees it (`agents::jobs::JobSummary` over

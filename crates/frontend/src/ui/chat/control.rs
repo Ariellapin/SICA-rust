@@ -15,6 +15,7 @@ use crate::ui::widgets::{caps_label, ghost_button};
 /// prompt from a background session stays reachable by switching back.
 pub fn draw_strips(app: &mut App, ui: &mut egui::Ui) {
     draw_approval_strip(app, ui);
+    draw_goal_strip(app, ui);
     draw_jobs_strip(app, ui);
     draw_plan_todo_row(app, ui);
 }
@@ -54,6 +55,79 @@ fn draw_approval_strip(app: &mut App, ui: &mut egui::Ui) {
     if let Some(allow) = verdict {
         app.pending_approval = None;
         app.send(UiCommand::SendRequest(Request::ResolveApproval { id, allow }));
+    }
+    ui.add_space(4.0);
+}
+
+/// The session's durable objective. Shown whenever one exists, because a
+/// goal is the one piece of state that makes the app act on its own: the
+/// user must be able to see that rounds are running and stop them in one
+/// click.
+fn draw_goal_strip(app: &mut App, ui: &mut egui::Ui) {
+    let Some(goal) = app.goal.clone() else { return };
+    let p = app.palette;
+    let mut command: Option<&str> = None;
+    ui.horizontal_wrapped(|ui| {
+        let (word, tint) = match goal.phase {
+            protocol::GoalPhase::Active if goal.armed => ("GOAL RUNNING", rgb(p.accent)),
+            protocol::GoalPhase::Active => ("GOAL PAUSED", rgb(p.muted)),
+            protocol::GoalPhase::Paused => ("GOAL PAUSED", rgb(p.muted)),
+            protocol::GoalPhase::Completed => ("GOAL DONE", rgb(p.ok)),
+            protocol::GoalPhase::Blocked => ("GOAL BLOCKED", rgb(p.danger)),
+        };
+        caps_label(ui, word, tint);
+        ui.label(
+            egui::RichText::new(format!(
+                "round {}/{}",
+                goal.rounds_started, goal.max_rounds
+            ))
+            .color(rgb(p.muted))
+            .small(),
+        );
+        ui.label(
+            egui::RichText::new(truncate(&goal.objective, 90))
+                .color(rgb(p.ink))
+                .small(),
+        )
+        .on_hover_text(&goal.objective);
+        if let Some(b) = &goal.blocker {
+            ui.label(
+                egui::RichText::new(format!("blocked: {}", truncate(b, 60)))
+                    .color(rgb(p.danger))
+                    .small(),
+            );
+        }
+        if goal.phase == protocol::GoalPhase::Active && goal.armed {
+            if ghost_button(ui, &p, "Pause")
+                .on_hover_text("Stop opening new rounds. The current turn finishes.")
+                .clicked()
+            {
+                command = Some("pause");
+            }
+        } else if !goal.phase.is_terminal() && goal.rounds_started < goal.max_rounds {
+            if ghost_button(ui, &p, "Continue")
+                .on_hover_text("Resume automatic rounds against this objective.")
+                .clicked()
+            {
+                command = Some("continue");
+            }
+        }
+        if !goal.phase.is_terminal()
+            && ghost_button(ui, &p, "Complete")
+                .on_hover_text("Mark the objective met and stop.")
+                .clicked()
+        {
+            command = Some("complete");
+        }
+    });
+    if let Some(input) = command {
+        let session_id = app.chat.session_id;
+        app.last_command_session = Some(session_id);
+        app.send(UiCommand::SendRequest(Request::RunCommand {
+            session_id,
+            name: "goal".into(),
+            input: input.into(),
+        }));
     }
     ui.add_space(4.0);
 }

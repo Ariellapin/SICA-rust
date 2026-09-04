@@ -109,6 +109,8 @@ pub struct App {
     /// Background jobs of the active session (strip above the composer).
     /// Replaced wholesale on every `JobsChanged`.
     pub jobs: Vec<protocol::JobDump>,
+    /// Durable objective of the active session, when it has one.
+    pub goal: Option<protocol::GoalDump>,
     /// Permission mode of the active session (status-bar pill).
     pub permission_mode: protocol::PermissionMode,
     /// Plan mode of the active session (composer toggle).
@@ -672,6 +674,7 @@ impl App {
             pending_question: None,
             todos: Vec::new(),
             jobs: Vec::new(),
+            goal: None,
             permission_mode: protocol::PermissionMode::default(),
             plan_active: false,
             last_command_session: None,
@@ -1235,6 +1238,7 @@ impl App {
                 // the dump; clearing here keeps the previous session's jobs
                 // off screen in the frame before it lands.
                 self.jobs.clear();
+                self.goal = None;
             }
             UiEvent::Catalog { entries } => {
                 self.push_log(
@@ -1298,6 +1302,11 @@ impl App {
             UiEvent::JobsChanged { session_id, jobs } => {
                 if session_id == self.chat.session_id {
                     self.jobs = jobs;
+                }
+            }
+            UiEvent::GoalChanged { session_id, goal } => {
+                if session_id == self.chat.session_id {
+                    self.goal = goal;
                 }
             }
             UiEvent::InboxChanged { session_id, queued, accepted } => {

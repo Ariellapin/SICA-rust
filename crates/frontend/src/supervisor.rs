@@ -114,6 +114,8 @@ pub enum UiEvent {
     InboxChanged { session_id: u64, queued: u32, accepted: String },
     /// A session's background jobs changed (started, finished, killed).
     JobsChanged { session_id: u64, jobs: Vec<protocol::JobDump> },
+    /// The session's durable objective changed (`None` = no goal).
+    GoalChanged { session_id: u64, goal: Option<protocol::GoalDump> },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -309,6 +311,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::JobsChanged { session_id, jobs } => {
             UiEvent::JobsChanged { session_id, jobs }
+        }
+        Event::GoalChanged { session_id, goal } => {
+            UiEvent::GoalChanged { session_id, goal }
         }
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }

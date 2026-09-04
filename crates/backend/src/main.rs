@@ -184,6 +184,13 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(Arc::new(agents::AskUser));
     skill_registry.register(Arc::new(agents::control::TodoWrite));
     skill_registry.register(Arc::new(agents::control::ExitPlanMode));
+    // The goal skills (Wave 4, guide §12.3) are harness controls too: they
+    // mutate the session log and drive the round loop, so their bodies run
+    // in the hub. A goal is what lets a session keep working after the
+    // reply that would normally end it.
+    skill_registry.register(Arc::new(agents::CreateGoal));
+    skill_registry.register(Arc::new(agents::GetGoal));
+    skill_registry.register(Arc::new(agents::UpdateGoal));
     // `model-eval` benchmarks the connected model against a prompt suite. It
     // needs the finished registry (for the live catalogue and the known-skill
     // predicate its tool-call checks use), so it is attached below alongside

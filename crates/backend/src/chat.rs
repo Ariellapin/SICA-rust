@@ -4,7 +4,7 @@
 //! to the model is derived from them on every hop. Nothing in this module
 //! mutates a message list — every persistence site is an [`append_event`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -15,13 +15,14 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use agents::goal::Goal;
 use agents::meter::TokenMeter;
 use agents::pipeline::{PermissionPolicy, PlanModePolicy, ReadBeforeEdit, RepeatReminder, ToolPolicy};
 use agents::{
     BrokerSet, EventSink, SkillRegistry, ToolFailureSink, ToolSubAgent,
 };
 use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
-use sica_core::event::{ContextSource, EventKind, SurfaceEntry, SurfaceOp};
+use sica_core::event::{ContextSource, EventKind, SurfaceEntry, SurfaceOp, TurnSource};
 use sica_core::message::{Message, Role};
 
 use crate::inbox::{Inbound, Inbox};
@@ -96,6 +97,15 @@ pub struct ChatHub {
     /// hands it over with [`Self::with_jobs`], so the hub and the skills
     /// share one registry.
     pub jobs:          Arc<agents::JobRegistry>,
+    /// Durable objective per session (`agents::goal`), restored from the
+    /// log's latest `GoalChange` on load.
+    pub goals:         Arc<Mutex<HashMap<u64, Goal>>>,
+    /// Sessions whose goal is *armed* — the round driver only opens rounds
+    /// for these. Deliberately not persisted and empty at startup: a
+    /// backend restart must never resume an autonomous loop on its own, so
+    /// a restored active goal waits for `/goal continue`.
+    pub goal_armed:    Arc<Mutex<HashSet<u64>>>,
+    pub next_goal_id:  Arc<AtomicU64>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -110,6 +120,15 @@ struct ControlState {
     repeat:       Arc<Mutex<HashMap<u64, Arc<RepeatReminder>>>>,
     read_seen:    Arc<Mutex<HashMap<u64, Arc<ReadBeforeEdit>>>>,
     brokers:      Arc<BrokerSet>,
+    goals:        Arc<Mutex<HashMap<u64, Goal>>>,
+    /// Who opened the turn this state belongs to. The goal skills' authority
+    /// check reads it: an automatic round may not set or pause its own
+    /// objective. Carried here rather than passed down four call layers.
+    turn_source:  TurnSource,
+    /// Sessions whose goal is *armed*. Process-local by design (§12.3) —
+    /// see `ControlState::armed`.
+    arm_set:      Arc<Mutex<HashSet<u64>>>,
+    next_goal:    Arc<AtomicU64>,
 }
 
 impl ControlState {
@@ -233,6 +252,55 @@ impl ControlState {
     /// the call like any other. Returns the outcome and whether the turn
     /// ends now.
     #[allow(clippy::too_many_arguments)]
+    /// This session's goal, if it has one.
+    async fn goal(&self, session_id: u64) -> Option<Goal> {
+        self.goals.lock().await.get(&session_id).cloned()
+    }
+
+    /// Whether the round driver may open rounds for this session. Process
+    /// state, never persisted: an active goal comes back disarmed after a
+    /// restart and waits for a human to say continue.
+    async fn armed(&self, session_id: u64) -> bool {
+        self.arm_set.lock().await.contains(&session_id)
+    }
+
+    async fn set_armed(&self, session_id: u64, on: bool) {
+        let mut g = self.arm_set.lock().await;
+        if on {
+            g.insert(session_id);
+        } else {
+            g.remove(&session_id);
+        }
+    }
+
+    /// Persist a goal change, remember it, and push it to the FE. Every
+    /// mutation goes through here so the three copies — log, memory,
+    /// frontend — cannot drift.
+    async fn put_goal(&self, sessions: &Sessions, session_id: u64, goal: Goal) {
+        append_event(sessions, session_id, EventKind::GoalChange {
+            goal_id:        goal.id,
+            revision:       goal.revision,
+            objective:      goal.objective.clone(),
+            phase:          goal.phase,
+            rounds_started: goal.rounds_started,
+            max_rounds:     goal.max_rounds,
+            blocker:        goal.blocker.clone(),
+        })
+        .await;
+        // A goal that can no longer run rounds is disarmed as a matter of
+        // course: leaving it armed would restart the loop the moment
+        // someone resumed it.
+        if !goal.rounds_left() {
+            self.set_armed(session_id, false).await;
+        }
+        let armed = self.armed(session_id).await;
+        self.events.emit(Event::GoalChanged {
+            session_id,
+            goal: Some(goal_dump(&goal, armed)),
+        });
+        self.goals.lock().await.insert(session_id, goal);
+    }
+
     async fn handle_control(
         &self,
         sessions: &Sessions,
@@ -252,7 +320,9 @@ impl ControlState {
             args_preview: args_preview.to_string(),
             expectation: expectation.to_string(),
         });
-        let (outcome, conclude) = self.handle_control_body(sessions, name, args, session_id, cancel).await;
+        let (outcome, conclude) = self
+            .handle_control_body(sessions, name, args, session_id, cancel)
+            .await;
         self.events.emit(Event::ToolCallFinished {
             id,
             ok: outcome.ok,
@@ -269,6 +339,7 @@ impl ControlState {
         session_id: u64,
         cancel: &CancellationToken,
     ) -> (agents::SkillOutcome, bool) {
+        let source = self.turn_source;
         let fail = |summary: &str| agents::SkillOutcome { ok: false, summary: summary.into() };
         if name == agents::control::TODO_WRITE_NAME {
             // Accepts the real array as well as its JSON text — the tool
@@ -353,6 +424,128 @@ impl ControlState {
                     fail(&format!("keeping plan mode: {feedback}")),
                     false,
                 ),
+            }
+        } else if name == agents::goal::CREATE_GOAL_NAME {
+            let objective = args
+                .get("objective")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(objective) = objective else {
+                return (
+                    fail("missing `objective` — say what the goal is, concretely"),
+                    false,
+                );
+            };
+            if !agents::goal::human_turn(source) {
+                return (
+                    fail(
+                        "only the user can set a goal — an automatic round cannot \
+                         give itself a new objective",
+                    ),
+                    false,
+                );
+            }
+            if let Some(existing) = self.goal(session_id).await {
+                if !existing.phase.is_terminal() {
+                    return (
+                        fail(&format!(
+                            "this session already has a goal — finish or block it \
+                             first:\n{}",
+                            existing.summary()
+                        )),
+                        false,
+                    );
+                }
+            }
+            let max_rounds = agents::goal::parse_max_rounds(args.get("max_rounds"));
+            let id = self.next_goal.fetch_add(1, Ordering::Relaxed);
+            let goal = Goal::new(id, objective.to_string(), max_rounds);
+            // A goal created in a human turn is armed by that same
+            // instruction; nothing else ever arms one implicitly.
+            self.set_armed(session_id, true).await;
+            let summary = goal.summary();
+            self.put_goal(sessions, session_id, goal).await;
+            self.events.emit(Event::LogLine {
+                level:   "INFO".into(),
+                message: format!("goal set ({max_rounds} rounds max): {objective}"),
+            });
+            (
+                agents::SkillOutcome {
+                    ok: true,
+                    summary: format!(
+                        "{summary}\n\nA fresh round opens against this objective each \
+                         time you go idle, until it is complete, blocked, paused by \
+                         the user, or the round budget runs out."
+                    ),
+                },
+                false,
+            )
+        } else if name == agents::goal::GET_GOAL_NAME {
+            match self.goal(session_id).await {
+                Some(goal) => {
+                    let armed = self.armed(session_id).await;
+                    (
+                        agents::SkillOutcome {
+                            ok: true,
+                            summary: format!(
+                                "{}\nrounds armed: {armed}",
+                                goal.summary()
+                            ),
+                        },
+                        false,
+                    )
+                }
+                None => (fail("this session has no goal"), false),
+            }
+        } else if name == agents::goal::UPDATE_GOAL_NAME {
+            let Some(goal) = self.goal(session_id).await else {
+                return (fail("this session has no goal to update"), false);
+            };
+            let revision = args
+                .get("revision")
+                .and_then(|v| match v {
+                    serde_json::Value::Number(n) => n.as_u64().map(|n| n as u32),
+                    serde_json::Value::String(s) => s.trim().parse::<u32>().ok(),
+                    _ => None,
+                });
+            let Some(revision) = revision else {
+                return (
+                    fail(&format!(
+                        "missing or unreadable `revision` — the goal is at revision {}",
+                        goal.revision
+                    )),
+                    false,
+                );
+            };
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let action = match agents::goal::GoalAction::parse(action) {
+                Ok(a) => a,
+                Err(e) => return (fail(&e), false),
+            };
+            let note = args.get("note").and_then(|v| v.as_str());
+            // Authority first, then compare-and-set: a caller who may not
+            // take this action should be told that, not handed a revision
+            // error it would go on to "fix".
+            if let Err(e) =
+                agents::goal::authorize(action, &goal, agents::goal::human_turn(source), 0)
+            {
+                return (fail(&e), false);
+            }
+            match agents::goal::apply(&goal, revision, action, note) {
+                Err(e) => (fail(&e), false),
+                Ok(next) => {
+                    if next.phase != protocol::GoalPhase::Active {
+                        self.set_armed(session_id, false).await;
+                    }
+                    let summary = next.summary();
+                    self.put_goal(sessions, session_id, next).await;
+                    self.events.emit(Event::LogLine {
+                        level:   "INFO".into(),
+                        message: format!("goal {}", summary.lines().next().unwrap_or("")),
+                    });
+                    (agents::SkillOutcome { ok: true, summary }, false)
+                }
             }
         } else {
             (fail(&format!("unknown control skill `{name}`")), false)
@@ -679,6 +872,9 @@ impl ChatHub {
             meters:       Arc::new(Mutex::new(HashMap::new())),
             inbox:        Arc::new(Inbox::new()),
             jobs:         Arc::new(agents::JobRegistry::new()),
+            goals:        Arc::new(Mutex::new(HashMap::new())),
+            goal_armed:   Arc::new(Mutex::new(HashSet::new())),
+            next_goal_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -700,19 +896,49 @@ impl ChatHub {
             let mut g = map.try_lock().expect("fresh ChatHub, no contention");
             let mut perms = hub.permissions.try_lock().expect("fresh ChatHub");
             let mut plans = hub.plans.try_lock().expect("fresh ChatHub");
+            let mut goals = hub.goals.try_lock().expect("fresh ChatHub");
+            let mut max_goal = 0;
             for s in loaded {
-                let (mode, plan) = control_state(&s);
+                let (mode, plan, goal) = control_state(&s);
                 if mode != PermissionMode::default() {
                     perms.insert(s.id, mode);
                 }
                 if plan {
                     plans.insert(s.id, true);
                 }
+                // Restored *disarmed*: `goal_armed` stays empty at startup,
+                // so an active goal resumes only when a human says so.
+                if let Some(goal) = goal {
+                    max_goal = max_goal.max(goal.id);
+                    goals.insert(s.id, goal);
+                }
                 g.insert(s.id, s);
             }
+            hub.next_goal_id.store(max_goal + 1, Ordering::Relaxed);
         }
         hub.next_id.store(max_id + 1, Ordering::Relaxed);
         hub
+    }
+
+    /// The per-session control plane the turn task and the harness
+    /// commands share. One constructor so a new field cannot be wired into
+    /// one path and forgotten in the other.
+    fn control(&self) -> ControlState {
+        ControlState {
+            events:       self.event_sink.clone(),
+            failure_sink: self.failure_sink.clone(),
+            permissions:  self.permissions.clone(),
+            plans:        self.plans.clone(),
+            repeat:       self.repeat.clone(),
+            read_seen:    self.read_seen.clone(),
+            brokers:      self.brokers.clone(),
+            goals:        self.goals.clone(),
+            arm_set:      self.goal_armed.clone(),
+            next_goal:    self.next_goal_id.clone(),
+            // Harness commands are the user acting directly; a turn task
+            // overrides this with its own source.
+            turn_source:  TurnSource::Human,
+        }
     }
 
     /// Adopt the job registry the skills were built with. Without this the
@@ -744,8 +970,8 @@ impl ChatHub {
     /// model reads. Injected context goes out under the `context` role so
     /// the FE never mistakes it for something the user typed.
     pub async fn dump_session(&self, id: u64) -> Option<SessionDump> {
-        // Loading a session is the FE switching to it, so push the jobs it
-        // owns: `JobsChanged` is otherwise only emitted on a change, and a
+        // Loading a session is the FE switching to it, so push its goal and
+        // the jobs it owns: `JobsChanged` is otherwise only emitted on a change, and a
         // session with a build already running would show an empty strip.
         self.event_sink.emit(Event::JobsChanged {
             session_id: id,
@@ -763,6 +989,14 @@ impl ChatHub {
                 })
                 .collect(),
         });
+        {
+            let goal = self.goals.lock().await.get(&id).cloned();
+            let armed = self.goal_armed.lock().await.contains(&id);
+            self.event_sink.emit(Event::GoalChanged {
+                session_id: id,
+                goal: goal.as_ref().map(|g| goal_dump(g, armed)),
+            });
+        }
         let g = self.sessions.lock().await;
         let log = g.get(&id)?;
         let messages = log
@@ -830,6 +1064,8 @@ impl ChatHub {
             self.inbox.clear(id).await;
             // Its background jobs go with it, process trees included.
             self.jobs.clear(id);
+            self.goals.lock().await.remove(&id);
+            self.goal_armed.lock().await.remove(&id);
         }
         removed
     }
@@ -934,6 +1170,10 @@ impl ChatHub {
         if let Some((_, tok)) = self.active_turns.lock().await.get(&session_id) {
             tok.cancel();
         }
+        // Stop also stops the goal loop. Anything else makes the button a
+        // lie: the round the user just killed would be followed by the next
+        // one a moment later.
+        self.goal_armed.lock().await.remove(&session_id);
         // Steers and injects aimed at the turn being killed die with it —
         // applying them to some later, unrelated turn would be worse than
         // dropping them. Queued user messages survive: pressing Stop right
@@ -1029,9 +1269,11 @@ impl ChatHub {
                 "plan" => self.command_plan(session_id, input).await,
                 "permission" => self.command_permission(session_id, input).await,
                 "job-kill" => self.command_job_kill(session_id, input).await,
+                "goal" => self.command_goal(session_id, input).await,
                 _ => (
                     false,
-                    "unknown command — want compact | plan | permission | job-kill".into(),
+                    "unknown command — want compact | plan | permission | job-kill | goal"
+                        .into(),
                 ),
             }
         };
@@ -1044,6 +1286,63 @@ impl ChatHub {
             .await;
         }
         text
+    }
+
+    /// `/goal` — read the objective; `/goal continue | pause | complete |
+    /// block <note>` — change it, on the user's own authority.
+    ///
+    /// `continue` is the only way an autonomous loop ever (re)starts:
+    /// arming is process-local, so a restored goal, a fork, or a session
+    /// the user pressed Stop on all wait here until a person asks.
+    async fn command_goal(&self, session_id: u64, input: &str) -> (bool, String) {
+        let control = self.control();
+        let Some(goal) = control.goal(session_id).await else {
+            return (
+                false,
+                "this session has no goal — the agent sets one with `create-goal`".into(),
+            );
+        };
+        let armed = control.armed(session_id).await;
+        let (word, note) = match input.trim().split_once(char::is_whitespace) {
+            Some((w, rest)) => (w.trim(), rest.trim()),
+            None => (input.trim(), ""),
+        };
+        if word.is_empty() {
+            return (true, format!("{}\nrounds armed: {armed}", goal.summary()));
+        }
+        let action = match agents::goal::GoalAction::parse(word) {
+            Ok(a) => a,
+            Err(e) => return (false, e),
+        };
+        // The user always has authority; only the compare-and-set applies,
+        // and it cannot fail here because the revision comes from the goal
+        // we just read.
+        let next = match agents::goal::apply(&goal, goal.revision, action, Some(note)) {
+            Ok(g) => g,
+            Err(e) => return (false, e),
+        };
+        let resumed = next.phase == protocol::GoalPhase::Active && next.rounds_left();
+        control.set_armed(session_id, resumed).await;
+        let summary = next.summary();
+        control.put_goal(&self.sessions, session_id, next).await;
+
+        // Resuming while the session is idle starts the next round now —
+        // otherwise "continue" would only take effect after the user sent
+        // an unrelated message.
+        if resumed && !self.active_turns.lock().await.contains_key(&session_id) {
+            if let Some(goal) = control.goal(session_id).await {
+                let started = agents::goal::start_round(&goal);
+                let prompt = agents::goal::round_prompt(&started);
+                control.put_goal(&self.sessions, session_id, started).await;
+                tokio::spawn(self.start_boxed(
+                    session_id,
+                    prompt,
+                    Vec::new(),
+                    TurnSource::GoalRound,
+                ));
+            }
+        }
+        (true, summary)
     }
 
     /// Stop a background job from the UI. Routed through the same registry
@@ -1155,7 +1454,7 @@ impl ChatHub {
             return;
         }
         if !self.active_turns.lock().await.contains_key(&session_id) {
-            self.start_turn(session_id, text, Vec::new()).await;
+            self.start_turn(session_id, text, Vec::new(), TurnSource::Human).await;
             return;
         }
         self.enqueue(session_id, Inbound::Steer { text }).await;
@@ -1188,9 +1487,10 @@ impl ChatHub {
         session_id: u64,
         text: String,
         images: Vec<UserImage>,
+        source: TurnSource,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let hub = self.clone();
-        Box::pin(async move { hub.start_turn(session_id, text, images).await })
+        Box::pin(async move { hub.start_turn(session_id, text, images, source).await })
     }
 
     /// Accept a user message: queue it when a turn is already running,
@@ -1221,7 +1521,7 @@ impl ChatHub {
                 return;
             }
         }
-        self.start_turn(session_id, text, images).await;
+        self.start_turn(session_id, text, images, TurnSource::Human).await;
     }
 
     /// Run one user message as a turn, unconditionally.
@@ -1235,6 +1535,7 @@ impl ChatHub {
         session_id: u64,
         text: String,
         images: Vec<UserImage>,
+        source: TurnSource,
     ) {
         let Some(client) = self.llm.lock().await.clone() else {
             // A followup handed this call a *reserved* slot. Nothing is
@@ -1309,7 +1610,7 @@ impl ChatHub {
                 content: text.clone(),
                 images: images.clone(),
             });
-            log.append(EventKind::TurnStart { turn_id: outer_turn });
+            log.append(EventKind::TurnStart { turn_id: outer_turn, source });
             // First message into a still-placeholder session: name it from
             // the message right now, so the sidebar never shows "Session N"
             // for something that has content. The LLM title (below, after
@@ -1353,15 +1654,7 @@ impl ChatHub {
         let inbox = self.inbox.clone();
         // The turn starts the next one itself when a followup is queued.
         let hub = self.clone();
-        let control = ControlState {
-            events: self.event_sink.clone(),
-            failure_sink: self.failure_sink.clone(),
-            permissions: self.permissions.clone(),
-            plans: self.plans.clone(),
-            repeat: self.repeat.clone(),
-            read_seen: self.read_seen.clone(),
-            brokers: self.brokers.clone(),
-        };
+        let control = ControlState { turn_source: source, ..self.control() };
         let plans = self.plans.clone();
         let active_turns = self.active_turns.clone();
         let next_turn = self.next_turn.clone();
@@ -1874,42 +2167,99 @@ impl ChatHub {
             })
             .await;
 
-            // Release this turn's slot — unless a queued message is waiting,
-            // in which case the slot stays held through the handoff so a
-            // send arriving in the gap still queues instead of racing the
-            // followup. Only this turn may hand off: a newer send has
-            // already replaced the marker.
-            let followup = {
+            // What happens next, decided under the session's slot lock so
+            // the slot is never released for a turn that is about to start
+            // anyway — a send arriving in that gap would otherwise race the
+            // continuation instead of queueing behind it.
+            //
+            // Order matters: a queued human message wins over a goal round.
+            // The person is here now; the objective can wait a turn.
+            enum Next {
+                Followup(String, Vec<UserImage>),
+                GoalRound(Goal),
+                Idle,
+            }
+            let next = {
                 let mut guard = active_turns.lock().await;
                 let mine = guard
                     .get(&session_id)
                     .is_some_and(|(slot_marker, _)| *slot_marker == marker);
-                let next = if mine { inbox.take_followup(session_id).await } else { None };
-                if mine && next.is_none() {
+                let next = if !mine {
+                    // A newer send already replaced this slot; it owns what
+                    // comes next.
+                    Next::Idle
+                } else if let Some((text, images)) = inbox.take_followup(session_id).await {
+                    Next::Followup(text, images)
+                } else if cancel.is_cancelled() {
+                    // Stop means stop: a goal round would restart the work
+                    // the user just interrupted. Disarming makes that
+                    // explicit and durable until they say continue.
+                    control.set_armed(session_id, false).await;
+                    Next::Idle
+                } else {
+                    match control.goal(session_id).await {
+                        Some(goal)
+                            if goal.rounds_left() && control.armed(session_id).await =>
+                        {
+                            Next::GoalRound(goal)
+                        }
+                        _ => Next::Idle,
+                    }
+                };
+                if mine && matches!(next, Next::Idle) {
                     guard.remove(&session_id);
                 }
                 next
             };
 
-            if let Some((next_text, next_images)) = followup {
-                let queued = inbox.queued(session_id).await;
-                event_sink.emit(Event::InboxChanged {
-                    session_id,
-                    queued,
-                    accepted: "running".into(),
-                });
-                event_sink.emit(Event::LogLine {
-                    level:   "INFO".into(),
-                    message: format!(
-                        "running queued message ({queued} still waiting)"
-                    ),
-                });
-                // Boxed: this is `send_user_message` calling itself one turn
-                // later, and the future's type has to stay finite.
-                let fut = hub.start_boxed(session_id, next_text, next_images);
-                tokio::spawn(fut);
+            match next {
+                Next::Followup(next_text, next_images) => {
+                    let queued = inbox.queued(session_id).await;
+                    event_sink.emit(Event::InboxChanged {
+                        session_id,
+                        queued,
+                        accepted: "running".into(),
+                    });
+                    event_sink.emit(Event::LogLine {
+                        level:   "INFO".into(),
+                        message: format!("running queued message ({queued} still waiting)"),
+                    });
+                    // Boxed: this is the turn loop starting the next turn,
+                    // and the future's type has to stay finite. A queued
+                    // message is still the user's own words, so it carries
+                    // human authority.
+                    tokio::spawn(hub.start_boxed(
+                        session_id,
+                        next_text,
+                        next_images,
+                        TurnSource::Followup,
+                    ));
+                }
+                // Round driver (§12.3): with an active, armed goal and
+                // rounds left, going idle opens the next round instead of
+                // ending the session's work.
+                Next::GoalRound(goal) => {
+                    let next_goal = agents::goal::start_round(&goal);
+                    let round = next_goal.rounds_started;
+                    let max = next_goal.max_rounds;
+                    let prompt = agents::goal::round_prompt(&next_goal);
+                    // The round is recorded *before* it runs: a round that
+                    // crashes must still cost a round, or an objective that
+                    // crashes every time would loop until the process died.
+                    control.put_goal(&sessions_map, session_id, next_goal).await;
+                    event_sink.emit(Event::LogLine {
+                        level:   "INFO".into(),
+                        message: format!("goal round {round}/{max} starting"),
+                    });
+                    tokio::spawn(hub.start_boxed(
+                        session_id,
+                        prompt,
+                        Vec::new(),
+                        TurnSource::GoalRound,
+                    ));
+                }
+                Next::Idle => {}
             }
-
 
             // Skip the auto-title work if the user interrupted — a partial
             // assistant reply isn't a useful title source.
@@ -2199,17 +2549,48 @@ fn parallel_call(
 
 /// Latest durable Wave-3 control state from a session's log: the newest
 /// `PermissionMode` event wins, the newest `PlanMode` event wins.
-fn control_state(log: &SessionLog) -> (PermissionMode, bool) {
+fn control_state(log: &SessionLog) -> (PermissionMode, bool, Option<Goal>) {
     let mut mode = PermissionMode::default();
     let mut plan = false;
+    let mut goal = None;
     for ev in &log.events {
         match &ev.kind {
             EventKind::PermissionMode { mode: m } => mode = *m,
             EventKind::PlanMode { active } => plan = *active,
+            // Latest wins, exactly like the two above: `GoalChange` is a
+            // full snapshot, so the last one is the goal.
+            EventKind::GoalChange {
+                goal_id, revision, objective, phase, rounds_started, max_rounds, blocker,
+            } => {
+                goal = Some(Goal {
+                    id:             *goal_id,
+                    revision:       *revision,
+                    objective:      objective.clone(),
+                    phase:          *phase,
+                    rounds_started: *rounds_started,
+                    max_rounds:     *max_rounds,
+                    blocker:        blocker.clone(),
+                });
+            }
             _ => {}
         }
     }
-    (mode, plan)
+    (mode, plan, goal)
+}
+
+/// A goal on the wire. `armed` is process state, not part of the goal, so
+/// it is passed in rather than read off it.
+fn goal_dump(goal: &Goal, armed: bool) -> protocol::GoalDump {
+    protocol::GoalDump {
+        id:             goal.id,
+        revision:       goal.revision,
+        objective:      goal.objective.clone(),
+        phase:          goal.phase,
+        rounds_started: goal.rounds_started,
+        max_rounds:     goal.max_rounds,
+        blocker:        goal.blocker.clone(),
+        armed,
+    }
 }
 
 /// Fold the older part of `session_id`'s history into an LLM-written summary
@@ -2922,6 +3303,12 @@ mod tests {
     }
 
     fn control() -> (ControlState, Sessions, Arc<Capture>) {
+        control_as(TurnSource::Human)
+    }
+
+    /// A control plane whose turn was opened by `source` — the goal skills'
+    /// authority check reads exactly that.
+    fn control_as(source: TurnSource) -> (ControlState, Sessions, Arc<Capture>) {
         let cap = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
         let cs = ControlState {
             events: cap.clone(),
@@ -2931,6 +3318,10 @@ mod tests {
             repeat: Arc::new(Mutex::new(HashMap::new())),
             read_seen: Arc::new(Mutex::new(HashMap::new())),
             brokers: Arc::new(BrokerSet::new()),
+            goals: Arc::new(Mutex::new(HashMap::new())),
+            arm_set: Arc::new(Mutex::new(HashSet::new())),
+            next_goal: Arc::new(AtomicU64::new(1)),
+            turn_source: source,
         };
         (cs, Arc::new(Mutex::new(HashMap::new())), cap)
     }
@@ -2947,9 +3338,31 @@ mod tests {
         log.append(EventKind::PermissionMode { mode: PermissionMode::DangerFullAccess });
         log.append(EventKind::PlanMode { active: false });
         log.append(EventKind::PlanMode { active: true });
-        let (mode, plan) = control_state(&log);
+        let (mode, plan, goal) = control_state(&log);
         assert_eq!(mode, PermissionMode::DangerFullAccess);
         assert!(plan);
+        assert!(goal.is_none());
+    }
+
+    #[test]
+    fn control_state_restores_the_latest_goal_snapshot() {
+        let mut log = SessionLog::new(1, "t");
+        let snapshot = |rev: u32, rounds: u32, phase| EventKind::GoalChange {
+            goal_id: 7,
+            revision: rev,
+            objective: "ship it".into(),
+            phase,
+            rounds_started: rounds,
+            max_rounds: 8,
+            blocker: None,
+        };
+        log.append(snapshot(1, 0, protocol::GoalPhase::Active));
+        log.append(snapshot(2, 1, protocol::GoalPhase::Active));
+        log.append(snapshot(3, 1, protocol::GoalPhase::Paused));
+        let (_, _, goal) = control_state(&log).clone();
+        let goal = goal.expect("goal restored");
+        assert_eq!((goal.id, goal.revision, goal.rounds_started), (7, 3, 1));
+        assert_eq!(goal.phase, protocol::GoalPhase::Paused);
     }
 
     #[tokio::test]
@@ -3137,5 +3550,129 @@ mod tests {
         assert!(parallel_call(&reg, &call("run-cli", "{\"command\": \"cargo build\"}")).is_none());
         assert!(parallel_call(&reg, &call("nope", "{}")).is_none());
         assert!(parallel_call(&reg, &call("read-file", "not json")).is_none());
+    }
+
+    /// Run one control skill through the harness path the dispatcher uses.
+    async fn control_call(
+        cs: &ControlState,
+        sessions: &Sessions,
+        name: &str,
+        args: serde_json::Value,
+    ) -> agents::SkillOutcome {
+        let cancel = CancellationToken::new();
+        cs.handle_control_body(sessions, name, &args, 1, &cancel).await.0
+    }
+
+    #[tokio::test]
+    async fn creating_a_goal_persists_it_arms_it_and_pushes_it() {
+        let (cs, sessions, cap) = control();
+        with_log(&sessions, 1).await;
+        let out = control_call(
+            &cs,
+            &sessions,
+            agents::goal::CREATE_GOAL_NAME,
+            serde_json::json!({ "objective": "make the tests pass", "max_rounds": "3" }),
+        )
+        .await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("make the tests pass"));
+
+        let goal = cs.goal(1).await.expect("goal stored");
+        assert_eq!(goal.max_rounds, 3);
+        assert!(cs.armed(1).await, "a goal set by a human is armed by that instruction");
+
+        // Durable, and visible to the FE.
+        let g = sessions.lock().await;
+        assert!(g[&1]
+            .events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::GoalChange { .. })));
+        drop(g);
+        let events = cap.0.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::GoalChanged { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_automatic_round_cannot_set_a_goal() {
+        let (cs, sessions, _) = control_as(TurnSource::GoalRound);
+        with_log(&sessions, 1).await;
+        let out = control_call(
+            &cs,
+            &sessions,
+            agents::goal::CREATE_GOAL_NAME,
+            serde_json::json!({ "objective": "something else entirely" }),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("only the user"), "{}", out.summary);
+        assert!(cs.goal(1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_goal_is_refused_while_the_first_is_live() {
+        let (cs, sessions, _) = control();
+        with_log(&sessions, 1).await;
+        let mk = |o: &str| serde_json::json!({ "objective": o });
+        assert!(control_call(&cs, &sessions, agents::goal::CREATE_GOAL_NAME, mk("first")).await.ok);
+        let out = control_call(&cs, &sessions, agents::goal::CREATE_GOAL_NAME, mk("second")).await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("already has a goal"), "{}", out.summary);
+    }
+
+    #[tokio::test]
+    async fn update_goal_enforces_the_revision_and_disarms_on_completion() {
+        let (cs, sessions, _) = control();
+        with_log(&sessions, 1).await;
+        control_call(
+            &cs,
+            &sessions,
+            agents::goal::CREATE_GOAL_NAME,
+            serde_json::json!({ "objective": "ship it" }),
+        )
+        .await;
+
+        // A stale revision is refused rather than applied.
+        let stale = control_call(
+            &cs,
+            &sessions,
+            agents::goal::UPDATE_GOAL_NAME,
+            serde_json::json!({ "revision": "99", "action": "complete", "note": "done" }),
+        )
+        .await;
+        assert!(!stale.ok);
+        assert!(stale.summary.contains("revision mismatch"), "{}", stale.summary);
+        assert!(cs.armed(1).await, "a refused update changes nothing");
+
+        let ok = control_call(
+            &cs,
+            &sessions,
+            agents::goal::UPDATE_GOAL_NAME,
+            serde_json::json!({ "revision": "1", "action": "complete", "note": "tests green" }),
+        )
+        .await;
+        assert!(ok.ok, "{}", ok.summary);
+        assert_eq!(cs.goal(1).await.unwrap().phase, protocol::GoalPhase::Completed);
+        assert!(!cs.armed(1).await, "a completed goal opens no more rounds");
+    }
+
+    #[tokio::test]
+    async fn get_goal_reports_the_revision_update_goal_needs() {
+        let (cs, sessions, _) = control();
+        with_log(&sessions, 1).await;
+        assert!(!control_call(&cs, &sessions, agents::goal::GET_GOAL_NAME, serde_json::json!({}))
+            .await
+            .ok, "no goal yet");
+        control_call(
+            &cs,
+            &sessions,
+            agents::goal::CREATE_GOAL_NAME,
+            serde_json::json!({ "objective": "x" }),
+        )
+        .await;
+        let out =
+            control_call(&cs, &sessions, agents::goal::GET_GOAL_NAME, serde_json::json!({})).await;
+        assert!(out.ok);
+        assert!(out.summary.contains("rev 1"), "{}", out.summary);
+        assert!(out.summary.contains("rounds armed: true"), "{}", out.summary);
     }
 }
