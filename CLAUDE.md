@@ -9,360 +9,71 @@ A two-binary Rust desktop app that hosts a local-LLM chat agent:
 - **`backend`** — long-lived daemon (`crates/backend`). Holds chat sessions, the LLM connection, the skill (tool) registry, and the idealist daemon.
 - **`frontend`** — egui/eframe GUI (`crates/frontend`) that spawns the backend as a child process, talks to it over a Windows named pipe, and offers rebuild/restart controls.
 
-The split exists so the GUI can hot-reload backend logic: edit code, rebuild backend, supervisor respawns the child, IPC reconnects. The FE's watcher observes **all** of `crates/` (1 s debounce) but only ever runs `cargo build -p backend`, so a change to `protocol`/`llm`/`agents`/`sica-core` needs the FE restarted too. `sica_core::build_id::source_version()` (latest mtime under `crates/*/src` + `crates/*/Cargo.toml`) is computed by both sides; when the BE's `ServerHello.version` diverges from the FE's freshly-computed value the footer shows a pulsing RESTART button.
+The split exists so the GUI can hot-reload backend logic. The FE watcher rebuilds
+**only** `backend`, so a change to any other crate needs the FE restarted too.
+See [docs/architecture.md](docs/architecture.md#what-this-is).
 
 ## Build / run / test
 
-**Always use the wrapper scripts.** This workspace targets `x86_64-pc-windows-gnullvm` (pinned in [rust-toolchain.toml](rust-toolchain.toml)) and needs LLVM-MinGW on PATH. The wrappers prepend `%USERPROFILE%\.cargo\bin` and the winget LLVM-MinGW `bin/` dir before calling cargo. Direct `cargo …` invocations will fail unless the user has already added both to PATH.
+**Always use the wrapper scripts.** This workspace targets `x86_64-pc-windows-gnullvm` (pinned in [rust-toolchain.toml](rust-toolchain.toml)) and needs LLVM-MinGW on PATH; the wrappers prepend it. Direct `cargo …` invocations will fail.
 
 ```powershell
 .\run.ps1 build --workspace
 .\run.ps1 test  --workspace
 .\run.ps1 run   -p frontend                  # launches the GUI
 .\run.ps1 run   -p frontend --bin smoke      # headless E2E smoke test
-.\run.ps1 run   -p backend -- --ipc <pipe>   # rarely needed; FE normally spawns BE
 ```
 
-Single crate / single test (plain cargo filters, forwarded verbatim):
+Cargo filters are forwarded verbatim (`.\run.ps1 test -p agents md_skill`). To pass
+flags to the test binary use PowerShell's stop-parsing token:
+`.\run.ps1 --% test -p agents proc -- --nocapture`. `run.bat` is the cmd.exe
+equivalent; `start.bat` builds + launches the GUI; `.\run.ps1 cmd <exe> <args…>`
+runs any other binary with the same PATH.
 
-```powershell
-.\run.ps1 test -p agents
-.\run.ps1 test -p agents md_skill
-.\run.ps1 test -p agents -- --exact md_skill::tests::parses_well_formed
-```
-
-`run.bat` is the cmd.exe equivalent of `run.ps1`. `start.bat` is a one-shot that builds + launches the GUI. `.\run.ps1 cmd <exe> <args…>` runs any other binary with the same PATH set up.
-
-There is no `clippy.toml`, `rustfmt.toml`, lints config, or CI. Tests are inline `#[cfg(test)]` modules (~200 tests, concentrated in `agents`; also `backend`, `sica-core`, `idealist`, `llm`, `protocol`, `frontend`). To pass flags to the test binary through the wrapper use PowerShell's stop-parsing token: `.\run.ps1 --% test -p agents proc -- --nocapture`. The `smoke` binary ([crates/frontend/src/bin/smoke.rs](crates/frontend/src/bin/smoke.rs)) is the canonical end-to-end check — it spawns the backend, exchanges the handshake, sends `IncrementCounter`/`ComputeFib`, asserts responses, then `Shutdown`s and confirms exit 0. Run it after any change that touches the protocol, IPC, dispatcher, or `be_core`. It reads `target/debug/backend.exe` directly, so build first.
+No clippy/rustfmt/lints config and no CI. Tests are inline `#[cfg(test)]` modules
+(~200, concentrated in `agents`). [crates/frontend/src/bin/smoke.rs](crates/frontend/src/bin/smoke.rs)
+is the canonical end-to-end check — run it after any change to the protocol, IPC,
+dispatcher, or `be_core`. It reads `target/debug/backend.exe`, so build first.
 
 ## Workspace layout
 
-Seven crates, dependency direction strictly downward:
+Seven crates, dependency direction strictly downward. Details in
+[docs/architecture.md](docs/architecture.md#workspace-layout).
 
 | Crate | Role |
 | --- | --- |
-| `protocol` | Wire types only (`Frame`, `Request`, `Response`, `Event`) + `PROTOCOL_VERSION`. No I/O, no dep on `sica-core`. Shared by both binaries — changes here force rebuilding both. |
-| `sica-core` | Shared utilities: `paths` (every on-disk surface), `event` (the append-only session log + `derive_surface` fold), `retain` (UTF-8-safe head/tail windows + the one omission sentence every cut uses), `message`/`session` (chat message types; `Session` survives only for legacy TOML migration), `build_id`, `theme`. |
-| `llm` | HTTP client for OpenAI-compatible `/v1/chat/completions` (llama.cpp, vLLM, OpenAI, Anthropic-compat), SSE streaming + `<think>` splitting, connection state machine, token counting. |
-| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds). |
-| `idealist` | Classifies failures (`FeBug` vs `BeFix`), writes improvement tickets to `idealist_workspace/`, optional BE auto-patching (off by default). |
-| `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `be_core/` holds the legacy demo state. |
-| `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the surfaces — `kit` (the design-system primitives), `icons`, `sidebar`, `chat/` (transcript, tool rows, composer, dock, control takeovers, `trajectory` (the event-log ledger), `details` (the tool / event inspector)), `settings/` (a modal). Styling is the dsh port described in [docs/harness-ui-guide.md](docs/harness-ui-guide.md); waves UI-1…UI-5 are in. |
+| `protocol` | Wire types only + `PROTOCOL_VERSION`. Shared by both binaries. |
+| `sica-core` | Shared utilities: `paths`, `event` (session log + `derive_surface`), `retain`, `message`/`session`, `build_id`, `theme`. |
+| `llm` | HTTP client for OpenAI-compatible `/v1/chat/completions`, SSE streaming, connection state, token counting. |
+| `agents` | Agent runtime: turns, skills, prompt assembly, compaction, delegation, jobs, goals, evals. |
+| `idealist` | Classifies failures, writes improvement tickets to `idealist_workspace/`. |
+| `backend` | Long-lived binary: dispatcher, `ChatHub` agent loop, legacy demo state. |
+| `frontend` | egui GUI: supervisor (BE child + IPC + watcher), `app.rs` state, `ui/` surfaces. |
 
-## Wire protocol
+## Reference docs
 
-- Transport: Windows named pipe `\\.\pipe\sica-rust-<fe-pid>` via the `interprocess` crate's tokio API.
-- Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
-- Payload: `bincode`-encoded `protocol::Frame`.
-- Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 22) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- **[docs/architecture.md](docs/architecture.md)** — the crate graph, the wire
+  protocol (framing, `PROTOCOL_VERSION` history v17–v22), every on-disk surface,
+  how to add a new request, and the conventions to respect when editing.
+- **[docs/agent-loop.md](docs/agent-loop.md)** — one turn end to end: history
+  derivation, prune/compact/trim, retry classification, the two tool-calling
+  modes, skills and the `ToolSubAgent` pipeline, the control plane, delegation,
+  the inbox, background jobs, goals, and `model-eval`.
+- [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) —
+  every dsh feature and its concrete sica-rust design. Read the relevant section
+  before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or
+  jobs feature.
+- [docs/harness-ui-guide.md](docs/harness-ui-guide.md) — the FE design system and
+  every UI surface. Read it before restyling or adding a frontend surface.
+- [docs/deepseek-harness-ideas.md](docs/deepseek-harness-ideas.md) — the ported
+  ideas catalogue, and the ones deliberately left for later.
 
-Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`).
+## Before you edit
 
-Two v17 events exist purely so the transcript can show what the log already
-records: `LlmRetry` (the retry chain row — the durable `EventKind::LlmRetry`
-was previously only a `LogLine`) and `TurnUsage` (one turn's own token and
-time totals, emitted at `TurnEnd`, distinct from the cumulative per-session
-`TokenUsage` meter). `ListModels` answers `Ok` and reports through
-`ModelsListed`, because the dispatcher loop is serial and a slow provider
-must not stall it.
-
-v18 adds prompt editing. `EditUserMessage { session_id, seq, text }` re-runs
-the conversation from an earlier prompt: the backend appends
-`EventKind::Rewind { start_seq, end_seq }` — the log's second shadowing
-mechanism, and the only one that contributes no message of its own, so it
-cannot be a `SurfaceOp::Replace` — and then runs an ordinary human turn
-carrying the original message's images. The superseded turns stay in the log.
-The rewind is appended *before* the turn's own instruction and
-runtime-context snapshots, since it names the whole tail and anything written
-ahead of it would fall inside the span it erases. It is refused while a turn
-is running. Two additions carry the handle it addresses: `MessageDump.seq`
-(every dumped message's durable id) and `Event::UserMessageStored`, pushed
-once per turn-opening message so the transcript can offer the edit on a
-prompt it has only seen live. The FE truncates optimistically and resyncs
-from `Response::Error`, which now reaches the user as a toast rather than
-only a raw line in the log panel.
-
-v22 adds the **request envelope**. `EventKind::RequestEnvelope
-{ fingerprint, system, tools, options }` records what one request went out
-with — the composed system prompt, the `tools` array, and the sampling
-options as JSON — and is appended by the hop that composed it **only when
-the fingerprint differs from the last envelope in the log**, so a session
-whose prompt never changes stores one copy and one whose `memory.md`
-changed mid-session stores the before and the after. It never surfaces:
-deriving it would send the system prompt twice. Every ledger row names the
-envelope in force at it (`EventDump.envelope` — the newest at or before the
-row), and the bodies travel once per page in
-`Response::SessionEvents.envelopes` rather than once per row. This is what
-makes the Trajectory inspector's Schema / System Prompt / Tools / Options
-tabs truthful about the row you clicked rather than about the prompt as it
-stands now.
-
-v21 adds two optional fields to `Event::QuestionAsked`: `detail`, the body
-under the headline, and `multi`, which turns the options into checkboxes.
-`ask-user` gains the matching optional args (`detail`, `multi`); a
-multi-select answer crosses back as the ticked labels joined with `; `, so
-it is still one string and nothing downstream changes. Plan review passes
-neither — it is Approve / Refuse.
-
-v20 adds the Trajectory view's ledger (UI guide §10).
-`LoadSessionEvents { session_id, from_seq, limit }` answers `SessionEvents
-{ events, total, next_seq }` with the session's **raw** log rather than the
-derived surface — `LoadSession` answers with what the model sees, this
-answers with what the log holds, and the difference (the events a compaction
-or a rewind shadowed) is the whole reason the view exists. `EventDump`
-([backend/src/trajectory.rs](crates/backend/src/trajectory.rs)) flattens each
-`SessionEvent`: a coarse `EventTag`, one line of text, the payload/result
-bodies, the provider's own token pair, the `ToolCall` join, the enclosing
-`turn_id`, the event's JSON for the inspector's Raw tab, and the two fields
-the transcript has no way to express — `shadowed` (asked of `derive_surface`
-itself, so the ledger and the fold can never disagree) and `shadows`, the
-span a `Replace` or a `Rewind` covered. Pages are capped at 500 rows and
-`next_seq` says whether more remains.
-
-`Event::ToolCallStarted` also gains `call_seq`: the live event carried only
-the process-local tool id while a reloaded row carried the durable `ToolCall`
-seq, so one call had two identities and the Inspect pill had nothing stable
-to jump to. `ToolSubAgent::with_log_seq` carries it from the dispatch site;
-it is `0` for a nested `SkillContext::sub` call, which is a live event only
-and never reaches the log.
-
-## The agent loop (the heart of the app)
-
-`ChatHub::send_user_message` ([crates/backend/src/chat.rs](crates/backend/src/chat.rs)) first handles the message itself: a leading whitespace-bounded `/name` token is resolved by `agents::invoke` (`commands/<name>.md` with `{{args}}` substitution → `agents/<name>.md` → `skills/<name>.md`) and its `<skill_content>` frame is appended as `ContextInjected { source: SkillInvocation }` *before* the `UserMessage`, which is stored as typed; an unresolvable token is sent as plain text. On a still-placeholder session the first five words / 40 bytes of the message become a fallback `SessionTitle` immediately (`title_gen::fallback`), so the sidebar never shows "Session N" for a session with content; the LLM titler overwrites it after the first reply. Then it spawns one task and loops until the model stops calling tools (`MAX_TOOL_HOPS = 12`). Each iteration:
-
-1. **Derive history from the session event log** (`build_history` → `SessionLog::derive_messages`) — never from an in-memory accumulator. Every persistence site is an `append_event` (`UserMessage`, `AssistantMessage`, `ToolCall`, `ToolResult`, `ContextInjected`, `CompactionSummary`, `LlmRetry`, `TokenUsage`, `RequestEnvelope`, `TurnStart`/`TurnEnd`, `SessionTitle`), flushed as one JSON line to `sessions/<id>.jsonl` immediately, so a crash mid-loop leaves a recoverable transcript. Nothing is ever removed from the log: compaction appends a summary whose `SurfaceOp::Replace { start_seq, end_seq }` *shadows* the folded span in the derived view (`sica_core::event`). `EventKind` has a `#[serde(other)] Unknown` variant so a log written by a newer backend still loads. The trimmer's "context notice" marker is wire-only and must never be logged. Two snapshots ride `ContextInjected` and shadow their predecessor so one copy is ever visible: the **runtime context** (time/cwd/os/model, refreshed once per turn) and the **workspace instructions** (`AGENTS.md`/`CLAUDE.md` chain via `agents::instructions`, re-checked after successful fs-tool calls). A `{{variable}}` reference in `memory.md` with no registered value fails the turn loudly (ERROR `LogLine`) rather than sending a malformed prompt.
-2. **Prune, compact, then trim.** Prompt budget is `context_window − (max_tokens ?? 4096) − 512`. At the connect-time `CompactPolicy.threshold_pct` (default 80%, dsh's policy) of that budget, `compact_session` first runs the *pruner*: every tool result older than the verbatim tail whose raw summary exceeds `compact::PRUNE_THRESHOLD` (8 KiB) is replaced by a 4 KiB head + 1 KiB tail window via a `ToolResult { surface: Replace { seq, seq }, pruned: true }` — no model call, and if that alone brings the prompt under the trigger the summariser is skipped. Otherwise `agents::compact` folds the older part of the history into an LLM-written summary — the call is a **KV-preserving prefix** (the conversation's own system prompt + the folded messages verbatim + the 8-section directive as the final user message), keeps `retain_pct` (default 16%) of the tail verbatim, and discards any summary cut off by `max_tokens` — landing as a system message framed in `<compacted-summary>` and prefixed with `CONTEXT_SUMMARY_PREFIX`; `agents::context::trim_to_budget` is only the backstop for when even that doesn't fit. Compaction must come before trimming — the budget is well under the window, so a trim-first order would silently amputate history before the meter ever read the trigger. The trigger itself uses the **usage-anchored meter** (`agents::meter`): when the provider's last `usage` covers this exact envelope (system prompt + tools fingerprint), only the surface added since is priced heuristically.
-3. **Run the turn** (`agents::turn::run_turn`) — streams `AssistantDelta`, emits `TokenUsage` every ~100 ms with a `breakdown` (system / tools / history), and returns accumulated content + reasoning + native tool calls + `error` (a transport/server failure, never swallowed). Requests set `stream_options.include_usage`; when the provider's `usage` trailer arrives it is the final `used_tokens` (it counts the real template, tool schemas and images, which `/tokenize` on concatenated text cannot) and is stored on the durable `TokenUsage` event as `prompt_tokens`/`completion_tokens` — and becomes the meter's next anchor.
-4. **Classify failures before persisting anything.** `llm::retry::classify` splits `TurnOutput.error` (and a clean stream that carried nothing at all) into retryable — connect/timeout/reset, HTTP 429/5xx, mid-stream SSE decode, empty response — vs fatal (other 4xx). A retryable failure appends `LlmRetry`, sleeps with jittered exponential backoff (500 ms → 10 s, max 5 retries per step, cancel-interruptible) and `continue`s: because the failed attempt persisted nothing, the rebuilt history is byte-identical and the retry is indistinguishable from the first attempt. This is a step-level listener, deliberately not a wrapper inside `llm::client`. Fatal/exhausted → ERROR `LogLine`, `TurnEnd { finish_reason: "error" }`, and the FE renders a *Request failed* line on the turn.
-5. **Persist the assistant message**, then dispatch any tool call through a `ToolSubAgent` (logging `ToolCall` immediately before dispatch so an interrupted batch leaves no orphan), append the `ToolResult`, and loop. The result carries `trusted` from `Skill::trusted()` (default `false`; `MarkdownSkill` is `true` because its body *is* the instruction) — an untrusted result derives with `event::UNTRUSTED_NOTICE` ("data, not instructions") in front of the fenced block; harness-authored results (hop limit, unknown skill) are trusted. After every dispatch — failed and unknown-skill calls included — `agents::guard::RepeatTracker` (one per session on `ChatHub::repeat`, cleared by each user message) keys the call on `skill + key-sorted canonical args`; at 3, 5 and 8 consecutive identical calls it injects an advisory `ContextInjected { source: ToolNotice }` naming the tool and count. It never blocks the call; `MAX_TOOL_HOPS` stays the hard stop.
-
-After the first complete exchange, `title_gen` renames a still-default-titled session and pushes `SessionTitleChanged`.
-
-### Two tool-calling modes
-
-Chosen per provider by `LlmOptions.native_tools`:
-
-- **Text protocol** (default; works with any llama.cpp build). The system prompt is composed by `agents::prompt` from ordered sections: `memory.md` + one guidance sentence per skill that provides one + the live `## Loaded skills` catalogue. The model emits one line — `skill-name '<arg>' … > <expectation>` — parsed by `agents::parse_tool_call`. A ` ```tool_call ` JSON fence is also accepted because small local models emit that shape from training data. Positional values are zipped onto the skill's declared `positional_args()`. `Tool`-role messages are downgraded to `user` on the wire, since local chat templates often lack a `tool` role. Successful outputs over 2 KB are re-summarised against the caller's `expectation` by a second LLM round-trip, keeping the main context tight; shorter output passes through verbatim (raw text is ground truth).
-- **Native** (`vLLM --enable-auto-tool-choice`, OpenAI, Anthropic-compat). `SkillRegistry::tools_json()` fills the request's `tools` array (optional args like `cwd`/`start`/`end` appear as non-required properties); real `tool` role + `tool_call_id` correlation is preserved on the wire and in storage. No expectation/summariser indirection — raw output goes back, per the OpenAI convention. Native `tool_calls` are *not* persisted on an interrupted turn: a dangling `tool_calls` with no matching results poisons the next request's template. Native mode keeps `memory.md` in the composed prompt (an identity section states that function calling is the interface); only the catalogue section is dropped, because the `tools` array carries it.
-
-Parsing is deliberately conservative. `extract_tool_call_known` only accepts natural-language lines whose skill name is registered — otherwise prose like `cargo build > compiles fine` becomes a bogus call. When the model emits something tool-call-shaped that the parser rejects, `parse_tool_call::rejected_attempt` names the defect (unreadable ```tool_call fence, a known-skill line missing its ` > <expectation>` clause) and the caller surfaces it as a WARN `LogLine` instead of failing silently. Both `chat.rs` and `agent-team` use it — a rejected call that passes silently is indistinguishable from "the model chose not to use a tool", which is how fabricated tool output gets into a transcript.
-
-### Skills
-
-`Skill` is an async trait (`name`, `description`, `positional_args`, `run`). Registration happens once at BE startup ([crates/backend/src/main.rs](crates/backend/src/main.rs)):
-
-1. Seed `skills/*.md` docs and `memory.md` if absent (**never overwritten** — those files are the user's once on disk). `skills/plan-mode.md` is seeded the same way but excluded from the skill scan by name — it is the plan-mode policy config, not a callable skill.
-2. `register` the Rust built-ins: `skill-creator`, `run-cli`, `run-pwsh`, `read-file` (line-numbered, optional `start`/`end`), `write-file`, `edit-file` (literal single-match replace), `glob` (gitignore-aware, newest first, cap 100), `grep` (regex over files, cap 250 matches), `model-eval`, `ask-user` (blocks on the broker for a human answer), the Wave-4 delegation set (`subagent`, `subagent-fork`, `ralph` — all three need the finished registry, so they are attached after the markdown scan like `agent-team`), the Wave-4 job trio (`job-output`, `job-list`, `job-kill`), plus the `todo-write` / `exit-plan-mode` / `create-goal` / `get-goal` / `update-goal` stubs — catalogue entries whose bodies run in `chat.rs` (session-log mutation + turn control), intercepted before any sub-agent spins up.
-3. `agent-team` (`agents::team`) registers **only if `skills/agent-team.md` exists** — that file is the feature's on/off switch and is deliberately *not* seeded in step 1. A team is N concurrent LLM conversations per call and its teammates are the least reliable output in the app, so it stays out of the catalogue until someone puts the doc there. Rename it to `agent-team.md.off` (only `*.md` is scanned) and restart the BE to turn it off.
-4. `md_skill::register_all` scans `skills/*.md` and uses **`register_if_absent`** so a markdown file can't shadow a built-in of the same name. This matters: the seeded `skills/run-cli.md` is documentation *for* `RunCli`, and shadowing it would make `run-cli` return its own docs instead of executing anything.
-
-A `MarkdownSkill` returns its body as the outcome, i.e. instructions fed back to the model, wrapped in the fixed `<skill_content name="…"><skill_resources>Base directory…</skill_resources><skill_instructions>…</skill_instructions></skill_content>` frame (`render_skill_content`) so relative resource paths in the body resolve. The same frame is what a typed `/name` injects. Frontmatter keys: `name` (required), `description`, `positional`.
-
-`run-cli`/`run-pwsh` share `builtins::run_shell`: the child is `kill_on_drop` *and*, on Windows, placed in a kill-on-close Job Object (`agents::proc::JobGuard`) so a timed-out or interrupted `cmd /C npm install` takes `node` with it instead of leaving it detached. `SICA_SESSION_ID` is set in the child environment. Each stream is capped at 32 KiB with the shared `retain` omission sentence.
-
-`ToolSubAgent` carries `depth`/`parent_id` (`max_depth = 4`) so a skill can spawn nested calls via `SkillContext::sub` and the FE can render the chain. Its pipeline (`agents::pipeline`, Wave 3) is: `pre_execute` policies (permission mode → plan mode → read-before-edit; first non-allow wins, `Ask` routes to the approval broker) → monotonic `guard`s (deny-only) → **cancel check** → **`Skill::timeout()`** (default 120 s; `agent-team` 30 min, `model-eval` 60 min, `skill-creator` 10 min, `ask-user`/`exit-plan-mode` 15 min — override it on any skill that drives its own LLM conversations, or the default kills it) → **spill-to-file** (`agents::spill`: a successful output over 48 KB is written to `spill/<session>/…` and the model gets a 4 KB head + omission marker naming the path + 1 KB tail; `read-file` is exempt so a follow-up read can't spill again) → `post_execute` (repeat-tool reminder rides `extra_context`; a `Block` replaces the outcome) → expectation summariser → failure sink. A `Deny`/`Block` is a failed outcome the model reads, never a defect: it skips the body and the sink, but still runs `post_execute` (so the repeat reminder counts denied calls) and still opens/closes its chip. Every failed *body* call (timeouts included) is also forwarded to a `ToolFailureSink`, which `main.rs` bridges into the idealist `TriggerBus` as a `tool_failed` trigger tagged `agents::tool::<skill>` — that's how a `cmd.exe`-only failure becomes a ticket suggesting `run-pwsh`. User interrupts are excluded (pressing Stop is not a defect). Every approval round-trip is appended as an `Approval` event for the audit; the model saw only the outcome.
-
-### Control plane (Wave 3)
-
-Permission modes (`read-only | workspace-write | danger-full-access`, policy level — no OS enforcement) and plan mode are per-session state on `ChatHub`, restored from the log's latest `PermissionMode`/`PlanMode` event on load, and rebuilt into pipeline policies on every dispatch so a flip applies on the next hop. The model is told via the runtime-context line plus (for plan mode) the `PLAN_POLICY` prompt section loaded from `skills/plan-mode.md`. Destructive-looking shell commands under `workspace-write` emit `ApprovalRequested` and wait on the broker (5 min → deny); `ask-user` and plan review emit `QuestionAsked` (10 min → fail the call). The FE answers via `ResolveApproval`/`AnswerQuestion` — both are **composer takeovers**: while a call is blocked on a human the composer is replaced in place by the approval card or the question panel, and the transcript stays scrollable above it. It renders the `todo-write` checklist as a dock card over the composer (cleared on the next turn start), and sends `/compact`/`/plan`/`permission` as `RunCommand` — harness commands that never create a model message and are audited as `Command` events. In native mode, consecutive `Parallel` calls (`read-file`, read-only shell) overlap in a bounded pool (cap 4) with model-order appends; everything else is an ordering barrier.
-
-### agent-team grounding
-
-`ToolSubAgent` wraps one tool call; `agents::team::AgentTeam` (opt-in, above) instead runs up to 6 *LLM* teammates concurrently, each with its own transcript, and merges their reports through a lead pass. Its failure mode is the opposite of a skill's: a teammate that calls nothing still writes fluent prose about files it never opened, and the lead launders that into the deliverable. Three guards, all in [crates/agents/src/team.rs](crates/agents/src/team.rs):
-
-- **Reports are typed** (`teammate_schema`, Wave 4): a teammate reports through the child-scoped `structured-output` tool as a list of claims, each citing the ids of the tool results that back it. The citations are checkable, not asserted — `runner` gives every dispatched call a stable id, echoes it to the child (`[id: call-2]`) and returns the trail on `Report.calls`, and `RunSpec.call_seq_start` keeps ids unique across the rounds a team runs over one transcript. A claim citing nothing, or citing an id that named no *successful* call, renders as `unverified:` in the board, the lead prompt and the final summary; a teammate with no cited claim is headed **UNVERIFIED**, a partly-cited one says so rather than passing as clean, and if nothing anywhere is cited the whole outcome gets a warning banner — that string is all the main agent ever sees.
-- A reply with no parsable tool call is checked with `parse_tool_call::rejected_attempt`. A botched call (`read-file 'README.md'` with no ` > ` clause) buys one `SYNTAX_CORRECTION` retry plus a WARN `LogLine`; previously it was silently accepted as the teammate's final answer, which is exactly how "the file exists" reached the user for a file that didn't.
-- Teammates see the catalogue via `catalogue_markdown_excluding(&[AGENT_TEAM_NAME])` — a teammate spawning its own team only unwinds at the depth limit.
-
-### Delegation (Wave 4)
-
-`agents::runner::run_conversation` is the one place a *child conversation*
-runs: its own system prompt, its own transcript, a bounded hop loop over
-`ToolSubAgent::child`, and one report crossing back. `agent-team`'s
-teammates, `subagent`/`subagent-fork` and every `ralph` round go through it,
-so the two grounding rules live once instead of three times — a run with
-zero successful tool calls is reported **UNVERIFIED**, and a reply that
-looks like a tool call but does not parse (`parse_tool_call::rejected_attempt`)
-buys one `SYNTAX_CORRECTION` retry before it is accepted as an answer.
-
-**Structured output.** `RunSpec.schema` registers a *child-scoped*
-`structured-output` skill (present only in that run's registry view) and
-appends its contract to the child's system prompt: only a call to it counts
-as the result. The argument is validated against a JSON Schema subset
-implemented in `runner::validate` — `type`, `properties`, `required`,
-`items`, `enum`, `minItems`, with unknown keywords deliberately ignored
-rather than rejected. There is no `jsonschema` dependency: every schema in
-the workspace is authored in this crate and stays inside that subset. A
-rejected argument is fed back as a tool error and retried within the hop
-budget; prose where a schema was demanded buys one reminder and is then
-reported unverified.
-
-- **`subagent 'task'`** — fresh child, empty conversation, so the task must
-  be self-contained. **`subagent-fork 'task'`** — child seeded with the
-  parent session's *completed* turns (`chat::fork_seed` cuts at the last
-  `TurnEnd`; the in-flight turn never crosses, since its tool results have
-  not landed). The two descriptions differ deliberately: the description is
-  what tells the model how to write the task. A fork with nothing to
-  inherit fails loudly rather than silently running as `subagent`.
-- **`ralph 'objective' 'max_rounds'`** — up to `MAX_ROUNDS` (64, default 8)
-  brand-new agents against one immutable objective. A round sees no parent
-  transcript and no earlier round — only the workspace (the stated source of
-  truth) and the previous round's bounded 16 KiB report. Each round must
-  report `{status, summary, evidence, next_steps, blocker}` through
-  `structured-output`; `ralph::check_report` then enforces the cross-field
-  rules the schema cannot express (`complete` needs evidence and no
-  `next_steps`; `continue` needs a `next_step` and no blocker; `blocked`
-  needs a concrete blocker). The loop stops on complete / blocked / round
-  limit / a round that fails to report. The portable idea is the one to
-  keep: *only a small validated struct crosses a context boundary.*
-
-Every delegated child runs on `registry.excluding(control::CHILD_EXCLUDED)`
-— no harness controls (`ask-user`, `todo-write`, `exit-plan-mode`) and no
-further delegation, since nested delegation would otherwise only unwind at
-`ToolSubAgent::max_depth` after spending a whole conversation per level.
-
-### The inbox (Wave 4)
-
-`ChatHub.inbox` ([crates/backend/src/inbox.rs](crates/backend/src/inbox.rs))
-is where input waits when the loop is busy, and the loop claims from it at
-two points: **at the top of every hop** it drains `Steer` (user text) and
-`Inject` (runtime context) into the log *before* `build_history`, so they
-ride the very next request; **at the end of the turn** it claims one
-`Followup` and starts the next turn itself. A `SendUserMessage` while a
-turn is running therefore queues instead of cancelling that turn;
-`SteerTurn` and `InjectContext` are the other two doors. `start_turn` is
-split from `send_user_message` for the handoff: the slot stays *reserved*
-across the gap (so a send arriving mid-handoff still queues), and going
-back through the queue gate while holding it would re-queue the followup it
-just claimed. Interrupting drops steers and injects aimed at the dying turn
-but keeps queued user messages — sending a message and then pressing Stop
-is how a user says "do this instead".
-
-What waits there is visible and addressable: every change publishes
-`InboxChanged` (the depth) and `QueueChanged` (the rows) together, and the
-composer's queue dock renders the rows with Edit · Remove · Steer.
-`Inbox` mints a stable id per item for this — a *position* stops naming the
-same message the moment the loop claims one, so an edit racing a claim would
-rewrite the wrong text. A verb whose id no longer names a waiting row is
-answered with an error rather than a silent no-op, because "the loop already
-took it" is a normal outcome the user has to see. Only followups are rows: a
-steer or inject is spent at the next hop, so there is never a moment to edit
-one. Steering a queued message is a promotion — it leaves the queue and joins
-the running turn — and is refused for a message carrying images, which a
-steer cannot take. In the FE the composer stays live during a
-turn: plain Enter follows the Settings > General "Enter behavior while busy"
-preference (Queue by default, so a send queues and shows in the queue dock)
-and Ctrl+Enter always does the other one - dsh's accelerated submit.
-
-### Background jobs (Wave 4)
-
-`run-cli` / `run-pwsh` with `background=true` start a job under
-`agents::jobs::JobRegistry` instead of waiting out the 30 s foreground cap,
-and return `started job cli-3`. Three generic tools cover it from then on —
-`job-output` (everything since the last read, ending in `[status: …]`),
-`job-list`, `job-kill` — so a PTY or a detached subagent would need no new
-controls. Jobs are per session (ids are invisible to any other) and die
-with the process; 10 running per session, 256 KiB of retained output each,
-and a read that lost bytes to that cap says so. Completion is **pushed**:
-`backend::jobs_bridge` turns a finished job into a durable `JobFinished`
-line plus a `ContextInjected { source: JobNotice }` in that session's
-inbox, so the model is told at its next step whether or not it thought to
-ask. It never wakes an idle session — that is the goal driver's job.
-
-Note the enabling change in `SkillRegistry::resolve`: a surplus positional
-of the form `key=value` binds to a **declared** optional arg. Without it
-the text protocol could not reach `background` or `cwd` at all — the value
-was dropped and the call quietly did something other than what it said.
-
-### Goals and the round driver (Wave 4)
-
-One durable objective per session (`agents::goal`, `EventKind::GoalChange`).
-While a goal is `Active` **and armed** and under its round cap, the driver
-in `chat.rs` opens a fresh turn against it every time the agent goes idle,
-carrying the `<goal_round>` prompt (`round_prompt`) that tells the model the
-workspace — not its own earlier narration — is authoritative. Skills
-`create-goal`, `get-goal`, `update-goal` are harness controls like
-`todo-write`; `/goal [continue|pause|complete|block <why>|edit <text>]` is the human
-door.
-
-Four rules bound it, and each answers a specific way autonomy goes wrong:
-
-- **Compare-and-set on `revision`.** A round superseded by a human edit is
-  refused, not silently applied over it.
-- **Authority at execution.** Create / pause / resume need a direct human
-  turn — which is what `TurnStart.source` (`sica_core::event::TurnSource`)
-  records. A queued followup still carries human authority; a goal round
-  does not. Complete / block also accept the current round.
-- **`BLOCKED_AFTER_CONSECUTIVE_ROUNDS`.** A round may not declare the goal
-  blocked in its first three attempts; a human may at any time.
-- **Arming is process-local and never persisted.** A restored active goal
-  comes back disarmed and waits for `/goal continue`, and pressing Stop
-  disarms — otherwise the Stop button would be a lie.
-
-The round is recorded *before* it runs, so an objective that crashes every
-time still exhausts its budget. At turn end the continuation — queued
-followup, goal round, or idle — is decided under one `active_turns` lock;
-a queued human message wins, because the person is here now.
-
-### model-eval (measuring the prompt configuration)
-
-`agents::model_eval::ModelEval` replays a suite of prompts against the **connected** model and scores each reply, so "did that `memory.md` edit help" stops being a matter of opinion. One run: load `evals/<suite>.toml` → per case, `repeats` fresh single-turn conversations carrying the *real* system prompt (`memory.md` + the live catalogue, the same shape `chat.rs::build_history` builds) → score → write `evals/reports/<suite>-<ts>.md` plus a `.json` baseline → diff against the previous baseline for that suite.
-
-- **Nothing is dispatched.** Tool-call cases are validated with `parse_tool_call::extract_known` / `rejected_attempt` — the same parser `chat.rs` dispatches through — so a passing case is a call the backend would really have executed, and a suite is safe to run unattended.
-- Failures are bucketed by `FailKind`, and each bucket carries a `lever()` naming the fix (a `memory.md` section, a skill description, the sampling temperature). The buckets exist because "answered from memory instead of calling the tool" and "reached for the tool and fumbled the syntax" look identical in a pass/fail column and need opposite fixes.
-- `repeats` (default 2, max 5) turns a coin flip into a pass *rate*; a case that passes some repeats and fails others is reported as **FLAKY**, which points at sampling settings rather than wording.
-- Caps: 40 cases/suite, 150 LLM calls/run, and the returned summary is held under 2 KB so `ToolSubAgent`'s summarizer never paraphrases the numbers.
-- Judge cases (`judge = "<rubric>"`) are graded by the same model under test — the weakest signal in the report, labelled as such; an unparsable verdict counts as a pass.
-
-## On-disk surfaces (all at workspace root)
-
-`sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
-
-| Path | Owner | Notes |
-| --- | --- | --- |
-| `memory.md` | `agents::memory` | Prepended as the system message on **every** text-protocol turn; re-read from disk each turn, so edits apply without restarting. Seeded once from `memory::SEED` — which is also the normative spec of the tool-call syntax the parser implements, and now tells the model what the untrusted-result frame and the repeat-call notice mean. Strict `{{variable}}` interpolation applies (`{{cwd}}`, `{{os}}`, `{{date}}`, `{{model}}`); an unknown reference fails the turn loudly. |
-| `AGENTS.md` / `CLAUDE.md` / `.sica/instructions.md` | `agents::instructions` | Discovered along the directory chain from the cwd up to the workspace root, combined under a 64 KiB budget (broadest omitted first, most specific truncated), and injected as one `<system-reminder>` snapshot (`ContextInjected { source: Instructions }`) that shadows its predecessor. Re-checked at turn start and after successful `read-file`/`write-file`/`edit-file` calls — no file watcher. `memory.md` is exempt from the budget. |
-| `commands/*.md`, `agents/*.md` | `agents::invoke`, `backend::catalog` | Listed in the `/` palette and resolved by a typed `/name` (commands substitute `{{args}}`). Read per message — no restart needed. |
-| `skills/*.md` | `agents::md_skill` | Scanned at BE startup only — adding a skill needs a BE restart. `plan-mode.md` is the plan-policy config, excluded from the scan by name. |
-| `sessions/<id>.jsonl` | `backend::sessions_store` | One append-only event log per chat session (`sica_core::event::SessionEvent`, one JSON object per line). A torn final line or a bad line mid-file is skipped, never fatal. Loaded eagerly at startup by `ChatHub::new_loaded`; a fresh session is not written until its first user message. Legacy `<id>.toml` files are migrated once into `LegacyMessage` events and renamed `<id>.toml.bak` (never deleted). |
-| `spill/<session>/*.txt` | `agents::spill` | Full text of tool outputs too large to feed back into context; the model holds only a digest + this path. `.gitignore`d churn. |
-| `sica-settings.json` | `frontend::settings_store` | FE settings, read at startup. Settings › General applies live (theme mode, content font size 12–17, Normal/Compact transcript, busy-Enter, reduce-motion) and writes through on every change; the other sections still have their own Apply / Connect buttons. |
-| `sica-settings/llm-providers/*.toml` | `frontend::llm_providers` | One panel per provider; filename stem is the id. `.gitignore`d — may hold API keys. In the UI, `0` means "auto" for `max_tokens`/`context_window`. Each card shows a per-model recommendation (`llm::preset`, matched from the model string: temperature / thinking / tool mode per family) with a one-click Apply that persists to the TOML. |
-| `idealist_workspace/Improvement-{BE,FE}-*.md` | `idealist` | Generated tickets. Append-only churn; don't treat as source. |
-| `evals/*.toml` | `agents::model_eval` | One prompt suite per file; `default.toml` seeded once at BE start, user-owned after. Read per run, so edits need no restart. |
-| `evals/reports/<suite>-<ts>.{md,json}` | `agents::model_eval` | Report + machine-readable baseline the next run of that suite diffs against. `.gitignore`d. |
-
-## Adding a new request (the common task)
-
-1. Add a variant to `Request` (and matching `Response`) in [crates/protocol/src/lib.rs](crates/protocol/src/lib.rs), and bump `PROTOCOL_VERSION`.
-2. Handle it in [crates/backend/src/dispatcher.rs](crates/backend/src/dispatcher.rs), delegating to `chat.rs` or `be_core/`.
-3. In the FE, send it via `UiCommand::SendRequest`; if it returns data the UI needs, add a `UiEvent` variant and map the `Response`/`Event` to it (`supervisor::forward_event` for events).
-
-Step 1 is a protocol change → rebuild both binaries (`.\run.ps1 build --workspace`) and restart the GUI; auto-watch alone only rebuilds the BE.
-
-Long-running handlers must not block the dispatcher loop — `ConnectLlm` spawns onto the runtime and reports back via `LlmStateChanged`; `SendUserMessage` spawns the whole turn task and returns `Ok` immediately.
-
-## Things to know before editing
-
-- The workspace deliberately avoids MSVC to skip the multi-GB Visual Studio Build Tools dependency. Don't switch the toolchain unless asked.
-- Common dependency versions live in `[workspace.dependencies]` in the root [Cargo.toml](Cargo.toml); reference them in member crates with `{ workspace = true }`.
-- `bincode` (v1) is the **pipe** format: types crossing the pipe must use externally-tagged enums — no `#[serde(tag/content)]`, no `untagged`, no `flatten` with maps. The `untagged`/`tag` attributes on `llm::client::ChatContent` and `ContentPart` are fine because those go out as JSON to the LLM, never over the pipe.
-- Session event logs are JSONL (`serde_json`, internally-tagged enums are fine there — they never cross the pipe); provider configs and eval suites are `toml`; the LLM wire format is `serde_json`. Three serialization formats coexist by design.
-- [docs/deepseek-harness-ideas.md](docs/deepseek-harness-ideas.md) catalogues the agent-harness ideas ported from DeepSeek's `dsh` (event log, step-level retry, tool timeouts, spill-to-file, and the Wave 1 hygiene set: repeat-tool reminder, untrusted-content frame, tool-result pruner, `retain`, `/name` expansion, fallback titles, Job Objects, provider `usage`) and the ones deliberately left for later.
-- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there. [docs/harness-ui-guide.md](docs/harness-ui-guide.md) is the FE counterpart: dsh's web-client design system (tokens, type, geometry, elevation), every shell/transcript/composer/control-plane/settings surface with its concrete values, the egui port for each, the additive protocol changes (v17), and a five-wave UI roadmap. Read it before restyling or adding a frontend surface — all five waves are implemented: **UI-1 (foundation)**, **UI-2 (transcript)**, **UI-3 (composer + control plane)**, **UI-4 (settings modal + session rows)**, **UI-5 (the Trajectory ledger + the event inspector)** and **UI-6 (the open items: the `@` file picker, produced-file chips and the branch action on the turn tail, `/goal edit`, and the question takeover's `detail`/`multi`)**. What is left is listed as **Open** in its §12 — only the composer's ghost hint after a claimed command.
-
-The `@` picker ([crates/frontend/src/ui/chat/at_menu.rs](crates/frontend/src/ui/chat/at_menu.rs)) is the frontend's own: `@` names a path in `workspace_root()`, which the FE resolves for itself, so a keystroke never queues behind the dispatcher. It walks with the `ignore` crate (the same one `glob` uses, so the two agree on what is in the tree), re-walks when the index is over 30 s old, opens on an `@` token under the *caret*, and browses into a directory on accept. The path it inserts is plain text — nothing resolves it, and the model reads it as written.
-
-Produced-file chips on the turn tail are derived from the turn's own successful `write-file`/`edit-file` rows rather than collected backend-side, so they cannot disagree with the transcript above them. The tail's branch action is `ForkSession`, offered only on the newest *finished* turn, because that is where `fork_session` actually cuts.
-- **The FE design system is `sica_core::theme` + `ui::kit`.** `theme` holds the
-  static ramps and the two semantic alias maps; every widget reads an alias
-  through `kit` and no module below it branches on light/dark or names a
-  literal colour. `App::apply_visuals` pours the tokens into `egui::Style` and
-  stashes the `Theme` in `Context` memory, which is how `kit` reaches it
-  without a palette threaded through every signature. Icons are painted by
-  `ui::icons` (no SVG dependency); the UI face is the platform sans loaded at
-  runtime and the code face is the vendored IBM Plex Mono.
-- Tracing logs go to stderr; the GUI captures backend stderr and renders it color-coded in the log panel, **at its own level** (`Event::LogLine.level` reaches `LogKind`, and a WARN/ERROR line also raises a toast over the conversation). `Event::LogLine` is the deliberate channel for anything the operator should see in the GUI — a `warn!` alone is invisible unless it also emits a `LogLine`.
-- The FE talks to the supervisor over `tokio::sync::mpsc` (commands) and back over `std::sync::mpsc` + `ctx.request_repaint()` (events). `App` state is only mutated while draining that channel on the UI thread.
-- Heartbeats arrive every 2 s and feed the IPC-dot watchdog; they are intentionally *not* logged to the user-visible panel.
+- The workspace deliberately avoids MSVC. Don't switch the toolchain unless asked.
+- Common dependency versions live in `[workspace.dependencies]` in the root [Cargo.toml](Cargo.toml).
+- Three serialization formats coexist by design: `bincode` over the pipe (externally-tagged enums only), JSONL for session logs, `toml` for configs, `serde_json` for the LLM wire.
+- Changing `Request`/`Response`/`Event` means bumping `PROTOCOL_VERSION` and rebuilding **both** binaries.
+- Nothing is ever removed from a session event log; compaction and rewind shadow spans in the derived view.
+- `Event::LogLine` is the channel for anything the operator should see in the GUI — a `warn!` alone is invisible.
+- The FE design system is `sica_core::theme` + `ui::kit`; no module below `kit` names a literal colour.
