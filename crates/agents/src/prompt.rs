@@ -233,13 +233,15 @@ pub const RUNTIME_CONTEXT_HEADER: &str =
 ///   identity's function-calling instruction.
 ///
 /// The runtime-context snapshot carries `{{date}}`, `{{cwd}}`, `{{os}}` and
-/// (when known) the model name; `extra_context` lines (permission mode,
-/// plan mode…) are appended by later waves.
+/// (when known) the model name; volatile policy facts (permission mode,
+/// plan mode) ride it as extra lines. The plan-mode policy itself is a
+/// `PLAN_POLICY` section, present only while plan mode is active.
 pub fn for_main_agent(
     memory: &str,
     registry: &SkillRegistry,
     native_tools: bool,
     vars: &BTreeMap<String, String>,
+    plan_policy: Option<&str>,
 ) -> Result<Rendered, PromptError> {
     let mut a = Assembly::new();
     a.vars = vars.clone();
@@ -248,6 +250,9 @@ pub fn for_main_agent(
         a.section(Section::new("identity", order::IDENTITY, NATIVE_IDENTITY));
     }
     a.section(Section::new("memory", order::MEMORY, memory));
+    if let Some(policy) = plan_policy.filter(|p| !p.trim().is_empty()) {
+        a.section(Section::new("plan-policy", order::PLAN_POLICY, policy));
+    }
     // One guidance section per skill that has any, all in the SKILL_GUIDANCE
     // slot — ties break by (section) name, i.e. the skill name.
     let mut names: Vec<&str> = registry.by_name.keys().map(String::as_str).collect();
@@ -292,6 +297,12 @@ pub fn runtime_context_text(vars: &BTreeMap<String, String>) -> String {
     match vars.get("model").map(String::as_str) {
         Some(m) if !m.is_empty() => out.push_str(&format!("\n- Model: {m}")),
         _ => {}
+    }
+    if let Some(perm) = vars.get("permission") {
+        out.push_str(&format!("\n- Permission mode: {perm}"));
+    }
+    if let Some(plan) = vars.get("plan") {
+        out.push_str(&format!("\n- Plan mode: {plan}"));
     }
     out
 }
@@ -388,7 +399,7 @@ mod tests {
         reg.register(Arc::new(Guided));
         reg.register(Arc::new(Plain));
         let vars = standard_vars("m");
-        let r = for_main_agent("MEMORY BODY", &reg, false, &vars).unwrap();
+        let r = for_main_agent("MEMORY BODY", &reg, false, &vars, None).unwrap();
         // memory → guidance → catalogue, blank-line joined.
         let sys = &r.system;
         assert!(sys.starts_with("MEMORY BODY"), "{sys}");
@@ -408,12 +419,27 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.register(Arc::new(Guided));
         let vars = standard_vars("m");
-        let r = for_main_agent("MEMORY BODY", &reg, true, &vars).unwrap();
+        let r = for_main_agent("MEMORY BODY", &reg, true, &vars, None).unwrap();
         let sys = &r.system;
         assert!(sys.starts_with(NATIVE_IDENTITY), "{sys}");
         assert!(sys.contains("MEMORY BODY"), "native mode keeps memory.md");
         assert!(sys.contains("GUIDED"));
         assert!(!sys.contains("## Loaded skills"), "tools array carries it");
+    }
+
+    #[test]
+    fn plan_policy_section_appears_only_when_active() {
+        let reg = SkillRegistry::new();
+        let vars = standard_vars("m");
+        let off = for_main_agent("MEM", &reg, false, &vars, None).unwrap();
+        assert!(!off.system.contains("plan mode"));
+        let on =
+            for_main_agent("MEM", &reg, false, &vars, Some("PLAN RULES")).unwrap();
+        assert!(on.system.contains("PLAN RULES"));
+        // PLAN_POLICY (500) sits between memory (0) and guidance (1000).
+        let mem = on.system.find("MEM").unwrap();
+        let plan = on.system.find("PLAN RULES").unwrap();
+        assert!(mem < plan);
     }
 
     #[test]

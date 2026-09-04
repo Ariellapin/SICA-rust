@@ -143,6 +143,12 @@ async fn run(args: Args) -> Result<()> {
     if let Err(e) = agents::memory::seed_default(&memory_path) {
         warn!(error = %e, path = %memory_path.display(), "seed memory.md failed");
     }
+    // The plan-mode policy is user-editable configuration: seed once,
+    // never overwrite. It lives in `skills/` next to the docs but is
+    // excluded from the skill scan by name (`md_skill::register_all`).
+    if let Err(e) = agents::control::seed_plan_mode(&skills_path) {
+        warn!(error = %e, dir = %skills_path.display(), "seed plan-mode.md failed");
+    }
     // `agents/` and `commands/` back the other two families of the FE's "/"
     // palette. Created empty so the folders are discoverable; the palette
     // simply lists nothing for a family with no files in it.
@@ -160,6 +166,13 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(Arc::new(agents::EditFile::new(root.clone())));
     skill_registry.register(Arc::new(agents::Glob::new(root.clone())));
     skill_registry.register(Arc::new(agents::Grep::new(root.clone())));
+    // `ask-user` needs the broker the hub installs on every sub-agent.
+    // `todo-write` / `exit-plan-mode` are catalogue entries whose bodies
+    // run in the hub (session-log mutation + turn control) — the
+    // dispatcher intercepts them before any sub-agent spins up.
+    skill_registry.register(Arc::new(agents::AskUser));
+    skill_registry.register(Arc::new(agents::control::TodoWrite));
+    skill_registry.register(Arc::new(agents::control::ExitPlanMode));
     // `model-eval` benchmarks the connected model against a prompt suite. It
     // needs the finished registry (for the live catalogue and the known-skill
     // predicate its tool-call checks use), so it is attached below alongside

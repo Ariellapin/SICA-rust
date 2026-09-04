@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::skill::{Skill, SkillContext, SkillOutcome};
+use crate::skill::{Concurrency, Skill, SkillContext, SkillOutcome};
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT: usize = 32 * 1024;
@@ -265,6 +265,14 @@ impl Skill for RunCli {
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
     fn optional_args(&self) -> Vec<String> { vec!["cwd".into()] }
     fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if crate::pipeline::is_read_only_command(cmd) {
+            Concurrency::Parallel
+        } else {
+            Concurrency::Exclusive
+        }
+    }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
@@ -341,6 +349,14 @@ impl Skill for RunPwsh {
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
     fn optional_args(&self) -> Vec<String> { vec!["cwd".into()] }
     fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if crate::pipeline::is_read_only_command(cmd) {
+            Concurrency::Parallel
+        } else {
+            Concurrency::Exclusive
+        }
+    }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
@@ -405,6 +421,9 @@ impl Skill for ReadFile {
     fn description(&self) -> &str { READ_FILE_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["path".into()] }
     fn optional_args(&self) -> Vec<String> { vec!["start".into(), "end".into()] }
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Parallel
+    }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
         let path = match args.get("path").and_then(|v| v.as_str()) {
@@ -778,6 +797,72 @@ impl Skill for Grep {
     }
 }
 
+/// Ask the human a question and wait for the answer (Wave 3, guide
+/// §10.1). The model asks; the tool blocks until the FE answers, and the
+/// answer returns as an ordinary tool result so no loop mechanics change.
+/// A runtime-owned child (teammate) never sees this skill — it must put
+/// the unresolved question in its final report instead.
+///
+/// `options` is an optional JSON array of suggested answers shown as
+/// buttons; the human may always answer in free text.
+pub struct AskUser;
+
+#[async_trait]
+impl Skill for AskUser {
+    fn name(&self) -> &str {
+        crate::control::ASK_USER_NAME
+    }
+    fn description(&self) -> &str {
+        "Ask the user a question and wait for their answer. Use when blocked on a human decision — never guess."
+    }
+    fn positional_args(&self) -> Vec<String> {
+        vec!["question".into()]
+    }
+    fn optional_args(&self) -> Vec<String> {
+        vec!["options".into()]
+    }
+    fn prompt_guidance(&self) -> Option<&'static str> {
+        Some("When blocked on a decision only the user can make, ask-user with a precise question instead of guessing.")
+    }
+    fn timeout(&self) -> Duration {
+        // Covers the broker's question wait with room to spare.
+        Duration::from_secs(15 * 60)
+    }
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
+        let question = match args.get("question").and_then(|v| v.as_str()) {
+            Some(q) if !q.trim().is_empty() => q.trim().to_string(),
+            _ => return err("missing or empty `question` arg"),
+        };
+        // The schema declares `options` a string, but native models often
+        // send the real array — `array_arg` takes either shape.
+        let options: Vec<String> = args
+            .get("options")
+            .and_then(crate::control::array_arg)
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (Some(brokers), Some(session_id)) = (ctx.sub.brokers.clone(), ctx.sub.session_id)
+        else {
+            return err("cannot ask the user from this context (no broker) — \
+                         include the unresolved question in your final report instead");
+        };
+        match brokers
+            .ask_question(&ctx.sub.events, session_id, &question, &options, ctx.sub.cancel.clone())
+            .await
+        {
+            Some(answer) if !answer.trim().is_empty() => SkillOutcome {
+                ok: true,
+                summary: format!("User answered: {}", answer.trim()),
+            },
+            _ => err("no answer — the question timed out or the turn was interrupted"),
+        }
+    }
+}
+
 /// Display a path relative to the workspace root when it is under it —
 /// relative paths are what the model should hand back to other skills.
 fn display_relative(root: &Path, p: &Path) -> String {
@@ -813,7 +898,7 @@ pub fn seed_defaults(skills_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
         return Ok(candidate.to_path_buf());

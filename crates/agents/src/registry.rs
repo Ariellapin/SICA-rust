@@ -38,6 +38,21 @@ impl SkillRegistry {
         self.by_name.get(name).cloned()
     }
 
+    /// A cheap dispatch view: this registry minus the named skills. Used
+    /// for teammates, which must never reach harness controls (`ask-user`,
+    /// `todo-write`, `exit-plan-mode`) or spawn their own team — anything
+    /// they need from those arrives via their final report instead. The
+    /// `Arc`s are shared, so filtering costs a map clone, not new skills.
+    pub fn excluding(&self, names: &[&str]) -> Self {
+        let mut out = Self::new();
+        for (name, skill) in &self.by_name {
+            if !names.contains(&name.as_str()) {
+                out.by_name.insert(name.clone(), skill.clone());
+            }
+        }
+        out
+    }
+
     /// Render the live registry as a deterministic Markdown bullet list, sorted
     /// by skill name. Each line is `- **name** ('arg1' 'arg2') — description`,
     /// where the args section is omitted for skills that take none. Used by the

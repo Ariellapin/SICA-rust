@@ -1,5 +1,6 @@
 //! Chat view: empty-state screens + message list + input bar.
 
+mod control;
 mod input_bar;
 mod messages;
 mod slash_menu;
@@ -35,12 +36,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             top: 8.0,
             bottom: 2.0,
         }))
-        .show_inside(ui, |ui| input_bar::draw(app, ui, disabled));
+        .show_inside(ui, |ui| {
+            control::draw_strips(app, ui);
+            input_bar::draw(app, ui, disabled)
+        });
     if disabled {
         draw_no_llm(app, ui);
     } else {
         messages::draw(app, ui);
     }
+    control::draw_question_modal(app, ui);
 }
 
 fn draw_protocol_banner(app: &mut App, ui: &mut egui::Ui, be_v: u32, fe_v: u32) {

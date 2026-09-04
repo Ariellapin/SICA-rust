@@ -113,6 +113,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 Response::Catalog { entries } => {
                                     bridge.send(UiEvent::Catalog { entries });
                                 }
+                                Response::CommandResult { text } => {
+                                    bridge.send(UiEvent::CommandResult { text });
+                                }
                                 _ => {}
                             }
                         }

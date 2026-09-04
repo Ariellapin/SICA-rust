@@ -231,6 +231,21 @@ fn wrapped_rows(ui: &egui::Ui, text: &str, font_id: &egui::FontId, width: f32) -
         .max(1)
 }
 
+/// `/compact`, `/plan …`, `/permission …` run as harness commands instead
+/// of model turns. The head token must match exactly (whitespace-bounded);
+/// everything after it is the command input.
+fn parse_harness_command(text: &str) -> Option<(String, String)> {
+    let head = text.split_whitespace().next()?;
+    let name = match head {
+        "/compact" => "compact",
+        "/plan" => "plan",
+        "/permission" => "permission",
+        _ => return None,
+    };
+    let input = text[head.len()..].trim().to_string();
+    Some((name.to_string(), input))
+}
+
 /// Build the outgoing `SendUserMessage`, draining `pending_images`.
 fn send_message(app: &mut App) {
     let text = std::mem::take(&mut app.chat.draft);
@@ -247,6 +262,22 @@ fn send_message(app: &mut App) {
 
     if text.trim().is_empty() && images.is_empty() {
         return;
+    }
+
+    // Harness commands never create a model message: route them to
+    // `RunCommand` instead of the turn loop (no Turn is pushed, so the
+    // transcript shows only the BE's log line + result).
+    if images.is_empty() {
+        if let Some((name, input)) = parse_harness_command(&text) {
+            let session_id = app.chat.session_id;
+            app.last_command_session = Some(session_id);
+            app.send(UiCommand::SendRequest(Request::RunCommand {
+                session_id,
+                name,
+                input,
+            }));
+            return;
+        }
     }
 
     let session_id = app.chat.session_id;

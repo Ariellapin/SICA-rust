@@ -21,6 +21,11 @@ pub struct Settings {
     /// provider was last active" — the app starts disconnected.
     #[serde(default)]
     pub last_active_provider:   Option<String>,
+    /// Permission mode applied to every freshly minted session
+    /// (`read-only | workspace-write | danger-full-access`). Hand-editable;
+    /// the backend default matches when this fails to parse.
+    #[serde(default = "default_permission_mode")]
+    pub default_permission_mode: String,
 }
 
 impl Default for Settings {
@@ -35,8 +40,13 @@ impl Default for Settings {
             release_profile:        false,
             auto_watch:             false,
             last_active_provider:   None,
+            default_permission_mode: default_permission_mode(),
         }
     }
+}
+
+fn default_permission_mode() -> String {
+    "workspace-write".into()
 }
 
 pub fn load() -> Settings {

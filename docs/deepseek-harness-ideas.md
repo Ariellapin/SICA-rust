@@ -21,7 +21,11 @@ library, tool-result pruner, repeat-tool reminder, untrusted-content frame,
 provider `usage`), and Wave 2 (composed system prompt + runtime-context
 snapshot, `AGENTS.md` loader with budget, time context, prefix-preserving
 8-section compaction at 80/16, usage-anchored meter with breakdown, and the
-file tools: line-numbered/ranged `read-file`, `edit-file`, `glob`, `grep`).
+file tools: line-numbered/ranged `read-file`, `edit-file`, `glob`, `grep`),
+and Wave 3 (control: `ToolPolicy` pipeline + brokers, approval and
+permission modes, plan mode + `todo-write`, read-before-edit, `RunCommand`
+with `/compact` `/plan` `/permission`, parallel read-only calls, protocol
+v13).
 
 ---
 
@@ -174,15 +178,22 @@ pruned result is under the threshold).
 
 ## 4. Tool pipeline and guards
 
-### 4.1 Guarded execution pipeline (pre-execute / guards / around / post-execute) — **Future**
+### 4.1 Guarded execution pipeline (pre-execute / guards / around / post-execute) — **Implemented**
 
 `allow | deny | ask` decisions before the body, deny-only *monotonic* guards
 after all listeners (ordering can't turn a denial back into permission), an
 around-wrapper for the timeout, and `accept | block` after the body with
 `additionalContexts` as the generic "attach a nudge to the next request"
-channel. sica-rust's pipeline is: depth check → cancel check → timeout →
-spill → summariser → failure sink. No allow/deny stage, no post-execute
-rewrite, no injected context channel.
+channel. sica-rust: [`agents::pipeline`](../crates/agents/src/pipeline.rs)
+(`PreDecision`, `PostDecision`, `CallView`, `ToolPolicy`) wired through
+`ToolSubAgent::run_report` — depth → cancel → pre (first non-allow wins,
+`Ask` routes to the approval broker or degrades to deny) → guards → timeout
+→ body → spill → post (first `Block` wins, all `extra_context` collected)
+→ summariser → failure sink. A `Deny`/`Block` is a failed outcome the model
+reads, never a defect: it skips the body and the sink but still runs
+`post_execute` and still opens/closes its chip. Policies shipped:
+`PermissionPolicy`, `PlanModePolicy`, `ReadBeforeEdit`, `RepeatReminder`.
+Every approval round-trip is audited as an `Approval` event.
 
 ### 4.2 Errors as results — **Present (variant)**
 
@@ -191,11 +202,16 @@ become `isError` results the model can self-correct from. sica-rust already
 returns `SkillOutcome { ok: false }` for unknown skills, bad JSON args, hop
 limits, timeouts and interrupts.
 
-### 4.3 Parallel / exclusive tool scheduling — **Future**
+### 4.3 Parallel / exclusive tool scheduling — **Implemented**
 
 Calls classified `parallel` overlap in a bounded pool; `exclusive` calls are
 ordering barriers; classification is per-call from args and fail-closed.
-sica-rust dispatches native tool calls strictly in sequence.
+sica-rust: `Skill::concurrency()` (`Exclusive` default; `read-file` always
+`Parallel`; the shells `Parallel` only for read-only commands via the same
+predicate the policies use). The native batch runner groups consecutive
+`Parallel` calls, overlaps them with `join_all` (cap 4), and appends every
+`ToolCall`/`ToolResult` pair in model order. The text protocol emits one
+call per hop, so nothing changes there.
 
 ### 4.4 Repeat-tool-reminder loop guard — **Implemented**
 
@@ -210,23 +226,35 @@ every dispatch on both tool paths — failed and unknown-skill calls too. The
 notice lands as `ContextInjected { source: ToolNotice }` (a user-role message
 after the tool result) plus a WARN `LogLine`; `MAX_TOOL_HOPS` remains the hard
 stop. Wording says "has produced the same result" rather than "cannot", since
-`run-cli` is not idempotent.
+`run-cli` is not idempotent. Wave 3 moved it onto the pipeline: the
+[`RepeatReminder`](../crates/agents/src/pipeline.rs) policy counts in
+`post_execute` (denied calls included) and returns the notice as
+`extra_context`; hop-limit and unknown-skill outcomes bypass the sub-agent
+and are counted manually by `ChatHub`.
 
-### 4.5 Approval, sandbox modes, permission presets — **Future**
+### 4.5 Approval, sandbox modes, permission presets — **Partial**
 
 `ctx.approval.request` → `allowed-once | rejected | cancelled | unavailable`
 (fails closed); sandbox modes `read-only | workspace-write |
 danger-full-access` with OS backends (Landlock, Seatbelt, Windows restricted
 token) that report enforcement completeness; a preset selector bundling the
-two knobs. sica-rust runs `run-cli` immediately with no confirmation and has
-no `Request` variant for approval. The only fs guard is `..`-traversal
-rejection in `write-file`.
+two knobs. sica-rust (Wave 3, policy level — no OS enforcement):
+[`agents::broker`](../crates/agents/src/broker.rs) rendezvous for one-shot
+approvals (5 min → deny) and questions (10 min → fail); `PermissionMode` on
+the wire with per-session durable state, a status-bar pill, and `/permission`;
+`PermissionPolicy` (read-only denies writes + non-read-only shell,
+workspace-write asks on destructive-looking commands, danger allows all);
+`ask-user` as an ordinary tool result. Missing: OS backends, and the
+bundled preset selector.
 
-### 4.6 Read-before-edit policy — **Future**
+### 4.6 Read-before-edit policy — **Implemented**
 
 Enforced purely through fs events: unseen file ⇒ create only; observed file
-⇒ replace only at the version last seen. sica-rust's `write-file` has no
-such check.
+⇒ replace only at the version last seen. sica-rust: the [`ReadBeforeEdit`](../crates/agents/src/pipeline.rs)
+policy holds per-session digests, filled by successful `read-file` (and
+`write`/`edit`) post-executes; `pre_execute` on `write-file`/`edit-file`
+denies unseen existing files and files changed on disk since the read.
+Writes to new paths pass.
 
 ## 5. System prompt
 
@@ -452,13 +480,25 @@ derive unframed (`trusted` defaults to `true` on load) so replay stays exact.
 
 ## 12. Product surfaces
 
-### 12.1 Plan mode with durable state — **Future**
+### 12.1 Plan mode with durable state — **Implemented**
 
 Prompt text is config; state is a `plan/mode` event; selections apply at the
 next pre-step; `exit_plan_mode` stays registered when off (catalog stability);
-approval goes through `ask_user_question`.
+approval goes through `ask_user_question`. sica-rust (Wave 3): `PlanMode`
+events (latest wins, restored on load), the user-editable `skills/plan-mode.md`
+composed as the `PLAN_POLICY` section while active, `PlanModePolicy` denying
+mutations, and `exit-plan-mode` handled in the hub — plan review via the
+question broker (Approve / Keep planning), approval leaving plan mode and
+concluding the turn. FE toggle in the composer + `/plan`.
 
-### 12.2 `todo_write` (full-replacement list) — **Future**
+### 12.2 `todo_write` (full-replacement list) — **Implemented**
+
+sica-rust (Wave 3): the `todo-write` catalogue entry is handled in the hub —
+full-list validation (trimmed non-empty content, no duplicates, at most one
+`in_progress`) persisted as `TodoWrite` events (latest wins, folded into the
+session dump for reloads) and pushed as `TodosChanged` for the FE checklist
+above the composer, cleared on the next turn start. Guidance ships as the
+skill's own `SKILL_GUIDANCE` sentence.
 
 ### 12.3 Goals with compare-and-set revisions and a round driver — **Future**
 
@@ -472,13 +512,21 @@ continue).
 `job_output` / `job_list` / `job_kill` cover every background kind; completion
 wakes an idle agent with a follow-up turn.
 
-### 12.5 `ask_user_question` as an ordinary tool result — **Future**
+### 12.5 `ask_user_question` as an ordinary tool result — **Implemented**
+
+sica-rust (Wave 3): the `ask-user` skill blocks on the question broker and
+the answer returns as an ordinary tool result. Teammates never see the skill
+— a runtime-owned child must put the unresolved question in its final report.
 
 ### 12.6 `/commands` that never create a model message — **Partial**
 
 sica-rust's `slash_menu.rs` has local app commands (`/new`, `/stop`,
-`/settings` …) that run without an LLM turn — the same stance — but nothing
-is logged (`command/run`, `command/done`).
+`/settings` …) that run without an LLM turn — the same stance. Wave 3 added
+the BE command table: `/compact`, `/plan`, `/permission` travel as
+`RunCommand`, are audited as `Command` events, and answer with
+`CommandResult` text. Still local-only: nothing else is logged
+(`command/run`, `command/done`), and `stats`/`goal`/`model`/`export` don't
+exist yet.
 
 ### 12.7 Session titles with input/output budgets — **Implemented**
 
@@ -545,22 +593,22 @@ effect* — for every plugin. Worth adopting for `skills/*.md` docs.
 
 ## Suggested next ports, in dependency order
 
-Waves 1 and 2 of the
+Waves 1–3 of the
 [implementation guide](harness-implementation-guide.md#15-roadmap) are done
-(Wave 2: §5.1–5.3 prompt assembly + runtime context, §5.5 instructions
-loader, §9.3 time context, §9.1 prefix-preserving compaction, §4.3
-usage-anchored meter, §6.6 file tools, protocol v12). Next:
+(Wave 3: `ToolPolicy` pipeline + brokers, approval + permission modes,
+plan mode + `todo-write`, read-before-edit, `RunCommand` + `/compact`
+`/plan` `/permission`, parallel read-only calls, protocol v13). Next, in
+dependency order (Wave 4 — delegation):
 
-1. **`ToolPolicy` pipeline** (§4.1 / guide §6.1) — the one M-sized seam
-   every control feature hangs on.
-2. **Approval + permission modes** (guide §10.1–10.3) — brokers for
-   `ask-user` and one-shot approvals; `read-only | workspace-write |
-   danger-full-access` as policy first, OS enforcement later.
-3. **Plan mode + `todo-write`** (guide §11) — durable `PlanMode`/`TodoWrite`
-   events, `exit-plan-mode` always registered.
-4. **Read-before-edit** (guide §8.5) — a `ReadBeforeEdit` policy on the
-   pipeline, now that `edit-file` exists.
-5. **`RunCommand` + `/compact` `/plan` `/permission`** (guide §8.4) — the
-   command table over the pipeline.
-6. **Parallel read-only calls** (guide §6.2) — native-mode `join_all` with a
-   per-skill concurrency classification.
+1. **`run_conversation` + `subagent`/`subagent-fork`** (guide §12.1) —
+   extract the teammate runner so a task can delegate to a fresh
+   conversation, seeded empty or forked from the parent's completed turns.
+2. **`structured_output` and typed team reports** (§12.2) — schema-shaped
+   teammate answers instead of free-form prose with an UNVERIFIED tag.
+3. **Jobs + background `run-cli`** (§12.4) — `job_output` / `job_list` /
+   `job_kill` over every background kind, completion pushed not polled.
+4. **Inbox `followup`/`steer`/`inject`** (§2.1) — a message sent mid-turn
+   queues instead of cancelling.
+5. **Goals + round driver** (§12.3) — one durable objective per session
+   with compare-and-set revisions and process-local arming.
+6. **Ralph** (§12.6) — fresh-agent rounds with a small validated handoff.

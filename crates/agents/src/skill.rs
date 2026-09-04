@@ -17,6 +17,17 @@ pub struct SkillOutcome {
     pub summary: String,
 }
 
+/// Per-call scheduling class for native multi-call batches (guide §6.2).
+/// `Parallel` calls overlap in a bounded pool; `Exclusive` calls are
+/// ordering barriers. Classification is per-call from args only and
+/// fail-closed: when in doubt, a skill is `Exclusive`. The text protocol
+/// emits one call per hop, so this only affects native mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Concurrency {
+    Exclusive,
+    Parallel,
+}
+
 /// Context handed to a skill while it runs. Carries a `ToolSubAgent` configured
 /// as a *child* of the current call so nested tool invocations inherit the
 /// parent chain and depth.
@@ -86,6 +97,14 @@ pub trait Skill: Send + Sync {
     /// editing a central blob. `None` (the default) contributes nothing.
     fn prompt_guidance(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Scheduling class of one call (native multi-call batches only).
+    /// Default `Exclusive`. `read-file` is `Parallel`; the shells are
+    /// `Parallel` only for read-only commands (same predicate the
+    /// permission and plan policies use), else `Exclusive`.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome;

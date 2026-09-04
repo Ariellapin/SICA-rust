@@ -77,6 +77,32 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     field_row(ui, &p, "Model",    &mut cfg.model,    false);
                     field_row(ui, &p, "API key",  &mut cfg.api_key,  true);
 
+                    // Per-model recommendation matched from the model string.
+                    // One click aligns temperature / thinking / tool mode;
+                    // identity fields (URL, model, key) are never touched.
+                    {
+                        let preset = llm::preset::preset_for_provider(&cfg.base_url, &cfg.model);
+                        let drift = cfg.preset_drift();
+                        ui.horizontal(|ui| {
+                            caps_label(ui, "Preset", rgb(p.muted));
+                            ui.label(
+                                RichText::new(format!("{}: {}", preset.label, preset.note))
+                                    .color(rgb(p.muted))
+                                    .small(),
+                            )
+                            .on_hover_text(preset.note);
+                        });
+                        if !drift.is_empty() {
+                            ui.horizontal(|ui| {
+                                caps_label(ui, &format!("differs: {}", drift.join(", ")), rgb(p.warn));
+                                if ghost_button(ui, &p, "Apply preset").clicked() {
+                                    cfg.apply_preset(&preset);
+                                    let _ = crate::llm_providers::save(cfg);
+                                }
+                            });
+                        }
+                    }
+
                     // Sampling / context tuning. 0 on the token fields means
                     // "auto" (server default / auto-detect) — see hover text.
                     ui.horizontal(|ui| {

@@ -197,11 +197,15 @@ impl Skill for AgentTeam {
             );
         };
         let registry = self.registry();
-        // The team hides itself from its own teammates — see
-        // `catalogue_markdown_excluding`.
+        // Teammates run with a restricted view: no harness controls and
+        // no nested teams. A runtime-owned child cannot ask the user,
+        // rewrite the todo list, exit the parent's plan, or spawn its own
+        // team — those needs arrive via its final report instead.
+        let registry =
+            registry.map(|r| Arc::new(r.excluding(crate::control::TEAMMATE_EXCLUDED)));
         let catalogue = registry
             .as_ref()
-            .map(|r| r.catalogue_markdown_excluding(&[AGENT_TEAM_NAME]))
+            .map(|r| r.catalogue_markdown_excluding(crate::control::TEAMMATE_EXCLUDED))
             .filter(|c| !c.is_empty());
         let cancel = ctx.sub.cancel.clone();
 

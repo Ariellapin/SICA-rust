@@ -150,6 +150,22 @@ pub enum EventKind {
     /// A message imported from a pre-event-log TOML session. Passed through
     /// verbatim; its tool metadata is unrecoverable.
     LegacyMessage { surface: SurfaceOp, message: Message },
+    /// A harness command ran without a model message (`/compact`, `/plan`,
+    /// `/permission`). Durable audit, never surfaced.
+    Command { name: String, input: String, ok: bool },
+    /// One-shot approval decision for a tool call. Durable audit; the model
+    /// saw only the tool outcome. `decision` is `allowed-once` / `denied` /
+    /// `timeout` / `unavailable`.
+    Approval { skill: String, args_preview: String, decision: String },
+    /// Permission-mode switch. Latest wins; drives the pipeline policy and
+    /// the runtime-context line. Never surfaced.
+    PermissionMode { mode: protocol::PermissionMode },
+    /// Plan-mode switch. Latest wins; drives the plan policy and the
+    /// `PLAN_POLICY` prompt section. Never surfaced.
+    PlanMode { active: bool },
+    /// Full-replacement todo list. Latest wins; never surfaced (the FE
+    /// renders the checklist from the pushed event).
+    TodoWrite { items: Vec<protocol::TodoItem> },
     /// A kind this build does not know — written by a newer backend. Kept
     /// so an older binary still loads the log; contributes nothing.
     #[serde(other)]

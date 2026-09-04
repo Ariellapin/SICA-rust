@@ -179,7 +179,12 @@ pub fn load_dir(dir: &Path) -> LoadReport {
 /// Returns the parse-error list so the caller can decide how to surface
 /// them (the BE forwards them as `LogLine` events).
 pub fn register_all(registry: &mut SkillRegistry, dir: &Path) -> Vec<(PathBuf, String)> {
-    let report = load_dir(dir);
+    let mut report = load_dir(dir);
+    // The plan-mode policy doc lives in `skills/` for editability but is
+    // configuration, not a callable skill — drop it (and its parse error,
+    // since it carries no frontmatter) before registering.
+    report.loaded.retain(|s| !crate::control::is_policy_doc(&s.source_path));
+    report.errors.retain(|(p, _)| !crate::control::is_policy_doc(p));
     for s in report.loaded {
         registry.register_if_absent(Arc::new(s));
     }

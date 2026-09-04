@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -41,6 +41,105 @@ impl Default for CompactPolicy {
 /// history. Shared so the frontend can recognise it when rebuilding a
 /// transcript from disk and render it as a marker rather than dropping it.
 pub const CONTEXT_SUMMARY_PREFIX: &str = "[context summary";
+
+/// Harness permission modes (Wave 3, guide §10.3). Policy level first:
+/// the mode decides which tools the pipeline allows, denies, or asks
+/// about. OS-level enforcement (restricted tokens, ACLs) is future work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PermissionMode {
+    /// No mutations: `write-file`, `edit-file`, `skill-creator` and every
+    /// non-read-only shell command are denied.
+    ReadOnly,
+    /// Writes stay inside the workspace; destructive-looking shell
+    /// commands ask first.
+    #[default]
+    WorkspaceWrite,
+    /// Everything allowed, approval policy `never`.
+    DangerFullAccess,
+}
+
+impl PermissionMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PermissionMode::ReadOnly => "read-only",
+            PermissionMode::WorkspaceWrite => "workspace-write",
+            PermissionMode::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            PermissionMode::ReadOnly =>
+                "No mutations. Writes and non-read-only shell commands are denied.",
+            PermissionMode::WorkspaceWrite =>
+                "Writes stay inside the workspace. Destructive shell commands ask first.",
+            PermissionMode::DangerFullAccess =>
+                "Everything allowed, nothing asks. Only for sandboxes you can throw away.",
+        }
+    }
+
+    /// Parse the `/permission` command input or a settings string.
+    /// Accepts the canonical labels plus short aliases.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "read-only" | "readonly" | "read" | "ro" => Some(PermissionMode::ReadOnly),
+            "workspace-write" | "workspace" | "write" | "ww" => {
+                Some(PermissionMode::WorkspaceWrite)
+            }
+            "danger-full-access" | "danger" | "full" | "full-access" => {
+                Some(PermissionMode::DangerFullAccess)
+            }
+            _ => None,
+        }
+    }
+
+    /// One-line policy summary for the runtime-context snapshot, so the
+    /// model always knows the policy it runs under.
+    pub fn context_line(&self) -> &'static str {
+        match self {
+            PermissionMode::ReadOnly =>
+                "read-only (no writes; only read-only shell commands run)",
+            PermissionMode::WorkspaceWrite =>
+                "workspace-write (writes outside the workspace are denied; \
+                 destructive shell commands ask first)",
+            PermissionMode::DangerFullAccess =>
+                "danger-full-access (everything allowed; nothing asks)",
+        }
+    }
+}
+
+/// One row of the durable `todo-write` list (Wave 3, guide §11.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status:  TodoStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            TodoStatus::Pending => "pending",
+            TodoStatus::InProgress => "in_progress",
+            TodoStatus::Completed => "completed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().replace('-', "_").as_str() {
+            "pending" => Some(TodoStatus::Pending),
+            "in_progress" | "inprogress" | "active" => Some(TodoStatus::InProgress),
+            "completed" | "complete" | "done" => Some(TodoStatus::Completed),
+            _ => None,
+        }
+    }
+}
 
 /// Tunables the frontend passes along with `ConnectLlm`. Kept as a struct so
 /// adding a knob later is one field, not a new request variant.
@@ -138,6 +237,21 @@ pub enum Request {
     /// registry plus the markdown-defined agents and commands on disk.
     ListCatalog,
 
+    /// Run a harness command that never creates a model message (`compact`,
+    /// `plan`, `permission`). Logged as `Command`, answered with
+    /// `CommandResult`.
+    RunCommand { session_id: u64, name: String, input: String },
+    /// Switch a session's permission mode (`read-only | workspace-write |
+    /// danger-full-access`). Durable; the model is told via runtime context.
+    SetPermissionMode { session_id: u64, mode: PermissionMode },
+    /// Enter (`active: true`) or leave plan mode. Leaving is normally done
+    /// through the `exit-plan-mode` tool so the plan gets reviewed first.
+    SetPlanMode { session_id: u64, active: bool },
+    /// Answer a pipeline approval request (`ApprovalRequested`).
+    ResolveApproval { id: u64, allow: bool },
+    /// Answer an `ask-user` / plan-review question (`QuestionAsked`).
+    AnswerQuestion { id: u64, answer: String },
+
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
 }
@@ -153,6 +267,9 @@ pub enum Response {
     SessionCreated { id: u64 },
     SessionLoaded  { session: SessionDump },
     Catalog        { entries: Vec<CatalogEntry> },
+    /// Outcome text of a `RunCommand` (shown in the log panel; never model
+    /// history).
+    CommandResult  { text: String },
 }
 
 /// Which family a [`CatalogEntry`] belongs to. Drives the group headings in
@@ -199,6 +316,16 @@ pub struct SessionDump {
     pub title: String,
     pub created_at: i64,
     pub messages: Vec<MessageDump>,
+    /// Current permission mode — drives the FE status-bar pill without a
+    /// second round-trip.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
+    /// Whether plan mode is active — drives the FE composer toggle.
+    #[serde(default)]
+    pub plan_active: bool,
+    /// Latest durable todo list — drives the FE checklist on reload.
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +485,41 @@ pub enum Event {
         path: String,
         kind: TicketKind,
     },
+
+    // Wave 3 control plane (guide §10–§11).
+    /// A pipeline policy returned `Ask`: the FE shows an Allow-once / Deny
+    /// strip and answers with `ResolveApproval`. Times out to deny.
+    ApprovalRequested {
+        id: u64,
+        session_id: u64,
+        skill: String,
+        args_preview: String,
+        reason: String,
+    },
+    /// The `ask-user` skill (or plan review) needs a human answer. The FE
+    /// shows a modal and answers with `AnswerQuestion`. Times out to none.
+    QuestionAsked {
+        id: u64,
+        session_id: u64,
+        question: String,
+        options: Vec<String>,
+    },
+    /// The durable `todo-write` list changed. The FE renders a checklist;
+    /// it clears on the next `TurnStarted`.
+    TodosChanged {
+        session_id: u64,
+        items: Vec<TodoItem>,
+    },
+    /// Plan mode flipped (via `/plan`, `SetPlanMode`, or `exit-plan-mode`).
+    PlanModeChanged {
+        session_id: u64,
+        active: bool,
+    },
+    /// Permission mode flipped (via `/permission` or `SetPermissionMode`).
+    PermissionModeChanged {
+        session_id: u64,
+        mode: PermissionMode,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -477,6 +639,57 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, CatalogKind::Skill);
         assert_eq!(entries[0].args, vec!["path".to_string()]);
+    }
+
+    #[test]
+    fn permission_mode_labels_parse_back() {
+        for m in [
+            PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            assert_eq!(PermissionMode::parse(m.label()), Some(m), "{}", m.label());
+        }
+        assert_eq!(PermissionMode::parse("ro"), Some(PermissionMode::ReadOnly));
+        assert_eq!(PermissionMode::parse("DANGER"), Some(PermissionMode::DangerFullAccess));
+        assert_eq!(PermissionMode::default(), PermissionMode::WorkspaceWrite);
+        assert_eq!(PermissionMode::parse("nuke"), None);
+    }
+
+    #[test]
+    fn todo_status_parses_aliases() {
+        assert_eq!(TodoStatus::parse("pending"), Some(TodoStatus::Pending));
+        assert_eq!(TodoStatus::parse("in-progress"), Some(TodoStatus::InProgress));
+        assert_eq!(TodoStatus::parse("done"), Some(TodoStatus::Completed));
+        assert_eq!(TodoStatus::parse("later"), None);
+    }
+
+    #[test]
+    fn roundtrip_wave3_events() {
+        let events = vec![
+            Event::ApprovalRequested {
+                id: 1, session_id: 2, skill: "run-cli".into(),
+                args_preview: "run-cli 'rm -rf x'".into(), reason: "destructive".into(),
+            },
+            Event::QuestionAsked {
+                id: 3, session_id: 2, question: "which?".into(),
+                options: vec!["a".into()],
+            },
+            Event::TodosChanged {
+                session_id: 2,
+                items: vec![TodoItem { content: "x".into(), status: TodoStatus::InProgress }],
+            },
+            Event::PlanModeChanged { session_id: 2, active: true },
+            Event::PermissionModeChanged { session_id: 2, mode: PermissionMode::ReadOnly },
+        ];
+        for ev in events {
+            let back = Frame::decode(&Frame::event(ev).encode().unwrap()).unwrap();
+            assert_eq!(back.id, 0);
+            assert!(matches!(back.payload, Payload::Event(_)));
+        }
+        let req = Request::RunCommand { session_id: 1, name: "compact".into(), input: String::new() };
+        let back = Frame::decode(&Frame::request(9, req).encode().unwrap()).unwrap();
+        assert!(matches!(back.payload, Payload::Request(Request::RunCommand { .. })));
     }
 
     #[test]

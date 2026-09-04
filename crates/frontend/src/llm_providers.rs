@@ -60,6 +60,48 @@ fn default_thinking() -> bool {
 }
 
 impl ProviderConfig {
+    /// Overwrite the tunable fields with a model preset. Identity fields
+    /// (`title`, `base_url`, `model`, `api_key`) are left untouched; knobs
+    /// the preset leaves at auto (0) reset the provider to auto as well so
+    /// re-applying after manual tweaks converges.
+    pub fn apply_preset(&mut self, p: &llm::preset::ModelPreset) {
+        self.temperature = p.temperature;
+        self.thinking = p.thinking;
+        self.native_tools = p.native_tools;
+        self.max_tokens = p.max_tokens;
+        self.context_window = p.context_window;
+        self.compact_threshold_pct = p.compact_threshold_pct;
+        self.compact_retain_pct = p.compact_retain_pct;
+        self.compact_max_tokens = p.compact_max_tokens;
+    }
+
+    /// Field names where the live config disagrees with the preset matched
+    /// from its own model string. Empty = already at the recommendation.
+    /// Only the always-set knobs (temperature / thinking / native_tools)
+    /// are compared — auto (0) knobs match any preset that also says auto.
+    pub fn preset_drift(&self) -> Vec<&'static str> {
+        let p = llm::preset::preset_for_provider(&self.base_url, &self.model);
+        let mut out = Vec::new();
+        if (self.temperature - p.temperature).abs() > f32::EPSILON {
+            out.push("temperature");
+        }
+        if self.thinking != p.thinking {
+            out.push("thinking");
+        }
+        if self.native_tools != p.native_tools {
+            out.push("native tools");
+        }
+        if self.max_tokens != p.max_tokens
+            || self.context_window != p.context_window
+            || self.compact_threshold_pct != p.compact_threshold_pct
+            || self.compact_retain_pct != p.compact_retain_pct
+            || self.compact_max_tokens != p.compact_max_tokens
+        {
+            out.push("limits");
+        }
+        out
+    }
+
     /// Wire-format options for `ConnectLlm`, mapping the 0-means-auto UI
     /// convention onto `Option`s.
     pub fn llm_options(&self) -> protocol::LlmOptions {

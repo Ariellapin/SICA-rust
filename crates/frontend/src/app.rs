@@ -78,6 +78,11 @@ pub struct App {
     // Live token meter — atomics so backend can update from any thread.
     pub tokens: Arc<TokenMeter>,
 
+    /// Generation speed derived from successive `TokenUsage.used` deltas.
+    /// UI-thread only (updated while draining `UiEvent`s, read while drawing
+    /// the footer) — no atomics needed, unlike `tokens`.
+    pub gen_speed: GenSpeed,
+
     // Active color palette (derived from `theme_dark`).
     pub palette: Palette,
 
@@ -92,6 +97,42 @@ pub struct App {
     /// per-document work between frames (streaming deltas re-render the
     /// same buffer many times per second).
     pub md_cache: egui_commonmark::CommonMarkCache,
+
+    // Wave 3 control-plane UI state.
+    /// One-shot approval currently awaiting the human (Allow once / Deny).
+    pub pending_approval: Option<PendingApproval>,
+    /// `ask-user` / plan-review question currently awaiting an answer.
+    pub pending_question: Option<PendingQuestion>,
+    /// Durable todo list of the active session (checklist above the
+    /// composer). Clears on the next turn start.
+    pub todos: Vec<protocol::TodoItem>,
+    /// Permission mode of the active session (status-bar pill).
+    pub permission_mode: protocol::PermissionMode,
+    /// Plan mode of the active session (composer toggle).
+    pub plan_active: bool,
+    /// Session the last composer `/command` targeted — its `CommandResult`
+    /// reloads that session, since compaction rewrites history.
+    pub last_command_session: Option<u64>,
+    /// Permission mode for freshly minted sessions (Settings JSON).
+    pub default_permission_mode: String,
+}
+
+/// One pipeline `Ask` waiting on the strip above the composer.
+pub struct PendingApproval {
+    pub id: u64,
+    pub session_id: u64,
+    pub skill: String,
+    pub args_preview: String,
+    pub reason: String,
+}
+
+/// One human question waiting on the modal.
+pub struct PendingQuestion {
+    pub id: u64,
+    pub session_id: u64,
+    pub question: String,
+    pub options: Vec<String>,
+    pub draft: String,
 }
 
 pub struct TokenMeter {
@@ -116,6 +157,98 @@ impl TokenMeter {
         }
         let used = self.used.load(Ordering::Relaxed);
         Some(((u64::from(used) * 100 / u64::from(budget)) as u32).min(100))
+    }
+}
+
+/// Live generation speed (tokens/sec) for the footer.
+///
+/// Derived entirely in the FE from successive `TokenUsage.used` deltas, so
+/// no protocol change is needed: `used` is prompt + generated-so-far and the
+/// backend emits it every ~100 ms mid-stream. The first reading of each turn
+/// is the prompt baseline (the jump from the previous turn's total is prompt,
+/// not generation) and everything after it counts as generated tokens. An
+/// exponential moving average over per-window rates gives a live feel; when
+/// the turn ends the footer freezes on the turn's overall average.
+#[derive(Default)]
+pub struct GenSpeed {
+    /// `true` between `TurnStarted` and `TurnFinished`.
+    pub streaming: bool,
+    /// Live EMA while streaming, frozen turn average after.
+    pub tps: f32,
+    /// Generated tokens so far (this turn, or the last one once finished).
+    pub completed: u32,
+    /// Wall time since the turn's baseline reading, in seconds.
+    pub elapsed_secs: f32,
+    turn_start: Option<Instant>,
+    start_used: u32,
+    last_used: u32,
+    last_update: Option<Instant>,
+    baseline_set: bool,
+}
+
+impl GenSpeed {
+    pub fn on_turn_started(&mut self) {
+        self.streaming = true;
+        self.tps = 0.0;
+        self.completed = 0;
+        self.elapsed_secs = 0.0;
+        self.turn_start = Some(Instant::now());
+        self.last_update = None;
+        self.baseline_set = false;
+    }
+
+    pub fn on_token_usage(&mut self, used: u32) {
+        if !self.streaming {
+            return;
+        }
+        let now = Instant::now();
+        if !self.baseline_set {
+            self.start_used = used;
+            self.last_used = used;
+            self.turn_start = Some(now);
+            self.last_update = Some(now);
+            self.baseline_set = true;
+            return;
+        }
+        self.completed = used.saturating_sub(self.start_used);
+        if let Some(t0) = self.turn_start {
+            self.elapsed_secs = now.duration_since(t0).as_secs_f32();
+        }
+        if let Some(last) = self.last_update {
+            let dt = now.duration_since(last).as_secs_f32();
+            if dt >= 0.05 {
+                let delta = used.saturating_sub(self.last_used) as f32;
+                if delta > 0.0 {
+                    let inst = delta / dt;
+                    self.tps = if self.tps <= 0.0 {
+                        inst
+                    } else {
+                        0.35 * inst + 0.65 * self.tps
+                    };
+                }
+                self.last_used = used;
+                self.last_update = Some(now);
+            }
+        } else {
+            self.last_used = used;
+            self.last_update = Some(now);
+        }
+    }
+
+    pub fn on_turn_finished(&mut self) {
+        self.streaming = false;
+        if self.baseline_set && self.elapsed_secs > 0.0 && self.completed > 0 {
+            self.tps = self.completed as f32 / self.elapsed_secs;
+        }
+    }
+
+    /// Turn average (what the tooltip shows next to the live EMA).
+    pub fn avg(&self) -> f32 {
+        if self.elapsed_secs > 0.0 {
+            self.completed as f32 / self.elapsed_secs
+        } else {
+            0.0
+        }
     }
 }
 
@@ -519,12 +652,20 @@ impl App {
                 limit:  AtomicU32::new(24_000),
                 budget: AtomicU32::new(0),
             }),
+            gen_speed: GenSpeed::default(),
             palette,
             workspace_name: sica_core::paths::workspace_root()
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "—".into()),
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            pending_approval: None,
+            pending_question: None,
+            todos: Vec::new(),
+            permission_mode: protocol::PermissionMode::default(),
+            plan_active: false,
+            last_command_session: None,
+            default_permission_mode: settings.default_permission_mode.clone(),
         }
     }
 
@@ -552,6 +693,7 @@ impl App {
             release_profile:        self.release_profile,
             auto_watch:             self.auto_watch,
             last_active_provider:   self.active_provider_id.clone(),
+            default_permission_mode: self.default_permission_mode.clone(),
         }
     }
 
@@ -899,6 +1041,12 @@ impl App {
                 self.llm_state = LlmUiState { state, last_error: err };
             }
             UiEvent::TurnStarted { session_id, turn_id } => {
+                self.gen_speed.on_turn_started();
+                // A new turn retires the checklist (the projection clears
+                // on turn start; the log keeps the audit).
+                if session_id == self.chat.session_id {
+                    self.todos.clear();
+                }
                 self.chat.turns.push(Turn {
                     session_id,
                     turn_id,
@@ -922,6 +1070,7 @@ impl App {
                 self.chat.scroll_to_bottom = true;
             }
             UiEvent::TurnFinished { finish_reason, .. } => {
+                self.gen_speed.on_turn_finished();
                 if let Some(t) = self.active_turn_mut() {
                     t.finished = true;
                     t.finish_reason = Some(finish_reason);
@@ -934,6 +1083,7 @@ impl App {
                 self.tokens.used.store(used, Ordering::Relaxed);
                 self.tokens.limit.store(limit, Ordering::Relaxed);
                 self.tokens.budget.store(budget, Ordering::Relaxed);
+                self.gen_speed.on_token_usage(used);
             }
             UiEvent::ContextCompacting { session_id } => {
                 if session_id == self.chat.session_id {
@@ -1047,6 +1197,13 @@ impl App {
                     });
                 }
                 self.switch_session(id);
+                // Fresh sessions start in the configured default mode.
+                let mode = protocol::PermissionMode::parse(&self.default_permission_mode)
+                    .unwrap_or_default();
+                self.send(UiCommand::SendRequest(Request::SetPermissionMode {
+                    session_id: id,
+                    mode,
+                }));
                 // Re-list so the title/timestamp come from the BE rather than
                 // the placeholder we just inserted.
                 self.send(UiCommand::SendRequest(Request::ListSessions));
@@ -1060,6 +1217,9 @@ impl App {
                 }
                 self.chat.turns = rebuild_turns(&session);
                 self.chat.scroll_to_bottom = true;
+                self.permission_mode = session.permission_mode;
+                self.plan_active = session.plan_active;
+                self.todos = session.todos;
             }
             UiEvent::Catalog { entries } => {
                 self.push_log(
@@ -1071,6 +1231,53 @@ impl App {
             UiEvent::SessionTitleChanged { session_id, title } => {
                 if let Some(s) = self.chat.sessions.iter_mut().find(|s| s.id == session_id) {
                     s.title = title;
+                }
+            }
+            UiEvent::CommandResult { text } => {
+                self.push_log(LogKind::Event, format!("command: {text}"));
+                // Compaction rewrites history — pull the fresh transcript
+                // for the session the command targeted.
+                if let Some(id) = self.last_command_session {
+                    if id == self.chat.session_id {
+                        self.send(UiCommand::SendRequest(Request::LoadSession { session_id: id }));
+                    }
+                    self.last_command_session = None;
+                }
+            }
+            UiEvent::ApprovalRequested { id, session_id, skill, args_preview, reason } => {
+                self.push_log(
+                    LogKind::Event,
+                    format!("approval requested: {skill} — {reason}"),
+                );
+                self.pending_approval = Some(PendingApproval {
+                    id, session_id, skill, args_preview, reason,
+                });
+            }
+            UiEvent::QuestionAsked { id, session_id, question, options } => {
+                self.push_log(LogKind::Event, "question asked — see modal".into());
+                self.pending_question = Some(PendingQuestion {
+                    id, session_id, question, options,
+                    draft: String::new(),
+                });
+            }
+            UiEvent::TodosChanged { session_id, items } => {
+                if session_id == self.chat.session_id {
+                    self.todos = items;
+                    self.chat.scroll_to_bottom = true;
+                }
+            }
+            UiEvent::PlanModeChanged { session_id, active } => {
+                if session_id == self.chat.session_id {
+                    self.plan_active = active;
+                }
+                self.push_log(
+                    LogKind::Event,
+                    format!("plan mode {}", if active { "on" } else { "off" }),
+                );
+            }
+            UiEvent::PermissionModeChanged { session_id, mode } => {
+                if session_id == self.chat.session_id {
+                    self.permission_mode = mode;
                 }
             }
         }
@@ -1231,5 +1438,44 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.cmd_tx.send(UiCommand::Quit);
         std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gen_speed_ignores_prompt_baseline() {
+        let mut g = GenSpeed::default();
+        g.on_turn_started();
+        assert!(g.streaming);
+        // First reading of a turn is the prompt baseline — not generation.
+        g.on_token_usage(5000);
+        assert_eq!(g.completed, 0);
+        assert_eq!(g.tps, 0.0);
+        // Growth past the baseline counts as generated tokens.
+        g.on_token_usage(5010);
+        assert_eq!(g.completed, 10);
+    }
+
+    #[test]
+    fn gen_speed_freezes_turn_average_on_finish() {
+        let mut g = GenSpeed::default();
+        g.on_turn_started();
+        g.on_token_usage(1000);
+        g.completed = 50;
+        g.elapsed_secs = 2.0;
+        g.on_turn_finished();
+        assert!(!g.streaming);
+        assert!((g.tps - 25.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn gen_speed_ignores_usage_outside_a_turn() {
+        let mut g = GenSpeed::default();
+        g.on_token_usage(1234);
+        assert_eq!(g.tps, 0.0);
+        assert_eq!(g.completed, 0);
     }
 }

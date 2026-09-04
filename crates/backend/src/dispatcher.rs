@@ -75,6 +75,32 @@ pub async fn handle(
             chat.interrupt_session(session_id).await;
             Response::Ok
         }
+        Request::RunCommand { session_id, name, input } => {
+            let text = chat.run_command(session_id, &name, &input).await;
+            Response::CommandResult { text }
+        }
+        Request::SetPermissionMode { session_id, mode } => {
+            chat.set_permission_mode(session_id, mode).await;
+            Response::Ok
+        }
+        Request::SetPlanMode { session_id, active } => {
+            chat.set_plan_mode(session_id, active).await;
+            Response::Ok
+        }
+        Request::ResolveApproval { id, allow } => {
+            if chat.resolve_approval(id, allow).await {
+                Response::Ok
+            } else {
+                Response::Error { message: format!("approval {id} is no longer pending") }
+            }
+        }
+        Request::AnswerQuestion { id, answer } => {
+            if chat.answer_question(id, answer).await {
+                Response::Ok
+            } else {
+                Response::Error { message: format!("question {id} is no longer pending") }
+            }
+        }
         Request::ReportFrontendError { module, message, traceback } => {
             idealist_bus.publish(idealist::Trigger {
                 kind: "fe_panic".into(),

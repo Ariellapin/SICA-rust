@@ -103,12 +103,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         };
         tiny_caps(ui, &format!("MODEL  {}", model.to_uppercase()), ink);
 
+        sep(ui, muted);
+        draw_permission_pill(app, ui, ink);
+
         // Right edge lays out right-to-left, so items added later sit further
-        // left: brandmark, token counts, context percentage, compaction mark.
+        // left: brandmark, token counts, context percentage, generation speed,
+        // compaction mark.
         right_aligned(ui, |ui| {
             ui.label(display_text("sica", 11.0).color(ink));
             sep(ui, muted);
             draw_context_meter(app, ui, ink);
+            sep(ui, muted);
+            draw_gen_speed(app, ui, ink);
 
             if app.be_state.restart_pending() {
                 sep(ui, muted);
@@ -117,6 +123,39 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         });
     });
     ui.spacing_mut().item_spacing = prev_spacing;
+}
+
+/// Permission-mode pill: the session's current mode, right-click (or long
+/// press) for the three-way switch. Danger mode paints red — it should
+/// always look alarming.
+fn draw_permission_pill(app: &mut App, ui: &mut egui::Ui, ink: egui::Color32) {
+    let mode = app.permission_mode;
+    let color = match mode {
+        protocol::PermissionMode::ReadOnly => rgb(app.palette.info),
+        protocol::PermissionMode::WorkspaceWrite => ink,
+        protocol::PermissionMode::DangerFullAccess => rgb(app.palette.danger),
+    };
+    let resp = tiny_caps(ui, &format!("PERM  {}", mode.label().to_uppercase()), color)
+        .on_hover_text(format!("{} — right-click to switch", mode.description()));
+    resp.context_menu(|ui| {
+        for m in [
+            protocol::PermissionMode::ReadOnly,
+            protocol::PermissionMode::WorkspaceWrite,
+            protocol::PermissionMode::DangerFullAccess,
+        ] {
+            let mut label = format!("{} — {}", m.label(), m.description());
+            if m == mode {
+                label.push_str("  ✓");
+            }
+            if ui.button(label).clicked() {
+                let id = app.chat.session_id;
+                app.send(crate::supervisor::UiCommand::SendRequest(
+                    protocol::Request::SetPermissionMode { session_id: id, mode: m },
+                ));
+                ui.close_menu();
+            }
+        }
+    });
 }
 
 /// Context meter: `CTX 42% · 8145 / 19392`, plus a "COMPRESSING" mark while the
@@ -176,6 +215,49 @@ fn draw_context_meter(app: &App, ui: &mut egui::Ui, ink: egui::Color32) {
         tiny_caps(ui, "⟳ COMPRESSING", rgb(p.info))
             .on_hover_text("Summarising older history to free context window space.");
     }
+}
+
+/// Generation speed: live tok/s while a turn streams, frozen turn average
+/// after it lands, dash before the first turn.
+///
+/// Derived in the FE from successive `TokenUsage.used` deltas (prompt +
+/// generated-so-far, emitted ~every 100 ms), so no protocol change is needed:
+/// the first reading of each turn is the prompt baseline and only the growth
+/// past it counts. Tooltip carries the generated count + wall time behind
+/// the rate.
+fn draw_gen_speed(app: &App, ui: &mut egui::Ui, ink: egui::Color32) {
+    let g = &app.gen_speed;
+    if g.streaming {
+        // Keep the readout ticking even if `TokenUsage` stalls mid-stream.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+    let (text, color, tip) = if g.streaming {
+        let avg = g.avg();
+        (
+            format!("TOK/S  {:.1}", g.tps),
+            if g.tps > 0.0 { rgb(app.palette.ok) } else { ink },
+            format!(
+                "Generating… {} tokens in {:.1}s (avg {:.1} tok/s).",
+                g.completed, g.elapsed_secs, avg,
+            ),
+        )
+    } else if g.tps > 0.0 {
+        (
+            format!("TOK/S  {:.1}", g.tps),
+            ink,
+            format!(
+                "Last turn: {} generated tokens in {:.1}s ({:.1} tok/s).",
+                g.completed, g.elapsed_secs, g.tps,
+            ),
+        )
+    } else {
+        (
+            "TOK/S  —".to_string(),
+            SEP_COLOR,
+            "Generation speed appears once a turn streams.".to_string(),
+        )
+    };
+    tiny_caps(ui, &text, color).on_hover_text(tip);
 }
 
 /// Pulsing "RESTART" pill shown when the on-disk source has drifted from the

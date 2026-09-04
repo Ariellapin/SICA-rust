@@ -95,9 +95,18 @@ pub enum UiEvent {
     SessionCreated { id: u64 },
     SessionLoaded { session: SessionDump },
     SessionTitleChanged { session_id: u64, title: String },
+    /// Outcome text of a harness `RunCommand` (`/compact` …).
+    CommandResult { text: String },
 
     /// Skills / agents / commands the BE can see — feeds the "/" palette.
     Catalog { entries: Vec<CatalogEntry> },
+
+    // Wave 3 control plane.
+    ApprovalRequested { id: u64, session_id: u64, skill: String, args_preview: String, reason: String },
+    QuestionAsked { id: u64, session_id: u64, question: String, options: Vec<String> },
+    TodosChanged { session_id: u64, items: Vec<protocol::TodoItem> },
+    PlanModeChanged { session_id: u64, active: bool },
+    PermissionModeChanged { session_id: u64, mode: protocol::PermissionMode },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -272,6 +281,21 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::ToolCallFinished { id, ok, summary } => {
             UiEvent::ToolCallFinished { id, ok, summary }
+        }
+        Event::ApprovalRequested { id, session_id, skill, args_preview, reason } => {
+            UiEvent::ApprovalRequested { id, session_id, skill, args_preview, reason }
+        }
+        Event::QuestionAsked { id, session_id, question, options } => {
+            UiEvent::QuestionAsked { id, session_id, question, options }
+        }
+        Event::TodosChanged { session_id, items } => {
+            UiEvent::TodosChanged { session_id, items }
+        }
+        Event::PlanModeChanged { session_id, active } => {
+            UiEvent::PlanModeChanged { session_id, active }
+        }
+        Event::PermissionModeChanged { session_id, mode } => {
+            UiEvent::PermissionModeChanged { session_id, mode }
         }
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }

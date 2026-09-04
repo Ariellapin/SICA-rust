@@ -29,12 +29,17 @@ use tracing::{debug, info, warn};
 use llm::client::{ChatMessage, LlmClient};
 
 use crate::agent::EventSink;
+use crate::broker::BrokerSet;
 use crate::parse_tool_call;
+use crate::pipeline::{CallView, PostDecision, PreDecision};
 use crate::skill::{Skill, SkillContext, SkillOutcome};
 
 static TOOL_ID: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 
-fn next_tool_id() -> u64 {
+/// Mint a tool-call id from the shared atomic. `ChatHub` uses the same
+/// space for harness-control calls it dispatches without a sub-agent, so
+/// chips never collide.
+pub fn next_tool_id() -> u64 {
     TOOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -66,6 +71,23 @@ pub struct ToolInvocation<'a> {
     pub expectation: String,
 }
 
+/// Audit record for one approval round-trip. `ChatHub` persists it as an
+/// `Approval` event; the model saw only the tool outcome.
+pub struct ApprovalRecord {
+    pub skill:        String,
+    pub args_preview: String,
+    /// `allowed-once` or `denied`.
+    pub decision:     &'static str,
+}
+
+/// Everything one pipeline run produces: the model-facing outcome, advisory
+/// context to inject after the result, and the approval audit (if asked).
+pub struct RunReport {
+    pub outcome:  SkillOutcome,
+    pub notices:  Vec<String>,
+    pub approval: Option<ApprovalRecord>,
+}
+
 #[derive(Clone)]
 pub struct ToolSubAgent {
     pub depth:         u8,
@@ -83,6 +105,20 @@ pub struct ToolSubAgent {
     /// outputs — the session id in production. `None` disables spilling
     /// (raw output passes through), which is what test doubles want.
     pub spill_label:   Option<String>,
+    /// Guarded-execution policies (Wave 3, `agents::pipeline`). Evaluated
+    /// pre → guards → post around the skill body. Empty in tests and in
+    /// standalone uses (team transcripts, evals) that predate the pipeline.
+    pub policies:      Arc<[Arc<dyn crate::pipeline::ToolPolicy>]>,
+    /// Human-in-the-loop rendezvous for `Ask` decisions and the `ask-user`
+    /// skill. `None` outside a live session (tests, teammates, evals) — an
+    /// `Ask` then degrades to a denial.
+    pub brokers:       Option<Arc<BrokerSet>>,
+    /// Session this call belongs to. Carried into broker events so the FE
+    /// can route the prompt; `None` means no human is reachable.
+    pub session_id:    Option<u64>,
+    /// Whether the owning session is in plan mode. Read by control skills;
+    /// inherited by children.
+    pub plan_active:   bool,
 }
 
 impl ToolSubAgent {
@@ -96,6 +132,10 @@ impl ToolSubAgent {
             summarizer:   None,
             cancel:       None,
             spill_label:  None,
+            policies:     Arc::new([]),
+            brokers:      None,
+            session_id:   None,
+            plan_active:  false,
         }
     }
 
@@ -128,6 +168,30 @@ impl ToolSubAgent {
         self
     }
 
+    /// Attach pipeline policies. Inherited by `child()`.
+    pub fn with_policies(mut self, policies: Vec<Arc<dyn crate::pipeline::ToolPolicy>>) -> Self {
+        self.policies = policies.into();
+        self
+    }
+
+    /// Attach the human-in-the-loop brokers. Inherited by `child()`.
+    pub fn with_brokers(mut self, brokers: Arc<BrokerSet>) -> Self {
+        self.brokers = Some(brokers);
+        self
+    }
+
+    /// Bind this call (and its children) to a session for broker events.
+    pub fn with_session(mut self, session_id: u64) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Mark calls from a plan-mode session. Read by control skills.
+    pub fn with_plan_active(mut self, active: bool) -> Self {
+        self.plan_active = active;
+        self
+    }
+
     /// Build a child sub-agent rooted at the call id `parent_id`. Used by
     /// `SkillContext` so a skill can spawn further sub-agents. Inherits the
     /// failure sink, summarizer and cancellation token so nested calls share
@@ -142,6 +206,10 @@ impl ToolSubAgent {
             summarizer:   self.summarizer.clone(),
             cancel:       self.cancel.clone(),
             spill_label:  self.spill_label.clone(),
+            policies:     self.policies.clone(),
+            brokers:      self.brokers.clone(),
+            session_id:   self.session_id,
+            plan_active:  self.plan_active,
         }
     }
 
@@ -155,7 +223,18 @@ impl ToolSubAgent {
     /// success, if a summarizer is configured and the expectation is non-
     /// empty, the raw `outcome.summary` is replaced by the LLM's focused
     /// answer.
+    ///
+    /// Thin wrapper over [`run_report`](Self::run_report) for callers that
+    /// only need the model-facing outcome (teammates, evals, tests).
     pub async fn run(&self, inv: ToolInvocation<'_>) -> SkillOutcome {
+        self.run_report(inv).await.outcome
+    }
+
+    /// Full pipeline run: pre-execute → guards → body → post-execute (see
+    /// `agents::pipeline`). A `Deny`/`Block` becomes a failed outcome the
+    /// model reads — never a defect, so never sunk — while `post_execute`
+    /// still runs for denied calls so the repeat reminder counts them.
+    pub async fn run_report(&self, inv: ToolInvocation<'_>) -> RunReport {
         let ToolInvocation { skill, args, raw_args, expectation } = inv;
 
         if self.depth >= self.max_depth {
@@ -175,9 +254,13 @@ impl ToolSubAgent {
                     skill.name()
                 ),
             });
-            return SkillOutcome {
-                ok: false,
-                summary: format!("sub-agent depth limit ({}) reached", self.max_depth),
+            return RunReport {
+                outcome: SkillOutcome {
+                    ok: false,
+                    summary: format!("sub-agent depth limit ({}) reached", self.max_depth),
+                },
+                notices: Vec::new(),
+                approval: None,
             };
         }
 
@@ -185,9 +268,13 @@ impl ToolSubAgent {
         // a start event here would leave a chip spinning for a call that never
         // ran.
         if self.cancelled() {
-            return SkillOutcome {
-                ok: false,
-                summary: "interrupted before the tool call started".into(),
+            return RunReport {
+                outcome: SkillOutcome {
+                    ok: false,
+                    summary: "interrupted before the tool call started".into(),
+                },
+                notices: Vec::new(),
+                approval: None,
             };
         }
 
@@ -227,6 +314,34 @@ impl ToolSubAgent {
             args_preview: args_preview.clone(),
             expectation:  expectation.clone(),
         });
+        let mut notices: Vec<String> = Vec::new();
+        let mut veto = false;
+        let approval: Option<ApprovalRecord>;
+
+        // Pipeline pre-stage. A denial skips the body but still flows
+        // through post-execute (repeat counting) and the finish events so
+        // the chip never spins forever and the transcript shows the veto.
+        // `view_args` is a clone: the body consumes `args` while post still
+        // needs them.
+        let view_args = args.clone();
+        let view = CallView {
+            skill:        skill.name(),
+            args:         &view_args,
+            args_preview: &args_preview,
+            depth:        self.depth,
+            session_id:   self.session_id,
+        };
+        let (denial, record) = self.pre_decision(&view).await;
+        approval = record;
+        if let Some(denied) = denial {
+            let outcome = SkillOutcome { ok: false, summary: denied };
+            let (summary, extra, blocked) = self.post_chain(&view, &outcome).await;
+            notices.extend(extra);
+            veto = true;
+            let outcome = SkillOutcome { ok: false, summary: if blocked { summary } else { outcome.summary } };
+            self.finish_call(id, skill.name(), args_preview, &outcome, veto);
+            return RunReport { outcome, notices, approval };
+        }
 
         let ctx = SkillContext { sub: self.child(id) };
         // Race the skill against the interrupt and its own wall-clock budget.
@@ -260,6 +375,18 @@ impl ToolSubAgent {
         // head/tail digest naming the file. Runs before the summariser so a
         // paraphrase is made from the digest, not from 200 KB of raw text.
         let spilled = self.spill(skill.name(), id, &mut outcome);
+
+        // Pipeline post-stage: accept (possibly with extra context) or
+        // block (the feedback replaces the outcome). A block is a policy
+        // veto, not a tool defect — sunk never, summarised never.
+        let (summary, extra, blocked) = self.post_chain(&view, &outcome).await;
+        notices.extend(extra);
+        if blocked {
+            veto = true;
+            outcome = SkillOutcome { ok: false, summary };
+        } else {
+            outcome.summary = summary;
+        }
 
         // Short outputs are passed through verbatim: the raw text is ground
         // truth, and every LLM rewrite is a chance to misquote it. Only
@@ -310,18 +437,138 @@ impl ToolSubAgent {
             }
         }
 
+        self.finish_call(id, skill.name(), args_preview, &outcome, veto);
+
+        RunReport { outcome, notices, approval }
+    }
+
+    /// First non-`Allow` pre-execute decision wins; monotonic guards run
+    /// after and can only deny. Returns the denial text (if any) plus the
+    /// approval audit whenever the verdict went through the broker —
+    /// approved or denied, every request is audited.
+    async fn pre_decision(&self, view: &CallView<'_>) -> (Option<String>, Option<ApprovalRecord>) {
+        let mut verdict: Option<PreDecision> = None;
+        for policy in self.policies.iter() {
+            match policy.pre_execute(view).await {
+                PreDecision::Allow => {}
+                other => {
+                    verdict = Some(other);
+                    break;
+                }
+            }
+        }
+        // Guards run even past a denial verdict — deny-only by contract —
+        // but only an Allow/Ask verdict can still change.
+        let mut verdict = verdict.unwrap_or(PreDecision::Allow);
+        if matches!(verdict, PreDecision::Allow | PreDecision::Ask { .. }) {
+            for policy in self.policies.iter() {
+                if let Some(reason) = policy.guard(view) {
+                    verdict = PreDecision::Deny { reason };
+                    break;
+                }
+            }
+        }
+        match verdict {
+            PreDecision::Allow => (None, None),
+            PreDecision::Deny { reason } => (Some(reason), None),
+            PreDecision::Ask { reason } => {
+                let allowed = match (&self.brokers, self.session_id) {
+                    (Some(brokers), Some(session_id)) => {
+                        brokers
+                            .ask_approval(
+                                &self.events,
+                                session_id,
+                                view.skill,
+                                view.args_preview,
+                                &reason,
+                                self.cancel.clone(),
+                            )
+                            .await
+                    }
+                    _ => false,
+                };
+                let record = ApprovalRecord {
+                    skill: view.skill.to_string(),
+                    args_preview: view.args_preview.to_string(),
+                    decision: if allowed { "allowed-once" } else { "denied" },
+                };
+                if allowed {
+                    self.events.emit(Event::LogLine {
+                        level: "INFO".into(),
+                        message: format!("approval: `{}` allowed once", view.skill),
+                    });
+                    (None, Some(record))
+                } else {
+                    self.events.emit(Event::LogLine {
+                        level: "WARN".into(),
+                        message: format!(
+                            "approval: `{}` denied ({})",
+                            view.skill,
+                            if self.brokers.is_some() && self.session_id.is_some() {
+                                "no allow arrived"
+                            } else {
+                                "no approval path for this call"
+                            }
+                        ),
+                    });
+                    (Some(format!(
+                        "approval denied ({reason}) — change approach, use a \
+                         read-only alternative, or ask the user"
+                    )), Some(record))
+                }
+            }
+        }
+    }
+
+    /// Run every `post_execute`; the first `Block` wins the summary while
+    /// all `extra_context` is collected. Returns (summary, context, blocked).
+    async fn post_chain(&self, view: &CallView<'_>, outcome: &SkillOutcome) -> (String, Vec<String>, bool) {
+        let mut summary = outcome.summary.clone();
+        let mut extra = Vec::new();
+        let mut blocked = false;
+        for policy in self.policies.iter() {
+            match policy.post_execute(view, outcome).await {
+                PostDecision::Accept { summary: s, extra_context } => {
+                    if !blocked {
+                        summary = s;
+                    }
+                    extra.extend(extra_context);
+                }
+                PostDecision::Block { feedback, extra_context } => {
+                    if !blocked {
+                        summary = feedback;
+                        blocked = true;
+                    }
+                    extra.extend(extra_context);
+                }
+            }
+        }
+        (summary, extra, blocked)
+    }
+
+    /// Shared tail for the body and deny paths: finish logging, the
+    /// `ToolCallFinished` chip event, and the failure-sink report (skipped
+    /// for interrupts and policy vetoes — neither is a defect).
+    fn finish_call(
+        &self,
+        id: u64,
+        skill_name: &str,
+        args_preview: String,
+        outcome: &SkillOutcome,
+        veto: bool,
+    ) {
         if outcome.ok {
             info!(
                 tool_id = id,
                 depth = self.depth,
-                skill = skill.name(),
+                skill = skill_name,
                 "sub-agent: tool call finished ok"
             );
         } else {
             warn!(
                 tool_id = id,
                 depth = self.depth,
-                skill = skill.name(),
+                skill = skill_name,
                 summary = %short(&outcome.summary),
                 "sub-agent: tool call failed"
             );
@@ -333,7 +580,7 @@ impl ToolSubAgent {
                 self.depth,
                 id,
                 if outcome.ok { "ok" } else { "err" },
-                skill.name(),
+                skill_name,
                 short(&outcome.summary),
             ),
         });
@@ -342,19 +589,16 @@ impl ToolSubAgent {
             ok: outcome.ok,
             summary: outcome.summary.clone(),
         });
-
-        // A user-initiated stop is not a defect: reporting it would spend an
-        // idealist ticket on "the operator pressed Stop".
-        if !outcome.ok && !self.cancelled() {
+        if !outcome.ok && !veto && !self.cancelled() {
             if let Some(sink) = &self.failure_sink {
                 info!(
                     tool_id = id,
-                    skill = skill.name(),
+                    skill = skill_name,
                     host_os = std::env::consts::OS,
                     "sub-agent: forwarding failure to idealist sink"
                 );
                 sink.report(ToolFailureReport {
-                    skill:        skill.name().to_string(),
+                    skill:        skill_name.to_string(),
                     args_preview,
                     summary:      outcome.summary.clone(),
                     depth:        self.depth,
@@ -363,8 +607,6 @@ impl ToolSubAgent {
                 });
             }
         }
-
-        outcome
     }
 
     /// Spill an oversized successful outcome to disk and replace its summary
@@ -647,6 +889,114 @@ mod tests {
         let root = ToolSubAgent::root(cap.clone());
         let out = root.run(inv(&Firehose)).await;
         assert_eq!(out.summary.len(), crate::spill::SPILL_THRESHOLD + 1);
+    }
+
+    struct DenyAll;
+    #[async_trait]
+    impl crate::pipeline::ToolPolicy for DenyAll {
+        async fn pre_execute(
+            &self,
+            _call: &crate::pipeline::CallView<'_>,
+        ) -> crate::pipeline::PreDecision {
+            crate::pipeline::PreDecision::Deny { reason: "nope".into() }
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_skips_body_and_sink_but_still_finishes() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let failures = Arc::new(CaptureFailures(Mutex::new(Vec::new())));
+        let root = ToolSubAgent::root(cap.clone())
+            .with_failure_sink(failures.clone())
+            .with_policies(vec![Arc::new(DenyAll)]);
+        let report = root.run_report(inv(&Echo)).await;
+        assert!(!report.outcome.ok);
+        assert!(report.outcome.summary.contains("nope"));
+        assert!(report.approval.is_none());
+        // A denial is the harness working, not a defect: no ticket.
+        assert!(failures.0.lock().unwrap().is_empty());
+        let events = lifecycle(&cap.0.lock().unwrap());
+        assert_eq!(events.len(), 2, "denied calls still open and close the chip");
+        assert!(matches!(events[1], Event::ToolCallFinished { ok: false, .. }));
+    }
+
+    struct AskAll;
+    #[async_trait]
+    impl crate::pipeline::ToolPolicy for AskAll {
+        async fn pre_execute(
+            &self,
+            _call: &crate::pipeline::CallView<'_>,
+        ) -> crate::pipeline::PreDecision {
+            crate::pipeline::PreDecision::Ask { reason: "sure?".into() }
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_without_broker_denies() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let root =
+            ToolSubAgent::root(cap.clone()).with_policies(vec![Arc::new(AskAll)]);
+        let report = root.run_report(inv(&Echo)).await;
+        assert!(!report.outcome.ok);
+        assert!(report.outcome.summary.contains("approval denied"));
+        let record = report.approval.expect("denials through Ask are audited");
+        assert_eq!(record.decision, "denied");
+    }
+
+    #[tokio::test]
+    async fn ask_with_broker_runs_body_on_allow() {
+        use crate::broker::BrokerSet;
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let brokers = Arc::new(BrokerSet::new());
+        let root = ToolSubAgent::root(cap.clone())
+            .with_session(9)
+            .with_brokers(brokers.clone())
+            .with_policies(vec![Arc::new(AskAll)]);
+        let (report, _) = tokio::join!(root.run_report(inv(&Echo)), async {
+            for _ in 0..100 {
+                // Id 1: the first broker request of this fresh set.
+                if brokers.resolve_approval(1, true).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(report.outcome.ok, "{}", report.outcome.summary);
+        let record = report.approval.expect("allowed asks are audited too");
+        assert_eq!(record.decision, "allowed-once");
+        assert_eq!(record.skill, "echo");
+    }
+
+    #[tokio::test]
+    async fn repeat_notice_arrives_as_context_not_block() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let reminder = Arc::new(crate::pipeline::RepeatReminder::new());
+        let root = ToolSubAgent::root(cap)
+            .with_policies(vec![reminder.clone() as Arc<dyn crate::pipeline::ToolPolicy>]);
+        let args = serde_json::json!({});
+        for _ in 0..2 {
+            let r = root
+                .run_report(ToolInvocation {
+                    skill: &Echo,
+                    args: args.clone(),
+                    raw_args: Vec::new(),
+                    expectation: String::new(),
+                })
+                .await;
+            assert!(r.outcome.ok);
+            assert!(r.notices.is_empty());
+        }
+        let r = root
+            .run_report(ToolInvocation {
+                skill: &Echo,
+                args,
+                raw_args: Vec::new(),
+                expectation: String::new(),
+            })
+            .await;
+        assert!(r.outcome.ok, "the reminder advises, never blocks");
+        assert_eq!(r.notices.len(), 1);
+        assert!(r.notices[0].contains("3 times"));
     }
 
     #[tokio::test]

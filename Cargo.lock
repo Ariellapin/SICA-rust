@@ -922,6 +922,7 @@ dependencies = [
  "futures",
  "image",
  "interprocess",
+ "llm",
  "notify",
  "notify-debouncer-mini",
  "parking_lot",
