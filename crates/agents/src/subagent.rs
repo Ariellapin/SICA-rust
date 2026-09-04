@@ -23,6 +23,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use protocol::Event;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use llm::client::{ChatMessage, LlmClient};
@@ -73,6 +74,15 @@ pub struct ToolSubAgent {
     pub events:        Arc<dyn EventSink>,
     pub failure_sink:  Option<Arc<dyn ToolFailureSink>>,
     pub summarizer:    Option<LlmClient>,
+    /// Fired by `InterruptTurn`. A tool call is the long pole of a turn — the
+    /// skill itself, plus a summarizer round-trip that is a whole second LLM
+    /// request — so without this the model keeps working long after the user
+    /// pressed Stop. Both stages race the token and abandon their work.
+    pub cancel:        Option<CancellationToken>,
+    /// Sub-directory under `spill_dir` for this call chain's oversized
+    /// outputs — the session id in production. `None` disables spilling
+    /// (raw output passes through), which is what test doubles want.
+    pub spill_label:   Option<String>,
 }
 
 impl ToolSubAgent {
@@ -84,7 +94,16 @@ impl ToolSubAgent {
             events,
             failure_sink: None,
             summarizer:   None,
+            cancel:       None,
+            spill_label:  None,
         }
+    }
+
+    /// Enable spill-to-file for outputs over `spill::SPILL_THRESHOLD`,
+    /// filed under `spill/<label>/`.
+    pub fn with_spill_label(mut self, label: impl Into<String>) -> Self {
+        self.spill_label = Some(label.into());
+        self
     }
 
     /// Attach a failure sink so any failed tool invocation (or one of its
@@ -102,9 +121,17 @@ impl ToolSubAgent {
         self
     }
 
+    /// Attach the turn's cancellation token so an interrupt unwinds this call
+    /// (and everything it spawns) instead of running to completion.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
     /// Build a child sub-agent rooted at the call id `parent_id`. Used by
     /// `SkillContext` so a skill can spawn further sub-agents. Inherits the
-    /// failure sink and summarizer so nested calls share configuration.
+    /// failure sink, summarizer and cancellation token so nested calls share
+    /// configuration and stop together.
     pub fn child(&self, parent_id: u64) -> Self {
         Self {
             depth:        self.depth.saturating_add(1),
@@ -113,7 +140,14 @@ impl ToolSubAgent {
             events:       self.events.clone(),
             failure_sink: self.failure_sink.clone(),
             summarizer:   self.summarizer.clone(),
+            cancel:       self.cancel.clone(),
+            spill_label:  self.spill_label.clone(),
         }
+    }
+
+    /// `true` once the turn this call belongs to has been interrupted.
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|t| t.is_cancelled())
     }
 
     /// Run one skill invocation. Emits the start/finish events with the
@@ -144,6 +178,16 @@ impl ToolSubAgent {
             return SkillOutcome {
                 ok: false,
                 summary: format!("sub-agent depth limit ({}) reached", self.max_depth),
+            };
+        }
+
+        // Interrupted before we even started: say nothing to the UI. Emitting
+        // a start event here would leave a chip spinning for a call that never
+        // ran.
+        if self.cancelled() {
+            return SkillOutcome {
+                ok: false,
+                summary: "interrupted before the tool call started".into(),
             };
         }
 
@@ -185,24 +229,74 @@ impl ToolSubAgent {
         });
 
         let ctx = SkillContext { sub: self.child(id) };
-        let mut outcome = skill.run(args, ctx).await;
+        // Race the skill against the interrupt and its own wall-clock budget.
+        // Dropping the skill future stops it at its next await point; a child
+        // process it owns dies with it only if the skill spawned it with
+        // `kill_on_drop`.
+        let limit = skill.timeout();
+        let timed = tokio::time::timeout(limit, skill.run(args, ctx));
+        let timed_out = || SkillOutcome {
+            ok: false,
+            summary: format!(
+                "`{}` timed out after {}s (pipeline limit) — the call was abandoned; \
+                 narrow the work or split it into smaller calls",
+                skill.name(),
+                limit.as_secs()
+            ),
+        };
+        let mut outcome = match &self.cancel {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => SkillOutcome {
+                    ok: false,
+                    summary: format!("`{}` interrupted", skill.name()),
+                },
+                res = timed => res.unwrap_or_else(|_| timed_out()),
+            },
+            None => timed.await.unwrap_or_else(|_| timed_out()),
+        };
+
+        // Oversized successful output goes to disk first; the model gets a
+        // head/tail digest naming the file. Runs before the summariser so a
+        // paraphrase is made from the digest, not from 200 KB of raw text.
+        let spilled = self.spill(skill.name(), id, &mut outcome);
 
         // Short outputs are passed through verbatim: the raw text is ground
         // truth, and every LLM rewrite is a chance to misquote it. Only
         // outputs too big to re-ingest are worth the lossy focused summary.
+        // Skipped outright on interrupt — the summary feeds the next hop, and
+        // there is no next hop.
         const SUMMARIZE_THRESHOLD: usize = 2000;
         if outcome.ok
+            && !self.cancelled()
             && !expectation.trim().is_empty()
             && outcome.summary.len() > SUMMARIZE_THRESHOLD
         {
             if let Some(client) = &self.summarizer {
-                match summarize(client, skill.name(), &expectation, &outcome.summary).await {
-                    Some(focused) => {
+                let focused = match &self.cancel {
+                    Some(token) => tokio::select! {
+                        biased;
+                        _ = token.cancelled() => None,
+                        s = summarize(client, skill.name(), &expectation, &outcome.summary) => s,
+                    },
+                    None => {
+                        summarize(client, skill.name(), &expectation, &outcome.summary).await
+                    }
+                };
+                match focused {
+                    Some(mut focused) => {
                         debug!(
                             tool_id = id,
                             skill = skill.name(),
                             "sub-agent: summarizer produced focused answer"
                         );
+                        // The summariser is free to drop the omission marker;
+                        // the path must survive so the model can still reach
+                        // the raw output.
+                        if let Some(path) = &spilled {
+                            focused.push('\n');
+                            focused.push_str(&crate::spill::pointer(path));
+                        }
                         outcome.summary = focused;
                     }
                     None => {
@@ -249,7 +343,9 @@ impl ToolSubAgent {
             summary: outcome.summary.clone(),
         });
 
-        if !outcome.ok {
+        // A user-initiated stop is not a defect: reporting it would spend an
+        // idealist ticket on "the operator pressed Stop".
+        if !outcome.ok && !self.cancelled() {
             if let Some(sink) = &self.failure_sink {
                 info!(
                     tool_id = id,
@@ -269,6 +365,56 @@ impl ToolSubAgent {
         }
 
         outcome
+    }
+
+    /// Spill an oversized successful outcome to disk and replace its summary
+    /// with the digest. Returns the file path when it happened. `read-file`
+    /// is exempt so the model's follow-up read of a spill file cannot spill
+    /// again. A write failure keeps the raw summary — spilling is an
+    /// optimisation, never a reason to fail a call that succeeded.
+    fn spill(&self, skill_name: &str, id: u64, outcome: &mut SkillOutcome) -> Option<std::path::PathBuf> {
+        let label = self.spill_label.as_deref()?;
+        if !outcome.ok
+            || self.cancelled()
+            || skill_name == crate::builtins::READ_FILE_NAME
+            || outcome.summary.len() <= crate::spill::SPILL_THRESHOLD
+        {
+            return None;
+        }
+        let base = sica_core::paths::spill_dir();
+        match crate::spill::write(&base, label, skill_name, id, &outcome.summary) {
+            Ok(path) => {
+                info!(
+                    tool_id = id,
+                    skill = skill_name,
+                    bytes = outcome.summary.len(),
+                    path = %path.display(),
+                    "sub-agent: output spilled to disk"
+                );
+                self.events.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: format!(
+                        "sub-agent[depth={}, id={}] `{}` output ({} bytes) spilled to {}",
+                        self.depth,
+                        id,
+                        skill_name,
+                        outcome.summary.len(),
+                        path.display()
+                    ),
+                });
+                outcome.summary = crate::spill::digest(&outcome.summary, &path);
+                Some(path)
+            }
+            Err(e) => {
+                warn!(
+                    tool_id = id,
+                    skill = skill_name,
+                    error = %e,
+                    "sub-agent: spill write failed — keeping raw output"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -427,6 +573,80 @@ mod tests {
         let out = root.run(inv(&Echo)).await;
         assert!(out.ok);
         assert!(failures.0.lock().unwrap().is_empty());
+    }
+
+    /// Sleeps far longer than its own declared timeout.
+    struct Slow;
+    #[async_trait]
+    impl Skill for Slow {
+        fn name(&self) -> &str { "slow" }
+        fn timeout(&self) -> std::time::Duration { std::time::Duration::from_millis(10) }
+        async fn run(&self, _args: Value, _ctx: SkillContext) -> SkillOutcome {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            SkillOutcome { ok: true, summary: "finished".into() }
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_fails_the_call_and_reports_to_sink() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let failures = Arc::new(CaptureFailures(Mutex::new(Vec::new())));
+        let root = ToolSubAgent::root(cap.clone()).with_failure_sink(failures.clone());
+        let out = root.run(inv(&Slow)).await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("timed out"), "{}", out.summary);
+        let reports = failures.0.lock().unwrap();
+        assert_eq!(reports.len(), 1, "a timeout is a defect worth a ticket");
+        let events = lifecycle(&cap.0.lock().unwrap());
+        assert!(matches!(events[1], Event::ToolCallFinished { ok: false, .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_beats_timeout_and_is_not_reported() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let failures = Arc::new(CaptureFailures(Mutex::new(Vec::new())));
+        let token = CancellationToken::new();
+        token.cancel();
+        let root = ToolSubAgent::root(cap.clone())
+            .with_failure_sink(failures.clone())
+            .with_cancel(token);
+        let out = root.run(inv(&Slow)).await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("interrupted"), "{}", out.summary);
+        assert!(failures.0.lock().unwrap().is_empty());
+    }
+
+    /// Returns a payload well over the spill threshold.
+    struct Firehose;
+    #[async_trait]
+    impl Skill for Firehose {
+        fn name(&self) -> &str { "firehose" }
+        async fn run(&self, _args: Value, _ctx: SkillContext) -> SkillOutcome {
+            SkillOutcome { ok: true, summary: "z".repeat(crate::spill::SPILL_THRESHOLD + 1) }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_output_is_spilled_when_labelled() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let label = format!("test-{}-{}", std::process::id(), next_tool_id());
+        let root = ToolSubAgent::root(cap.clone()).with_spill_label(label.clone());
+        let out = root.run(inv(&Firehose)).await;
+        assert!(out.ok);
+        assert!(out.summary.len() < crate::spill::SPILL_THRESHOLD);
+        assert!(out.summary.contains("bytes omitted"), "{}", out.summary);
+        let dir = sica_core::paths::spill_dir().join(&label);
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn oversized_output_passes_through_without_label() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let root = ToolSubAgent::root(cap.clone());
+        let out = root.run(inv(&Firehose)).await;
+        assert_eq!(out.summary.len(), crate::spill::SPILL_THRESHOLD + 1);
     }
 
     #[tokio::test]

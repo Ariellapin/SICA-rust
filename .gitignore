@@ -15,3 +15,9 @@ Thumbs.db
 /sica-settings/
 idealist_workspace/*.md
 sessions/*.*
+
+# Oversized tool outputs the sub-agent spilled to disk (see agents::spill).
+spill/
+
+# model-eval reports — regenerated on every run.
+evals/reports/

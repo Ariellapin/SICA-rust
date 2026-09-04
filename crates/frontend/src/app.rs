@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use protocol::{LlmState, Request, SessionDump, SessionMeta, Severity, UserImage};
+use protocol::{CatalogEntry, LlmState, Request, SessionDump, SessionMeta, Severity, UserImage};
 use sica_core::theme::Palette;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -96,7 +96,27 @@ pub struct App {
 
 pub struct TokenMeter {
     pub used:  AtomicU32,
+    /// The model's full context window.
     pub limit: AtomicU32,
+    /// Slice of `limit` available to the prompt (window minus the reply
+    /// reserve). Denominator of the status-bar percentage, and the number the
+    /// backend's auto-compaction triggers on. Zero until the first turn
+    /// reports it.
+    pub budget: AtomicU32,
+}
+
+impl TokenMeter {
+    /// Prompt-budget occupancy in percent, clamped to 100. `None` while no
+    /// turn has reported a budget yet, so the status bar can render a dash
+    /// instead of a misleading 0%.
+    pub fn pct(&self) -> Option<u32> {
+        let budget = self.budget.load(Ordering::Relaxed);
+        if budget == 0 {
+            return None;
+        }
+        let used = self.used.load(Ordering::Relaxed);
+        Some(((u64::from(used) * 100 / u64::from(budget)) as u32).min(100))
+    }
 }
 
 #[derive(Clone)]
@@ -279,6 +299,36 @@ pub struct ChatState {
     /// middle click over the transcript, cleared by any other click or Esc.
     /// While set, vertical pointer displacement from the anchor scrolls.
     pub middle_scroll_origin: Option<egui::Pos2>,
+    /// `true` between sending `InterruptTurn` and the BE confirming the turn
+    /// is over. Interrupting mid-tool-call is not instant — the skill and any
+    /// summarizer round-trip still have to unwind — so the UI reports
+    /// "Stopping…" rather than pretending the work already ended.
+    pub interrupt_requested: bool,
+    /// `true` while the backend is summarising older history to free context.
+    /// Surfaced as a "COMPRESSING" marker in the status bar; the finished
+    /// result lands in the transcript as a [`Notice`].
+    pub compacting: bool,
+    /// The "/" palette that opens when the draft starts with a slash.
+    pub slash: SlashState,
+}
+
+/// State of the "/" palette in the composer. The catalogue is pulled once per
+/// IPC connection (`Request::ListCatalog`); everything else here is per-keystroke
+/// picker state.
+#[derive(Default)]
+pub struct SlashState {
+    /// Skills, markdown agents and markdown commands the BE reported. The
+    /// frontend's own app commands (`/new`, `/stop`, …) are appended by the
+    /// palette at draw time and never travel over the wire.
+    pub entries: Vec<CatalogEntry>,
+    /// Index of the highlighted row within the *filtered* list.
+    pub selected: usize,
+    /// Query the highlight belongs to. When the query changes the highlight
+    /// snaps back to the first row instead of pointing at an unrelated entry.
+    pub last_query: String,
+    /// Set by Esc: hides the list without discarding what was typed. Cleared
+    /// as soon as the query changes, so typing brings the list back.
+    pub dismissed: bool,
 }
 
 /// One image the user has attached, ready to send. `texture` is materialised
@@ -329,6 +379,41 @@ pub struct Turn {
     /// assistant-only or tool-only turns). Each `Attachment` lazily uploads
     /// its bytes as an egui texture the first time it's rendered.
     pub images:             Vec<Attachment>,
+    /// When `Some`, this entry is not a message at all but an out-of-band
+    /// transcript marker (today: the auto-compaction record). It renders as a
+    /// centred caps line and every other field stays empty.
+    pub notice:             Option<Notice>,
+}
+
+impl Turn {
+    /// A marker entry in the transcript. `turn_id` is 0 — notices are not
+    /// turns the backend knows about, and nothing correlates against them.
+    pub fn marker(session_id: u64, notice: Notice) -> Self {
+        Self {
+            session_id,
+            turn_id: 0,
+            user: String::new(),
+            assistant: String::new(),
+            reasoning: String::new(),
+            finished: true,
+            finish_reason: None,
+            tool_chips: Vec::new(),
+            reasoning_collapsed: true,
+            images: Vec::new(),
+            notice: Some(notice),
+        }
+    }
+}
+
+/// Out-of-band transcript marker. `detail` is the hover text — for a
+/// compaction that is the summary the model wrote, so the user can read
+/// exactly what replaced their history.
+#[derive(Clone)]
+pub struct Notice {
+    pub label:  String,
+    pub detail: String,
+    /// `false` tints the marker with the danger colour (the operation failed).
+    pub ok:     bool,
 }
 
 /// In-history attachment, owned by a `Turn`. Mirrors `PendingAttachment` but
@@ -430,8 +515,9 @@ impl App {
                 ..ChatState::default()
             },
             tokens: Arc::new(TokenMeter {
-                used:  AtomicU32::new(0),
-                limit: AtomicU32::new(24_000),
+                used:   AtomicU32::new(0),
+                limit:  AtomicU32::new(24_000),
+                budget: AtomicU32::new(0),
             }),
             palette,
             workspace_name: sica_core::paths::workspace_root()
@@ -646,6 +732,8 @@ impl App {
         self.chat.selected_turn = None;
         self.chat.autoscroll_paused = false;
         self.chat.middle_scroll_origin = None;
+        self.chat.interrupt_requested = false;
+        self.chat.compacting = false;
         self.send(UiCommand::SendRequest(Request::LoadSession { session_id: id }));
     }
 
@@ -666,9 +754,20 @@ impl App {
         }
     }
 
-    /// Find the active turn (last unfinished, else last) and return a mutable ref.
+    /// Ask the BE to abandon the in-flight turn for the active session, and
+    /// flag the UI as stopping until the BE confirms with `TurnFinished`.
+    /// Idempotent — pressing Stop twice sends twice, which the BE tolerates.
+    pub fn interrupt_turn(&mut self) {
+        let session_id = self.chat.session_id;
+        self.chat.interrupt_requested = true;
+        self.send(UiCommand::SendRequest(Request::InterruptTurn { session_id }));
+    }
+
+    /// Find the active turn and return a mutable ref. Marker entries (context
+    /// notices) are skipped — a notice pushed between turns must never absorb
+    /// the next stream's deltas.
     fn active_turn_mut(&mut self) -> Option<&mut Turn> {
-        self.chat.turns.last_mut()
+        self.chat.turns.iter_mut().rev().find(|t| t.notice.is_none())
     }
 
     fn drain_events(&mut self) {
@@ -730,6 +829,10 @@ impl App {
                 // Pull the session list so the sidebar can populate. If the
                 // BE has none yet, the SessionList handler will create one.
                 self.send(UiCommand::SendRequest(Request::ListSessions));
+                // Refresh the "/" palette: skills and markdown files are read
+                // by the BE at startup, so a reconnect is exactly when the
+                // catalogue can have changed.
+                self.send(UiCommand::SendRequest(Request::ListCatalog));
             }
             UiEvent::IpcDisconnected { error } => {
                 self.ipc_state.connected = false;
@@ -807,6 +910,7 @@ impl App {
                     tool_chips: Vec::new(),
                     reasoning_collapsed: false,
                     images: Vec::new(),
+                    notice: None,
                 });
                 self.chat.scroll_to_bottom = true;
             }
@@ -823,11 +927,52 @@ impl App {
                     t.finish_reason = Some(finish_reason);
                     t.reasoning_collapsed = true;
                 }
+                self.chat.interrupt_requested = false;
                 self.chat.scroll_to_bottom = true;
             }
-            UiEvent::TokenUsage { used, limit, .. } => {
+            UiEvent::TokenUsage { used, limit, budget, .. } => {
                 self.tokens.used.store(used, Ordering::Relaxed);
                 self.tokens.limit.store(limit, Ordering::Relaxed);
+                self.tokens.budget.store(budget, Ordering::Relaxed);
+            }
+            UiEvent::ContextCompacting { session_id } => {
+                if session_id == self.chat.session_id {
+                    self.chat.compacting = true;
+                }
+                self.push_log(
+                    LogKind::Event,
+                    "context: compressing older history to free window space…".into(),
+                );
+            }
+            UiEvent::ContextCompacted {
+                session_id, ok, folded, before_tokens, after_tokens, summary,
+            } => {
+                if session_id == self.chat.session_id {
+                    self.chat.compacting = false;
+                }
+                let label = if ok {
+                    let saved = before_tokens.saturating_sub(after_tokens);
+                    format!(
+                        "Context compressed · {folded} messages → summary · \
+                         {before_tokens} → {after_tokens} tokens (−{saved})"
+                    )
+                } else {
+                    "Context compression failed · oldest messages will be trimmed instead"
+                        .to_string()
+                };
+                self.push_log(
+                    if ok { LogKind::Event } else { LogKind::Error },
+                    format!("context: {label}"),
+                );
+                // Only the active session's transcript is on screen; a notice
+                // for a background session would land in the wrong scrollback.
+                if session_id == self.chat.session_id {
+                    self.chat.turns.push(Turn::marker(
+                        session_id,
+                        Notice { label, detail: summary, ok },
+                    ));
+                    self.chat.scroll_to_bottom = true;
+                }
             }
             UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
                 if let Some(t) = self.active_turn_mut() {
@@ -907,6 +1052,13 @@ impl App {
                 self.chat.turns = rebuild_turns(&session);
                 self.chat.scroll_to_bottom = true;
             }
+            UiEvent::Catalog { entries } => {
+                self.push_log(
+                    LogKind::Event,
+                    format!("catalog: {} entries available to the / palette", entries.len()),
+                );
+                self.chat.slash.entries = entries;
+            }
             UiEvent::SessionTitleChanged { session_id, title } => {
                 if let Some(s) = self.chat.sessions.iter_mut().find(|s| s.id == session_id) {
                     s.title = title;
@@ -938,9 +1090,14 @@ pub fn rgb(c: sica_core::theme::Rgb) -> egui::Color32 {
 
 /// Rebuild a `Vec<Turn>` from a session's persisted message list. Walks the
 /// messages, pairing each user message with the assistant message that
-/// follows it (if any). System/tool roles are skipped — they aren't shown
-/// in the chat panel today. Tool chips are not reconstructed: `Message`
-/// has no tool-call field, so this is a known v1 limitation.
+/// follows it (if any). System messages are skipped — except the
+/// auto-compaction summary, which becomes a marker so a reloaded session
+/// shows where its history was compressed instead of just starting
+/// abruptly. Tool-role messages whose dump carries `tool_name` (recovered
+/// from the backend's event log) become finished chips on the current turn;
+/// tool messages migrated from the pre-event-log format have no such
+/// metadata and are skipped. `context`-role messages (harness-injected) are
+/// markers when they are a `/name` load, otherwise omitted.
 fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut current: Option<Turn> = None;
@@ -961,6 +1118,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     tool_chips: Vec::new(),
                     reasoning_collapsed: true,
                     images: m.images.iter().map(Attachment::from_user_image).collect(),
+                    notice: None,
                 });
             }
             "assistant" => {
@@ -975,11 +1133,68 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     tool_chips: Vec::new(),
                     reasoning_collapsed: true,
                     images: Vec::new(),
+                    notice: None,
                 });
                 slot.assistant = m.content.clone();
                 if let Some(r) = &m.reasoning {
                     slot.reasoning = r.clone();
                 }
+            }
+            "tool" => {
+                let Some(name) = m.tool_name.clone() else { continue };
+                let Some(slot) = current.as_mut() else { continue };
+                // Synthetic id: no live `ToolCallFinished` will ever look it
+                // up, and chips only need ids to be distinct within a turn.
+                let id = u64::MAX - slot.tool_chips.len() as u64;
+                slot.tool_chips.push(ToolChip {
+                    id,
+                    parent_id: None,
+                    depth: 0,
+                    name: name.clone(),
+                    args_preview: m.tool_args_preview.clone().unwrap_or(name),
+                    expectation: m.tool_expectation.clone().unwrap_or_default(),
+                    finished: true,
+                    ok: m.tool_ok.unwrap_or(true),
+                    summary: m.content.clone(),
+                });
+            }
+            "system" if m.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX) => {
+                if let Some(t) = current.take() {
+                    turns.push(t);
+                }
+                turns.push(Turn::marker(
+                    session.id,
+                    Notice {
+                        label: "Context compressed · earlier messages folded into a summary"
+                            .into(),
+                        detail: m.content.clone(),
+                        ok: true,
+                    },
+                ));
+            }
+            // Harness-injected context. A `/name` load precedes the user
+            // message it belongs to, so it becomes a marker between turns
+            // with the loaded body on hover. Anything else (a loop-guard
+            // notice mid-turn) is left out of the transcript rather than
+            // split a turn in two — the log panel already showed it live.
+            "context" if m.content.starts_with("<skill_content") => {
+                if let Some(t) = current.take() {
+                    turns.push(t);
+                }
+                let name = m
+                    .content
+                    .split_once("name=\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(n, _)| n.to_string())
+                    .unwrap_or_default();
+                turns.push(Turn::marker(
+                    session.id,
+                    Notice {
+                        label: format!("Loaded /{name} · instructions injected for the next message"),
+                        detail: m.content.clone(),
+                        ok: true,
+                    },
+                ));
             }
             _ => {}
         }

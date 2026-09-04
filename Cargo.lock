@@ -40,16 +40,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "llm",
  "once_cell",
  "protocol",
+ "regex",
  "serde",
  "serde_json",
  "sica-core",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -175,6 +179,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "bytes",
+ "chrono",
  "futures",
  "idealist",
  "interprocess",
@@ -1685,6 +1690,7 @@ dependencies = [
  "anyhow",
  "eventsource-stream",
  "futures",
+ "http",
  "once_cell",
  "protocol",
  "regex",

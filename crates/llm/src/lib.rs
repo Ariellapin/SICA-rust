@@ -1,6 +1,7 @@
 //! LLM HTTP client (llama.cpp-compatible OpenAI API), streaming, tokenize, state machine.
 
 pub mod client;
+pub mod retry;
 pub mod state;
 pub mod streaming;
 pub mod tokenize;

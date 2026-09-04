@@ -6,7 +6,18 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 11;
+
+/// Prompt-budget occupancy (percent) at which the backend folds older history
+/// into an LLM-written summary instead of letting the trimmer amputate it.
+/// Shared so the frontend can tint the status-bar meter at exactly the point
+/// the backend acts.
+pub const COMPACT_TRIGGER_PCT: u32 = 95;
+
+/// Prefix the backend stamps on the system message that replaces compacted
+/// history. Shared so the frontend can recognise it when rebuilding a
+/// transcript from disk and render it as a marker rather than dropping it.
+pub const CONTEXT_SUMMARY_PREFIX: &str = "[context summary";
 
 /// Tunables the frontend passes along with `ConnectLlm`. Kept as a struct so
 /// adding a knob later is one field, not a new request variant.
@@ -17,13 +28,19 @@ pub struct LlmOptions {
     /// Per-response completion cap. `None` = let the server decide.
     pub max_tokens: Option<u32>,
     /// Prompt-window budget used for history trimming and the token meter.
-    /// `None` = auto-detect from the server (vLLM `max_model_len`,
+    /// `None` = auto-detect from the server (llama.cpp `/props` `n_ctx`,
+    /// i.e. the launched `--ctx-size`, then vLLM `max_model_len` /
     /// llama.cpp `n_ctx_train`), falling back to 24k.
     pub context_window: Option<u32>,
     /// Use the OpenAI-native `tools` / `tool_calls` API instead of the
     /// text-protocol tool calling. Requires a server + template with tool
     /// support (e.g. vLLM with `--enable-auto-tool-choice`).
     pub native_tools: bool,
+    /// Let the model emit reasoning (`<think>` blocks). When off, requests
+    /// carry `chat_template_kwargs: {"enable_thinking": false}` so servers
+    /// that template the toggle (llama.cpp, vLLM/Qwen) skip reasoning
+    /// entirely — faster replies at some quality cost.
+    pub thinking: bool,
 }
 
 impl Default for LlmOptions {
@@ -33,6 +50,7 @@ impl Default for LlmOptions {
             max_tokens: None,
             context_window: None,
             native_tools: false,
+            thinking: true,
         }
     }
 }
@@ -41,7 +59,7 @@ impl Default for LlmOptions {
 /// base64-encoded (no `data:` URL prefix). `mime` is the MIME type, e.g.
 /// `image/png`, `image/jpeg`. Used both on the wire (`SendUserMessage`) and
 /// in persisted session storage (via `sica_core::message::Message`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserImage {
     pub mime: String,
     pub data_base64: String,
@@ -88,6 +106,10 @@ pub enum Request {
     ConnectLlm    { base_url: String, model: String, api_key: Option<String>, options: LlmOptions },
     DisconnectLlm,
 
+    /// Everything the workspace can offer the "/" palette: the live skill
+    /// registry plus the markdown-defined agents and commands on disk.
+    ListCatalog,
+
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
 }
@@ -102,6 +124,35 @@ pub enum Response {
     SessionList    { sessions: Vec<SessionMeta> },
     SessionCreated { id: u64 },
     SessionLoaded  { session: SessionDump },
+    Catalog        { entries: Vec<CatalogEntry> },
+}
+
+/// Which family a [`CatalogEntry`] belongs to. Drives the group headings in
+/// the frontend's "/" palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CatalogKind {
+    /// A callable skill from the live `SkillRegistry` — the Rust built-ins
+    /// plus every `skills/*.md`.
+    Skill,
+    /// A markdown persona from `agents/*.md`.
+    Agent,
+    /// A markdown prompt from `commands/*.md`. The frontend's own app actions
+    /// (`/new`, `/stop`, …) share this kind but never travel over the wire.
+    Command,
+}
+
+/// One selectable row in the "/" palette.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub kind:        CatalogKind,
+    pub name:        String,
+    pub description: String,
+    /// Ordered positional argument names, as declared by the skill or by the
+    /// file's `positional:` frontmatter. Empty when the entry takes none.
+    pub args:        Vec<String>,
+    /// Display path of the file backing this entry, when there is one. Shown
+    /// as the row's hover text so the user can find the file to edit.
+    pub source:      Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +180,17 @@ pub struct MessageDump {
     pub reasoning: Option<String>,
     #[serde(default)]
     pub images: Vec<UserImage>,
+    /// On `tool`-role messages: the skill that ran, recovered from the
+    /// session's event log so a reloaded transcript can rebuild its tool
+    /// chips. `None` for messages migrated from the pre-event-log format.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_ok: Option<bool>,
+    #[serde(default)]
+    pub tool_args_preview: Option<String>,
+    #[serde(default)]
+    pub tool_expectation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +242,32 @@ pub enum Event {
     SessionTitleChanged { session_id: u64, title: String },
 
     // Live token meter (fixes the stale-meter bug from Python).
-    TokenUsage { session_id: u64, used: u32, limit: u32 },
+    //
+    // `used` is prompt + generated-so-far, `limit` is the model's full context
+    // window, and `budget` is the slice of that window available to the prompt
+    // (window minus the reply reserve) — the denominator auto-compaction
+    // measures against, and the one the status-bar percentage uses.
+    TokenUsage { session_id: u64, used: u32, limit: u32, budget: u32 },
+
+    /// Auto-compaction started: the assembled prompt crossed
+    /// [`COMPACT_TRIGGER_PCT`] of the prompt budget and the older half of the
+    /// history is being summarised.
+    ContextCompacting { session_id: u64 },
+
+    /// Auto-compaction finished. On success `folded` messages were replaced by
+    /// a single summary message and the history shrank from `before_tokens` to
+    /// `after_tokens` (approximate counts, history only — the system preamble
+    /// is not included). On failure (`ok == false`) history was left untouched
+    /// and the trimmer takes over as the backstop.
+    ContextCompacted {
+        session_id:    u64,
+        ok:            bool,
+        folded:        u32,
+        before_tokens: u32,
+        after_tokens:  u32,
+        /// The summary the compactor wrote; empty when `ok == false`.
+        summary:       String,
+    },
 
     // Tool-call / sub-agent UI events. Nested calls inherit parent_id.
     //
@@ -268,7 +355,12 @@ mod tests {
 
     #[test]
     fn roundtrip_token_usage() {
-        let f = Frame::event(Event::TokenUsage { session_id: 1, used: 1234, limit: 24000 });
+        let f = Frame::event(Event::TokenUsage {
+            session_id: 1,
+            used: 1234,
+            limit: 24000,
+            budget: 19392,
+        });
         let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();
         matches!(back.payload, Payload::Event(Event::TokenUsage { .. }));
@@ -287,6 +379,30 @@ mod tests {
         let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();
         matches!(back.payload, Payload::Event(Event::ToolCallStarted { .. }));
+    }
+
+    #[test]
+    fn roundtrip_catalog() {
+        let f = Frame::response(
+            11,
+            Response::Catalog {
+                entries: vec![CatalogEntry {
+                    kind:        CatalogKind::Skill,
+                    name:        "read-file".into(),
+                    description: "read a UTF-8 file".into(),
+                    args:        vec!["path".into()],
+                    source:      Some("skills/read-file.md".into()),
+                }],
+            },
+        );
+        let bytes = f.encode().unwrap();
+        let back = Frame::decode(&bytes).unwrap();
+        let Payload::Response(Response::Catalog { entries }) = back.payload else {
+            panic!("expected Catalog response");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, CatalogKind::Skill);
+        assert_eq!(entries[0].args, vec!["path".to_string()]);
     }
 
     #[test]

@@ -77,6 +77,70 @@ pub fn extract_known(text: &str, is_known: impl Fn(&str) -> bool) -> Option<Tool
     None
 }
 
+/// True when `text` contains a shape the model commonly *thinks* is a tool
+/// call but this parser does not accept. Callers use it to surface the
+/// silent-drop case instead of treating the reply as ordinary prose. Kept
+/// conservative: the explicit ```tool_call fence, and the OpenAI-ish
+/// `"skill": … "args": …` JSON pair.
+pub fn looks_like_attempt(text: &str) -> bool {
+    if text.contains("```tool_call") {
+        return true;
+    }
+    let has_skill_key = text.contains("\"skill\"") || text.contains("'skill'");
+    let has_args_key  = text.contains("\"args\"")  || text.contains("'args'");
+    has_skill_key && has_args_key
+}
+
+/// Explain, in one human-readable clause, why a reply that produced no
+/// parsable tool call still looks like an attempt at one. `None` means the
+/// reply is ordinary prose and the model simply chose not to call a tool.
+///
+/// Only meaningful *after* [`extract_known`] returned `None` for the same
+/// text and predicate. The natural-language branch is deliberately narrow:
+/// the line must start with a **registered** skill name and still carry a
+/// quote or a `>`, so prose like "read-file is the skill you want" is not
+/// mistaken for a botched call.
+pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<String> {
+    if text.contains("```tool_call") {
+        return Some(
+            "a ```tool_call fence whose body the parser could not read \
+             (malformed JSON, or missing `skill`/`args` keys)"
+                .into(),
+        );
+    }
+    for line in text.lines() {
+        let trimmed = strip_fence_indent(line);
+        let Some((name, rest)) = take_skill_name(trimmed) else { continue };
+        if !is_known(&name) {
+            continue;
+        }
+        // Without one of these the line is prose that merely happens to open
+        // with a skill name.
+        if !rest.contains('\'') && !rest.contains('"') && !rest.contains('>') {
+            continue;
+        }
+        if split_on_expectation(rest.trim_start()).is_none() {
+            // Either there is genuinely no ` > ` clause, or an unclosed quote
+            // swallowed it — indistinguishable from here, and the fix the
+            // model needs is the same either way.
+            return Some(format!(
+                "a `{name}` line with no ` > <expectation>` part \
+                 (or an unclosed quote before it)"
+            ));
+        }
+        return Some(format!(
+            "a `{name}` line whose arguments are not correctly quoted"
+        ));
+    }
+    if looks_like_attempt(text) {
+        return Some(
+            "a JSON object with `skill`/`args` keys outside a ```tool_call fence"
+                .into(),
+        );
+    }
+    None
+}
+
 /// Scan `text` for the first ```tool_call``` fenced block and parse its body
 /// as JSON. Returns `None` if no such fence exists, the JSON is malformed,
 /// or the required `skill` / `args` keys are missing.
@@ -448,6 +512,52 @@ mod tests {
         let tc = extract(s).unwrap();
         assert!(tc.args_json.is_some());
         assert_eq!(tc.args_json.unwrap()["command"], "a");
+    }
+
+    #[test]
+    fn rejected_attempt_flags_missing_expectation() {
+        let known = |n: &str| n == "read-file";
+        // The single most common miscall: quoted arg, no ` > ` clause. The
+        // parser drops it, and without this the caller would treat the reply
+        // as a finished answer about a file it never opened.
+        let reason = rejected_attempt("read-file 'README.md'", known).unwrap();
+        assert!(reason.contains("read-file"), "{reason}");
+        assert!(reason.contains("expectation"), "{reason}");
+    }
+
+    #[test]
+    fn rejected_attempt_flags_unreadable_fence() {
+        let reason = rejected_attempt("```tool_call\n{ not json\n```", |_| true).unwrap();
+        assert!(reason.contains("tool_call"), "{reason}");
+    }
+
+    #[test]
+    fn rejected_attempt_ignores_prose_and_unknown_skills() {
+        let known = |n: &str| n == "read-file";
+        // Prose that merely opens with a skill name.
+        assert!(rejected_attempt("read-file is the skill you want here.", known).is_none());
+        // Ordinary prose.
+        assert!(rejected_attempt("The workspace has seven crates.", known).is_none());
+        // Shaped like a call, but for a skill nobody registered.
+        assert!(rejected_attempt("frobnicate 'a.md'", known).is_none());
+    }
+
+    #[test]
+    fn rejected_attempt_flags_unbalanced_quotes() {
+        let known = |n: &str| n == "run-cli";
+        // The unclosed quote swallows the ` > ` separator, so this lands in
+        // the same bucket as a missing expectation — deliberately, since the
+        // correction the model needs is identical.
+        let reason = rejected_attempt("run-cli 'cargo test > report the failures", known).unwrap();
+        assert!(reason.contains("run-cli"), "{reason}");
+        assert!(reason.contains("quote"), "{reason}");
+    }
+
+    #[test]
+    fn looks_like_attempt_matches_fence_and_json_pair() {
+        assert!(looks_like_attempt("```tool_call\n{}\n```"));
+        assert!(looks_like_attempt(r#"{ "skill": "run-cli", "args": {} }"#));
+        assert!(!looks_like_attempt("no tools here"));
     }
 
     #[test]

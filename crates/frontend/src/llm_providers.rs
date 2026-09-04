@@ -33,10 +33,19 @@ pub struct ProviderConfig {
     /// Requires server-side tool support (e.g. vLLM `--enable-auto-tool-choice`).
     #[serde(default)]
     pub native_tools: bool,
+    /// Let the model emit `<think>` reasoning. Off sends
+    /// `chat_template_kwargs: {"enable_thinking": false}` with every request,
+    /// which llama.cpp/vLLM template away (faster, terser answers).
+    #[serde(default = "default_thinking")]
+    pub thinking: bool,
 }
 
 fn default_temperature() -> f32 {
     0.2
+}
+
+fn default_thinking() -> bool {
+    true
 }
 
 impl ProviderConfig {
@@ -48,6 +57,7 @@ impl ProviderConfig {
             max_tokens: (self.max_tokens > 0).then_some(self.max_tokens),
             context_window: (self.context_window > 0).then_some(self.context_window),
             native_tools: self.native_tools,
+            thinking: self.thinking,
         }
     }
 }
@@ -125,6 +135,7 @@ fn defaults() -> Vec<ProviderConfig> {
         max_tokens: 0,
         context_window: 0,
         native_tools: false,
+        thinking: true,
     };
     vec![
         ProviderConfig {

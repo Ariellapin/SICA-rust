@@ -1,9 +1,9 @@
 //! "General" settings — appearance, startup, logging, idealist policy,
-//! skills folder. Each section opens with an italic-serif heading and a
-//! hairline rule; the "why" subtext under each control is muted italic
-//! serif.
+//! skills folder, slash-palette folders. Each section opens with an
+//! italic-serif heading and a hairline rule; the "why" subtext under each
+//! control is muted italic serif.
 
-use sica_core::paths::skills_dir;
+use sica_core::paths::{agents_dir, commands_dir, skills_dir};
 
 use crate::app::App;
 use crate::ui::widgets::{ghost_button, muted_italic, section_heading};
@@ -79,6 +79,33 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
+    ui.add_space(20.0);
+    section_heading(ui, &p, "Slash palette");
+    ui.label(muted_italic(
+        &p,
+        "Typing / in the composer lists every skill above, plus the markdown \
+         files in the two folders below and the built-in app commands \
+         (/new, /stop, /clear, /settings, /llm, /skills, /rebuild). Use ↑↓ to \
+         move, Enter to accept, Esc to dismiss. Agent and command files use the \
+         same frontmatter format as skills.",
+    ));
+    ui.add_space(6.0);
+    for (label, folder) in [("Agents", agents_dir()), ("Commands", commands_dir())] {
+        ui.horizontal(|ui| {
+            ui.label(format!("{label}: {}", folder.display()));
+            if ghost_button(ui, &p, "Open").clicked() {
+                if let Err(e) = std::fs::create_dir_all(&folder) {
+                    tracing::warn!(error = %e, "create palette dir failed");
+                }
+                if let Err(e) = open_in_explorer(&folder) {
+                    tracing::warn!(error = %e, "open palette folder failed");
+                }
+            }
+        });
+    }
+
+    ui.add_space(20.0);
+    section_heading(ui, &p, "Detected skills");
     let report = agents::md_skill::load_dir(&dir);
     ui.add_space(6.0);
     ui.label(muted_italic(

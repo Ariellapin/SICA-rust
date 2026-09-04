@@ -92,8 +92,82 @@ async fn main() -> Result<()> {
     println!("smoke: fib(10) -> {:?}", resp);
     assert!(matches!(resp, Response::FibResult { n: 10, value: 55 }), "expected fib(10)=55, got {:?}", resp);
 
+    // ListCatalog — the "/" palette's source of truth. The built-in skills are
+    // always registered, so a healthy BE can never answer with an empty list.
+    writer.send(Frame::request(3, Request::ListCatalog).encode()?.into()).await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 3 => break r,
+            _ => {}
+        }
+    };
+    let Response::Catalog { entries } = resp else {
+        anyhow::bail!("expected Catalog, got {resp:?}");
+    };
+    println!("smoke: catalog -> {} entries", entries.len());
+    for e in &entries {
+        println!("smoke:   {:?} /{} — {}", e.kind, e.name, e.description);
+    }
+    assert!(
+        entries.iter().any(|e| e.name == "read-file"),
+        "catalog missing the built-in read-file skill: {entries:?}"
+    );
+
+    // Session round-trip through the event-log store. A fresh session lives
+    // in memory only (nothing is written until its first user message), so
+    // this leaves no file behind in `sessions/`.
+    writer.send(Frame::request(5, Request::NewSession).encode()?.into()).await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 5 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionCreated { id: new_id } = resp else {
+        anyhow::bail!("expected SessionCreated, got {resp:?}");
+    };
+    println!("smoke: new session -> {new_id}");
+
+    writer.send(Frame::request(6, Request::ListSessions).encode()?.into()).await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 6 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionList { sessions } = resp else {
+        anyhow::bail!("expected SessionList, got {resp:?}");
+    };
+    println!("smoke: sessions -> {} listed", sessions.len());
+    assert!(
+        sessions.iter().any(|s| s.id == new_id),
+        "fresh session {new_id} missing from list: {sessions:?}"
+    );
+
+    writer.send(Frame::request(7, Request::LoadSession { session_id: new_id }).encode()?.into()).await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 7 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionLoaded { session } = resp else {
+        anyhow::bail!("expected SessionLoaded, got {resp:?}");
+    };
+    println!("smoke: load session -> id={} title={:?} messages={}", session.id, session.title, session.messages.len());
+    assert_eq!(session.id, new_id);
+    assert!(session.messages.is_empty(), "fresh session should have no messages");
+
     // Shutdown
-    writer.send(Frame::request(3, Request::Shutdown).encode()?.into()).await?;
+    writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;
     let _ = writer.get_mut().shutdown().await;
 
     // Wait for BE to exit

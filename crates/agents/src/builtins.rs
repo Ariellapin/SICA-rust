@@ -151,7 +151,7 @@ impl Skill for RunCli {
     fn description(&self) -> &str { RUN_CLI_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => return err("missing or empty `command` arg"),
@@ -170,24 +170,50 @@ impl Skill for RunCli {
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
+        run_shell(cmd, "cmd", &ctx).await
+    }
+}
 
-        let output = match timeout(CLI_TIMEOUT, cmd.output()).await {
-            Ok(Ok(o))  => o,
-            Ok(Err(e)) => return err(&format!("spawn: {e}")),
-            Err(_)     => return err(&format!("timeout after {}s", CLI_TIMEOUT.as_secs())),
-        };
+/// Spawn a prepared shell command, cap its streams, and report
+/// `exit=N` + stdout + stderr. Shared by `run-cli` and `run-pwsh`.
+///
+/// Process management: the child is `kill_on_drop` (a timeout or an
+/// `InterruptTurn` drops the future) *and*, on Windows, placed in a
+/// kill-on-close Job Object so the processes *it* started die with it —
+/// without that a timed-out `cmd /C npm install` leaves `node` running.
+/// `SICA_SESSION_ID` is set for scripts that want to know their caller.
+async fn run_shell(mut cmd: Command, exe: &str, ctx: &SkillContext) -> SkillOutcome {
+    if let Some(session) = &ctx.sub.spill_label {
+        cmd.env("SICA_SESSION_ID", session);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
 
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        truncate(&mut stdout, MAX_OUTPUT);
-        truncate(&mut stderr, MAX_OUTPUT);
-        let code = output.status.code().unwrap_or(-1);
-        SkillOutcome {
-            ok: output.status.success(),
-            summary: format!(
-                "exit={code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-            ),
-        }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return err(&format!("spawn {exe}: {e}")),
+    };
+    // Held until the child has finished: dropping it closes the job.
+    let _job = crate::proc::JobGuard::attach(&child);
+
+    let output = match timeout(CLI_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o))  => o,
+        Ok(Err(e)) => return err(&format!("wait {exe}: {e}")),
+        Err(_)     => return err(&format!("timeout after {}s", CLI_TIMEOUT.as_secs())),
+    };
+
+    let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    truncate(&mut stdout, MAX_OUTPUT);
+    truncate(&mut stderr, MAX_OUTPUT);
+    let code = output.status.code().unwrap_or(-1);
+    SkillOutcome {
+        ok: output.status.success(),
+        summary: format!(
+            "exit={code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        ),
     }
 }
 
@@ -199,7 +225,7 @@ impl Skill for RunPwsh {
     fn description(&self) -> &str { RUN_PWSH_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => return err("missing or empty `command` arg"),
@@ -230,24 +256,7 @@ impl Skill for RunPwsh {
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
-
-        let output = match timeout(CLI_TIMEOUT, cmd.output()).await {
-            Ok(Ok(o))  => o,
-            Ok(Err(e)) => return err(&format!("spawn {exe}: {e}")),
-            Err(_)     => return err(&format!("timeout after {}s", CLI_TIMEOUT.as_secs())),
-        };
-
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        truncate(&mut stdout, MAX_OUTPUT);
-        truncate(&mut stderr, MAX_OUTPUT);
-        let code = output.status.code().unwrap_or(-1);
-        SkillOutcome {
-            ok: output.status.success(),
-            summary: format!(
-                "exit={code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-            ),
-        }
+        run_shell(cmd, exe, &ctx).await
     }
 }
 
@@ -362,6 +371,11 @@ impl Skill for WriteFile {
 /// Drop `skills/<name>.md` for each built-in skill if absent — the loader
 /// reads them on startup so the LLM sees the contract alongside any user-
 /// authored skills. Never clobbers a file the user already edited.
+///
+/// `agent-team` is deliberately **not** seeded here: its doc file doubles as
+/// the on/off switch for the feature (see `team::AGENT_TEAM_SEED_MD` and the
+/// registration in `backend::main`), so seeding it would turn the feature on
+/// for everyone on first run.
 pub fn seed_defaults(skills_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(skills_dir)?;
     for (name, body) in [
@@ -401,14 +415,17 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(root.join(candidate))
 }
 
+/// Cap one output stream at `limit` bytes, keeping the head. The omission
+/// notice uses the shared `retain` wording so the model reads the same
+/// sentence here as on a spill digest or a pruned result.
 fn truncate(s: &mut String, limit: usize) {
-    if s.len() > limit {
-        let mut end = limit;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-        s.push_str("\n…[truncated]");
+    let window = sica_core::retain::head_only(s, limit);
+    if window.omitted != sica_core::retain::Omitted::None {
+        let marker = sica_core::retain::notice(
+            window.omitted,
+            "the stream was capped; narrow the command or redirect to a file",
+        );
+        *s = window.render(&marker);
     }
 }
 
@@ -494,6 +511,28 @@ mod tests {
         ).await;
         assert!(out.ok, "cli failed: {}", out.summary);
         assert!(out.summary.contains("hi"));
+        assert!(out.summary.starts_with("exit=0"));
+    }
+
+    #[tokio::test]
+    async fn cli_sees_session_id_when_labelled() {
+        let sink: std::sync::Arc<dyn crate::agent::EventSink> = std::sync::Arc::new(NullSink);
+        let ctx = SkillContext { sub: crate::ToolSubAgent::root(sink).with_spill_label("77") };
+        let command = if cfg!(windows) { "echo %SICA_SESSION_ID%" } else { "echo $SICA_SESSION_ID" };
+        let out = RunCli.run(json!({ "command": command }), ctx).await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("77"), "{}", out.summary);
+    }
+
+    #[test]
+    fn truncate_caps_with_shared_notice() {
+        let mut s = "x".repeat(100);
+        truncate(&mut s, 100);
+        assert_eq!(s.len(), 100, "at the limit nothing changes");
+        let mut s = "x".repeat(150);
+        truncate(&mut s, 100);
+        assert!(s.starts_with(&"x".repeat(100)));
+        assert!(s.contains("[… 50 bytes omitted; the stream was capped"), "{s}");
     }
 
     #[test]
@@ -504,6 +543,11 @@ mod tests {
             let p = dir.join(format!("{name}.md"));
             assert!(p.exists(), "expected {}", p.display());
         }
+        // `agent-team` is opt-in — seeding its doc would silently enable it.
+        assert!(
+            !dir.join(format!("{}.md", crate::team::AGENT_TEAM_NAME)).exists(),
+            "agent-team.md must not be seeded"
+        );
         // Tamper, re-seed: file must not be clobbered.
         let path = dir.join(format!("{RUN_CLI_NAME}.md"));
         std::fs::write(&path, "edited").unwrap();

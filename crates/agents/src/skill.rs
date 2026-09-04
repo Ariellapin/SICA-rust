@@ -1,7 +1,15 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::subagent::ToolSubAgent;
+
+/// Pipeline-level wall-clock limit applied to every skill that does not
+/// override [`Skill::timeout`]. Long enough for a slow local model to answer
+/// a summariser round-trip, short enough that a hung child process or a
+/// skill stuck on I/O cannot pin the turn open indefinitely.
+pub const DEFAULT_SKILL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct SkillOutcome {
@@ -40,6 +48,27 @@ pub trait Skill: Send + Sync {
     /// a sign the call was malformed).
     fn positional_args(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Wall-clock budget `ToolSubAgent` enforces around `run`. When it
+    /// elapses the skill future is dropped (a child process survives only
+    /// if the skill spawned it without `kill_on_drop`) and the call is
+    /// reported as a failed outcome the model can read. Never visible to
+    /// the model. Skills that legitimately run for minutes — anything that
+    /// drives its own LLM conversations — must override this.
+    fn timeout(&self) -> Duration {
+        DEFAULT_SKILL_TIMEOUT
+    }
+
+    /// Whether this skill's output is *instructions* the model should
+    /// follow (`true`) or *data* it fetched from somewhere — a file, a
+    /// command, the web — that may contain text posing as instructions
+    /// (`false`). Untrusted results are framed with
+    /// `sica_core::event::UNTRUSTED_NOTICE` in the derived history. The
+    /// default is the safe one; only a skill whose body *is* the
+    /// instruction (a markdown skill) should return `true`.
+    fn trusted(&self) -> bool {
+        false
     }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome;

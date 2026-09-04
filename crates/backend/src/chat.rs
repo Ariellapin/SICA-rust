@@ -1,20 +1,25 @@
 //! Chat session bookkeeping + LLM connection wiring used by the dispatcher.
+//!
+//! Sessions are append-only event logs ([`SessionLog`]); the history sent
+//! to the model is derived from them on every hop. Nothing in this module
+//! mutates a message list — every persistence site is an [`append_event`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use protocol::{Event, Frame, LlmOptions, LlmState, SessionMeta, UserImage};
+use protocol::{Event, Frame, LlmOptions, LlmState, MessageDump, SessionDump, SessionMeta, UserImage};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use agents::guard::RepeatTracker;
 use agents::{EventSink, SkillRegistry, ToolFailureSink, ToolSubAgent};
 use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
+use sica_core::event::{ContextSource, EventKind, SurfaceOp};
 use sica_core::message::{Message, Role};
-use sica_core::session::Session;
 
-use crate::sessions_store;
+use crate::sessions_store::{self, SessionLog};
 use crate::title_gen;
 
 /// Hard cap on tool hops within one user message. Stops a model from
@@ -30,9 +35,11 @@ pub fn default_title(id: u64) -> String {
     format!("Session {id}")
 }
 
+type Sessions = Arc<Mutex<HashMap<u64, SessionLog>>>;
+
 #[derive(Clone)]
 pub struct ChatHub {
-    pub sessions:      Arc<Mutex<HashMap<u64, Session>>>,
+    pub sessions:      Sessions,
     pub next_id:       Arc<AtomicU64>,
     pub next_turn:     Arc<AtomicU64>,
     pub llm:           Arc<Mutex<Option<LlmClient>>>,
@@ -57,7 +64,12 @@ pub struct ChatHub {
     pub llm_opts:      Arc<Mutex<LlmOptions>>,
     /// Effective prompt window (configured or auto-detected at connect).
     pub context_window: Arc<AtomicU32>,
+    /// Repeat-tool-reminder chain per session (`agents::guard`). Cleared
+    /// by every user message; consulted after every dispatched call.
+    pub repeat:        Arc<Mutex<HashMap<u64, RepeatTracker>>>,
 }
+
+type Repeats = Arc<Mutex<HashMap<u64, RepeatTracker>>>;
 
 /// Fallback prompt window when neither the user nor the server reports one.
 const DEFAULT_CONTEXT_WINDOW: u32 = 24_000;
@@ -83,12 +95,14 @@ impl ChatHub {
             next_marker:  Arc::new(AtomicU64::new(1)),
             llm_opts:     Arc::new(Mutex::new(LlmOptions::default())),
             context_window: Arc::new(AtomicU32::new(DEFAULT_CONTEXT_WINDOW)),
+            repeat:       Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Build a hub pre-populated with every session it can find on disk.
-    /// `next_id` is advanced past the largest existing id so newly minted
-    /// sessions never collide with restored ones.
+    /// Build a hub pre-populated with every session it can find on disk
+    /// (migrating legacy TOML files on the way). `next_id` is advanced past
+    /// the largest existing id so newly minted sessions never collide with
+    /// restored ones.
     pub fn new_loaded(
         out_tx: mpsc::UnboundedSender<Frame>,
         skills: Arc<SkillRegistry>,
@@ -114,21 +128,61 @@ impl ChatHub {
             .values()
             .map(|s| SessionMeta {
                 id: s.id,
-                title: s.title.clone(),
-                created_at: s.created_at,
+                title: s.title(),
+                created_at: s.created_at(),
             })
             .collect();
         out.sort_by_key(|s| s.created_at);
         out
     }
 
-    pub async fn load_session(&self, id: u64) -> Option<Session> {
-        self.sessions.lock().await.get(&id).cloned()
+    /// The wire dump the FE rebuilds a transcript from. Tool-role entries
+    /// carry the skill name / outcome recovered from their `ToolCall`
+    /// event so chips survive a reload, and their `content` is the raw
+    /// outcome text (what the live chip showed), not the fenced block the
+    /// model reads. Injected context goes out under the `context` role so
+    /// the FE never mistakes it for something the user typed.
+    pub async fn dump_session(&self, id: u64) -> Option<SessionDump> {
+        let g = self.sessions.lock().await;
+        let log = g.get(&id)?;
+        let messages = log
+            .derive_surface()
+            .into_iter()
+            .map(|e| {
+                let role = if e.context.is_some() {
+                    "context"
+                } else {
+                    role_to_str(e.message.role)
+                };
+                let (content, tool_name, tool_ok, tool_args_preview, tool_expectation) = match e.tool {
+                    Some(t) => (t.summary, Some(t.name), Some(t.ok), Some(t.args_preview), Some(t.expectation)),
+                    None => (e.message.content, None, None, None, None),
+                };
+                MessageDump {
+                    role: role.into(),
+                    content,
+                    reasoning: e.message.reasoning,
+                    images: e.message.images,
+                    tool_name,
+                    tool_ok,
+                    tool_args_preview,
+                    tool_expectation,
+                }
+            })
+            .collect();
+        Some(SessionDump {
+            id: log.id,
+            title: log.title(),
+            created_at: log.created_at(),
+            messages,
+        })
     }
 
+    /// Mint a session in memory only. It reaches disk with its first user
+    /// message, so an unused "new session" leaves no file behind.
     pub async fn create_session(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let s = Session::new(id, default_title(id));
+        let s = SessionLog::new(id, default_title(id));
         self.sessions.lock().await.insert(id, s);
         id
     }
@@ -165,10 +219,12 @@ impl ChatHub {
         let mut client = LlmClient::new(base_url.clone(), model.clone(), api_key);
         client.temperature = options.temperature;
         client.max_tokens = options.max_tokens;
+        client.thinking = options.thinking;
         match client.health().await {
             Ok(()) => {
                 // Prompt window: explicit setting wins; otherwise ask the
-                // server (vLLM `max_model_len`, llama.cpp `n_ctx_train`).
+                // server (llama.cpp `/props` `n_ctx` — the launched
+                // `--ctx-size` — then vLLM `max_model_len` / `n_ctx_train`).
                 let window = match options.context_window {
                     Some(w) if w > 0 => w,
                     _ => client
@@ -188,13 +244,14 @@ impl ChatHub {
                     level: "INFO".into(),
                     message: format!(
                         "LLM: ready ({base_url}, model={model}, ctx={window}, \
-                         temp={}, max_tokens={}, native_tools={})",
+                         temp={}, max_tokens={}, native_tools={}, thinking={})",
                         options.temperature,
                         options
                             .max_tokens
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "server-default".into()),
                         options.native_tools,
+                        options.thinking,
                     ),
                 });
             }
@@ -251,17 +308,65 @@ impl ChatHub {
             return;
         };
 
-        // Ensure session exists, push the user message, and write the TOML
-        // file straight away — that way a session is recoverable even if the
-        // LLM call dies mid-stream.
+        // A new user message starts a fresh repeat-tool chain.
+        self.repeat.lock().await.remove(&session_id);
+
+        // `/name …` loads the named command / agent / skill body as
+        // instructions *before* the message — a palette pick and a typed
+        // token arrive here identically. The message itself is kept as
+        // typed so the transcript shows what the user sent.
+        let expansion = agents::invoke::expand(&text, &agents::invoke::Roots::from_workspace());
+        if let Some(exp) = &expansion {
+            self.event_sink.emit(Event::LogLine {
+                level: "INFO".into(),
+                message: format!("loaded /{} ({:?}) as context for this turn", exp.name, exp.family),
+            });
+        }
+
+        // Ensure the session exists and record the user message straight
+        // away — the log is flushed on every append, so the session is
+        // recoverable even if the LLM call dies mid-stream.
+        let outer_turn = self.next_turn.fetch_add(1, Ordering::Relaxed);
+        // The placeholder-or-fallback title this send leaves behind, so the
+        // LLM titler later knows the title is still automatic.
+        let provisional_title;
         {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions
+            let log = sessions
                 .entry(session_id)
-                .or_insert_with(|| Session::new(session_id, default_title(session_id)));
-            session.messages.push(Message::user_with_images(text.clone(), images.clone()));
-            if let Err(e) = sessions_store::save(session) {
-                warn!(error = %e, session_id, "save session (after user msg) failed");
+                .or_insert_with(|| SessionLog::new(session_id, default_title(session_id)));
+            if let Some(exp) = expansion {
+                log.append(EventKind::ContextInjected {
+                    surface: SurfaceOp::Append,
+                    source: ContextSource::SkillInvocation { name: exp.name },
+                    content: exp.content,
+                });
+            }
+            log.append(EventKind::UserMessage {
+                surface: SurfaceOp::Append,
+                content: text.clone(),
+                images: images.clone(),
+            });
+            log.append(EventKind::TurnStart { turn_id: outer_turn });
+            // First message into a still-placeholder session: name it from
+            // the message right now, so the sidebar never shows "Session N"
+            // for something that has content. The LLM title (below, after
+            // the reply) replaces this.
+            let mut title = log.title();
+            if title == default_title(session_id) {
+                let fb = title_gen::fallback(&text);
+                if !fb.is_empty() {
+                    log.append(EventKind::SessionTitle { title: fb.clone() });
+                    self.event_sink.emit(Event::SessionTitleChanged {
+                        session_id,
+                        title: fb.clone(),
+                    });
+                    title = fb;
+                }
+            }
+            provisional_title = title;
+            if let Err(e) = sessions_store::flush(log) {
+                warn!(error = %e, session_id, "flush session (after user msg) failed");
             }
         }
 
@@ -279,6 +384,7 @@ impl ChatHub {
 
         let events = self.event_sink.clone();
         let sessions_map = self.sessions.clone();
+        let repeats = self.repeat.clone();
         let active_turns = self.active_turns.clone();
         let next_turn = self.next_turn.clone();
         let skills = self.skills.clone();
@@ -292,21 +398,55 @@ impl ChatHub {
         let window = self.context_window.load(Ordering::Relaxed);
         tokio::spawn(async move {
             let mut hops: u8 = 0;
+            // Retry budget for the *current* step; reset once a step lands.
+            let mut retries: u32 = 0;
+            // Why the loop ended, for the durable `TurnEnd`. An interrupt is
+            // detected from the token after the loop.
+            let mut finish = "done";
             // Always overwritten on the first iteration before the post-loop
             // read; the initial value is just to satisfy definite assignment.
             #[allow(unused_assignments)]
             let mut last_assistant = String::new();
             loop {
-                // Rebuild history fresh from persisted session messages each
-                // iteration: the previous hop appended both the assistant
-                // call and the tool result, so this picks them up uniformly.
-                let history =
+                // Interrupts land between hops as often as mid-stream. Bailing
+                // here keeps a cancelled turn from opening another request —
+                // which would emit a fresh `TurnStarted` the FE renders as a
+                // new (empty) turn, and burn a tokenize round-trip first.
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                // Derive the history fresh from the event log each iteration:
+                // the previous hop appended both the assistant message and
+                // the tool result, so this picks them up uniformly.
+                let mut history =
                     build_history(&sessions_map, session_id, &skills, native_tools).await;
 
-                // Trim to the prompt budget: window minus room for the
-                // response (and a small safety margin for template overhead).
+                // Prompt budget: window minus room for the response (and a
+                // small safety margin for template overhead).
                 let reserve = opt_max_tokens.unwrap_or(4096).saturating_add(512);
                 let budget = window.saturating_sub(reserve).max(1024);
+
+                // Auto-compaction. Once the assembled prompt fills
+                // COMPACT_TRIGGER_PCT of that budget, fold the older half of
+                // the history into an LLM-written summary. This runs *before*
+                // the trim so compaction is the primary mechanism and the
+                // trimmer stays a backstop — otherwise the trimmer would
+                // silently amputate history long before the meter ever read
+                // 95%, because the budget is already well under the window.
+                let prompt_tokens = agents::compact::approx_total_wire(&history);
+                let over = u64::from(prompt_tokens) * 100
+                    >= u64::from(budget) * u64::from(protocol::COMPACT_TRIGGER_PCT);
+                if over
+                    && compact_session(&sessions_map, session_id, &client, &event_sink, budget)
+                        .await
+                {
+                    history =
+                        build_history(&sessions_map, session_id, &skills, native_tools).await;
+                }
+
+                // The trimmer's "context notice" marker is wire-only: it is
+                // inserted here and never enters the log.
                 let trimmed = agents::context::trim_to_budget(history, budget);
                 if trimmed.dropped > 0 {
                     event_sink.emit(Event::LogLine {
@@ -333,21 +473,77 @@ impl ChatHub {
                             None
                         },
                         limit: window,
+                        budget,
                         cancel: Some(cancel.clone()),
                     },
                 )
                 .await;
+
+                // A transport/server failure — or a clean stream that carried
+                // nothing at all — is not an assistant reply. Nothing from the
+                // attempt is persisted, so looping back rebuilds the identical
+                // request over the same history: a retry the model cannot
+                // tell from the first attempt. Fatal errors (4xx) and an
+                // exhausted budget end the turn visibly instead of leaving a
+                // blank bubble that looks like the model chose silence.
+                let failure = match &out.error {
+                    Some(e) => Some(llm::retry::classify(e)),
+                    None if out.content.is_empty()
+                        && out.reasoning.is_empty()
+                        && out.tool_calls.is_empty()
+                        && !cancel.is_cancelled() =>
+                    {
+                        Some(llm::retry::empty_response())
+                    }
+                    None => None,
+                };
+                if let Some(failure) = failure {
+                    if failure.is_retryable() && retries < llm::retry::RETRY_MAX {
+                        retries += 1;
+                        let delay = llm::retry::backoff(retries);
+                        let msg = format!(
+                            "LLM request failed ({}) — retry {retries}/{} in {} ms",
+                            failure.reason(),
+                            llm::retry::RETRY_MAX,
+                            delay.as_millis()
+                        );
+                        warn!(session_id, turn_id, "{msg}");
+                        event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg });
+                        append_event(&sessions_map, session_id, EventKind::LlmRetry {
+                            attempt: retries,
+                            max: llm::retry::RETRY_MAX,
+                            delay_ms: delay.as_millis() as u64,
+                            reason: failure.reason().to_string(),
+                        })
+                        .await;
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        continue;
+                    }
+                    let msg = if failure.is_retryable() {
+                        format!(
+                            "LLM request failed ({}) — giving up after {retries} retries",
+                            failure.reason()
+                        )
+                    } else {
+                        format!("LLM request failed ({}) — not retryable", failure.reason())
+                    };
+                    warn!(session_id, turn_id, "{msg}");
+                    event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg });
+                    finish = "error";
+                    break;
+                }
+                retries = 0;
                 last_assistant = out.content.clone();
 
                 // Persist the assistant message (it includes the tool_call
                 // block if one was emitted — kept verbatim so re-loading the
-                // session shows what the model actually said).
+                // session shows what the model actually said), then the
+                // durable token reading for this hop.
                 {
-                    let mut g = sessions_map.lock().await;
-                    let Some(session) = g.get_mut(&session_id) else {
-                        debug!(session_id, "session vanished mid-turn, skipping persist");
-                        return;
-                    };
                     let reasoning = if out.reasoning.is_empty() {
                         None
                     } else {
@@ -363,16 +559,26 @@ impl ChatHub {
                     } else {
                         Some(native_calls_to_json(&out.tool_calls))
                     };
-                    session.messages.push(Message {
-                        role: Role::Assistant,
+                    let mut g = sessions_map.lock().await;
+                    let Some(log) = g.get_mut(&session_id) else {
+                        debug!(session_id, "session vanished mid-turn, skipping persist");
+                        return;
+                    };
+                    log.append(EventKind::AssistantMessage {
+                        surface: SurfaceOp::Append,
                         content: out.content.clone(),
                         reasoning,
-                        images: Vec::new(),
                         tool_calls,
-                        tool_call_id: None,
                     });
-                    if let Err(e) = sessions_store::save(session) {
-                        warn!(error = %e, session_id, "save session (after assistant msg) failed");
+                    log.append(EventKind::TokenUsage {
+                        used: out.used_tokens,
+                        limit: window,
+                        budget,
+                        prompt_tokens: out.usage.map(|u| u.prompt_tokens),
+                        completion_tokens: out.usage.map(|u| u.completion_tokens),
+                    });
+                    if let Err(e) = sessions_store::flush(log) {
+                        warn!(error = %e, session_id, "flush session (after assistant msg) failed");
                     }
                 }
 
@@ -392,31 +598,62 @@ impl ChatHub {
                         hops += 1;
                     }
                     for call in &out.tool_calls {
-                        let outcome = if over_limit {
-                            agents::SkillOutcome {
-                                ok: false,
-                                summary: format!(
-                                    "tool-hop limit ({MAX_TOOL_HOPS}) reached — call not executed"
-                                ),
-                            }
-                        } else {
-                            dispatch_native_call(
-                                call,
-                                &skills,
-                                &events,
-                                failure_sink.clone(),
+                        // A model can emit several calls at once; an interrupt
+                        // part-way through must stop the rest, not run them all
+                        // because they were already parsed. Logging the call
+                        // only here keeps an interrupted batch free of
+                        // `ToolCall` events that never got a result.
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let call_seq = append_event(&sessions_map, session_id, EventKind::ToolCall {
+                            name: call.name.clone(),
+                            args_preview: format!("{} {}", call.name, call.arguments),
+                            expectation: String::new(),
+                            call_id: Some(call.id.clone()),
+                        })
+                        .await
+                        .unwrap_or(0);
+                        let (outcome, trusted) = if over_limit {
+                            (
+                                agents::SkillOutcome {
+                                    ok: false,
+                                    summary: format!(
+                                        "tool-hop limit ({MAX_TOOL_HOPS}) reached — call not executed"
+                                    ),
+                                },
+                                true,
                             )
-                            .await
+                        } else {
+                            (
+                                dispatch_native_call(
+                                    call,
+                                    session_id,
+                                    &skills,
+                                    &events,
+                                    &client,
+                                    failure_sink.clone(),
+                                    cancel.clone(),
+                                )
+                                .await,
+                                skills.get(&call.name).is_some_and(|s| s.trusted()),
+                            )
                         };
                         append_tool_result(
                             &sessions_map,
                             session_id,
+                            call_seq,
                             &call.name,
                             Some(&call.id),
                             outcome.ok,
                             &outcome.summary,
+                            trusted,
                         )
                         .await;
+                        let args = serde_json::from_str(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
+                        observe_repeat(&repeats, &sessions_map, &event_sink, session_id, &call.name, &args)
+                            .await;
                     }
                     if over_limit {
                         event_sink.emit(Event::LogLine {
@@ -425,6 +662,7 @@ impl ChatHub {
                                 "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
                             ),
                         });
+                        finish = "hop-limit";
                         break;
                     }
                     continue;
@@ -441,25 +679,38 @@ impl ChatHub {
                         skills.by_name.contains_key(name)
                     })
                 else {
-                    if looks_like_tool_call_attempt(&out.content) {
-                        let msg = "assistant emitted a tool-call-shaped block \
-                                   the parser could not read (malformed JSON \
-                                   inside the ```tool_call fence, or missing \
-                                   `skill`/`args` keys)";
+                    if let Some(reason) = agents::parse_tool_call::rejected_attempt(
+                        &out.content,
+                        |name| skills.by_name.contains_key(name),
+                    ) {
+                        let msg = format!(
+                            "assistant emitted {reason} — no skill ran, so treat \
+                             its reply as unverified"
+                        );
                         warn!(session_id, "{msg}");
                         event_sink.emit(Event::LogLine {
                             level:   "WARN".into(),
-                            message: msg.into(),
+                            message: msg,
                         });
                     }
                     break;
                 };
+                let call_seq = append_event(&sessions_map, session_id, EventKind::ToolCall {
+                    name: call.skill.clone(),
+                    args_preview: agents::parse_tool_call::render(&call.skill, &call.raw_args),
+                    expectation: call.expectation.clone(),
+                    call_id: None,
+                })
+                .await
+                .unwrap_or(0);
                 if hops >= MAX_TOOL_HOPS {
                     let msg = format!(
                         "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
                     );
                     event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg.clone() });
-                    append_tool_result(&sessions_map, session_id, &call.skill, None, false, &msg).await;
+                    append_tool_result(&sessions_map, session_id, call_seq, &call.skill, None, false, &msg, true)
+                        .await;
+                    finish = "hop-limit";
                     break;
                 }
                 hops += 1;
@@ -470,36 +721,57 @@ impl ChatHub {
                 // the main agent receives a focused answer instead of the
                 // raw skill output (matches the natural-language contract in
                 // memory.md).
-                let outcome = match skills.resolve(&call) {
+                let (outcome, trusted, observed_args) = match skills.resolve(&call) {
                     Some((skill, args)) => {
                         let mut sub = ToolSubAgent::root(events.clone())
-                            .with_summarizer(client.clone());
+                            .with_summarizer(client.clone())
+                            .with_cancel(cancel.clone())
+                            .with_spill_label(session_id.to_string());
                         if let Some(fs) = failure_sink.clone() {
                             sub = sub.with_failure_sink(fs);
                         }
-                        sub.run(agents::ToolInvocation {
-                            skill: &*skill,
-                            args,
-                            raw_args: call.raw_args.clone(),
-                            expectation: call.expectation.clone(),
-                        }).await
+                        let outcome = sub
+                            .run(agents::ToolInvocation {
+                                skill: &*skill,
+                                args: args.clone(),
+                                raw_args: call.raw_args.clone(),
+                                expectation: call.expectation.clone(),
+                            })
+                            .await;
+                        (outcome, skill.trusted(), args)
                     }
-                    None => agents::SkillOutcome {
-                        ok: false,
-                        summary: format!("unknown skill `{}`", call.skill),
-                    },
+                    None => (
+                        agents::SkillOutcome {
+                            ok: false,
+                            summary: format!("unknown skill `{}`", call.skill),
+                        },
+                        true,
+                        serde_json::json!(call.raw_args),
+                    ),
                 };
 
                 append_tool_result(
                     &sessions_map,
                     session_id,
+                    call_seq,
                     &call.skill,
                     None,
                     outcome.ok,
                     &outcome.summary,
+                    trusted,
                 )
                 .await;
+                observe_repeat(&repeats, &sessions_map, &event_sink, session_id, &call.skill, &observed_args)
+                    .await;
             }
+
+            let finish = if cancel.is_cancelled() { "interrupted" } else { finish };
+            append_event(&sessions_map, session_id, EventKind::TurnEnd {
+                turn_id: outer_turn,
+                finish_reason: finish.to_string(),
+                hops,
+            })
+            .await;
 
             // Release this turn's slot, but only if a *newer* send hasn't
             // already replaced it (marker comparison avoids clobbering).
@@ -519,17 +791,14 @@ impl ChatHub {
             }
 
             // Auto-title only fires once, after the first complete exchange
-            // (user → assistant final). Count user messages to decide.
+            // (user → assistant final). Count user messages to decide. The
+            // title is "still automatic" when it is the placeholder or the
+            // fallback this send wrote.
             let trigger_title = {
                 let g = sessions_map.lock().await;
-                let Some(session) = g.get(&session_id) else { return };
-                let user_count = session
-                    .messages
-                    .iter()
-                    .filter(|m| m.role == Role::User)
-                    .count();
-                let title_is_default = session.title == default_title(session_id);
-                user_count == 1 && title_is_default && !last_assistant.is_empty()
+                let Some(log) = g.get(&session_id) else { return };
+                let title_is_auto = log.title() == provisional_title;
+                log.user_message_count() == 1 && title_is_auto && !last_assistant.is_empty()
             };
 
             if trigger_title {
@@ -544,17 +813,17 @@ impl ChatHub {
                         return;
                     };
                     let mut g = sessions_map.lock().await;
-                    let Some(session) = g.get_mut(&session_id) else {
+                    let Some(log) = g.get_mut(&session_id) else {
                         return;
                     };
-                    // Re-check the default — the user may have renamed it
-                    // manually in the meantime (future feature, harmless now).
-                    if session.title != default_title(session_id) {
+                    // Re-check — the user may have renamed it manually in
+                    // the meantime (future feature, harmless now).
+                    if log.title() != provisional_title || log.title() == title {
                         return;
                     }
-                    session.title = title.clone();
-                    if let Err(e) = sessions_store::save(session) {
-                        warn!(error = %e, session_id, "save session (after title-gen) failed");
+                    log.append(EventKind::SessionTitle { title: title.clone() });
+                    if let Err(e) = sessions_store::flush(log) {
+                        warn!(error = %e, session_id, "flush session (after title-gen) failed");
                     }
                     event_sink.emit(Event::SessionTitleChanged {
                         session_id,
@@ -566,23 +835,279 @@ impl ChatHub {
     }
 }
 
-/// Rebuild the LLM wire history for `session_id`: prepend `memory.md` (if
-/// present) plus a live `## Loaded skills` listing built from the registry as
-/// a single system message, then every persisted message. The dynamic list
-/// matters because `memory.md` only enumerates the built-ins — without this
-/// step, user-authored skills are callable but invisible to the model.
-/// Tool-role messages are surfaced to the local server as `user` content so
-/// even llama.cpp builds without OpenAI tool-call awareness can read the
-/// result.
+/// Append one event to a session's log and flush it. Returns the seq, or
+/// `None` when the session no longer exists. A flush failure is logged and
+/// the in-memory log keeps going — the next successful flush writes every
+/// line still pending.
+async fn append_event(sessions: &Sessions, session_id: u64, kind: EventKind) -> Option<u64> {
+    let mut g = sessions.lock().await;
+    let log = g.get_mut(&session_id)?;
+    let seq = log.append(kind);
+    if let Err(e) = sessions_store::flush(log) {
+        warn!(error = %e, session_id, seq, "flush session failed");
+    }
+    Some(seq)
+}
+
+/// Feed one dispatched call to the session's repeat-tool chain and, at a
+/// threshold, inject the advisory notice as context for the next step.
+/// Runs for failed and unknown-skill calls too — a model hammering a
+/// failing call is exactly the loop worth breaking.
+async fn observe_repeat(
+    repeats: &Repeats,
+    sessions: &Sessions,
+    events: &Arc<dyn EventSink>,
+    session_id: u64,
+    skill: &str,
+    args: &serde_json::Value,
+) {
+    let notice = repeats
+        .lock()
+        .await
+        .entry(session_id)
+        .or_default()
+        .observe(skill, args);
+    let Some(notice) = notice else { return };
+    warn!(session_id, skill, "repeat-tool reminder issued");
+    events.emit(Event::LogLine {
+        level: "WARN".into(),
+        message: format!("loop guard: `{skill}` called repeatedly with identical arguments — reminder injected"),
+    });
+    append_event(sessions, session_id, EventKind::ContextInjected {
+        surface: SurfaceOp::Append,
+        source: ContextSource::ToolNotice,
+        content: notice,
+    })
+    .await;
+}
+
+/// Fold the older part of `session_id`'s history into an LLM-written summary
+/// and record it as a `CompactionSummary` event that shadows the folded
+/// span. Returns `true` when that happened, in which case the caller must
+/// rebuild its wire history. The shadowed events stay in the log.
+///
+/// The summarizer round-trip happens without the sessions lock held, so the
+/// log is re-checked before the append: if anything was appended in the
+/// meantime the compaction is discarded rather than shadowing a span the
+/// summary never saw.
+///
+/// Emits `ContextCompacting` / `ContextCompacted` so the FE can show the
+/// transcript notice, plus a log line either way. On failure the history is
+/// left untouched and `trim_to_budget` takes over.
+///
+/// Before paying for the summariser, the *pruner* runs: every tool result
+/// older than the tail and over `compact::PRUNE_THRESHOLD` is replaced (a
+/// `Replace { seq, seq }` on its own seq) by its head/tail window — no
+/// model call, and often enough on its own, in which case the summary is
+/// skipped entirely.
+async fn compact_session(
+    sessions: &Sessions,
+    session_id: u64,
+    client: &LlmClient,
+    events: &Arc<dyn EventSink>,
+    budget: u32,
+) -> bool {
+    let (entries, last_seq) = {
+        let g = sessions.lock().await;
+        let Some(log) = g.get(&session_id) else { return false };
+        (log.derive_surface(), log.last_seq())
+    };
+    let snapshot: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
+
+    let split = agents::compact::split_index(&snapshot, budget);
+    let pruned = prune_tool_results(sessions, session_id, &entries, split, last_seq).await;
+    if pruned > 0 {
+        events.emit(Event::LogLine {
+            level: "INFO".into(),
+            message: format!("context: pruned {pruned} oversized older tool result(s) to head/tail windows"),
+        });
+    }
+    let (entries, last_seq, snapshot) = if pruned > 0 {
+        let g = sessions.lock().await;
+        let Some(log) = g.get(&session_id) else { return false };
+        let entries = log.derive_surface();
+        let snapshot: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
+        // Enough on its own? Then the summariser round-trip is not needed.
+        let tokens = agents::compact::approx_total(&snapshot);
+        if u64::from(tokens) * 100 < u64::from(budget) * u64::from(protocol::COMPACT_TRIGGER_PCT) {
+            return true;
+        }
+        (entries, log.last_seq(), snapshot)
+    } else {
+        (entries, last_seq, snapshot)
+    };
+
+    // Cheap pre-check: if there is nothing foldable, don't announce a
+    // compaction that isn't going to happen (a single enormous message, say —
+    // that's the trimmer's problem, not ours).
+    let Some(split) = agents::compact::split_index(&snapshot, budget) else {
+        debug!(session_id, "context over threshold but nothing foldable");
+        return pruned > 0;
+    };
+
+    let before_tokens = agents::compact::approx_total(&snapshot);
+    events.emit(Event::ContextCompacting { session_id });
+    events.emit(Event::LogLine {
+        level: "INFO".into(),
+        message: format!(
+            "context: prompt reached {}% of the {budget}-token budget — \
+             compressing {before_tokens} tokens of history",
+            protocol::COMPACT_TRIGGER_PCT,
+        ),
+    });
+
+    let failed = |events: &Arc<dyn EventSink>| {
+        events.emit(Event::ContextCompacted {
+            session_id,
+            ok: false,
+            folded: 0,
+            before_tokens,
+            after_tokens: before_tokens,
+            summary: String::new(),
+        });
+    };
+
+    let Some(summary) = agents::compact::summarize_fold(client, &snapshot[..split]).await else {
+        warn!(session_id, "context compaction produced no summary");
+        events.emit(Event::LogLine {
+            level: "WARN".into(),
+            message: "context: compression failed (summarizer returned nothing) \
+                      — falling back to trimming the oldest messages"
+                .into(),
+        });
+        failed(events);
+        return false;
+    };
+
+    let content = agents::compact::summary_message(&summary);
+    let after_tokens = {
+        let mut after = vec![Message::system(content.clone())];
+        after.extend_from_slice(&snapshot[split..]);
+        agents::compact::approx_total(&after)
+    };
+    {
+        let mut g = sessions.lock().await;
+        let Some(log) = g.get_mut(&session_id) else {
+            debug!(session_id, "session vanished during compaction");
+            return false;
+        };
+        if log.last_seq() != last_seq {
+            debug!(session_id, "history changed during compaction — discarding it");
+            failed(events);
+            return false;
+        }
+        log.append(EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace {
+                start_seq: entries[0].seq,
+                end_seq: entries[split - 1].seq,
+            },
+            content,
+            summary: summary.clone(),
+            folded: split as u32,
+            before_tokens,
+            after_tokens,
+        });
+        if let Err(e) = sessions_store::flush(log) {
+            warn!(error = %e, session_id, "flush session (after compaction) failed");
+        }
+    }
+
+    events.emit(Event::LogLine {
+        level: "INFO".into(),
+        message: format!(
+            "context: compressed {split} message(s) into a summary — history {before_tokens} \
+             → {after_tokens} tokens"
+        ),
+    });
+    events.emit(Event::ContextCompacted {
+        session_id,
+        ok: true,
+        folded: split as u32,
+        before_tokens,
+        after_tokens,
+        summary,
+    });
+    true
+}
+
+/// Replace every oversized tool result older than the tail with its pruned
+/// window. `split` is where the verbatim tail begins (from `split_index`);
+/// with no foldable split the last `compact::MIN_TAIL` entries are kept.
+/// Returns the number of results pruned. Discarded wholesale if the log
+/// moved under us (`last_seq` changed) — the next hop tries again.
+async fn prune_tool_results(
+    sessions: &Sessions,
+    session_id: u64,
+    entries: &[sica_core::event::SurfaceEntry],
+    split: Option<usize>,
+    last_seq: u64,
+) -> usize {
+    let keep_from = split.unwrap_or_else(|| entries.len().saturating_sub(agents::compact::MIN_TAIL));
+    let candidates: Vec<EventKind> = entries[..keep_from]
+        .iter()
+        .filter_map(|e| {
+            let t = e.tool.as_ref()?;
+            let pruned = agents::compact::prune_summary(&t.summary)?;
+            Some(EventKind::ToolResult {
+                surface: SurfaceOp::Replace { start_seq: e.seq, end_seq: e.seq },
+                call_seq: t.call_seq,
+                skill: t.name.clone(),
+                tool_call_id: e.message.tool_call_id.clone(),
+                ok: t.ok,
+                summary: pruned,
+                trusted: t.trusted,
+                pruned: true,
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+    let mut g = sessions.lock().await;
+    let Some(log) = g.get_mut(&session_id) else { return 0 };
+    if log.last_seq() != last_seq {
+        debug!(session_id, "history changed before pruning — skipping");
+        return 0;
+    }
+    let n = candidates.len();
+    for kind in candidates {
+        log.append(kind);
+    }
+    if let Err(e) = sessions_store::flush(log) {
+        warn!(error = %e, session_id, "flush session (after pruning) failed");
+    }
+    n
+}
+
+/// Derive `session_id`'s history from its log and assemble the wire form.
 async fn build_history(
-    sessions: &Arc<Mutex<HashMap<u64, Session>>>,
+    sessions: &Sessions,
     session_id: u64,
     skills: &SkillRegistry,
     native_tools: bool,
 ) -> Vec<ChatMessage> {
-    let g = sessions.lock().await;
-    let Some(session) = g.get(&session_id) else { return Vec::new() };
-    let mut out: Vec<ChatMessage> = Vec::with_capacity(session.messages.len() + 1);
+    let messages = {
+        let g = sessions.lock().await;
+        let Some(log) = g.get(&session_id) else { return Vec::new() };
+        log.derive_messages()
+    };
+    build_wire_history(&messages, skills, native_tools)
+}
+
+/// Assemble the LLM wire history: prepend `memory.md` (if present) plus a
+/// live `## Loaded skills` listing built from the registry as a single
+/// system message, then every derived message. The dynamic list matters
+/// because `memory.md` only enumerates the built-ins — without this step,
+/// user-authored skills are callable but invisible to the model.
+/// Tool-role messages are surfaced to the local server as `user` content so
+/// even llama.cpp builds without OpenAI tool-call awareness can read the
+/// result.
+fn build_wire_history(
+    messages: &[Message],
+    skills: &SkillRegistry,
+    native_tools: bool,
+) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len() + 1);
     let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
     let catalogue = skills.catalogue_markdown();
     // In native mode the tool contract travels in the request's `tools`
@@ -617,7 +1142,7 @@ async fn build_history(
     if !system_body.is_empty() {
         out.push(ChatMessage::text("system", system_body));
     }
-    for m in &session.messages {
+    for m in messages {
         // Text-protocol servers may lack a `tool` role in their template, so
         // tool results are surfaced as `user` there. Native mode keeps the
         // real `tool` role + correlation id the template expects.
@@ -663,14 +1188,20 @@ fn native_calls_to_json(calls: &[agents::turn::NativeToolCall]) -> String {
     serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
 }
 
-/// Dispatch one native tool call through the sub-agent machinery. No
-/// summarizer is attached: native mode returns raw tool output, which is
-/// what the OpenAI tool-call convention (and the model's training) expects.
+/// Dispatch one native tool call through the sub-agent machinery. The LLM
+/// client is attached to the sub-agent's summarizer slot, but native mode
+/// still returns raw tool output — the summarizer only ever rewrites when an
+/// `expectation` is set, and native calls always pass an empty one. The
+/// attach exists so LLM-driven skills (`agent-team`) can reach the connected
+/// client through `SkillContext`.
 async fn dispatch_native_call(
     call: &agents::turn::NativeToolCall,
+    session_id: u64,
     skills: &SkillRegistry,
     events: &Arc<dyn EventSink>,
+    client: &LlmClient,
     failure_sink: Option<Arc<dyn ToolFailureSink>>,
+    cancel: CancellationToken,
 ) -> agents::SkillOutcome {
     let Some(skill) = skills.get(&call.name) else {
         return agents::SkillOutcome {
@@ -701,7 +1232,10 @@ async fn dispatch_native_call(
                 .collect()
         })
         .unwrap_or_default();
-    let mut sub = ToolSubAgent::root(events.clone());
+    let mut sub = ToolSubAgent::root(events.clone())
+        .with_summarizer(client.clone())
+        .with_cancel(cancel)
+        .with_spill_label(session_id.to_string());
     if let Some(fs) = failure_sink {
         sub = sub.with_failure_sink(fs);
     }
@@ -737,53 +1271,32 @@ fn build_chat_content(text: &str, images: &[UserImage]) -> ChatContent {
     ChatContent::Parts(parts)
 }
 
-/// Append the result of one skill invocation as a `Tool` message, formatted
-/// as a `tool_result` fenced block. Persists the session so a crash mid-loop
-/// still preserves the partial transcript.
+/// Record the result of the skill invocation logged at `call_seq`. The
+/// derived history renders it as a `Tool`-role `tool_result` fenced block
+/// (see `sica_core::event::tool_result_message`), framed as untrusted data
+/// unless `trusted`.
+#[allow(clippy::too_many_arguments)]
 async fn append_tool_result(
-    sessions: &Arc<Mutex<HashMap<u64, Session>>>,
+    sessions: &Sessions,
     session_id: u64,
+    call_seq: u64,
     skill: &str,
     tool_call_id: Option<&str>,
     ok: bool,
     summary: &str,
+    trusted: bool,
 ) {
-    let block = format!(
-        "```tool_result\n{}\n```",
-        serde_json::json!({
-            "skill":   skill,
-            "ok":      ok,
-            "summary": summary,
-        })
-    );
-    let mut g = sessions.lock().await;
-    let Some(session) = g.get_mut(&session_id) else { return };
-    session.messages.push(Message {
-        role: Role::Tool,
-        content: block,
-        reasoning: None,
-        images: Vec::new(),
-        tool_calls: None,
+    append_event(sessions, session_id, EventKind::ToolResult {
+        surface: SurfaceOp::Append,
+        call_seq,
+        skill: skill.to_string(),
         tool_call_id: tool_call_id.map(str::to_string),
-    });
-    if let Err(e) = sessions_store::save(session) {
-        warn!(error = %e, session_id, "save session (after tool result) failed");
-    }
-}
-
-/// True when `content` contains a shape the model commonly *thinks* is a
-/// tool call but the parser does not accept. Used to surface the silent-
-/// drop case as a `LogLine` — without it, the FE just sees an ordinary
-/// assistant message and the operator has no signal that a tool was meant
-/// to fire. Kept conservative: matches the explicit ```tool_call fence and
-/// the OpenAI-ish `"skill": "..."` + `"args":` JSON pair.
-fn looks_like_tool_call_attempt(content: &str) -> bool {
-    if content.contains("```tool_call") {
-        return true;
-    }
-    let has_skill_key = content.contains("\"skill\"") || content.contains("'skill'");
-    let has_args_key  = content.contains("\"args\"")  || content.contains("'args'");
-    has_skill_key && has_args_key
+        ok,
+        summary: summary.to_string(),
+        trusted,
+        pruned: false,
+    })
+    .await;
 }
 
 fn role_to_str(role: Role) -> &'static str {
@@ -808,5 +1321,193 @@ impl EventSink for OutSink {
 impl idealist::IdealistEventSink for OutSink {
     fn emit(&self, ev: Event) {
         let _ = self.tx.send(Frame::event(ev));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sica_core::event::{derive_messages, SessionEvent};
+
+    fn registry() -> SkillRegistry {
+        SkillRegistry::new()
+    }
+
+    #[test]
+    fn wire_history_downgrades_tool_role_in_text_mode() {
+        let msgs = vec![
+            Message::user("hi"),
+            Message {
+                role: Role::Tool,
+                content: "```tool_result\n{}\n```".into(),
+                reasoning: None,
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+        ];
+        let wire = build_wire_history(&msgs, &registry(), false);
+        // memory.md may or may not exist on this machine; look at the tail.
+        let n = wire.len();
+        assert_eq!(wire[n - 2].role, "user");
+        assert_eq!(wire[n - 1].role, "user");
+        assert!(wire[n - 1].tool_call_id.is_none());
+        assert!(wire[n - 1].tool_calls.is_none());
+    }
+
+    #[test]
+    fn wire_history_replays_native_tool_calls() {
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                reasoning: None,
+                images: Vec::new(),
+                tool_calls: Some(r#"[{"id":"c1","type":"function","function":{"name":"run-cli","arguments":"{}"}}]"#.into()),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "out".into(),
+                reasoning: None,
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+        ];
+        let wire = build_wire_history(&msgs, &registry(), true);
+        let n = wire.len();
+        assert_eq!(wire[n - 2].role, "assistant");
+        assert!(wire[n - 2].tool_calls.is_some());
+        assert_eq!(wire[n - 1].role, "tool");
+        assert_eq!(wire[n - 1].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn wire_history_inlines_images_as_parts() {
+        let msgs = vec![Message::user_with_images(
+            "look",
+            vec![UserImage { mime: "image/png".into(), data_base64: "AAAA".into() }],
+        )];
+        let wire = build_wire_history(&msgs, &registry(), false);
+        let last = wire.last().unwrap();
+        match &last.content {
+            ChatContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[1], ContentPart::ImageUrl { image_url } if image_url.url.starts_with("data:image/png;base64,")));
+            }
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    /// The Replace fold must produce exactly what the old in-place splice
+    /// (`summary + messages[split..]`) produced.
+    #[test]
+    fn compaction_replace_matches_legacy_splice() {
+        let mut log = SessionLog::new(1, "t");
+        let texts = ["a", "b", "c", "d", "e", "f"];
+        for (i, t) in texts.iter().enumerate() {
+            if i % 2 == 0 {
+                log.append(EventKind::UserMessage {
+                    surface: SurfaceOp::Append,
+                    content: (*t).into(),
+                    images: Vec::new(),
+                });
+            } else {
+                log.append(EventKind::AssistantMessage {
+                    surface: SurfaceOp::Append,
+                    content: (*t).into(),
+                    reasoning: None,
+                    tool_calls: None,
+                });
+            }
+        }
+        let entries = log.derive_surface();
+        let snapshot: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
+        let split = 4;
+        let content = agents::compact::summary_message("S");
+        let mut legacy = vec![Message::system(content.clone())];
+        legacy.extend_from_slice(&snapshot[split..]);
+
+        log.append(EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace { start_seq: entries[0].seq, end_seq: entries[split - 1].seq },
+            content,
+            summary: "S".into(),
+            folded: split as u32,
+            before_tokens: 0,
+            after_tokens: 0,
+        });
+        let events: &[SessionEvent] = &log.events;
+        assert_eq!(derive_messages(events), legacy);
+    }
+
+    fn tool_pair(log: &mut SessionLog, skill: &str, summary: &str) {
+        let call_seq = log.append(EventKind::ToolCall {
+            name: skill.into(),
+            args_preview: format!("{skill} 'x'"),
+            expectation: String::new(),
+            call_id: None,
+        });
+        log.append(EventKind::ToolResult {
+            surface: SurfaceOp::Append,
+            call_seq,
+            skill: skill.into(),
+            tool_call_id: None,
+            ok: true,
+            summary: summary.into(),
+            trusted: false,
+            pruned: false,
+        });
+    }
+
+    #[tokio::test]
+    async fn pruner_replaces_old_big_results_and_leaves_the_tail() {
+        let mut log = SessionLog::new(1, "t");
+        let big = "b".repeat(agents::compact::PRUNE_THRESHOLD + 100);
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u1".into(), images: Vec::new() });
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a1".into(), reasoning: None, tool_calls: None });
+        tool_pair(&mut log, "run-cli", &big);
+        tool_pair(&mut log, "read-file", "small");
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a2".into(), reasoning: None, tool_calls: None });
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u2".into(), images: Vec::new() });
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a3".into(), reasoning: None, tool_calls: None });
+        tool_pair(&mut log, "run-cli", &big); // in the tail: must survive
+        let entries = log.derive_surface();
+        let last_seq = log.last_seq();
+        let n = entries.len();
+
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(1u64, log)])));
+        // Tail = the last two entries (a3 + the recent big result).
+        let pruned = prune_tool_results(&sessions, 1, &entries, Some(n - 2), last_seq).await;
+        assert_eq!(pruned, 1);
+
+        let g = sessions.lock().await;
+        let after = g[&1].derive_surface();
+        assert_eq!(after.len(), n, "pruning replaces, never removes");
+        let old = after.iter().find(|e| e.tool.as_ref().is_some_and(|t| t.pruned)).unwrap();
+        assert!(old.tool.as_ref().unwrap().summary.len() <= agents::compact::PRUNE_THRESHOLD);
+        assert_eq!(old.tool.as_ref().unwrap().name, "run-cli");
+        assert!(!old.tool.as_ref().unwrap().trusted, "trust flag carries over");
+        let recent = after.last().unwrap().tool.as_ref().unwrap();
+        assert!(!recent.pruned);
+        assert_eq!(recent.summary.len(), big.len());
+        // Idempotent: a second pass finds nothing.
+        drop(g);
+        let entries = sessions.lock().await[&1].derive_surface();
+        let last_seq = sessions.lock().await[&1].last_seq();
+        assert_eq!(prune_tool_results(&sessions, 1, &entries, Some(n - 2), last_seq).await, 0);
+    }
+
+    #[tokio::test]
+    async fn pruner_backs_off_when_the_log_moved() {
+        let mut log = SessionLog::new(1, "t");
+        let big = "b".repeat(agents::compact::PRUNE_THRESHOLD + 1);
+        tool_pair(&mut log, "run-cli", &big);
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u".into(), images: Vec::new() });
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a".into(), reasoning: None, tool_calls: None });
+        let entries = log.derive_surface();
+        let stale_seq = log.last_seq() - 1;
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(1u64, log)])));
+        assert_eq!(prune_tool_results(&sessions, 1, &entries, Some(1), stale_seq).await, 0);
     }
 }

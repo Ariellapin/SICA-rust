@@ -8,6 +8,7 @@
 //!   * Containers  — [`card`]
 //!   * Rules       — [`hairline`]
 //!   * Marks       — [`blade_mark`], [`chat_rail_mark`], [`settings_rail_mark`]
+//!   * Activity    — [`working_sweep`]
 //!   * Status      — [`status_icon`], [`status_pill`]
 
 use egui::{
@@ -244,6 +245,47 @@ pub fn settings_rail_mark(painter: &Painter, rect: Rect, color: Color32) {
     );
     // Center dot.
     painter.circle_filled(center, 1.5, color);
+}
+
+// ----------------------------------------------------------------------------
+// Activity
+// ----------------------------------------------------------------------------
+
+/// Animated "still working" mark: a bright accent arc sweeping around a
+/// hairline ring, vector-painted to match the rest of the mark kit. Sized off
+/// `diameter` so it can sit inline on a caps label's baseline.
+///
+/// The sweep is driven by wall-clock time rather than a stored phase, so the
+/// caller keeps no animation state; it does request a repaint every frame it
+/// is drawn, which is what keeps the arc moving while a turn streams.
+pub fn working_sweep(ui: &mut Ui, palette: &Palette, diameter: f32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let t = ui.input(|i| i.time) as f32;
+        let center = rect.center();
+        let radius = (diameter * 0.5 - 1.4).max(1.0);
+        let painter = ui.painter();
+        painter.circle_stroke(center, radius, Stroke::new(1.0, rgb(palette.hairline)));
+
+        // A 35%-of-circle arc, approximated by a polyline — epaint has no
+        // arc primitive, and 14 segments is already smooth at this size.
+        const SEGMENTS: usize = 14;
+        let sweep = std::f32::consts::TAU * 0.35;
+        let start = (t * 2.6) % std::f32::consts::TAU;
+        let points = (0..=SEGMENTS)
+            .map(|i| {
+                let angle = start + sweep * (i as f32 / SEGMENTS as f32);
+                Pos2::new(
+                    center.x + radius * angle.cos(),
+                    center.y + radius * angle.sin(),
+                )
+            })
+            .collect::<Vec<_>>();
+        painter.add(Shape::line(points, Stroke::new(1.6, rgb(palette.accent))));
+    }
+    // Animation only advances on repaint, so ask for the next frame.
+    ui.ctx().request_repaint();
+    resp
 }
 
 // ----------------------------------------------------------------------------

@@ -113,7 +113,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         )
                         .on_hover_text(
                             "Prompt-window budget for history trimming. \
-                             0 = auto-detect from the server (falls back to 24k).",
+                             0 = auto-detect from the server — llama.cpp \
+                             reports its launched --ctx-size via /props \
+                             (falls back to 24k).",
                         );
                     });
                     ui.add_space(4.0);
@@ -127,6 +129,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                          Requires server-side tool support — e.g. vLLM started \
                          with --enable-auto-tool-choice and a --tool-call-parser \
                          matching the model. Takes effect on next Connect.",
+                    );
+                    ui.checkbox(
+                        &mut cfg.thinking,
+                        "Thinking (model reasoning)",
+                    )
+                    .on_hover_text(
+                        "Let the model emit <think> reasoning before its \
+                         answer. Off sends chat_template_kwargs \
+                         {\"enable_thinking\": false}, which llama.cpp/vLLM \
+                         chat templates honour for models like Qwen3 — \
+                         faster, terser replies. Providers that ignore the \
+                         field keep reasoning on. Takes effect on next \
+                         Connect.",
                     );
 
                     ui.add_space(8.0);

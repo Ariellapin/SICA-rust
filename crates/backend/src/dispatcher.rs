@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use protocol::{MessageDump, Request, Response, SessionDump};
-use sica_core::message::Role;
+use protocol::{Request, Response};
 
 use crate::be_core::{fib, BeState};
 use crate::chat::ChatHub;
@@ -44,27 +43,14 @@ pub async fn handle(
             let sessions = chat.list_sessions().await;
             Response::SessionList { sessions }
         }
-        Request::LoadSession { session_id } => match chat.load_session(session_id).await {
-            Some(session) => Response::SessionLoaded {
-                session: SessionDump {
-                    id: session.id,
-                    title: session.title,
-                    created_at: session.created_at,
-                    messages: session
-                        .messages
-                        .into_iter()
-                        .map(|m| MessageDump {
-                            role: role_str(m.role).into(),
-                            content: m.content,
-                            reasoning: m.reasoning,
-                            images: m.images,
-                        })
-                        .collect(),
-                },
-            },
+        Request::LoadSession { session_id } => match chat.dump_session(session_id).await {
+            Some(session) => Response::SessionLoaded { session },
             None => Response::Error {
                 message: format!("session {session_id} not found"),
             },
+        },
+        Request::ListCatalog => Response::Catalog {
+            entries: crate::catalog::build_from_workspace(&chat.skills),
         },
         Request::DeleteSession { session_id } => {
             chat.delete_session(session_id).await;
@@ -101,11 +87,3 @@ pub async fn handle(
     }
 }
 
-fn role_str(role: Role) -> &'static str {
-    match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::System => "system",
-        Role::Tool => "tool",
-    }
-}

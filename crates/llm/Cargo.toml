@@ -21,3 +21,8 @@ eventsource-stream = { workspace = true }
 url                = { workspace = true }
 regex              = { workspace = true }
 once_cell          = { workspace = true }
+
+[dev-dependencies]
+# Already in the tree via reqwest; used to fabricate status-code errors in
+# `retry` tests.
+http = "1"

@@ -12,6 +12,25 @@ pub struct StreamChunk {
     /// The caller accumulates fragments by index into complete calls.
     pub delta_tool_calls: Vec<ToolCallDelta>,
     pub finish_reason:   Option<String>,
+    /// The provider's own token accounting. Sent once, on the final chunk,
+    /// when the request asked for `stream_options.include_usage`
+    /// (llama.cpp, vLLM, OpenAI all do); that chunk has no `choices`.
+    pub usage:           Option<Usage>,
+}
+
+/// Provider-reported token counts for one completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens:     u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+}
+
+impl Usage {
+    pub fn total(&self) -> u32 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
 }
 
 /// One streamed fragment of a native tool call. The first fragment for an
@@ -26,7 +45,10 @@ pub struct ToolCallDelta {
 
 #[derive(Debug, Deserialize)]
 struct SseEnvelope {
+    #[serde(default)]
     choices: Vec<SseChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,7 +185,11 @@ pub fn parse_sse_event(json: &str, splitter: &mut ThinkSplitter) -> Option<Strea
         Ok(v) => v,
         Err(_) => return None,
     };
-    let choice = env.choices.into_iter().next()?;
+    let usage = env.usage;
+    let Some(choice) = env.choices.into_iter().next() else {
+        // The usage-only trailer: no choices, just the final accounting.
+        return usage.map(|u| StreamChunk { usage: Some(u), ..StreamChunk::default() });
+    };
 
     let raw_content = choice.delta.content.unwrap_or_default();
     let (mut content, mut reasoning) = splitter.feed(&raw_content);
@@ -196,6 +222,7 @@ pub fn parse_sse_event(json: &str, splitter: &mut ThinkSplitter) -> Option<Strea
         && reasoning.is_empty()
         && delta_tool_calls.is_empty()
         && choice.finish_reason.is_none()
+        && usage.is_none()
     {
         return None;
     }
@@ -204,6 +231,7 @@ pub fn parse_sse_event(json: &str, splitter: &mut ThinkSplitter) -> Option<Strea
         delta_reasoning: std::mem::take(&mut reasoning),
         delta_tool_calls,
         finish_reason: choice.finish_reason,
+        usage,
     })
 }
 
@@ -249,6 +277,23 @@ mod tests {
         let chunk = parse_sse_event(frag, &mut s).unwrap();
         assert_eq!(chunk.delta_tool_calls[0].arguments, "{\"command\":");
         assert!(chunk.delta_tool_calls[0].id.is_none());
+    }
+
+    #[test]
+    fn usage_trailer_without_choices_is_a_chunk() {
+        let mut s = ThinkSplitter::new();
+        let trailer = r#"{"id":"x","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":7,"total_tokens":127}}"#;
+        let chunk = parse_sse_event(trailer, &mut s).unwrap();
+        assert_eq!(chunk.usage, Some(Usage { prompt_tokens: 120, completion_tokens: 7 }));
+        assert!(chunk.delta_content.is_empty());
+        assert!(chunk.finish_reason.is_none());
+        // Some servers put usage on the same chunk as the finish reason.
+        let last = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#;
+        let chunk = parse_sse_event(last, &mut s).unwrap();
+        assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunk.usage.unwrap().total(), 3);
+        // No choices and no usage: nothing to report.
+        assert!(parse_sse_event(r#"{"choices":[]}"#, &mut s).is_none());
     }
 
     #[test]

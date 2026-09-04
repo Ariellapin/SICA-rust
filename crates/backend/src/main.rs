@@ -7,9 +7,12 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use protocol::{Event, Frame, Payload, Request};
-use sica_core::paths::{memory_file, skills_dir, workspace_root};
+use sica_core::paths::{
+    agents_dir, commands_dir, evals_dir, memory_file, skills_dir, workspace_root,
+};
 
 mod be_core;
+mod catalog;
 mod chat;
 mod dispatcher;
 mod ipc;
@@ -132,9 +135,21 @@ async fn run(args: Args) -> Result<()> {
     if let Err(e) = agents::builtins::seed_defaults(&skills_path) {
         warn!(error = %e, dir = %skills_path.display(), "seed builtin skill docs failed");
     }
+    let evals_path = evals_dir();
+    if let Err(e) = agents::model_eval::seed_defaults(&skills_path, &evals_path) {
+        warn!(error = %e, dir = %evals_path.display(), "seed model-eval suite failed");
+    }
     let memory_path = memory_file();
     if let Err(e) = agents::memory::seed_default(&memory_path) {
         warn!(error = %e, path = %memory_path.display(), "seed memory.md failed");
+    }
+    // `agents/` and `commands/` back the other two families of the FE's "/"
+    // palette. Created empty so the folders are discoverable; the palette
+    // simply lists nothing for a family with no files in it.
+    for dir in [agents_dir(), commands_dir()] {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(error = %e, dir = %dir.display(), "create palette dir failed");
+        }
     }
     let mut skill_registry = agents::SkillRegistry::new();
     skill_registry.register(Arc::new(agents::SkillCreator::new(skills_path.clone())));
@@ -142,16 +157,66 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(Arc::new(agents::RunPwsh));
     skill_registry.register(Arc::new(agents::ReadFile::new(root.clone())));
     skill_registry.register(Arc::new(agents::WriteFile::new(root.clone())));
+    // `model-eval` benchmarks the connected model against a prompt suite. It
+    // needs the finished registry (for the live catalogue and the known-skill
+    // predicate its tool-call checks use), so it is attached below alongside
+    // `agent-team`. It never dispatches a skill — tool-call cases are
+    // parse-only — so a suite is safe to run unattended.
+    let model_eval = Arc::new(agents::ModelEval::new(root.clone()));
+    skill_registry.register(model_eval.clone());
+    // `agent-team` is opt-in: it registers only when the user has put
+    // `skills/agent-team.md` on disk. A team is N full LLM conversations per
+    // call and its teammates are the least reliable output in the app on a
+    // small local model, so it stays out of the catalogue — and out of the
+    // model's reach — until someone asks for it. Deleting the doc turns it
+    // off again at the next backend start.
+    //
+    // Registered before the markdown scan so that same doc can't shadow the
+    // real skill (`register_if_absent` in `register_all`).
+    let team_doc = skills_path.join(format!("{}.md", agents::team::AGENT_TEAM_NAME));
+    let agent_team = team_doc.exists().then(|| {
+        let team = Arc::new(agents::AgentTeam::new());
+        skill_registry.register(team.clone());
+        team
+    });
     let parse_errors = agents::md_skill::register_all(&mut skill_registry, &skills_path);
     let skill_count = skill_registry.by_name.len();
     let skill_registry = Arc::new(skill_registry);
-    info!(count = skill_count, dir = %skills_path.display(), "skills loaded");
+    // The team skill needs the finished registry so its teammates can call
+    // other skills; attached as a Weak because the registry also owns it.
+    if let Some(team) = &agent_team {
+        team.attach_registry(&skill_registry);
+    }
+    model_eval.attach_registry(&skill_registry);
+    info!(
+        count = skill_count,
+        dir = %skills_path.display(),
+        agent_team = agent_team.is_some(),
+        "skills loaded"
+    );
     let _ = out_tx.send(Frame::event(Event::LogLine {
         level: "INFO".into(),
         message: format!(
             "skills: {skill_count} loaded from {}",
             skills_path.display()
         ),
+    }));
+    let _ = out_tx.send(Frame::event(Event::LogLine {
+        level: "INFO".into(),
+        message: if agent_team.is_some() {
+            format!(
+                "agent-team: enabled ({} present) — to disable, rename it to \
+                 agent-team.md.off (only *.md is scanned) or delete it, then \
+                 restart the backend",
+                team_doc.display()
+            )
+        } else {
+            format!(
+                "agent-team: disabled — put a file at {} and restart the \
+                 backend to enable it",
+                team_doc.display()
+            )
+        },
     }));
     for (path, err) in parse_errors {
         warn!(file = %path.display(), error = %err, "skill parse error");

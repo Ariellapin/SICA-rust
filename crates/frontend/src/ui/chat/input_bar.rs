@@ -11,6 +11,11 @@
 //! consumed before the multiline editor sees it so the field doesn't keep
 //! a stray line break.
 //!
+//! A draft that starts with `/` opens the slash palette (see
+//! [`super::slash_menu`]), which lists every skill, agent and command in the
+//! workspace. While it is open it owns ↑↓/Enter/Tab/Esc, so Enter picks a row
+//! instead of sending and Esc closes the list instead of interrupting the turn.
+//!
 //! Image input:
 //!   * Paperclip button -> native file picker
 //!   * Drop image files anywhere in the chat panel
@@ -31,6 +36,8 @@ use crate::ui::widgets::{caps_label, ghost_button, primary_button_enabled};
 
 const SEND_BUTTON_W: f32 = 84.0;
 const ATTACH_BUTTON_W: f32 = 36.0;
+/// Height of the empty composer, in rows.
+const MIN_INPUT_ROWS: usize = 2;
 /// Rows after which the field stops growing and scrolls internally.
 const MAX_INPUT_ROWS: usize = 8;
 const THUMB_SIZE: f32 = 56.0;
@@ -43,9 +50,23 @@ const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
     handle_dropped_files(app, ui);
     handle_paste(app, ui);
-    handle_escape(app, ui);
 
     let p = app.palette;
+
+    // Stable id so we can read the focus state from `Memory` *before* the
+    // TextEdit is added — needed so we can consume Enter and suppress the
+    // newline the multiline editor would otherwise insert.
+    let input_id = egui::Id::new("chat_input_field");
+    let input_focused = ui.memory(|m| m.has_focus(input_id));
+
+    // The "/" palette draws above the composer and claims ↑↓/Enter/Tab/Esc
+    // while it is open, so it has to run before the Esc-interrupt and
+    // Enter-sends handlers below get a look at the same keys.
+    let slash = super::slash_menu::draw(app, ui, input_focused);
+
+    if !slash.open {
+        handle_escape(app, ui);
+    }
 
     // Thumbnail strip for pending attachments (above the input row).
     if !app.chat.pending_images.is_empty() {
@@ -55,13 +76,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
 
     let turn_in_flight = last_turn_in_flight(app);
 
-    // Stable id so we can read the focus state from `Memory` *before* the
-    // TextEdit is added — needed so we can consume Enter and suppress the
-    // newline the multiline editor would otherwise insert.
-    let input_id = egui::Id::new("chat_input_field");
-    let input_focused = ui.memory(|m| m.has_focus(input_id));
     let submit_via_enter = !disabled
         && input_focused
+        && !slash.open
         && ui.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
         });
@@ -105,24 +122,43 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
             .rounding(Rounding::same(INPUT_FRAME_RADIUS))
             .inner_margin(egui::Margin::symmetric(INPUT_FRAME_PAD_X, INPUT_FRAME_PAD_Y))
             .show(ui, |ui| {
-                // The TextEdit grows with the draft (desired_rows is only a
-                // minimum); the ScrollArea caps that growth and scrolls the
-                // overflow. TextEdit keeps its own cursor in view.
+                // Height tracks the draft: we lay the text out at the field's
+                // own width and ask the galley how many rows it needs, so a
+                // single long pasted line opens the field exactly as far as
+                // the same text typed across several lines would. Past
+                // `MAX_INPUT_ROWS` the ScrollArea takes over and scrolls the
+                // overflow, keeping Send on screen. Row height is resolved
+                // from the live style, so changing the body font size
+                // rescales the composer with it.
                 let font_id = egui::TextStyle::Body.resolve(ui.style());
                 let row_h = ui.fonts(|f| f.row_height(&font_id));
+                // TextEdit wraps its galley at `desired_width` minus its own
+                // 4px side margins; measuring at the outer width undercounts
+                // by a row exactly when a line fits outside the margins but
+                // not inside them — the caret then hides below the field.
+                let text_w = (input_w - 8.0).max(40.0);
+                let rows = wrapped_rows(ui, &app.chat.draft, &font_id, text_w)
+                    .clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS);
+                // Allocate the height up front instead of letting the scroll
+                // area derive it from the space available. A bottom panel is
+                // only as tall as last frame's content, so a scroll area that
+                // shrinks to fit that space can never ask for more than it
+                // already has — which pins the field at its opening height no
+                // matter how much is typed. Allocating makes the panel grow.
+                let field_h = row_h * rows as f32 + 4.0;
+                ui.allocate_ui(egui::vec2(input_w, field_h), |ui| {
                 egui::ScrollArea::vertical()
                     .id_source("chat_input_scroll")
-                    .max_height(row_h * MAX_INPUT_ROWS as f32 + 4.0)
                     .show(ui, |ui| {
                         let input = egui::TextEdit::multiline(&mut app.chat.draft)
                             .id(input_id)
                             .hint_text(if disabled {
                                 "(disabled — connect an LLM)"
                             } else {
-                                "Type a message…  (Enter to send, Shift+Enter for newline)"
+                                "Type a message, or / for skills and commands…"
                             })
                             .desired_width(input_w)
-                            .desired_rows(2)
+                            .desired_rows(rows)
                             // egui only inserts a newline for the configured
                             // return key; plain Enter is consumed above to
                             // send, so map newline to Shift+Enter.
@@ -134,6 +170,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
                         ui.add_enabled(!disabled, input)
                     })
                     .inner
+                })
+                .inner
             });
         let _ = frame_inner.inner;
         app.chat.input_hovered = frame_inner.response.hovered();
@@ -141,10 +179,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
         // While a turn streams, swap the SEND button for STOP. Same slot so
         // the cursor doesn't have to hunt.
         if turn_in_flight {
-            let stop_resp = primary_button_enabled(ui, &p, "Stop", true);
-            if stop_resp.clicked() {
-                let session_id = app.chat.session_id;
-                app.send(UiCommand::SendRequest(Request::InterruptTurn { session_id }));
+            // Disabled once an interrupt is already in flight — the label
+            // reports that the turn is winding down rather than inviting a
+            // second click that would do nothing visible.
+            let stopping = app.chat.interrupt_requested;
+            let label = if stopping { "Stopping" } else { "Stop" };
+            let stop_resp = primary_button_enabled(ui, &p, label, !stopping);
+            if stop_resp.clicked() && !stopping {
+                app.interrupt_turn();
             }
         } else {
             let send_enabled = !disabled
@@ -163,6 +205,30 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
         ui.add_space(8.0);
         caps_label(ui, &format!("TICKET {ticket}"), rgb(p.muted));
     }
+}
+
+/// Visual rows `text` occupies when wrapped at `width` — wrapped
+/// continuations included, never less than one. A trailing newline gets no row
+/// of its own in the galley even though the caret has moved to a fresh line,
+/// so it is counted back in: pressing Shift+Enter should open the field
+/// immediately, not on the next keystroke.
+fn wrapped_rows(ui: &egui::Ui, text: &str, font_id: &egui::FontId, width: f32) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    // Colour is irrelevant — only the row count is read back.
+    let job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        font_id.clone(),
+        egui::Color32::WHITE,
+        width,
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    galley
+        .rows
+        .len()
+        .saturating_add(usize::from(text.ends_with('\n')))
+        .max(1)
 }
 
 /// Build the outgoing `SendUserMessage`, draining `pending_images`.
@@ -202,8 +268,10 @@ fn send_message(app: &mut App) {
         tool_chips: Vec::new(),
         reasoning_collapsed: false,
         images: history_images,
+        notice: None,
     });
     app.chat.scroll_to_bottom = true;
+    app.chat.interrupt_requested = false;
     app.send(UiCommand::SendRequest(Request::SendUserMessage {
         session_id,
         text,
@@ -433,9 +501,8 @@ fn handle_escape(app: &mut App, ui: &mut egui::Ui) {
     if !pressed {
         return;
     }
-    if last_turn_in_flight(app) {
-        let session_id = app.chat.session_id;
-        app.send(UiCommand::SendRequest(Request::InterruptTurn { session_id }));
+    if last_turn_in_flight(app) && !app.chat.interrupt_requested {
+        app.interrupt_turn();
     }
 }
 

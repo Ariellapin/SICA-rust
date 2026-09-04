@@ -62,6 +62,7 @@ impl Skill for SkillCreator {
     fn positional_args(&self) -> Vec<String> {
         vec!["name".into(), "description".into(), "body".into()]
     }
+    fn timeout(&self) -> std::time::Duration { std::time::Duration::from_secs(600) }
 
     async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
         match write_skill(&self.skills_dir, &args) {

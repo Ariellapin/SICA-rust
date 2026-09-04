@@ -4,16 +4,16 @@
 //! inset 24px with a left-edge info-blue hairline and italic serif body.
 
 use egui::{
-    Align, Key, Layout, Modifiers, PointerButton, Pos2, Rect, RichText, Rounding, Sense,
-    Shape, Stroke, Vec2,
+    Align, Color32, Key, Layout, Modifiers, PointerButton, Pos2, Rect, RichText, Rounding,
+    Sense, Shape, Stroke, Vec2,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use sica_core::theme::Palette;
 
-use crate::app::{rgb, App};
+use crate::app::{rgb, App, Notice, ToolChip};
 use crate::ui::widgets::{
-    blade_mark, caps_button, caps_job, caps_label, display_text, hairline,
+    blade_mark, caps_button, caps_job, caps_label, display_text, hairline, working_sweep,
 };
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
@@ -26,6 +26,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // every frame so a stale snap doesn't fire when auto-follow resumes.
     let force_scroll =
         std::mem::take(&mut app.chat.scroll_to_bottom) && !app.chat.autoscroll_paused;
+    // An interrupt has been sent but the backend hasn't confirmed the turn is
+    // over yet — the strip says so instead of implying work is progressing.
+    let stopping = app.chat.interrupt_requested;
     // Screen rect of each rendered assistant body, for Ctrl+A targeting.
     let mut assistant_rects: Vec<(usize, Rect)> = Vec::new();
     let selected = app.chat.selected_turn;
@@ -36,6 +39,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         // panning the viewport — otherwise message text can't be highlighted.
         // Wheel and scrollbar scrolling are unaffected.
         .drag_to_scroll(false)
+        // We drive the bottom-snap by writing the offset ourselves (see
+        // `transcript_input`). Animated targets would fight that write, and
+        // an animated snap rubber-bands on every streamed delta anyway.
+        .animated(false)
         .max_height(height.max(120.0))
         .show(ui, |ui| {
             if app.chat.turns.is_empty() {
@@ -43,7 +50,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 return;
             }
             for i in 0..app.chat.turns.len() {
-                let (user, assistant, reasoning_text, finished, collapsed) = {
+                // Marker entries (auto-compaction records) carry no message
+                // body — draw the strip and move on.
+                if let Some(notice) = app.chat.turns[i].notice.clone() {
+                    draw_notice(ui, &notice, &palette);
+                    continue;
+                }
+                let (user, assistant, reasoning_text, finished, collapsed, errored) = {
                     let t = &app.chat.turns[i];
                     (
                         t.user.clone(),
@@ -51,6 +64,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         t.reasoning.clone(),
                         t.finished,
                         t.reasoning_collapsed,
+                        t.finish_reason.as_deref().is_some_and(|r| r.starts_with("error")),
                     )
                 };
                 let has_images = !app.chat.turns[i].images.is_empty();
@@ -72,16 +86,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         draw_reasoning(ui, &reasoning_text, &palette);
                     }
                 }
-                if !assistant.is_empty() || !finished {
+                // No placeholder for an empty in-flight reply: the activity
+                // strip below already says work is happening, and says what.
+                if !assistant.is_empty() {
                     let body = ui
                         .scope(|ui| {
-                            draw_assistant(
-                                ui,
-                                &mut app.md_cache,
-                                i,
-                                if assistant.is_empty() { "…" } else { &assistant },
-                                &palette,
-                            );
+                            draw_assistant(ui, &mut app.md_cache, i, &assistant, &palette);
                         })
                         .response
                         .rect;
@@ -101,23 +111,110 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if !chips.is_empty() {
                     super::tool_chips::draw(ui, &chips, &palette);
                 }
+                if !finished {
+                    draw_working(ui, &chips, stopping, &palette);
+                } else if errored {
+                    // The request itself failed (after the backend's retries):
+                    // say so where the reply would have been, so an empty
+                    // bubble never reads as "the model chose silence". The
+                    // log panel carries the exact error.
+                    ui.add_space(6.0);
+                    caps_label(ui, "Request failed · see log", rgb(palette.danger));
+                }
                 ui.add_space(20.0);
             }
-            // Bottom anchor: when new content arrived this frame, hard-snap
-            // the viewport here. This guarantees autoscroll even when egui's
-            // `stick_to_bottom` heuristic disengages (e.g. on first render
-            // after a session switch, or when streaming starts while the
-            // user was not yet at the bottom).
-            if force_scroll {
-                let anchor = ui.allocate_response(Vec2::ZERO, Sense::hover());
-                anchor.scroll_to_me(Some(Align::BOTTOM));
-            }
         });
-    transcript_input(app, ui, &output, &assistant_rects);
+    transcript_input(app, ui, &output, &assistant_rects, force_scroll);
     // The pill is pointless while everything already fits on screen.
     if output.content_size.y > output.inner_rect.height() {
-        resume_button(app, ui, output.inner_rect);
+        resume_button(app, ui, visible_viewport(ui, &output));
     }
+}
+
+/// The part of the transcript viewport actually on screen.
+///
+/// With horizontal scrolling off and `auto_shrink` off, egui grows the scroll
+/// area's `inner_rect` to whatever width the content demanded, so a single
+/// unwrappable line (a long path in a tool chip, say) can hand us a rect far
+/// wider than the window. Anything doing hit-testing or positioning has to
+/// clamp to the visible clip rect first, or it lands off-screen.
+fn visible_viewport(ui: &egui::Ui, output: &egui::scroll_area::ScrollAreaOutput<()>) -> Rect {
+    output.inner_rect.intersect(ui.clip_rect())
+}
+
+/// Live activity strip under the turn that is still running: the animated
+/// sweep plus a caps line naming what is currently executing. The innermost
+/// unfinished tool call is the one actually doing work, and a call nested
+/// below the main agent (`depth > 0`) is a sub-agent — so it is named as one.
+fn draw_working(ui: &mut egui::Ui, chips: &[ToolChip], stopping: bool, p: &Palette) {
+    let active = chips
+        .iter()
+        .filter(|c| !c.finished)
+        .max_by_key(|c| c.depth);
+    let (label, tint) = if stopping {
+        ("Stopping…".to_string(), rgb(p.caution))
+    } else {
+        match active {
+            Some(c) if c.depth > 0 => {
+                (format!("Sub-agent · {}", c.name), rgb(p.info))
+            }
+            Some(c) => (format!("Running · {}", c.name), rgb(p.accent)),
+            None => ("Thinking".to_string(), rgb(p.accent)),
+        }
+    };
+    ui.add_space(6.0);
+    let resp = ui.horizontal(|ui| {
+        working_sweep(ui, p, 13.0);
+        ui.add_space(6.0);
+        caps_label(ui, &label, tint);
+    });
+    // Hovering the strip explains what the sub-agent was asked to produce —
+    // the same expectation text the chip carries.
+    if let Some(c) = active {
+        if !c.expectation.is_empty() {
+            resp.response
+                .on_hover_text(format!("expect: {}", c.expectation));
+        }
+    }
+}
+
+// ---------- markers ----------
+
+/// Out-of-band transcript marker: a tracked-caps line flanked by tinted rules,
+/// info-blue when the operation succeeded and danger when it didn't. Hovering
+/// reveals `detail` — for a compaction that is the summary the model wrote, so
+/// the user can read exactly what replaced their history.
+fn draw_notice(ui: &mut egui::Ui, n: &Notice, p: &Palette) {
+    let tint = if n.ok { rgb(p.info) } else { rgb(p.danger) };
+    ui.add_space(10.0);
+    let row = ui.horizontal(|ui| {
+        notice_rule(ui, 20.0, tint);
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(caps_job(&n.label, tint, 9.0)).selectable(false));
+        ui.add_space(6.0);
+        // Fill whatever is left; `available_width` can be zero on a narrow
+        // window, and `allocate_exact_size` dislikes negative extents.
+        notice_rule(ui, (ui.available_width() - 4.0).max(0.0), tint);
+    });
+    if !n.detail.is_empty() {
+        let detail = n.detail.clone();
+        let muted = rgb(p.muted);
+        row.response.on_hover_ui(move |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new(&detail).color(muted));
+        });
+    }
+    ui.add_space(14.0);
+}
+
+/// Half-strength horizontal rule used either side of a marker label.
+fn notice_rule(ui: &mut egui::Ui, width: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 1.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0, color.linear_multiply(0.45)),
+    );
 }
 
 // ---------- viewport input: pause/resume, keyboard + middle-click scroll ----------
@@ -130,15 +227,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 ///   * Windows-style middle-click pan: a middle click drops an anchor and
 ///     vertical pointer displacement scrolls until any other click / Esc;
 ///   * Ctrl+A selecting the hovered (else last) assistant message and
-///     Ctrl+C copying the selected one.
+///     Ctrl+C copying the selected one;
+///   * committing the viewport offset — the keyboard/pan delta, the hard
+///     bottom-snap when new content arrived, and the horizontal pin.
 fn transcript_input(
     app: &mut App,
     ui: &mut egui::Ui,
     output: &egui::scroll_area::ScrollAreaOutput<()>,
     assistant_rects: &[(usize, Rect)],
+    force_scroll: bool,
 ) {
     let ctx = ui.ctx().clone();
-    let rect = output.inner_rect;
+    let rect = visible_viewport(ui, output);
     // Include the scrollbar gutter so grabbing the bar also counts as the
     // user taking control of the viewport.
     let hit_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x + 14.0, rect.max.y));
@@ -200,13 +300,31 @@ fn transcript_input(
         ctx.request_repaint();
     }
 
+    // --- commit the viewport offset ---
+    // Every scroll this view performs is vertical. `offset.x` is pinned to
+    // zero so a horizontal scroll target leaking in from a nested widget can
+    // never shift the transcript sideways and cut the start off every line.
+    let max_offset = (output.content_size.y - rect.height()).max(0.0);
+    let mut state = output.state;
+    let mut dirty = state.offset.x != 0.0;
+    state.offset.x = 0.0;
     if delta != 0.0 {
         if delta < 0.0 {
             app.chat.autoscroll_paused = true;
         }
-        let max_offset = (output.content_size.y - rect.height()).max(0.0);
-        let mut state = output.state;
         state.offset.y = (state.offset.y + delta).clamp(0.0, max_offset);
+        dirty = true;
+    } else if force_scroll {
+        // Hard bottom-snap on new content. Covers the cases egui's
+        // `stick_to_bottom` heuristic misses — first render after a session
+        // switch, or streaming starting while the user sat mid-transcript.
+        // A keyboard/pan delta this frame wins: the user is steering.
+        if state.offset.y != max_offset {
+            state.offset.y = max_offset;
+            dirty = true;
+        }
+    }
+    if dirty {
         state.store(&ctx, output.id);
         ctx.request_repaint();
     }

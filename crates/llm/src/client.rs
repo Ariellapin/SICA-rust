@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use eventsource_stream::Eventsource;
 
 use crate::streaming::{parse_sse_event, ThinkSplitter};
-pub use crate::streaming::{StreamChunk, ToolCallDelta};
+pub use crate::streaming::{StreamChunk, ToolCallDelta, Usage};
 
 #[derive(Clone, Debug)]
 pub struct LlmClient {
@@ -21,6 +21,11 @@ pub struct LlmClient {
     pub temperature: f32,
     /// Per-response completion cap; `None` = server default.
     pub max_tokens: Option<u32>,
+    /// When false, requests carry `chat_template_kwargs: {"enable_thinking":
+    /// false}` so servers that template the toggle (llama.cpp, vLLM/Qwen)
+    /// suppress `<think>` reasoning. When true (default) nothing extra is
+    /// sent — strict providers like OpenAI reject unknown request fields.
+    pub thinking: bool,
     api_key:      Option<String>,
     http:         reqwest::Client,
 }
@@ -37,6 +42,16 @@ pub struct ChatRequest {
     /// uses the text-protocol tool calling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
+    /// Extra kwargs forwarded to the server's chat template. Only populated
+    /// to disable thinking; omitted otherwise so strict providers don't
+    /// reject the request as carrying an unknown field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// `{ "include_usage": true }` — asks for the provider's token counts on
+    /// the final chunk. A standard OpenAI field, so strict providers accept
+    /// it; servers that predate it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +171,7 @@ impl LlmClient {
             model:    model.into(),
             temperature: 0.2,
             max_tokens: None,
+            thinking: true,
             api_key:  api_key.filter(|k| !k.is_empty()),
             // No *total* request timeout: a streaming completion legitimately
             // runs for many minutes on a local server. `read_timeout` guards
@@ -207,10 +223,35 @@ impl LlmClient {
         Ok(list.data)
     }
 
-    /// Best-effort context-window detection from `/v1/models`. Prefers the
-    /// entry matching `self.model`, falls back to the first entry. `None`
-    /// when the server doesn't report a length in any known field.
+    /// GET /props — llama.cpp-only endpoint reporting the context size the
+    /// server was actually launched with (`-c` / `--ctx-size`), as
+    /// `default_generation_settings.n_ctx`. This is the per-slot serving
+    /// window, unlike `n_ctx_train` from `/v1/models`, which is the model's
+    /// training window and can be far larger than what the server allocated.
+    /// Non-llama.cpp providers 404 here → `None`.
+    async fn props_n_ctx(&self) -> Option<u32> {
+        let url = format!("{}/props", self.base_url.trim_end_matches('/'));
+        let resp = self.auth(self.http.get(url)).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        v.get("default_generation_settings")?
+            .get("n_ctx")?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0)
+    }
+
+    /// Best-effort context-window detection. Tries llama.cpp's `/props` first
+    /// so the window matches the server's own `--ctx-size` setting, then
+    /// falls back to `/v1/models` (vLLM `max_model_len`, llama.cpp
+    /// `n_ctx_train`), preferring the entry matching `self.model`. `None`
+    /// when no endpoint reports a length.
     pub async fn detect_context_window(&self) -> Option<u32> {
+        if let Some(n) = self.props_n_ctx().await {
+            return Some(n);
+        }
         let entries = self.fetch_models().await.ok()?;
         entries
             .iter()
@@ -259,6 +300,9 @@ impl LlmClient {
             temperature: Some(self.temperature),
             max_tokens: self.max_tokens,
             tools,
+            chat_template_kwargs: (!self.thinking)
+                .then(|| serde_json::json!({ "enable_thinking": false })),
+            stream_options: Some(serde_json::json!({ "include_usage": true })),
         };
 
         // POST itself is racy against cancellation: if Esc fires before the

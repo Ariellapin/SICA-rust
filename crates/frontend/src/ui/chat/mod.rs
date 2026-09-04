@@ -2,6 +2,7 @@
 
 mod input_bar;
 mod messages;
+mod slash_menu;
 mod tool_chips;
 
 use egui::{Rect, Sense, Vec2};

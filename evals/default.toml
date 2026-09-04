@@ -1,0 +1,104 @@
+# Default model-eval suite.
+#
+# Every case runs as its own single-turn conversation against the connected
+# model, with the real system prompt (memory.md + the live skill catalogue).
+# Nothing here is executed — tool-call cases only check that the call the
+# model wrote would have parsed and dispatched.
+#
+# Edit freely: add cases for the prompts your own work actually depends on.
+# Re-run after every memory.md / skill-doc edit; the report diffs against the
+# previous run so you can see whether the edit helped.
+
+[suite]
+name        = "default"
+description = "Baseline behaviour: tool-call syntax, restraint, grounding, output shape."
+system      = "live"
+repeats     = 2
+
+# --- tool syntax: does the model form calls the parser accepts? -------------
+
+[[case]]
+id       = "read-file-basic"
+category = "tool-syntax"
+prompt   = "Which positional arguments does the read-file skill accept? Check its documentation file skills/read-file.md before answering."
+expect_tool         = ["read-file"]
+expect_args_contain = ["read-file.md"]
+single_tool_call    = true
+
+[[case]]
+id       = "shell-version"
+category = "tool-syntax"
+prompt   = "Find out which version of cargo is installed on this machine."
+expect_tool         = ["run-pwsh", "run-cli"]
+expect_args_contain = ["cargo"]
+single_tool_call    = true
+
+[[case]]
+id       = "write-two-args"
+category = "tool-args"
+prompt   = "Create a file at notes/eval-probe.md whose entire contents are the line: hello from the eval"
+expect_tool         = ["write-file"]
+min_args            = 2
+expect_args_contain = ["notes/eval-probe.md", "hello from the eval"]
+
+[[case]]
+id       = "one-call-at-a-time"
+category = "protocol"
+prompt   = "Compare memory.md with skills/run-cli.md and tell me which one documents the ` > ` expectation clause."
+expect_tool      = ["read-file"]
+single_tool_call = true
+
+# --- restraint: does it stop reaching for tools it doesn't need? ------------
+
+[[case]]
+id       = "no-tool-for-arithmetic"
+category = "restraint"
+prompt   = "What is 17 * 3? Reply with just the number."
+expect_no_tool = true
+contains       = ["51"]
+max_words      = 6
+
+[[case]]
+id       = "no-tool-for-definition"
+category = "restraint"
+prompt   = "In one sentence, what is a trait in Rust?"
+expect_no_tool = true
+max_words      = 60
+
+# --- grounding: does it admit what it has not checked? ----------------------
+
+[[case]]
+id       = "grounding-missing-file"
+category = "grounding"
+prompt   = 'What are the contents of C:\sica-eval\does-not-exist-9f3a.txt?'
+judge    = "PASS if the reply either issues a tool call to look the file up, or says plainly that it has not read the file / cannot know without checking. FAIL if it states or paraphrases any supposed contents of the file, or asserts the file exists or does not exist as established fact."
+
+[[case]]
+id       = "no-fabricated-tool-result"
+category = "grounding"
+prompt   = "Does a file named README.md exist at the workspace root?"
+not_contains = ["tool_result"]
+judge        = "PASS if the reply issues a tool call to check, or says it needs to check. FAIL if it answers yes or no as established fact without a tool call, or if it writes out what a tool supposedly returned."
+
+# --- output shape: does it follow an explicit format instruction? -----------
+
+[[case]]
+id       = "format-single-word"
+category = "format"
+prompt   = "Reply with exactly one word: OK. No punctuation, no explanation, no preamble."
+regex     = "(?i)^\\W*ok\\W*$"
+max_words = 2
+
+[[case]]
+id       = "format-json"
+category = "format"
+prompt   = "Reply with a JSON object with exactly two keys, name and purpose, describing the app you are running inside. No prose, no code fence."
+json      = true
+contains  = ["name", "purpose"]
+
+[[case]]
+id       = "follow-negative-constraint"
+category = "instruction"
+prompt   = "In at most 25 words, say what a named pipe is. Do not use the word 'very' anywhere in your answer."
+not_contains = ["very"]
+max_words    = 35

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use protocol::{Event, Frame, LlmState, Request, SessionDump, SessionMeta, Severity, TicketKind};
+use protocol::{
+    CatalogEntry, Event, Frame, LlmState, Request, SessionDump, SessionMeta, Severity, TicketKind,
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -53,7 +55,18 @@ pub enum UiEvent {
     TurnStarted { session_id: u64, turn_id: u64 },
     AssistantDelta { session_id: u64, turn_id: u64, content: String, reasoning: String },
     TurnFinished { session_id: u64, turn_id: u64, finish_reason: String },
-    TokenUsage { session_id: u64, used: u32, limit: u32 },
+    TokenUsage { session_id: u64, used: u32, limit: u32, budget: u32 },
+
+    // Auto-compaction lifecycle.
+    ContextCompacting { session_id: u64 },
+    ContextCompacted {
+        session_id:    u64,
+        ok:            bool,
+        folded:        u32,
+        before_tokens: u32,
+        after_tokens:  u32,
+        summary:       String,
+    },
 
     // Tool chips.
     ToolCallStarted {
@@ -71,6 +84,9 @@ pub enum UiEvent {
     SessionCreated { id: u64 },
     SessionLoaded { session: SessionDump },
     SessionTitleChanged { session_id: u64, title: String },
+
+    /// Skills / agents / commands the BE can see — feeds the "/" palette.
+    Catalog { entries: Vec<CatalogEntry> },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -231,9 +247,15 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::SessionTitleChanged { session_id, title } => {
             UiEvent::SessionTitleChanged { session_id, title }
         }
-        Event::TokenUsage { session_id, used, limit } => {
-            UiEvent::TokenUsage { session_id, used, limit }
+        Event::TokenUsage { session_id, used, limit, budget } => {
+            UiEvent::TokenUsage { session_id, used, limit, budget }
         }
+        Event::ContextCompacting { session_id } => UiEvent::ContextCompacting { session_id },
+        Event::ContextCompacted {
+            session_id, ok, folded, before_tokens, after_tokens, summary,
+        } => UiEvent::ContextCompacted {
+            session_id, ok, folded, before_tokens, after_tokens, summary,
+        },
         Event::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
             UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation }
         }

@@ -18,3 +18,16 @@ tracing     = { workspace = true }
 futures     = { workspace = true }
 async-trait = { workspace = true }
 once_cell   = { workspace = true }
+# `model-eval`: TOML suites, regex checks, timestamped report filenames.
+toml        = { workspace = true }
+regex       = { workspace = true }
+chrono      = { workspace = true }
+
+# `proc`: Job Objects so a killed shell takes its child processes with it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

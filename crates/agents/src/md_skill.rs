@@ -11,11 +11,13 @@
 //! follow when this skill fires.
 //! ```
 //!
-//! On `run`, the skill returns its body as the outcome summary, so the
-//! caller (typically a `ToolSubAgent`) can feed those instructions back
-//! into the LLM. Skills with malformed frontmatter are skipped at load
-//! time and surfaced as a warning to the caller — the runtime itself
-//! does not crash on a bad file.
+//! On `run`, the skill returns its body — framed as a `<skill_content>`
+//! block naming the directory it came from, so relative resource paths in
+//! the body resolve — as the outcome summary, so the caller (typically a
+//! `ToolSubAgent`) can feed those instructions back into the LLM. The same
+//! frame is what a typed `/name` injects (see `crate::invoke`). Skills with
+//! malformed frontmatter are skipped at load time and surfaced as a warning
+//! to the caller — the runtime itself does not crash on a bad file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,12 +56,59 @@ impl Skill for MarkdownSkill {
         self.positionals.clone()
     }
 
+    /// A markdown skill's body *is* the instruction — framing it as
+    /// untrusted data would tell the model to ignore it.
+    fn trusted(&self) -> bool {
+        true
+    }
+
     async fn run(&self, _args: Value, _ctx: SkillContext) -> SkillOutcome {
         SkillOutcome {
             ok:      true,
-            summary: self.body.clone(),
+            summary: self.render_skill_content(),
         }
     }
+}
+
+impl MarkdownSkill {
+    /// The fixed frame a loaded skill is delivered in:
+    ///
+    /// ```text
+    /// <skill_content name="…">
+    /// <skill_resources>Base directory for this skill: …</skill_resources>
+    /// <skill_instructions>
+    /// …body…
+    /// </skill_instructions>
+    /// </skill_content>
+    /// ```
+    ///
+    /// The base directory lets a skill refer to sibling files by relative
+    /// path; `read-file` resolves against the workspace root, so the
+    /// absolute directory is spelled out rather than assumed.
+    pub fn render_skill_content(&self) -> String {
+        let base = self
+            .source_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".into());
+        format!(
+            "<skill_content name=\"{}\">\n\
+             <skill_resources>Base directory for this skill: {base}</skill_resources>\n\
+             <skill_instructions>\n{}\n</skill_instructions>\n\
+             </skill_content>",
+            self.name,
+            self.body.trim_end(),
+        )
+    }
+}
+
+/// Parse one markdown skill file. Same rules as [`load_dir`], for a single
+/// path — used to resolve a typed `/name` against `commands/`, `agents/`
+/// and `skills/` without scanning whole directories.
+pub fn load_file(path: &Path) -> Result<MarkdownSkill, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    parse(&text, path)
 }
 
 /// Outcome of a `load_dir` call. Skills that parsed successfully are in
@@ -223,12 +272,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_returns_body() {
+    async fn run_returns_framed_body() {
         let s = MarkdownSkill {
             name: "n".into(),
             description: "d".into(),
-            body: "instructions".into(),
-            source_path: dummy(),
+            body: "instructions\n".into(),
+            source_path: PathBuf::from("skills").join("n.md"),
             positionals: Vec::new(),
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
@@ -236,7 +285,27 @@ mod tests {
         let ctx = SkillContext { sub };
         let out = s.run(Value::Null, ctx).await;
         assert!(out.ok);
-        assert_eq!(out.summary, "instructions");
+        assert!(s.trusted());
+        assert_eq!(
+            out.summary,
+            "<skill_content name=\"n\">\n\
+             <skill_resources>Base directory for this skill: skills</skill_resources>\n\
+             <skill_instructions>\ninstructions\n</skill_instructions>\n\
+             </skill_content>"
+        );
+    }
+
+    #[test]
+    fn load_file_reads_one_skill() {
+        let dir = std::env::temp_dir().join(format!("sica-md-skill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("one.md");
+        std::fs::write(&path, "---\nname: one\n---\nbody\n").unwrap();
+        let s = load_file(&path).unwrap();
+        assert_eq!(s.name, "one");
+        assert_eq!(s.source_path, path);
+        assert!(load_file(&dir.join("missing.md")).unwrap_err().starts_with("read:"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

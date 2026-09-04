@@ -45,7 +45,20 @@ impl SkillRegistry {
     /// static `memory.md` only names the built-ins, so without this the LLM
     /// has no way to discover any skill the user has dropped into `skills/`.
     pub fn catalogue_markdown(&self) -> String {
-        let mut names: Vec<&str> = self.by_name.keys().map(String::as_str).collect();
+        self.catalogue_markdown_excluding(&[])
+    }
+
+    /// [`catalogue_markdown`](Self::catalogue_markdown) minus the named
+    /// skills. Used by `agent-team` to hide itself from its own teammates:
+    /// a teammate spawning another team is pure cost on a small model, and
+    /// the nesting only unwinds when it hits the sub-agent depth limit.
+    pub fn catalogue_markdown_excluding(&self, exclude: &[&str]) -> String {
+        let mut names: Vec<&str> = self
+            .by_name
+            .keys()
+            .map(String::as_str)
+            .filter(|n| !exclude.contains(n))
+            .collect();
         names.sort_unstable();
         let mut out = String::new();
         for name in names {
@@ -238,5 +251,14 @@ mod tests {
 - **tk** ('<path>' '<content>')
 ";
         assert_eq!(md, expected);
+    }
+
+    #[test]
+    fn catalogue_can_exclude_names() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Described));
+        reg.register(Arc::new(Bare));
+        let md = reg.catalogue_markdown_excluding(&["fetch"]);
+        assert_eq!(md, "- **noop**\n");
     }
 }

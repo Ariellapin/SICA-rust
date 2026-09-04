@@ -110,6 +110,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 Response::SessionLoaded { session } => {
                                     bridge.send(UiEvent::SessionLoaded { session });
                                 }
+                                Response::Catalog { entries } => {
+                                    bridge.send(UiEvent::Catalog { entries });
+                                }
                                 _ => {}
                             }
                         }
