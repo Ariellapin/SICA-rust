@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -251,6 +251,16 @@ pub enum Request {
     ResolveApproval { id: u64, allow: bool },
     /// Answer an `ask-user` / plan-review question (`QuestionAsked`).
     AnswerQuestion { id: u64, answer: String },
+
+    /// Splice `text` into the *running* turn as a user message at its next
+    /// hop, instead of queueing it as a separate turn. This is the user
+    /// redirecting an agent mid-flight; with no turn running it is an
+    /// ordinary send.
+    SteerTurn { session_id: u64, text: String },
+    /// Put non-user context into the session at the next hop (or at the
+    /// start of the next turn when idle). Injected content is model-visible
+    /// but never attributed to the user.
+    InjectContext { session_id: u64, text: String },
 
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
@@ -519,6 +529,16 @@ pub enum Event {
     PermissionModeChanged {
         session_id: u64,
         mode: PermissionMode,
+    },
+    /// The session's inbox changed: `queued` user messages are waiting to
+    /// run as their own turns once the current one ends. `accepted` says
+    /// what the arriving item became — `"queued"`, `"steered"` or
+    /// `"injected"` — so the FE can label the message it just optimistically
+    /// rendered instead of leaving it looking stalled.
+    InboxChanged {
+        session_id: u64,
+        queued: u32,
+        accepted: String,
     },
 }
 

@@ -101,6 +101,14 @@ pub async fn handle(
                 Response::Error { message: format!("question {id} is no longer pending") }
             }
         }
+        Request::SteerTurn { session_id, text } => {
+            chat.steer_turn(session_id, text).await;
+            Response::Ok
+        }
+        Request::InjectContext { session_id, text } => {
+            chat.inject_context(session_id, text).await;
+            Response::Ok
+        }
         Request::ReportFrontendError { module, message, traceback } => {
             idealist_bus.publish(idealist::Trigger {
                 kind: "fe_panic".into(),

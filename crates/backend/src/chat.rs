@@ -5,6 +5,8 @@
 //! mutates a message list — every persistence site is an [`append_event`].
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -22,6 +24,7 @@ use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
 use sica_core::event::{ContextSource, EventKind, SurfaceEntry, SurfaceOp};
 use sica_core::message::{Message, Role};
 
+use crate::inbox::{Inbound, Inbox};
 use crate::sessions_store::{self, SessionLog};
 use crate::title_gen;
 
@@ -84,6 +87,10 @@ pub struct ChatHub {
     /// the provider's own `usage` after each successful request; cleared on
     /// reconnect.
     pub meters:        Arc<Mutex<HashMap<u64, TokenMeter>>>,
+    /// What is waiting to enter each session's loop (`crate::inbox`): user
+    /// messages sent while a turn was running, mid-turn steers, and context
+    /// the runtime wants the model to see at its next step.
+    pub inbox:         Arc<Inbox>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -665,6 +672,7 @@ impl ChatHub {
             plans:        Arc::new(Mutex::new(HashMap::new())),
             brokers:      Arc::new(BrokerSet::new()),
             meters:       Arc::new(Mutex::new(HashMap::new())),
+            inbox:        Arc::new(Inbox::new()),
         }
     }
 
@@ -786,6 +794,7 @@ impl ChatHub {
         let removed = self.sessions.lock().await.remove(&id).is_some();
         if removed {
             sessions_store::delete(id);
+            self.inbox.clear(id).await;
         }
         removed
     }
@@ -890,6 +899,11 @@ impl ChatHub {
         if let Some((_, tok)) = self.active_turns.lock().await.get(&session_id) {
             tok.cancel();
         }
+        // Steers and injects aimed at the turn being killed die with it —
+        // applying them to some later, unrelated turn would be worse than
+        // dropping them. Queued user messages survive: pressing Stop right
+        // after sending one is how a user says "do this instead".
+        self.inbox.drain_mid_turn(session_id).await;
     }
 
     async fn session_exists(&self, session_id: u64) -> bool {
@@ -1073,16 +1087,118 @@ impl ChatHub {
         }
     }
 
+    /// Enqueue one inbox item and tell the FE what it became.
+    async fn enqueue(&self, session_id: u64, item: Inbound) -> u32 {
+        let accepted = item.accepted().to_string();
+        let queued = self.inbox.push(session_id, item).await;
+        self.event_sink.emit(Event::InboxChanged { session_id, queued, accepted });
+        queued
+    }
+
+    /// Splice user text into the running turn at its next hop. With no turn
+    /// running there is nothing to steer, so it is an ordinary send.
+    pub async fn steer_turn(&self, session_id: u64, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if !self.active_turns.lock().await.contains_key(&session_id) {
+            self.start_turn(session_id, text, Vec::new()).await;
+            return;
+        }
+        self.enqueue(session_id, Inbound::Steer { text }).await;
+        self.event_sink.emit(Event::LogLine {
+            level:   "INFO".into(),
+            message: "steering the running turn — the message lands at its next step".into(),
+        });
+    }
+
+    /// Push non-user context into the session. Reaches the model at the
+    /// running turn's next hop, or at the start of the next turn when idle.
+    pub async fn inject_context(&self, session_id: u64, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.enqueue(
+            session_id,
+            Inbound::Inject { content: text, source: ContextSource::Injected },
+        )
+        .await;
+    }
+
+    /// [`Self::start_turn`] as a type-erased future.
+    ///
+    /// A turn that ends with a followup queued starts the next turn itself,
+    /// which makes `start_turn` indirectly recursive. Boxing through
+    /// `dyn Future` is what keeps that future's type finite.
+    fn start_boxed(
+        &self,
+        session_id: u64,
+        text: String,
+        images: Vec<UserImage>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let hub = self.clone();
+        Box::pin(async move { hub.start_turn(session_id, text, images).await })
+    }
+
+    /// Accept a user message: queue it when a turn is already running,
+    /// otherwise start a turn for it.
     pub async fn send_user_message(
         &self,
         session_id: u64,
         text: String,
         images: Vec<UserImage>,
     ) {
+        // A send that arrives while a turn is running is *queued*, not a
+        // cancellation: the running turn keeps its plan and this message
+        // runs as the next turn, with no second send needed. The check and
+        // the enqueue happen under the `active_turns` lock the turn task
+        // also takes when it hands off, so a turn ending right now either
+        // sees this followup or leaves its slot standing for us.
+        {
+            let guard = self.active_turns.lock().await;
+            if guard.contains_key(&session_id) {
+                let queued = self
+                    .enqueue(session_id, Inbound::Followup { text, images })
+                    .await;
+                drop(guard);
+                self.event_sink.emit(Event::LogLine {
+                    level:   "INFO".into(),
+                    message: format!("a turn is running — message queued ({queued} waiting)"),
+                });
+                return;
+            }
+        }
+        self.start_turn(session_id, text, images).await;
+    }
+
+    /// Run one user message as a turn, unconditionally.
+    ///
+    /// Separate from [`Self::send_user_message`] because the turn loop calls
+    /// it to start a queued followup while still *holding* the session's
+    /// slot: going back through the queue gate there would see that slot,
+    /// re-queue the message it had just claimed, and strand it.
+    async fn start_turn(
+        &self,
+        session_id: u64,
+        text: String,
+        images: Vec<UserImage>,
+    ) {
         let Some(client) = self.llm.lock().await.clone() else {
+            // A followup handed this call a *reserved* slot. Nothing is
+            // going to run now, so release it — otherwise the session reads
+            // as busy forever and every later send queues behind a turn
+            // that does not exist. A no-op on the ordinary path.
+            self.active_turns.lock().await.remove(&session_id);
+            let stranded = self.inbox.queued(session_id).await;
             self.event_sink.emit(Event::LogLine {
-                level: "WARN".into(),
-                message: "no LLM connected — cannot send".into(),
+                level:   "WARN".into(),
+                message: if stranded > 0 {
+                    format!(
+                        "no LLM connected — cannot send ({stranded} queued                          message(s) will not run; send them again once                          connected)"
+                    )
+                } else {
+                    "no LLM connected — cannot send".into()
+                },
             });
             return;
         };
@@ -1170,6 +1286,10 @@ impl ChatHub {
         let marker = self.next_marker.fetch_add(1, Ordering::Relaxed);
         {
             let mut guard = self.active_turns.lock().await;
+            // Any slot found here is either a turn the FE let overlap (a
+            // safety net — cancel it) or this session's own reservation
+            // from a followup handoff, whose token is already finished, so
+            // cancelling is a no-op.
             if let Some((_, prev)) = guard.insert(session_id, (marker, cancel.clone())) {
                 prev.cancel();
             }
@@ -1177,6 +1297,9 @@ impl ChatHub {
 
         let events = self.event_sink.clone();
         let sessions_map = self.sessions.clone();
+        let inbox = self.inbox.clone();
+        // The turn starts the next one itself when a followup is queued.
+        let hub = self.clone();
         let control = ControlState {
             events: self.event_sink.clone(),
             failure_sink: self.failure_sink.clone(),
@@ -1217,6 +1340,43 @@ impl ChatHub {
                 // new (empty) turn, and burn a tokenize round-trip first.
                 if cancel.is_cancelled() {
                     break;
+                }
+
+                // Claim whatever arrived since the last hop. This has to
+                // happen before `build_history` or the request about to go
+                // out would not contain it — that is the whole point of the
+                // inbox: input reaches the model at the next step instead
+                // of after the turn.
+                for item in inbox.drain_mid_turn(session_id).await {
+                    match item {
+                        Inbound::Steer { text } => {
+                            event_sink.emit(Event::LogLine {
+                                level:   "INFO".into(),
+                                message: format!("steer applied: {}", one_line(&text, 120)),
+                            });
+                            append_event(&sessions_map, session_id, EventKind::UserMessage {
+                                surface: SurfaceOp::Append,
+                                content: text,
+                                images:  Vec::new(),
+                            })
+                            .await;
+                        }
+                        Inbound::Inject { content, source } => {
+                            event_sink.emit(Event::LogLine {
+                                level:   "INFO".into(),
+                                message: format!("context injected ({})", source.label()),
+                            });
+                            append_event(&sessions_map, session_id, EventKind::ContextInjected {
+                                surface: SurfaceOp::Append,
+                                source,
+                                content,
+                            })
+                            .await;
+                        }
+                        // Followups wait for their own turn; `drain_mid_turn`
+                        // leaves them queued.
+                        Inbound::Followup { .. } => {}
+                    }
                 }
 
                 // Derive the history fresh from the event log each iteration:
@@ -1661,16 +1821,42 @@ impl ChatHub {
             })
             .await;
 
-            // Release this turn's slot, but only if a *newer* send hasn't
-            // already replaced it (marker comparison avoids clobbering).
-            {
+            // Release this turn's slot — unless a queued message is waiting,
+            // in which case the slot stays held through the handoff so a
+            // send arriving in the gap still queues instead of racing the
+            // followup. Only this turn may hand off: a newer send has
+            // already replaced the marker.
+            let followup = {
                 let mut guard = active_turns.lock().await;
-                if let Some((slot_marker, _)) = guard.get(&session_id) {
-                    if *slot_marker == marker {
-                        guard.remove(&session_id);
-                    }
+                let mine = guard
+                    .get(&session_id)
+                    .is_some_and(|(slot_marker, _)| *slot_marker == marker);
+                let next = if mine { inbox.take_followup(session_id).await } else { None };
+                if mine && next.is_none() {
+                    guard.remove(&session_id);
                 }
+                next
+            };
+
+            if let Some((next_text, next_images)) = followup {
+                let queued = inbox.queued(session_id).await;
+                event_sink.emit(Event::InboxChanged {
+                    session_id,
+                    queued,
+                    accepted: "running".into(),
+                });
+                event_sink.emit(Event::LogLine {
+                    level:   "INFO".into(),
+                    message: format!(
+                        "running queued message ({queued} still waiting)"
+                    ),
+                });
+                // Boxed: this is `send_user_message` calling itself one turn
+                // later, and the future's type has to stay finite.
+                let fut = hub.start_boxed(session_id, next_text, next_images);
+                tokio::spawn(fut);
             }
+
 
             // Skip the auto-title work if the user interrupted — a partial
             // assistant reply isn't a useful title source.
@@ -1721,6 +1907,13 @@ impl ChatHub {
             }
         });
     }
+}
+
+/// One-line, length-capped preview of user text for a log line.
+fn one_line(text: &str, cap: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let head = sica_core::retain::utf8_head(&flat, cap);
+    if head.len() < flat.len() { format!("{head}…") } else { head.to_string() }
 }
 
 /// Append one event to a session's log and flush it. Returns the seq, or

@@ -83,6 +83,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
             i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
         });
 
+    // Ctrl+Enter while a turn is running *steers* it: the text lands in the
+    // running turn at its next step instead of queueing behind it. Plain
+    // Enter still queues, which is the safer default — a steer changes the
+    // instructions of work the user has not seen the end of.
+    let steer_via_enter = !disabled
+        && input_focused
+        && !slash.open
+        && turn_in_flight
+        && ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
+        });
+
     ui.horizontal(|ui| {
         let spacing = ui.spacing().item_spacing.x;
         let frame_pad_x = INPUT_FRAME_PAD_X * 2.0;
@@ -154,6 +166,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
                             .id(input_id)
                             .hint_text(if disabled {
                                 "(disabled — connect an LLM)"
+                            } else if turn_in_flight {
+                                "Enter queues · Ctrl+Enter steers this turn…"
                             } else {
                                 "Type a message, or / for skills and commands…"
                             })
@@ -178,6 +192,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
 
         // While a turn streams, swap the SEND button for STOP. Same slot so
         // the cursor doesn't have to hunt.
+        let can_submit = !disabled
+            && (!app.chat.draft.trim().is_empty() || !app.chat.pending_images.is_empty());
         if turn_in_flight {
             // Disabled once an interrupt is already in flight — the label
             // reports that the turn is winding down rather than inviting a
@@ -188,13 +204,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
             if stop_resp.clicked() && !stopping {
                 app.interrupt_turn();
             }
+            // The composer stays live during a turn: Enter queues the
+            // message behind it, Ctrl+Enter steers the turn itself.
+            if (submit_via_enter || steer_via_enter) && can_submit {
+                send_message(app, steer_via_enter);
+                ui.memory_mut(|m| m.request_focus(input_id));
+            }
         } else {
-            let send_enabled = !disabled
-                && (!app.chat.draft.trim().is_empty() || !app.chat.pending_images.is_empty());
-            let send_resp = primary_button_enabled(ui, &p, "Send", send_enabled);
+            let send_resp = primary_button_enabled(ui, &p, "Send", can_submit);
             let send = send_resp.clicked();
-            if (send || submit_via_enter) && send_enabled {
-                send_message(app);
+            if (send || submit_via_enter) && can_submit {
+                send_message(app, false);
                 // Re-acquire focus so the user can keep typing.
                 ui.memory_mut(|m| m.request_focus(input_id));
             }
@@ -246,8 +266,22 @@ fn parse_harness_command(text: &str) -> Option<(String, String)> {
     Some((name.to_string(), input))
 }
 
+/// One-line, length-capped preview for a transcript marker label.
+fn one_line(text: &str, cap: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(cap) {
+        Some((i, _)) => format!("{}…", &flat[..i]),
+        None => flat,
+    }
+}
+
 /// Build the outgoing `SendUserMessage`, draining `pending_images`.
-fn send_message(app: &mut App) {
+///
+/// `steer` routes the text into the *running* turn (`SteerTurn`) instead of
+/// queueing it as the next one. It only applies while a turn is in flight
+/// and only to plain text — there is no image channel on a steer, so an
+/// attachment falls back to the ordinary send, which the backend queues.
+fn send_message(app: &mut App, steer: bool) {
     let text = std::mem::take(&mut app.chat.draft);
     let attachments = std::mem::take(&mut app.chat.pending_images);
     let images = attachments.iter().map(PendingAttachment::to_user_image).collect::<Vec<_>>();
@@ -263,6 +297,24 @@ fn send_message(app: &mut App) {
     if text.trim().is_empty() && images.is_empty() {
         return;
     }
+
+    // A steer joins the turn already on screen rather than opening one of
+    // its own, so it shows as a marker in the transcript.
+    if steer && images.is_empty() {
+        let session_id = app.chat.session_id;
+        app.chat.turns.push(crate::app::Turn::marker(
+            session_id,
+            crate::app::Notice {
+                label:  format!("steered: {}", one_line(&text, 80)),
+                detail: text.clone(),
+                ok:     true,
+            },
+        ));
+        app.chat.scroll_to_bottom = true;
+        app.send(UiCommand::SendRequest(Request::SteerTurn { session_id, text }));
+        return;
+    }
+
 
     // Harness commands never create a model message: route them to
     // `RunCommand` instead of the turn loop (no Turn is pushed, so the
@@ -300,6 +352,7 @@ fn send_message(app: &mut App) {
         reasoning_collapsed: false,
         images: history_images,
         notice: None,
+        queued: false,
     });
     app.chat.scroll_to_bottom = true;
     app.chat.interrupt_requested = false;

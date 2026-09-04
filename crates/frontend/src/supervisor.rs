@@ -108,6 +108,11 @@ pub enum UiEvent {
     PlanModeChanged { session_id: u64, active: bool },
     PermissionModeChanged { session_id: u64, mode: protocol::PermissionMode },
 
+    // Wave 4 inbox: a message sent while a turn was running was queued
+    // rather than cancelling it (`accepted` is "queued" | "steered" |
+    // "injected" | "running").
+    InboxChanged { session_id: u64, queued: u32, accepted: String },
+
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
     IdealistTicketWritten { path: String, kind: TicketKind },
@@ -296,6 +301,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::PermissionModeChanged { session_id, mode } => {
             UiEvent::PermissionModeChanged { session_id, mode }
+        }
+        Event::InboxChanged { session_id, queued, accepted } => {
+            UiEvent::InboxChanged { session_id, queued, accepted }
         }
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }

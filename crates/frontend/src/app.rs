@@ -516,6 +516,11 @@ pub struct Turn {
     /// transcript marker (today: the auto-compaction record). It renders as a
     /// centred caps line and every other field stays empty.
     pub notice:             Option<Notice>,
+    /// The backend queued this message behind a turn that was already
+    /// running instead of starting it (Wave 4 inbox). It renders as
+    /// "queued" rather than as a stalled stream, and clears when the
+    /// backend reports it running.
+    pub queued:             bool,
 }
 
 impl Turn {
@@ -534,6 +539,7 @@ impl Turn {
             reasoning_collapsed: true,
             images: Vec::new(),
             notice: Some(notice),
+            queued: false,
         }
     }
 }
@@ -1059,6 +1065,7 @@ impl App {
                     reasoning_collapsed: false,
                     images: Vec::new(),
                     notice: None,
+            queued: false,
                 });
                 self.chat.scroll_to_bottom = true;
             }
@@ -1280,6 +1287,43 @@ impl App {
                     self.permission_mode = mode;
                 }
             }
+            UiEvent::InboxChanged { session_id, queued, accepted } => {
+                if session_id == self.chat.session_id {
+                    match accepted.as_str() {
+                        // The optimistic turn this send pushed is waiting
+                        // behind the running one — say so instead of
+                        // letting it read as a stalled stream.
+                        "queued" => {
+                            if let Some(t) = self
+                                .chat
+                                .turns
+                                .iter_mut()
+                                .rev()
+                                .find(|t| t.notice.is_none() && !t.finished)
+                            {
+                                t.queued = true;
+                            }
+                        }
+                        // The oldest queued message just became the running
+                        // turn; `TurnStarted` fills the rest in.
+                        "running" => {
+                            if let Some(t) = self
+                                .chat
+                                .turns
+                                .iter_mut()
+                                .find(|t| t.queued)
+                            {
+                                t.queued = false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.push_log(
+                    LogKind::Event,
+                    format!("message {accepted} ({queued} queued)"),
+                );
+            }
         }
     }
 
@@ -1335,6 +1379,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     reasoning_collapsed: true,
                     images: m.images.iter().map(Attachment::from_user_image).collect(),
                     notice: None,
+            queued: false,
                 });
             }
             "assistant" => {
@@ -1350,6 +1395,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     reasoning_collapsed: true,
                     images: Vec::new(),
                     notice: None,
+            queued: false,
                 });
                 slot.assistant = m.content.clone();
                 if let Some(r) = &m.reasoning {

@@ -192,6 +192,9 @@ pub enum ContextSource {
     JobNotice,
     /// The goal driver opened a round.
     GoalRound,
+    /// Pushed in from outside the loop (`Request::InjectContext`) — the
+    /// operator handing the model a fact, not the model asking for one.
+    Injected,
     /// Volatile facts (time, permission mode) snapshotted for this step.
     RuntimeContext,
 }
@@ -206,6 +209,7 @@ impl ContextSource {
             ContextSource::ToolNotice => "tool notice".into(),
             ContextSource::JobNotice => "job notice".into(),
             ContextSource::GoalRound => "goal round".into(),
+            ContextSource::Injected => "injected".into(),
             ContextSource::RuntimeContext => "runtime context".into(),
         }
     }

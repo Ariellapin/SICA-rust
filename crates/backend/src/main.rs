@@ -15,6 +15,7 @@ mod be_core;
 mod catalog;
 mod chat;
 mod dispatcher;
+mod inbox;
 mod ipc;
 mod parent_watch;
 mod sessions_store;

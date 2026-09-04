@@ -71,6 +71,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if !user.is_empty() || has_images {
                     draw_user(ui, &user, &palette);
                 }
+                // A message the backend queued behind a running turn: say
+                // so, or an empty reply that has not started yet reads as a
+                // stalled stream.
+                if app.chat.turns[i].queued {
+                    draw_queued(ui, &palette);
+                }
                 if has_images {
                     draw_user_images(app, ui, i);
                 }
@@ -436,6 +442,23 @@ fn draw_empty(ui: &mut egui::Ui, p: &Palette) {
 }
 
 // ---------- user ----------
+
+/// Right-aligned "queued" caption under a message the backend has accepted
+/// but not started — it runs as its own turn once the current one ends.
+fn draw_queued(ui: &mut egui::Ui, p: &Palette) {
+    let avail = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail, 0.0),
+        Layout::right_to_left(Align::Min),
+        |ui| {
+            ui.add(egui::Label::new(
+                RichText::new("queued — runs when the current turn ends")
+                    .size(11.0)
+                    .color(rgb(p.muted)),
+            ));
+        },
+    );
+}
 
 fn draw_user(ui: &mut egui::Ui, text: &str, p: &Palette) {
     let avail = ui.available_width();
