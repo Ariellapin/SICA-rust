@@ -112,6 +112,8 @@ pub enum UiEvent {
     // rather than cancelling it (`accepted` is "queued" | "steered" |
     // "injected" | "running").
     InboxChanged { session_id: u64, queued: u32, accepted: String },
+    /// A session's background jobs changed (started, finished, killed).
+    JobsChanged { session_id: u64, jobs: Vec<protocol::JobDump> },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -304,6 +306,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::InboxChanged { session_id, queued, accepted } => {
             UiEvent::InboxChanged { session_id, queued, accepted }
+        }
+        Event::JobsChanged { session_id, jobs } => {
+            UiEvent::JobsChanged { session_id, jobs }
         }
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }

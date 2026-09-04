@@ -153,8 +153,11 @@ impl SkillRegistry {
     ///   args object is forwarded verbatim (the model already named each arg).
     /// - `args_json: None` — natural-language shape; positional values are
     ///   zipped onto the skill's declared `positional_args()` to form the
-    ///   object. Extra positional values past the declared list are silently
-    ///   dropped; missing trailing args become absent JSON keys.
+    ///   object. A surplus positional of the form `key=value` binds to a
+    ///   *declared* optional arg (`run-cli 'cargo build' 'background=true'`)
+    ///   — that is the only way the natural-language form can reach one;
+    ///   any other surplus value is dropped, and missing trailing args
+    ///   become absent JSON keys.
     pub fn resolve(&self, call: &ToolCall) -> Option<(Arc<dyn Skill>, Value)> {
         let skill = self.get(&call.skill)?;
         if let Some(json) = &call.args_json {
@@ -164,6 +167,22 @@ impl SkillRegistry {
         let mut obj = Map::new();
         for (name, val) in names.iter().zip(call.raw_args.iter()) {
             obj.insert(name.clone(), Value::String(val.clone()));
+        }
+        // Surplus positionals of the form `key=value` bind to *declared*
+        // optional args, so the natural-language form can reach them at all
+        // — `run-cli 'cargo build' 'background=true'`. Without this the
+        // extra value was silently dropped and the call did something other
+        // than what it said. Only names the skill declares are accepted, so
+        // a command that merely contains `=` cannot become an argument.
+        let optional = skill.optional_args();
+        if !optional.is_empty() {
+            for raw in call.raw_args.iter().skip(names.len()) {
+                let Some((key, value)) = raw.split_once('=') else { continue };
+                let key = key.trim();
+                if optional.iter().any(|o| o == key) {
+                    obj.insert(key.to_string(), Value::String(value.trim().to_string()));
+                }
+            }
         }
         Some((skill, Value::Object(obj)))
     }
@@ -298,5 +317,66 @@ mod tests {
         reg.register(Arc::new(Bare));
         let md = reg.catalogue_markdown_excluding(&["fetch"]);
         assert_eq!(md, "- **noop**\n");
+    }
+
+    struct ShellLike;
+    #[async_trait]
+    impl Skill for ShellLike {
+        fn name(&self) -> &str { "sh" }
+        fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
+        fn optional_args(&self) -> Vec<String> { vec!["cwd".into(), "background".into()] }
+        async fn run(&self, _a: Value, _c: SkillContext) -> SkillOutcome {
+            SkillOutcome { ok: true, summary: String::new() }
+        }
+    }
+
+    fn call(args: &[&str]) -> ToolCall {
+        ToolCall {
+            skill: "sh".into(),
+            raw_args: args.iter().map(|s| s.to_string()).collect(),
+            expectation: "ok".into(),
+            args_json: None,
+        }
+    }
+
+    #[test]
+    fn surplus_key_value_positionals_bind_to_declared_optional_args() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(ShellLike));
+        let (_, args) = reg
+            .resolve(&call(&["cargo build", "background=true", "cwd=/tmp"]))
+            .unwrap();
+        assert_eq!(args["command"], "cargo build");
+        assert_eq!(args["background"], "true");
+        assert_eq!(args["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn a_command_containing_an_equals_sign_is_not_mistaken_for_an_argument() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(ShellLike));
+        // Positional 1 is the command, whatever it contains; and a surplus
+        // pair whose key the skill never declared is ignored rather than
+        // invented.
+        let (_, args) = reg
+            .resolve(&call(&["FOO=bar make", "colour=always"]))
+            .unwrap();
+        assert_eq!(args["command"], "FOO=bar make");
+        assert!(args.get("colour").is_none());
+        assert!(args.get("FOO").is_none());
+    }
+
+    #[test]
+    fn a_skill_with_no_optional_args_still_drops_surplus_positionals() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Tk));
+        let c = ToolCall {
+            skill: "tk".into(),
+            raw_args: vec!["a.md".into(), "hi".into(), "x=1".into()],
+            expectation: String::new(),
+            args_json: None,
+        };
+        let (_, args) = reg.resolve(&c).unwrap();
+        assert_eq!(args.as_object().unwrap().len(), 2);
     }
 }

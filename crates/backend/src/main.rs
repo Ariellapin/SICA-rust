@@ -16,6 +16,7 @@ mod catalog;
 mod chat;
 mod dispatcher;
 mod inbox;
+mod jobs_bridge;
 mod ipc;
 mod parent_watch;
 mod sessions_store;
@@ -158,10 +159,19 @@ async fn run(args: Args) -> Result<()> {
             warn!(error = %e, dir = %dir.display(), "create palette dir failed");
         }
     }
+    // Background jobs (Wave 4, guide §12.4). Built before the registry
+    // because the shell skills hold it: `run-cli 'cargo build'
+    // 'background=true'` starts a job instead of waiting. The hub adopts the
+    // same instance below (`with_jobs`) and the bridge wires completions
+    // back into the session.
+    let jobs = Arc::new(agents::JobRegistry::new());
     let mut skill_registry = agents::SkillRegistry::new();
     skill_registry.register(Arc::new(agents::SkillCreator::new(skills_path.clone())));
-    skill_registry.register(Arc::new(agents::RunCli));
-    skill_registry.register(Arc::new(agents::RunPwsh));
+    skill_registry.register(Arc::new(agents::RunCli(Some(jobs.clone()))));
+    skill_registry.register(Arc::new(agents::RunPwsh(Some(jobs.clone()))));
+    skill_registry.register(Arc::new(agents::JobOutput(jobs.clone())));
+    skill_registry.register(Arc::new(agents::JobList(jobs.clone())));
+    skill_registry.register(Arc::new(agents::JobKill(jobs.clone())));
     skill_registry.register(Arc::new(agents::ReadFile::new(root.clone())));
     skill_registry.register(Arc::new(agents::WriteFile::new(root.clone())));
     skill_registry.register(Arc::new(agents::EditFile::new(root.clone())));
@@ -274,7 +284,13 @@ async fn run(args: Args) -> Result<()> {
         out_tx.clone(),
         skill_registry.clone(),
         Some(tool_failure_sink.clone()),
-    );
+    )
+    .with_jobs(jobs.clone());
+
+    // Bridge: a finished job appends its audit line, drops a notice into the
+    // owning session's inbox (the model reads it at its next step) and
+    // refreshes the FE's list.
+    jobs.attach_notifier(Arc::new(jobs_bridge::JobsBridge::new(&chat)));
 
     // Initial broadcasts: ServerHello + initial LLM state so the FE can sync.
     let _ = out_tx.send(Frame {

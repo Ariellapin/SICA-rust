@@ -76,8 +76,8 @@ mod tests {
     #[test]
     fn skills_come_from_the_registry_and_are_sorted() {
         let mut reg = SkillRegistry::new();
-        reg.register(Arc::new(agents::RunPwsh));
-        reg.register(Arc::new(agents::RunCli));
+        reg.register(Arc::new(agents::RunPwsh(None)));
+        reg.register(Arc::new(agents::RunCli(None)));
         let missing = Path::new("no-such-dir");
         let entries = build(&reg, missing, missing, missing);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();

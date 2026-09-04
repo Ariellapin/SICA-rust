@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -540,6 +540,25 @@ pub enum Event {
         queued: u32,
         accepted: String,
     },
+    /// A session's background jobs changed — one started, finished or was
+    /// killed. Carries the whole list so the FE never has to reconcile
+    /// deltas.
+    JobsChanged {
+        session_id: u64,
+        jobs: Vec<JobDump>,
+    },
+}
+
+/// One background job as the FE sees it (`agents::jobs::JobSummary` over
+/// the wire; `status` is the rendered label, since the FE only displays it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDump {
+    pub id:      String,
+    pub kind:    String,
+    pub command: String,
+    pub status:  String,
+    pub running: bool,
+    pub unread:  u64,
 }
 
 #[derive(Debug, Error)]

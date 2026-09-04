@@ -15,6 +15,7 @@ use crate::ui::widgets::{caps_label, ghost_button};
 /// prompt from a background session stays reachable by switching back.
 pub fn draw_strips(app: &mut App, ui: &mut egui::Ui) {
     draw_approval_strip(app, ui);
+    draw_jobs_strip(app, ui);
     draw_plan_todo_row(app, ui);
 }
 
@@ -53,6 +54,52 @@ fn draw_approval_strip(app: &mut App, ui: &mut egui::Ui) {
     if let Some(allow) = verdict {
         app.pending_approval = None;
         app.send(UiCommand::SendRequest(Request::ResolveApproval { id, allow }));
+    }
+    ui.add_space(4.0);
+}
+
+/// Background jobs for the active session. Running ones first, since those
+/// are the ones a "Kill" click is for; a finished job stays listed until
+/// its session is closed, because its output is still readable.
+fn draw_jobs_strip(app: &mut App, ui: &mut egui::Ui) {
+    if app.jobs.is_empty() {
+        return;
+    }
+    let p = app.palette;
+    let mut kill: Option<String> = None;
+    ui.horizontal_wrapped(|ui| {
+        caps_label(ui, "JOBS", rgb(p.muted));
+        for job in &app.jobs {
+            let color = if job.running {
+                rgb(p.warn)
+            } else if job.status.starts_with("exited 0") {
+                rgb(p.ok)
+            } else {
+                rgb(p.danger)
+            };
+            ui.label(
+                egui::RichText::new(format!("{} [{}]", job.id, job.status))
+                    .color(color)
+                    .small(),
+            )
+            .on_hover_text(format!(
+                "{}\n{} unread byte(s)",
+                job.command, job.unread
+            ));
+            if job.running && ghost_button(ui, &p, "Kill").clicked() {
+                kill = Some(job.id.clone());
+            }
+        }
+    });
+    // Killing from the UI goes through the same tool the model would use,
+    // so the completion notice reaches the model either way.
+    if let Some(id) = kill {
+        let session_id = app.chat.session_id;
+        app.send(UiCommand::SendRequest(Request::RunCommand {
+            session_id,
+            name: "job-kill".into(),
+            input: id,
+        }));
     }
     ui.add_space(4.0);
 }

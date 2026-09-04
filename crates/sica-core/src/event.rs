@@ -166,6 +166,15 @@ pub enum EventKind {
     /// Full-replacement todo list. Latest wins; never surfaced (the FE
     /// renders the checklist from the pushed event).
     TodoWrite { items: Vec<protocol::TodoItem> },
+    /// A background job ended. Durable audit only — what the model reads is
+    /// the `ContextInjected { source: JobNotice }` that accompanies it, so
+    /// the notice is part of the derived history and this is not.
+    JobFinished {
+        id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
     /// A kind this build does not know — written by a newer backend. Kept
     /// so an older binary still loads the log; contributes nothing.
     #[serde(other)]

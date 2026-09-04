@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,13 +35,17 @@ pub const GLOB_NAME:       &str = "glob";
 pub const GREP_NAME:       &str = "grep";
 
 pub const RUN_CLI_DESCRIPTION: &str =
-    "Execute a shell command. Positional args: <command>. \
-     Returns stdout/stderr/exit_code; capped to 32 KiB output, 30 s timeout.";
+    "Execute a shell command. Positional args: <command>. Optional named \
+     args: cwd, background (`true` starts it as a background job and \
+     returns a job id instead of waiting). Returns stdout/stderr/exit_code; \
+     capped to 32 KiB output, 30 s timeout in the foreground.";
 
 pub const RUN_PWSH_DESCRIPTION: &str =
     "Execute a PowerShell command (preferred on Windows). \
-     Positional args: <command>. Returns stdout/stderr/exit_code; \
-     capped to 32 KiB output, 30 s timeout.";
+     Positional args: <command>. Optional named args: cwd, background \
+     (`true` starts it as a background job and returns a job id instead of \
+     waiting). Returns stdout/stderr/exit_code; capped to 32 KiB output, \
+     30 s timeout in the foreground.";
 
 pub const READ_FILE_DESCRIPTION: &str =
     "Read a UTF-8 file with line numbers. Positional args: <path>. \
@@ -102,6 +107,30 @@ Behaviour:
 
 Use this for build tools, git, package managers, or one-shot scripts.
 
+Background jobs — for anything longer than the 30 s foreground cap
+(a build, a test suite, a watcher). Pass `background=true` and the call
+returns a job id immediately instead of waiting:
+
+    run-cli 'cargo build --workspace' 'background=true' > start the build
+
+    started job `cli-3` in the background: cargo build --workspace
+
+From then on three tools cover it, and they work for any job whatever
+started it:
+
+    job-list                       > what is running
+    job-output 'cli-3'             > what the build printed so far
+    job-kill 'cli-3'               > stop it
+
+`job-output` returns everything printed **since your last read** and ends
+with a `[status: …]` line, so polling it twice does not repeat output. You
+do not have to poll: when a job ends, a notice naming it and its exit status
+is put in front of you at your next step automatically.
+
+Limits: 10 running jobs per session, 256 KiB of retained output per job
+(a job that out-runs that says how much was dropped). Jobs belong to the
+session that started them and die with the backend.
+
 **Windows note:** if a command fails with `is not recognized as an internal
 or external command` or `is not recognized as the name of a cmdlet`, the
 shell can't find the executable. Retry the same command with `run-pwsh`,
@@ -136,6 +165,9 @@ Behaviour:
 - The outcome `ok` mirrors the child exit code (0 = ok).
 - Optional named arg `cwd` (JSON-fenced / native calls only): sets the
   working directory for the command.
+- Optional named arg `background`: `true` starts the command as a
+  background job and returns a job id instead of waiting. See `run-cli` for
+  the full description; `job-list` / `job-output` / `job-kill` control it.
 "#;
 
 pub const READ_FILE_SEED_MD: &str = r#"---
@@ -256,14 +288,17 @@ Behaviour:
 - Uses Rust `regex` syntax — no backreferences, no look-around.
 "#;
 
-pub struct RunCli;
+/// `run-cli`. The optional job registry is what makes
+/// `'background=true'` possible; `None` (tests, the catalogue probe) simply
+/// means background is unavailable.
+pub struct RunCli(pub Option<Arc<crate::jobs::JobRegistry>>);
 
 #[async_trait]
 impl Skill for RunCli {
     fn name(&self) -> &str { RUN_CLI_NAME }
     fn description(&self) -> &str { RUN_CLI_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
-    fn optional_args(&self) -> Vec<String> { vec!["cwd".into()] }
+    fn optional_args(&self) -> Vec<String> { vec!["cwd".into(), "background".into()] }
     fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
     fn concurrency(&self, args: &Value) -> Concurrency {
         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -293,7 +328,59 @@ impl Skill for RunCli {
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
+        if wants_background(&args) {
+            return start_background(&self.0, "cli", &command, cmd, &ctx);
+        }
         run_shell(cmd, "cmd", &ctx).await
+    }
+}
+
+/// `background` arrives as a JSON bool from a native call and as a string
+/// from the text protocol (`'background=true'`). Accept both, and treat
+/// anything unrecognised as "no" — running in the foreground is the safe
+/// misreading, since the caller still gets its output.
+fn wants_background(args: &Value) -> bool {
+    match args.get("background") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+        }
+        _ => false,
+    }
+}
+
+/// Start `cmd` under the session's job registry instead of waiting for it.
+///
+/// Refuses rather than falling back to a foreground run: a caller that asked
+/// for background wants a command longer than the 30 s foreground cap, so
+/// running it in the foreground would just time out and lose the work.
+fn start_background(
+    jobs: &Option<Arc<crate::jobs::JobRegistry>>,
+    kind: &str,
+    command: &str,
+    cmd: Command,
+    ctx: &SkillContext,
+) -> SkillOutcome {
+    let Some(jobs) = jobs else {
+        return err("background jobs are not available in this context");
+    };
+    let Some(session_id) = ctx.sub.session_id else {
+        return err("background jobs are per session and this call has none");
+    };
+    match jobs.start_shell(session_id, kind, command, cmd) {
+        Ok(id) => SkillOutcome {
+            ok:      true,
+            summary: format!(
+                "started job `{id}` in the background: {command}\n\
+                 It is still running. Read what it prints with \
+                 `{} '{id}' > what it printed`, list jobs with `{}`, stop it \
+                 with `{} '{id}'`. You will be told when it finishes.",
+                crate::jobs::JOB_OUTPUT_NAME,
+                crate::jobs::JOB_LIST_NAME,
+                crate::jobs::JOB_KILL_NAME,
+            ),
+        },
+        Err(e) => err(&e),
     }
 }
 
@@ -340,14 +427,15 @@ async fn run_shell(mut cmd: Command, exe: &str, ctx: &SkillContext) -> SkillOutc
     }
 }
 
-pub struct RunPwsh;
+/// `run-pwsh`. See [`RunCli`] for the job registry.
+pub struct RunPwsh(pub Option<Arc<crate::jobs::JobRegistry>>);
 
 #[async_trait]
 impl Skill for RunPwsh {
     fn name(&self) -> &str { RUN_PWSH_NAME }
     fn description(&self) -> &str { RUN_PWSH_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
-    fn optional_args(&self) -> Vec<String> { vec!["cwd".into()] }
+    fn optional_args(&self) -> Vec<String> { vec!["cwd".into(), "background".into()] }
     fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
     fn concurrency(&self, args: &Value) -> Concurrency {
         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -388,6 +476,9 @@ impl Skill for RunPwsh {
         ]);
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
+        }
+        if wants_background(&args) {
+            return start_background(&self.0, "pwsh", &command, cmd, &ctx);
         }
         run_shell(cmd, exe, &ctx).await
     }
@@ -1093,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_echoes() {
-        let out = RunCli.run(
+        let out = RunCli(None).run(
             json!({ "command": if cfg!(windows) { "echo hi" } else { "echo hi" } }),
             ctx(),
         ).await;
@@ -1107,7 +1198,7 @@ mod tests {
         let sink: std::sync::Arc<dyn crate::agent::EventSink> = std::sync::Arc::new(NullSink);
         let ctx = SkillContext { sub: crate::ToolSubAgent::root(sink).with_spill_label("77") };
         let command = if cfg!(windows) { "echo %SICA_SESSION_ID%" } else { "echo $SICA_SESSION_ID" };
-        let out = RunCli.run(json!({ "command": command }), ctx).await;
+        let out = RunCli(None).run(json!({ "command": command }), ctx).await;
         assert!(out.ok, "{}", out.summary);
         assert!(out.summary.contains("77"), "{}", out.summary);
     }
@@ -1144,5 +1235,44 @@ mod tests {
         std::fs::write(&path, "edited").unwrap();
         seed_defaults(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+    }
+
+    #[test]
+    fn background_is_recognised_from_both_call_shapes() {
+        // Native calls send a JSON bool; the text protocol sends a string.
+        assert!(wants_background(&json!({ "background": true })));
+        assert!(wants_background(&json!({ "background": "true" })));
+        assert!(wants_background(&json!({ "background": "YES" })));
+        // Anything else runs in the foreground — the safe misreading, since
+        // the caller still gets its output.
+        assert!(!wants_background(&json!({ "background": "later" })));
+        assert!(!wants_background(&json!({ "background": false })));
+        assert!(!wants_background(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn background_without_a_registry_fails_instead_of_running_in_the_foreground() {
+        // Falling back would run a command the caller expected to outlive
+        // the 30 s foreground cap, and time it out.
+        let out = RunCli(None)
+            .run(json!({ "command": "echo hi", "background": true }), ctx())
+            .await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("not available"), "{}", out.summary);
+    }
+
+    #[tokio::test]
+    async fn a_background_shell_call_returns_a_job_id_and_keeps_running() {
+        let jobs = std::sync::Arc::new(crate::jobs::JobRegistry::new());
+        let mut c = ctx();
+        c.sub.session_id = Some(7);
+        let out = RunCli(Some(jobs.clone()))
+            .run(json!({ "command": "echo hi", "background": "true" }), c)
+            .await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("cli-1"), "{}", out.summary);
+        assert!(out.summary.contains(crate::jobs::JOB_OUTPUT_NAME));
+        assert_eq!(jobs.list(7).len(), 1);
+        jobs.clear(7);
     }
 }

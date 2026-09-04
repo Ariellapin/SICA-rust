@@ -41,7 +41,7 @@ pub fn default_title(id: u64) -> String {
     format!("Session {id}")
 }
 
-type Sessions = Arc<Mutex<HashMap<u64, SessionLog>>>;
+pub type Sessions = Arc<Mutex<HashMap<u64, SessionLog>>>;
 
 #[derive(Clone)]
 pub struct ChatHub {
@@ -91,6 +91,11 @@ pub struct ChatHub {
     /// messages sent while a turn was running, mid-turn steers, and context
     /// the runtime wants the model to see at its next step.
     pub inbox:         Arc<Inbox>,
+    /// Background jobs (`agents::jobs`). `main.rs` builds this *before* the
+    /// skill registry — the shell skills need it to start a job — and
+    /// hands it over with [`Self::with_jobs`], so the hub and the skills
+    /// share one registry.
+    pub jobs:          Arc<agents::JobRegistry>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -673,6 +678,7 @@ impl ChatHub {
             brokers:      Arc::new(BrokerSet::new()),
             meters:       Arc::new(Mutex::new(HashMap::new())),
             inbox:        Arc::new(Inbox::new()),
+            jobs:         Arc::new(agents::JobRegistry::new()),
         }
     }
 
@@ -709,6 +715,14 @@ impl ChatHub {
         hub
     }
 
+    /// Adopt the job registry the skills were built with. Without this the
+    /// hub would hold an empty registry of its own and never see the jobs
+    /// the shell skills actually start.
+    pub fn with_jobs(mut self, jobs: Arc<agents::JobRegistry>) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
     pub async fn list_sessions(&self) -> Vec<SessionMeta> {
         let g = self.sessions.lock().await;
         let mut out: Vec<SessionMeta> = g
@@ -730,6 +744,25 @@ impl ChatHub {
     /// model reads. Injected context goes out under the `context` role so
     /// the FE never mistakes it for something the user typed.
     pub async fn dump_session(&self, id: u64) -> Option<SessionDump> {
+        // Loading a session is the FE switching to it, so push the jobs it
+        // owns: `JobsChanged` is otherwise only emitted on a change, and a
+        // session with a build already running would show an empty strip.
+        self.event_sink.emit(Event::JobsChanged {
+            session_id: id,
+            jobs: self
+                .jobs
+                .list(id)
+                .into_iter()
+                .map(|j| protocol::JobDump {
+                    id:      j.id,
+                    kind:    j.kind,
+                    command: j.command,
+                    status:  j.status.label(),
+                    running: j.status.is_running(),
+                    unread:  j.unread,
+                })
+                .collect(),
+        });
         let g = self.sessions.lock().await;
         let log = g.get(&id)?;
         let messages = log
@@ -795,6 +828,8 @@ impl ChatHub {
         if removed {
             sessions_store::delete(id);
             self.inbox.clear(id).await;
+            // Its background jobs go with it, process trees included.
+            self.jobs.clear(id);
         }
         removed
     }
@@ -993,7 +1028,11 @@ impl ChatHub {
                 "compact" => self.command_compact(session_id).await,
                 "plan" => self.command_plan(session_id, input).await,
                 "permission" => self.command_permission(session_id, input).await,
-                _ => (false, "unknown command — want compact | plan | permission".into()),
+                "job-kill" => self.command_job_kill(session_id, input).await,
+                _ => (
+                    false,
+                    "unknown command — want compact | plan | permission | job-kill".into(),
+                ),
             }
         };
         if self.session_exists(session_id).await {
@@ -1005,6 +1044,20 @@ impl ChatHub {
             .await;
         }
         text
+    }
+
+    /// Stop a background job from the UI. Routed through the same registry
+    /// the `job-kill` skill uses, so the model is told the job ended by the
+    /// usual completion notice rather than finding it gone.
+    async fn command_job_kill(&self, session_id: u64, input: &str) -> (bool, String) {
+        let id = input.trim();
+        if id.is_empty() {
+            return (false, "usage: /job-kill <job id>".into());
+        }
+        match self.jobs.kill(session_id, id) {
+            Ok(()) => (true, format!("asked job {id} to stop")),
+            Err(e) => (false, e),
+        }
     }
 
     /// Manual compaction: fold older history into a summary right now
@@ -1920,7 +1973,11 @@ fn one_line(text: &str, cap: usize) -> String {
 /// `None` when the session no longer exists. A flush failure is logged and
 /// the in-memory log keeps going — the next successful flush writes every
 /// line still pending.
-async fn append_event(sessions: &Sessions, session_id: u64, kind: EventKind) -> Option<u64> {
+pub(crate) async fn append_event(
+    sessions: &Sessions,
+    session_id: u64,
+    kind: EventKind,
+) -> Option<u64> {
     let mut g = sessions.lock().await;
     let log = g.get_mut(&session_id)?;
     let seq = log.append(kind);
@@ -3069,7 +3126,7 @@ mod tests {
     fn parallel_grouping_classifies_by_skill_and_args() {
         let mut reg = SkillRegistry::new();
         reg.register(Arc::new(agents::ReadFile::new(std::env::temp_dir())));
-        reg.register(Arc::new(agents::RunCli));
+        reg.register(Arc::new(agents::RunCli(None)));
         let call = |name: &str, args: &str| agents::turn::NativeToolCall {
             id: "c".into(),
             name: name.into(),

@@ -106,6 +106,9 @@ pub struct App {
     /// Durable todo list of the active session (checklist above the
     /// composer). Clears on the next turn start.
     pub todos: Vec<protocol::TodoItem>,
+    /// Background jobs of the active session (strip above the composer).
+    /// Replaced wholesale on every `JobsChanged`.
+    pub jobs: Vec<protocol::JobDump>,
     /// Permission mode of the active session (status-bar pill).
     pub permission_mode: protocol::PermissionMode,
     /// Plan mode of the active session (composer toggle).
@@ -668,6 +671,7 @@ impl App {
             pending_approval: None,
             pending_question: None,
             todos: Vec::new(),
+            jobs: Vec::new(),
             permission_mode: protocol::PermissionMode::default(),
             plan_active: false,
             last_command_session: None,
@@ -1227,6 +1231,10 @@ impl App {
                 self.permission_mode = session.permission_mode;
                 self.plan_active = session.plan_active;
                 self.todos = session.todos;
+                // The backend pushes this session's `JobsChanged` alongside
+                // the dump; clearing here keeps the previous session's jobs
+                // off screen in the frame before it lands.
+                self.jobs.clear();
             }
             UiEvent::Catalog { entries } => {
                 self.push_log(
@@ -1285,6 +1293,11 @@ impl App {
             UiEvent::PermissionModeChanged { session_id, mode } => {
                 if session_id == self.chat.session_id {
                     self.permission_mode = mode;
+                }
+            }
+            UiEvent::JobsChanged { session_id, jobs } => {
+                if session_id == self.chat.session_id {
+                    self.jobs = jobs;
                 }
             }
             UiEvent::InboxChanged { session_id, queued, accepted } => {
