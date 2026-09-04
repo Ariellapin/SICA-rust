@@ -637,6 +637,9 @@ fn tag_colors(tag: EventTag, t: &Theme) -> (egui::Color32, egui::Color32) {
         ),
         EventTag::Retry => (kit::col(a.warn_tertiary), kit::col(a.error)),
         EventTag::Turn | EventTag::Usage => (kit::col(a.tip), kit::col(a.label[1])),
+        // The envelope is the request's own frame rather than anything in
+        // the conversation, so it reads as chrome, not as a message.
+        EventTag::Prompt => (kit::col(a.tip), kit::col(a.business)),
         _ => (kit::col(a.tip), kit::col(a.label[2])),
     }
 }
@@ -709,6 +712,17 @@ pub fn selected_row(state: &TrajectoryState) -> Option<&EventDump> {
     state.rows.iter().find(|r| r.seq == seq)
 }
 
+/// The request envelope in force at `row` — what the model was actually
+/// reading when this event happened. `None` for a row before the session's
+/// first request, and for every row of a log written before envelopes were
+/// recorded.
+pub fn envelope_of<'a>(
+    state: &'a TrajectoryState,
+    row: &EventDump,
+) -> Option<&'a protocol::EnvelopeDump> {
+    state.envelopes.get(&row.envelope?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +743,7 @@ mod tests {
             call_seq: None,
             turn_id: turn,
             raw: String::new(),
+            envelope: None,
         }
     }
 

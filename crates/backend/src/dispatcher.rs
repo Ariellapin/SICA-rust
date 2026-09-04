@@ -51,8 +51,14 @@ pub async fn handle(
         },
         Request::LoadSessionEvents { session_id, from_seq, limit } => {
             match chat.dump_events(session_id, from_seq, limit).await {
-                Some((events, total, next_seq)) => {
-                    Response::SessionEvents { session_id, events, total, next_seq }
+                Some((events, envelopes, total, next_seq)) => {
+                    Response::SessionEvents {
+                        session_id,
+                        events,
+                        envelopes,
+                        total,
+                        next_seq,
+                    }
                 }
                 None => Response::Error {
                     message: format!("session {session_id} not found"),

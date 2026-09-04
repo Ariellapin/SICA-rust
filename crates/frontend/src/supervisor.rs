@@ -131,6 +131,8 @@ pub enum UiEvent {
     SessionEvents {
         session_id: u64,
         events:     Vec<protocol::EventDump>,
+        /// The request envelopes those rows point at, each sent once.
+        envelopes:  Vec<protocol::EnvelopeDump>,
         total:      u32,
         next_seq:   Option<u64>,
     },

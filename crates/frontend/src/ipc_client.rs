@@ -136,12 +136,14 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 Response::SessionEvents {
                                     session_id,
                                     events,
+                                    envelopes,
                                     total,
                                     next_seq,
                                 } => {
                                     bridge.send(UiEvent::SessionEvents {
                                         session_id,
                                         events,
+                                        envelopes,
                                         total,
                                         next_seq,
                                     });

@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use protocol::{EventDump, EventTag};
+use protocol::{EnvelopeDump, EventDump, EventTag};
 use sica_core::event::{EventKind, SessionEvent, SurfaceOp};
 
 use crate::sessions_store::SessionLog;
@@ -27,8 +27,17 @@ pub const MAX_PAGE: u32 = 500;
 pub const DEFAULT_PAGE: u32 = 200;
 
 /// One page of `log`, starting at the first event with `seq >= from_seq`.
-/// Returns the rows, the log's total length, and the seq to ask for next.
-pub fn page(log: &SessionLog, from_seq: u64, limit: u32) -> (Vec<EventDump>, u32, Option<u64>) {
+///
+/// Returns the rows, the request envelopes those rows point at, the log's
+/// total length, and the seq to ask for next. The envelopes travel beside
+/// the rows rather than on them: a system prompt is kilobytes and a page is
+/// up to 500 rows, but the number of *distinct* prompts in a session is
+/// usually one.
+pub fn page(
+    log: &SessionLog,
+    from_seq: u64,
+    limit: u32,
+) -> (Vec<EventDump>, Vec<EnvelopeDump>, u32, Option<u64>) {
     let limit = match limit {
         0 => DEFAULT_PAGE,
         n => n.min(MAX_PAGE),
@@ -43,11 +52,18 @@ pub fn page(log: &SessionLog, from_seq: u64, limit: u32) -> (Vec<EventDump>, u32
     // Turn ids are carried forward from the enclosing `TurnStart`, which is
     // why the whole prefix is walked even when the page starts late.
     let mut turn_id: Option<u64> = None;
+    // The envelope in force: the newest one at or before the row. Carried
+    // forward across the whole prefix for the same reason `turn_id` is —
+    // a page starting late still has to know what the model was reading.
+    let mut envelope: Option<u64> = None;
     let mut rows = Vec::new();
     let mut next_seq = None;
     for ev in &log.events {
         if let EventKind::TurnStart { turn_id: id, .. } = &ev.kind {
             turn_id = Some(*id);
+        }
+        if matches!(ev.kind, EventKind::RequestEnvelope { .. }) {
+            envelope = Some(ev.seq);
         }
         let ends_turn = matches!(ev.kind, EventKind::TurnEnd { .. });
         if ev.seq >= from_seq {
@@ -55,16 +71,44 @@ pub fn page(log: &SessionLog, from_seq: u64, limit: u32) -> (Vec<EventDump>, u32
                 next_seq = Some(ev.seq);
                 break;
             }
-            rows.push(dump(ev, turn_id, &live));
+            rows.push(dump(ev, turn_id, envelope, &live));
         }
         if ends_turn {
             turn_id = None;
         }
     }
-    (rows, log.events.len() as u32, next_seq)
+    let envelopes = envelopes_for(log, &rows);
+    (rows, envelopes, log.events.len() as u32, next_seq)
 }
 
-fn dump(ev: &SessionEvent, turn_id: Option<u64>, live: &HashSet<u64>) -> EventDump {
+/// The envelopes `rows` point at, in seq order and each sent once.
+fn envelopes_for(log: &SessionLog, rows: &[EventDump]) -> Vec<EnvelopeDump> {
+    let wanted: HashSet<u64> = rows.iter().filter_map(|r| r.envelope).collect();
+    log.events
+        .iter()
+        .filter(|e| wanted.contains(&e.seq))
+        .filter_map(|e| match &e.kind {
+            EventKind::RequestEnvelope { fingerprint, system, tools, options } => {
+                Some(EnvelopeDump {
+                    seq:         e.seq,
+                    ts:          e.ts,
+                    fingerprint: *fingerprint,
+                    system:      system.clone(),
+                    tools:       tools.clone(),
+                    options:     options.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn dump(
+    ev: &SessionEvent,
+    turn_id: Option<u64>,
+    envelope: Option<u64>,
+    live: &HashSet<u64>,
+) -> EventDump {
     let d = describe(&ev.kind);
     let shadows = match &ev.kind {
         EventKind::Rewind { start_seq, end_seq } => Some((*start_seq, *end_seq)),
@@ -91,6 +135,7 @@ fn dump(ev: &SessionEvent, turn_id: Option<u64>, live: &HashSet<u64>) -> EventDu
         call_seq: d.call_seq,
         turn_id,
         raw: serde_json::to_string(ev).unwrap_or_default(),
+        envelope,
     }
 }
 
@@ -286,6 +331,17 @@ fn describe(kind: &EventKind) -> Described {
         )
         .payload(objective.clone())
         .result(blocker.clone().unwrap_or_default()),
+        EventKind::RequestEnvelope { system, tools, options, .. } => {
+            let mut text = format!("prompt envelope · {} chars of system", system.len());
+            if tools.is_empty() {
+                text.push_str(" · text protocol");
+            } else {
+                text.push_str(" · tools array");
+            }
+            row(EventTag::Prompt, text)
+                .payload(system.clone())
+                .result(if tools.is_empty() { options.clone() } else { tools.clone() })
+        }
         EventKind::JobFinished { id, status, exit_code } => {
             let text = match exit_code {
                 Some(c) => format!("job {id} · {status} · exit {c}"),
@@ -341,13 +397,13 @@ mod tests {
             user("hi"),
             EventKind::TurnEnd { turn_id: 1, finish_reason: "stop".into(), hops: 1 },
         ]);
-        let (rows, total, next) = page(&log, 1, 2);
+        let (rows, _, total, next) = page(&log, 1, 2);
         assert_eq!(total, 4);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].seq, 1);
         assert_eq!(next, Some(3));
 
-        let (rest, _, next) = page(&log, 3, 100);
+        let (rest, _, _, next) = page(&log, 3, 100);
         assert_eq!(rest.len(), 2);
         assert_eq!(next, None);
     }
@@ -360,7 +416,7 @@ mod tests {
             EventKind::TurnEnd { turn_id: 7, finish_reason: "stop".into(), hops: 1 },
             EventKind::SessionTitle { title: "after".into() },
         ]);
-        let (rows, _, _) = page(&log, 0, 0);
+        let (rows, _, _, _) = page(&log, 0, 0);
         let by_seq = |s: u64| rows.iter().find(|r| r.seq == s).unwrap().clone();
         assert_eq!(by_seq(3).turn_id, Some(7));
         assert_eq!(by_seq(4).turn_id, Some(7), "the TurnEnd itself is in the turn");
@@ -373,7 +429,7 @@ mod tests {
             EventKind::TurnStart { turn_id: 3, source: Default::default() },
             user("hi"),
         ]);
-        let (rows, _, _) = page(&log, 3, 10);
+        let (rows, _, _, _) = page(&log, 3, 10);
         assert_eq!(rows[0].seq, 3);
         assert_eq!(rows[0].turn_id, Some(3));
     }
@@ -399,7 +455,7 @@ mod tests {
                 after_tokens: 10,
             },
         ]);
-        let (rows, _, _) = page(&log, 0, 0);
+        let (rows, _, _, _) = page(&log, 0, 0);
         let by_seq = |s: u64| rows.iter().find(|r| r.seq == s).unwrap().clone();
         assert!(by_seq(2).shadowed);
         assert!(by_seq(3).shadowed);
@@ -411,7 +467,7 @@ mod tests {
     #[test]
     fn a_rewind_shadows_its_span_without_contributing_a_message() {
         let log = log_with(vec![user("first"), EventKind::Rewind { start_seq: 2, end_seq: 2 }]);
-        let (rows, _, _) = page(&log, 0, 0);
+        let (rows, _, _, _) = page(&log, 0, 0);
         assert!(rows.iter().find(|r| r.seq == 2).unwrap().shadowed);
         let rewind = rows.iter().find(|r| r.seq == 3).unwrap();
         assert!(!rewind.shadowed, "the rewind is bookkeeping, not surface");
@@ -439,7 +495,7 @@ mod tests {
                 pruned: false,
             },
         ]);
-        let (rows, _, _) = page(&log, 0, 0);
+        let (rows, _, _, _) = page(&log, 0, 0);
         let call = rows.iter().find(|r| r.seq == 2).unwrap();
         let result = rows.iter().find(|r| r.seq == 3).unwrap();
         assert_eq!(call.tag, EventTag::Tool);
@@ -459,7 +515,7 @@ mod tests {
             prompt_tokens: Some(1000),
             completion_tokens: Some(200),
         }]);
-        let (rows, _, _) = page(&log, 2, 0);
+        let (rows, _, _, _) = page(&log, 2, 0);
         assert_eq!(rows[0].tag, EventTag::Usage);
         assert_eq!((rows[0].tokens_in, rows[0].tokens_out), (1000, 200));
         assert!(!rows[0].text.contains("estimated"));
@@ -474,7 +530,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
         }]);
-        let (rows, _, _) = page(&log, 2, 0);
+        let (rows, _, _, _) = page(&log, 2, 0);
         assert!(rows[0].text.contains("estimated"));
         assert_eq!(rows[0].tokens_in, 900);
     }
@@ -486,7 +542,7 @@ mod tests {
             source: ContextSource::SkillInvocation { name: "review".into() },
             content: "body".into(),
         }]);
-        let (rows, _, _) = page(&log, 2, 0);
+        let (rows, _, _, _) = page(&log, 2, 0);
         assert_eq!(rows[0].tag, EventTag::Context);
         assert!(rows[0].text.starts_with("/review"));
     }
@@ -494,16 +550,66 @@ mod tests {
     #[test]
     fn the_raw_field_round_trips_the_event() {
         let log = log_with(vec![EventKind::SessionTitle { title: "x".into() }]);
-        let (rows, _, _) = page(&log, 2, 0);
+        let (rows, _, _, _) = page(&log, 2, 0);
         let back: SessionEvent = serde_json::from_str(&rows[0].raw).unwrap();
         assert_eq!(back.seq, 2);
         assert_eq!(back.kind, EventKind::SessionTitle { title: "x".into() });
     }
 
+    fn envelope(fingerprint: u64, system: &str) -> EventKind {
+        EventKind::RequestEnvelope {
+            fingerprint,
+            system:  system.into(),
+            tools:   String::new(),
+            options: r#"{"model":"m"}"#.into(),
+        }
+    }
+
+    #[test]
+    fn every_row_names_the_envelope_in_force_at_it() {
+        let log = log_with(vec![
+            user("before any request"),
+            envelope(11, "system one"),
+            user("first"),
+            envelope(22, "system two"),
+            user("second"),
+        ]);
+        let (rows, envs, _, _) = page(&log, 0, 0);
+        let by_seq = |s: u64| rows.iter().find(|r| r.seq == s).unwrap().clone();
+        assert_eq!(by_seq(2).envelope, None, "nothing was sent before this row");
+        assert_eq!(by_seq(4).envelope, Some(3));
+        assert_eq!(by_seq(6).envelope, Some(5));
+        // Both envelopes travel, once each, with their bodies.
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0].system, "system one");
+        assert_eq!(envs[1].fingerprint, 22);
+        assert_eq!(by_seq(3).tag, EventTag::Prompt);
+    }
+
+    #[test]
+    fn a_page_starting_after_the_envelope_still_carries_it() {
+        let log = log_with(vec![envelope(11, "system one"), user("a"), user("b")]);
+        let (rows, envs, _, _) = page(&log, 4, 10);
+        assert_eq!(rows[0].seq, 4);
+        assert_eq!(rows[0].envelope, Some(2));
+        assert_eq!(envs.len(), 1, "the envelope's own row is pages back, its body is not");
+        assert_eq!(envs[0].seq, 2);
+    }
+
+    #[test]
+    fn an_envelope_row_is_never_shadowed_and_carries_its_bodies() {
+        let log = log_with(vec![envelope(11, "the composed prompt")]);
+        let (rows, _, _, _) = page(&log, 0, 0);
+        let row = rows.iter().find(|r| r.seq == 2).unwrap();
+        assert!(!row.shadowed, "an envelope never reaches the model's surface");
+        assert_eq!(row.payload, "the composed prompt");
+        assert!(row.text.contains("text protocol"));
+    }
+
     #[test]
     fn the_page_cap_is_enforced_over_the_clients_ask() {
         let log = log_with((0..MAX_PAGE + 50).map(|i| user(&format!("m{i}"))).collect());
-        let (rows, _, next) = page(&log, 0, u32::MAX);
+        let (rows, _, _, next) = page(&log, 0, u32::MAX);
         assert_eq!(rows.len(), MAX_PAGE as usize);
         assert!(next.is_some());
     }

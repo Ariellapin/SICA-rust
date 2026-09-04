@@ -1186,6 +1186,25 @@ each `TokenUsage` closes a successful request and each `LlmRetry` closes a
 failed one (a failed attempt persists no usage, so the retry row *is* the
 boundary), which is what makes `Request #n — failed` truthful.
 
+The **request envelope** deviates from the sketch above in one way that
+matters. The guide put a `RequestEnvelope { system_hash, tools_hash, tokens }`
+on `TurnStart`; what landed is a durable `EventKind::RequestEnvelope`
+carrying the *bodies* — the composed system prompt, the `tools` array, and
+the sampling options as JSON — appended by the hop that composed it and
+**only when its fingerprint differs from the last envelope in the log**. Two
+reasons. Hashes alone cannot fill a System Prompt tab, so the bodies have to
+live somewhere, and the log is the only place that survives a restart, a
+fork and a session reload alike. And the prompt is a property of a *request*,
+not of a turn: plan mode can flip mid-turn and `memory.md` is re-read every
+turn, so an envelope pinned to `TurnStart` would describe some of its own
+turn's hops wrongly. Instead every row names the newest envelope at or
+before it (`EventDump.envelope`), and the bodies travel once per page beside
+the rows (`Response::SessionEvents.envelopes`) rather than once per row — a
+session whose prompt never changes stores and sends exactly one copy. The
+inspector's **Schema** tab cuts the selected tool's entry out of that
+envelope's tools array, and says plainly that a text-protocol request sent no
+schemas at all rather than showing an empty box.
+
 The ledger is painted rather than built on `egui_extras::TableBuilder` — a
 fixed-width table did not justify a new dependency — turn headers scroll
 instead of sticking (egui has no sticky row), a timeline segment click
@@ -1216,12 +1235,15 @@ Additive only; `#[serde(default)]` on every new field so old logs load.
 | `Request::ListModels { base_url, api_key }` → `Event::ModelsListed` | "Fetch available models" §7 | ✅ — **deviation:** the guide sketched `Response::Models`, but the dispatcher loop is serial and a slow provider would stall every other request behind it, which `CLAUDE.md` forbids. It answers `Ok` and pushes the list as an event, like `ConnectLlm`. Provider configs live on the FE, so the FE sends what the call needs rather than a `provider` id. |
 | `Request::LoadSessionEvents { session_id, from_seq, limit }` → `Response::SessionEvents { events, total, next_seq }` | trajectory §10 | ✅ (v20; `EventDump` is the flattened mirror — tag, one-line text, payload/result bodies, the provider's token pair, the `ToolCall` join, the enclosing `turn_id`, `shadowed` + the `shadows` span, and the event's own JSON for the Raw tab. Paged: the backend caps a page at 500 and answers `next_seq` when more remains) |
 | `Event::ToolCallStarted += call_seq: u64` | the Inspect pill §3.4 | ✅ (v20 — **addition**: the live event carried only the process-local tool id, while a reloaded row carries the durable `ToolCall` seq, so the same call had two identities and the pill had nothing stable to jump to. `0` for a nested `SkillContext::sub` call, which is a live event only and never reaches the log) |
+| `EventKind::RequestEnvelope { fingerprint, system, tools, options }` · `EventDump += envelope` · `Response::SessionEvents += envelopes: Vec<EnvelopeDump>` | the inspector's Schema / System Prompt / Tools / Options tabs §10 | ✅ (v22 — **deviation:** the bodies live in a durable log event written on *change*, not a hash on `TurnStart`; see §10. `EventTag::Prompt` is its ledger tag) |
 | `TurnFinished.finish_reason` gains `"max_tokens"` and `"interrupted"` as stable strings | §3.2, §3.5 | ✅ (`run_turn` normalises the provider's `"length"`; `chat.rs` ends the turn on it rather than hunting for a tool call in a truncated reply) |
 
 `forward_event` keeps `LogLine.level` (no wire change). `PROTOCOL_VERSION`
-is **21** (v17 batch → v18 prompt editing → v19 queue verbs → v20 trajectory
-→ v21 `QuestionAsked.detail` / `.multi`); `smoke` passes on it, and now
-exercises `LoadSessionEvents` too.
+is **22** (v17 batch → v18 prompt editing → v19 queue verbs → v20 trajectory
+→ v21 `QuestionAsked.detail` / `.multi` → v22 the request envelope); `smoke`
+passes on it, and now exercises `LoadSessionEvents` too — including the rule
+that a session with nothing sent yet reports no envelope rather than
+pointing at one.
 
 ---
 
@@ -1236,9 +1258,9 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-2 Transcript** ✅ | user bubble with `/name`+`@path` runs, flat assistant, `TurnStatus` shimmer + 15 s clock, reasoning disclosure with the sweep glare, tool rows with variants/states/nesting and diff / terminal / read / search / IN-OUT bodies + the `+A -R` diff stat, the retry chain with its live countdown, per-turn usage and time pills on the tail, error / max-tokens / stopped / compaction / injection rows, compact-mode turn fold, hero, back-to-bottom. **Open:** nothing. Produced-file chips and the tail's branch action landed with UI-6; the Inspect pill landed with UI-5. | **L** | v17 batch 1 ✅ |
 | **UI-3 Composer + control plane** ✅ | r=22 card, toolbar (`+`, permission chip + risk gate, plan chip, model select, context ring with the `TokenBreakdown` panel, send/stop), keymap with the busy-Enter preference, dock (to-dos, goal, queue with per-row Edit · Remove · Steer over the backend's real inbox), stats line, approval and question/plan-review takeovers, `/` menu with dsh's fuzzy ranking, drop overlay, toasts for WARN/ERROR. **Open:** the ghost hint after a claimed command is not in, and the `/` menu renders in the composer's panel rather than a floating overlay. `@file` completion landed with UI-6. | **L** | v17 batch 2 ✅ (queue dock landed on v19) |
 | **UI-4 Settings + sessions** ✅ | Settings modal with General (live) / Models / Skills / Diagnostics; session rows with the status dot, relative time and a ⋯ menu (Open · Rename · Fork · Archive · Copy title · Delete); inline rename, Last-updated order, the header search field with dsh's 250 ms debounce over the backend content scan, and "Fetch available models" as pickable chips per provider. **Open:** nothing — un-archive stays deliberately absent (§13). | **M** | v17 batch 3 ✅ |
-| **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** the Schema / System Prompt / Tools / Options tabs still need a `RequestEnvelope` on `TurnStart` — the one remaining item in this guide, and a storage decision as much as a UI one, since the envelope would put a copy of the system prompt and the tool schemas in every session log. | **L** | `LoadSessionEvents` (v20) ✅ |
+| **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 
-| **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; and the question takeover's `detail` body and `multi` checkboxes. | **M** | v21 ✅ |
+| **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the

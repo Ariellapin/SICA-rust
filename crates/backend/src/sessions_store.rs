@@ -44,6 +44,19 @@ impl SessionLog {
         log
     }
 
+    /// Fingerprint of the newest [`EventKind::RequestEnvelope`] in the log,
+    /// or `None` when none has been written yet.
+    ///
+    /// The hop that is about to send compares its own fingerprint with this
+    /// and appends only on a difference, which is what keeps one copy of the
+    /// system prompt per *distinct* prompt rather than one per request.
+    pub fn latest_envelope(&self) -> Option<u64> {
+        self.events.iter().rev().find_map(|e| match &e.kind {
+            EventKind::RequestEnvelope { fingerprint, .. } => Some(*fingerprint),
+            _ => None,
+        })
+    }
+
     /// A fork: a fresh session carrying `src`'s events up to and including
     /// `cut` (the caller cuts at the last `TurnEnd`, so an in-flight turn
     /// never crosses — the same rule `subagent-fork` follows).
@@ -323,6 +336,23 @@ pub fn delete_in(dir: &Path, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_envelope_is_the_newest_one_written() {
+        let mut log = SessionLog::new(1, "t");
+        assert_eq!(log.latest_envelope(), None);
+        for fingerprint in [7u64, 9] {
+            log.append(EventKind::RequestEnvelope {
+                fingerprint,
+                system:  "sys".into(),
+                tools:   String::new(),
+                options: String::new(),
+            });
+            // Events written after it must not hide it.
+            log.append(EventKind::SessionTitle { title: "x".into() });
+            assert_eq!(log.latest_envelope(), Some(fingerprint));
+        }
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sica-sessions-{tag}-{}", std::process::id()));

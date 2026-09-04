@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -339,6 +339,11 @@ pub enum Response {
     SessionEvents  {
         session_id: u64,
         events:     Vec<EventDump>,
+        /// Every request envelope the rows in this page point at, sent once
+        /// each rather than copied onto every row — a system prompt is
+        /// kilobytes and a page is hundreds of rows. Includes the envelope
+        /// in force when the page opens, whose own row may be pages back.
+        envelopes:  Vec<EnvelopeDump>,
         /// How many events the log holds, so the view can say "200 of 1204"
         /// without loading the rest.
         total:      u32,
@@ -371,6 +376,8 @@ pub enum EventTag {
     Retry,
     /// Prompt size after a completed hop — the request boundary.
     Usage,
+    /// The system prompt / tools / options a request went out with.
+    Prompt,
     /// A harness command that never made a model message.
     Command,
     Approval,
@@ -393,6 +400,7 @@ impl EventTag {
             EventTag::Compacted => "COMPACTED",
             EventTag::Retry => "RETRY",
             EventTag::Usage => "USAGE",
+            EventTag::Prompt => "PROMPT",
             EventTag::Command => "COMMAND",
             EventTag::Approval => "APPROVAL",
             EventTag::Goal => "GOAL",
@@ -444,6 +452,31 @@ pub struct EventDump {
     pub turn_id:    Option<u64>,
     /// The event as the log stores it — the inspector's Raw tab.
     pub raw:        String,
+    /// Seq of the [`EnvelopeDump`] in force at this row: the newest request
+    /// envelope at or before it. `None` for rows written before the first
+    /// request of the session — and for every row of a log written by a
+    /// backend that did not record envelopes.
+    pub envelope:   Option<u64>,
+}
+
+/// One request envelope, as the inspector's System Prompt / Tools / Options
+/// / Schema tabs read it. Sent alongside a page of [`EventDump`]s and joined
+/// by [`EventDump::envelope`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvelopeDump {
+    /// Seq of the envelope's own log event — the join key.
+    pub seq:         u64,
+    pub ts:          i64,
+    /// Hash of the three bodies together; two rows carrying the same
+    /// fingerprint went out with the same prompt.
+    pub fingerprint: u64,
+    /// The composed system prompt, verbatim.
+    pub system:      String,
+    /// The `tools` array, pretty-printed. Empty in text-protocol mode, where
+    /// the catalogue lives inside `system`.
+    pub tools:       String,
+    /// Sampling and mode options, as JSON.
+    pub options:     String,
 }
 
 /// Which family a [`CatalogEntry`] belongs to. Drives the group headings in

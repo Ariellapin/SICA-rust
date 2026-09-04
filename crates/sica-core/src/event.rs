@@ -208,6 +208,34 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocker: Option<String>,
     },
+    /// The prompt envelope a request went out with: the composed system
+    /// prompt, the tool schemas the `tools` array carried, and the sampling
+    /// options that shaped the call.
+    ///
+    /// Written by the hop that composed it, and **only when `fingerprint`
+    /// differs from the last envelope in this log** — a session whose prompt
+    /// never changes stores one copy, and one that reloads `memory.md`
+    /// mid-session stores the before and the after. That is the point: the
+    /// envelope in force at any row is the newest one at or before it, so
+    /// the log can answer "what did the model actually read here" without
+    /// carrying a copy per request.
+    ///
+    /// Never surfaced. The model already read this; the event is the record
+    /// that it did, and the only durable source the Trajectory inspector's
+    /// System Prompt / Tools / Options / Schema tabs have.
+    RequestEnvelope {
+        /// Hash of system + tools + options together. One comparison
+        /// answers "has anything about the request changed since last time".
+        fingerprint: u64,
+        system: String,
+        /// The `tools` array as it goes on the wire, pretty-printed. Empty
+        /// in text-protocol mode, where the catalogue is in the prompt.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tools: String,
+        /// Sampling and mode options, as JSON.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        options: String,
+    },
     /// A background job ended. Durable audit only — what the model reads is
     /// the `ContextInjected { source: JobNotice }` that accompanies it, so
     /// the notice is part of the derived history and this is not.
@@ -479,6 +507,26 @@ pub fn derive_messages(events: &[SessionEvent]) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_envelope_is_recorded_but_never_surfaced() {
+        // It is the record of what the model read, not something the model
+        // reads — putting it in the derived history would send the system
+        // prompt twice.
+        let events = vec![
+            user(1, "hi"),
+            ev(2, EventKind::RequestEnvelope {
+                fingerprint: 5,
+                system:      "you are a helpful blade".into(),
+                tools:       String::new(),
+                options:     "{}".into(),
+            }),
+            assistant(3, "hello"),
+        ];
+        let messages = derive_messages(&events);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| !m.content.contains("blade")));
+    }
 
     fn ev(seq: u64, kind: EventKind) -> SessionEvent {
         SessionEvent { seq, ts: 0, kind }

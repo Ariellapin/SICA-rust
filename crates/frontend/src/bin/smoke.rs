@@ -181,15 +181,23 @@ async fn main() -> Result<()> {
             _ => {}
         }
     };
-    let Response::SessionEvents { session_id, events, total, next_seq } = resp else {
+    let Response::SessionEvents { session_id, events, envelopes, total, next_seq } = resp else {
         anyhow::bail!("expected SessionEvents, got {resp:?}");
     };
-    println!("smoke: load events -> session={session_id} events={} total={total}", events.len());
+    println!(
+        "smoke: load events -> session={session_id} events={} envelopes={} total={total}",
+        events.len(),
+        envelopes.len()
+    );
     assert_eq!(session_id, new_id);
     assert_eq!(next_seq, None, "one page should cover a fresh session");
     assert!(!events.is_empty(), "a session's log always opens with SessionCreated");
     assert_eq!(events[0].seq, 1);
     assert!(!events[0].raw.is_empty(), "the inspector's Raw tab has no source");
+    // A session with no request behind it has no envelope, and every row
+    // must say so rather than pointing at one that is not there.
+    assert!(envelopes.is_empty(), "nothing has been sent in this session yet");
+    assert!(events.iter().all(|e| e.envelope.is_none()));
 
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;

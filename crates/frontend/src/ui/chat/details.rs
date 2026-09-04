@@ -7,37 +7,70 @@
 //! column becomes the **event inspector** — Summary · Payload · Result ·
 //! Timing · Raw, over the durable event rather than the live chip.
 //!
-//! dsh's remaining tabs (Schema, System Prompt, Tools, Options) need the
-//! *request envelope* — the system prompt and tool schemas a request went out
-//! with. `TokenUsage.breakdown` prices those three sections but the log does
-//! not store them, so those tabs would have nothing truthful to show and are
-//! left out until `TurnStart` carries a `RequestEnvelope`.
+//! dsh's remaining tabs — Schema, System Prompt, Tools, Options — read the
+//! *request envelope*: the composed system prompt, the tool schemas the
+//! `tools` array carried, and the sampling options one request went out
+//! with. The log records one (`EventKind::RequestEnvelope`) whenever the
+//! envelope *changes*, and every row names the newest one at or before it,
+//! so these four tabs show what the model was reading at that row rather
+//! than what it would read now. A row from before the session's first
+//! request — or from a log written by a backend that recorded none — says so
+//! instead of showing today's prompt and calling it history.
 
-use protocol::EventDump;
+use protocol::{EnvelopeDump, EventDump, EventTag};
 
 use crate::app::{App, ChatView};
 use crate::ui::kit::{self, Weight};
 
-/// Inspector tabs, in dsh's order minus the ones with no durable source.
+/// Inspector tabs, in dsh's order minus Diff / Source / Usage, whose content
+/// lives elsewhere in this app (the tool row's diff body, the ledger's own
+/// token columns).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Summary,
     Payload,
     Result,
+    /// The selected tool's own JSON schema, cut out of the envelope's tools
+    /// array. Offered only on a tool row, where it names something.
+    Schema,
     Timing,
+    SystemPrompt,
+    Tools,
+    Options,
     Raw,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Summary, Tab::Payload, Tab::Result, Tab::Timing, Tab::Raw];
     fn label(self) -> &'static str {
         match self {
             Tab::Summary => "Summary",
             Tab::Payload => "Payload",
             Tab::Result => "Result",
+            Tab::Schema => "Schema",
             Tab::Timing => "Timing",
+            Tab::SystemPrompt => "System Prompt",
+            Tab::Tools => "Tools",
+            Tab::Options => "Options",
             Tab::Raw => "Raw",
         }
+    }
+
+    /// Which tabs this row offers. Schema appears only on a tool row: on any
+    /// other event there is no tool whose schema it could be, and a tab that
+    /// is always empty teaches the reader to stop clicking it.
+    fn for_row(ev: &EventDump) -> Vec<Tab> {
+        let mut tabs = vec![Tab::Summary, Tab::Payload, Tab::Result];
+        if matches!(ev.tag, EventTag::Tool | EventTag::ToolResult) {
+            tabs.push(Tab::Schema);
+        }
+        tabs.extend([
+            Tab::Timing,
+            Tab::SystemPrompt,
+            Tab::Tools,
+            Tab::Options,
+            Tab::Raw,
+        ]);
+        tabs
     }
 }
 
@@ -120,9 +153,15 @@ fn event_inspector(app: &mut App, ui: &mut egui::Ui) {
     // Tabs. Held in egui memory rather than on `App`: the choice is per
     // inspector and means nothing once the column is closed.
     let id = egui::Id::new("event_inspector_tab");
+    let tabs = Tab::for_row(&ev);
     let mut tab: Tab = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(Tab::Summary);
+    // Selecting a Schema row and then clicking a non-tool one would otherwise
+    // leave the inspector on a tab this row does not offer.
+    if !tabs.contains(&tab) {
+        tab = Tab::Summary;
+    }
     ui.horizontal_wrapped(|ui| {
-        for candidate in Tab::ALL {
+        for candidate in tabs {
             if kit::pill(ui, candidate.label(), tab == candidate).clicked() {
                 tab = candidate;
             }
@@ -134,12 +173,19 @@ fn event_inspector(app: &mut App, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_source("event_inspector_body")
-        .show(ui, |ui| match tab {
-            Tab::Summary => summary_tab(app, ui, &ev),
-            Tab::Payload => body_tab(ui, &ev.payload, "This event carries no payload."),
-            Tab::Result => body_tab(ui, &ev.result, "This event carries no result."),
-            Tab::Timing => timing_tab(app, ui, &ev),
-            Tab::Raw => kit::code_block(ui, "json", &ev.raw),
+        .show(ui, |ui| {
+            let env = super::trajectory::envelope_of(&app.trajectory, &ev).cloned();
+            match tab {
+                Tab::Summary => summary_tab(app, ui, &ev),
+                Tab::Payload => body_tab(ui, &ev.payload, "This event carries no payload."),
+                Tab::Result => body_tab(ui, &ev.result, "This event carries no result."),
+                Tab::Schema => schema_tab(ui, &ev, env.as_ref()),
+                Tab::Timing => timing_tab(app, ui, &ev),
+                Tab::SystemPrompt => envelope_tab(ui, env.as_ref(), |e| (&e.system, "text")),
+                Tab::Tools => envelope_tab(ui, env.as_ref(), |e| (&e.tools, "json")),
+                Tab::Options => envelope_tab(ui, env.as_ref(), |e| (&e.options, "json")),
+                Tab::Raw => kit::code_block(ui, "json", &ev.raw),
+            }
         });
 }
 
@@ -173,6 +219,16 @@ fn summary_tab(app: &mut App, ui: &mut egui::Ui, ev: &EventDump) {
         "In the model's view".into(),
         if ev.shadowed { "no" } else { "yes" }.into(),
     ));
+    // Which prompt was in force here. Two rows carrying the same envelope
+    // seq went out with byte-identical system prompts, tools and options,
+    // which is the fact the four envelope tabs rest on.
+    facts.push((
+        "Envelope".into(),
+        match ev.envelope {
+            Some(seq) => format!("#{seq}"),
+            None => "none recorded".into(),
+        },
+    ));
     for (k, v) in facts {
         fact_row(ui, &t, &k, &v, 130.0);
     }
@@ -192,6 +248,100 @@ fn summary_tab(app: &mut App, ui: &mut egui::Ui, ev: &EventDump) {
             app.trajectory.scroll_to = Some(call);
         }
     }
+}
+
+/// One body out of the envelope in force at the row, or the reason there is
+/// none. The two "none" cases are different and are worth saying apart: a row
+/// with no envelope at all predates the session's first request, while an
+/// envelope whose body is empty is a real answer (text-protocol mode carries
+/// no tools array, and the catalogue is in the system prompt instead).
+fn envelope_tab<'a>(
+    ui: &mut egui::Ui,
+    env: Option<&'a EnvelopeDump>,
+    pick: impl Fn(&'a EnvelopeDump) -> (&'a String, &'static str),
+) {
+    let Some(env) = env else {
+        empty(
+            ui,
+            "No request envelope covers this event \u{2014} it happened before the \
+             session's first request, or the log was written by a backend that \
+             did not record one.",
+        );
+        return;
+    };
+    let (body, lang) = pick(env);
+    if body.trim().is_empty() {
+        empty(
+            ui,
+            "Empty in this envelope. In text-protocol mode the tools array is \
+             not sent at all \u{2014} the catalogue is a section of the system \
+             prompt instead.",
+        );
+        return;
+    }
+    kit::footnote(ui, &format!("from the envelope at #{}", env.seq));
+    ui.add_space(4.0);
+    kit::code_block(ui, lang, body);
+}
+
+/// The selected tool's entry in the envelope's tools array. Native mode only:
+/// under the text protocol there is no schema, because the model is told
+/// about the tool in prose.
+fn schema_tab(ui: &mut egui::Ui, ev: &EventDump, env: Option<&EnvelopeDump>) {
+    let Some(name) = tool_name_of(ev) else {
+        empty(ui, "This row names no tool.");
+        return;
+    };
+    let Some(env) = env else {
+        empty(ui, "No request envelope covers this event, so there is no schema to show.");
+        return;
+    };
+    if env.tools.trim().is_empty() {
+        empty(
+            ui,
+            "This request went out under the text protocol, which sends no tool \
+             schemas \u{2014} the model reads the catalogue in the system prompt. \
+             Look there instead.",
+        );
+        return;
+    }
+    match find_schema(&env.tools, &name) {
+        Some(schema) => {
+            kit::footnote(ui, &format!("{name} \u{b7} from the envelope at #{}", env.seq));
+            ui.add_space(4.0);
+            kit::code_block(ui, "json", &schema);
+        }
+        None => empty(
+            ui,
+            &format!(
+                "`{name}` is not in the tools array this request carried. A skill \
+                 registered after the envelope was recorded, or one excluded from \
+                 this call, looks exactly like this."
+            ),
+        ),
+    }
+}
+
+/// The skill a tool row is about. The ledger's text opens with the name for
+/// both halves of a call: `read-file 'x'` and `read-file \u{b7} contents`.
+fn tool_name_of(ev: &EventDump) -> Option<String> {
+    if !matches!(ev.tag, EventTag::Tool | EventTag::ToolResult) {
+        return None;
+    }
+    let head = ev.text.split(['\u{b7}', ' ']).next()?.trim();
+    (!head.is_empty()).then(|| head.to_string())
+}
+
+/// Cut one function's schema out of an OpenAI `tools` array.
+fn find_schema(tools_json: &str, name: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(tools_json).ok()?;
+    let found = parsed.as_array()?.iter().find(|t| {
+        t.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            == Some(name)
+    })?;
+    serde_json::to_string_pretty(found).ok()
 }
 
 fn timing_tab(app: &mut App, ui: &mut egui::Ui, ev: &EventDump) {
@@ -319,4 +469,65 @@ fn tool_details(app: &mut App, ui: &mut egui::Ui) {
                 kit::footnote(ui, &format!("expected: {}", chip.expectation));
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_row(tag: EventTag, text: &str) -> EventDump {
+        EventDump {
+            seq: 1,
+            ts: 0,
+            tag,
+            text: text.into(),
+            payload: String::new(),
+            result: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            ok: None,
+            shadowed: false,
+            shadows: None,
+            call_seq: None,
+            turn_id: None,
+            raw: String::new(),
+            envelope: None,
+        }
+    }
+
+    #[test]
+    fn schema_is_offered_on_tool_rows_only() {
+        assert!(Tab::for_row(&tool_row(EventTag::Tool, "read-file 'x'")).contains(&Tab::Schema));
+        assert!(Tab::for_row(&tool_row(EventTag::ToolResult, "read-file \u{b7} ok")).contains(&Tab::Schema));
+        assert!(!Tab::for_row(&tool_row(EventTag::User, "hello")).contains(&Tab::Schema));
+        // The envelope tabs are on every row: "no envelope here" is itself
+        // something the reader needs to be able to find out.
+        assert!(Tab::for_row(&tool_row(EventTag::User, "hi")).contains(&Tab::SystemPrompt));
+    }
+
+    #[test]
+    fn the_tool_name_is_read_off_either_half_of_a_call() {
+        assert_eq!(
+            tool_name_of(&tool_row(EventTag::Tool, "read-file 'README.md'")).as_deref(),
+            Some("read-file")
+        );
+        assert_eq!(
+            tool_name_of(&tool_row(EventTag::ToolResult, "run-cli \u{b7} exit 0")).as_deref(),
+            Some("run-cli")
+        );
+        assert_eq!(tool_name_of(&tool_row(EventTag::Usage, "1200 tok")), None);
+    }
+
+    #[test]
+    fn a_schema_is_cut_out_of_the_tools_array_by_name() {
+        let tools = r#"[
+            {"type":"function","function":{"name":"glob","parameters":{}}},
+            {"type":"function","function":{"name":"read-file","parameters":{"x":1}}}
+        ]"#;
+        let found = find_schema(tools, "read-file").unwrap();
+        assert!(found.contains("read-file"));
+        assert!(!found.contains("glob"));
+        assert!(find_schema(tools, "write-file").is_none());
+        assert!(find_schema("not json", "glob").is_none());
+    }
 }

@@ -145,6 +145,11 @@ pub struct TrajectoryState {
     /// Set when a row should be scrolled into view on the next frame — the
     /// Inspect pill's jump, and the "Load more" landing.
     pub scroll_to:  Option<u64>,
+    /// Request envelopes by their own seq, accumulated across pages. A row's
+    /// `envelope` field is the key; the bodies arrive once per envelope
+    /// rather than once per row, so this map is what the inspector's System
+    /// Prompt / Tools / Options / Schema tabs read.
+    pub envelopes:  std::collections::HashMap<u64, protocol::EnvelopeDump>,
 }
 
 pub struct App {
@@ -1406,6 +1411,10 @@ impl App {
         let session_id = self.chat.session_id;
         let from_seq = if reset || self.trajectory.session_id != session_id {
             self.trajectory.rows.clear();
+            // The envelope map is keyed by seq, and seqs are per session —
+            // keeping it across a switch would answer the new session's rows
+            // with the old session's prompt.
+            self.trajectory.envelopes.clear();
             self.trajectory.session_id = session_id;
             self.trajectory.next_seq = None;
             0
@@ -1946,7 +1955,7 @@ impl App {
                 // be committed against the one being opened.
                 self.goal_edit = None;
             }
-            UiEvent::SessionEvents { session_id, events, total, next_seq } => {
+            UiEvent::SessionEvents { session_id, events, envelopes, total, next_seq } => {
                 self.trajectory.loading = false;
                 // A page for a session the user has already left is dropped,
                 // the same rule `SessionLoaded` follows.
@@ -1963,6 +1972,9 @@ impl App {
                     self.trajectory.rows.retain(|r| r.seq < first);
                 }
                 self.trajectory.rows.extend(events);
+                for env in envelopes {
+                    self.trajectory.envelopes.insert(env.seq, env);
+                }
             }
             UiEvent::Catalog { entries } => {
                 self.push_log(

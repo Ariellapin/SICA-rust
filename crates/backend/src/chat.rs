@@ -1012,7 +1012,12 @@ impl ChatHub {
         id: u64,
         from_seq: u64,
         limit: u32,
-    ) -> Option<(Vec<protocol::EventDump>, u32, Option<u64>)> {
+    ) -> Option<(
+        Vec<protocol::EventDump>,
+        Vec<protocol::EnvelopeDump>,
+        u32,
+        Option<u64>,
+    )> {
         let g = self.sessions.lock().await;
         let log = g.get(&id)?;
         Some(crate::trajectory::page(log, from_seq, limit))
@@ -1981,6 +1986,13 @@ impl ChatHub {
         };
         let model_name = client.model.clone();
         let window = self.context_window.load(Ordering::Relaxed);
+        // The options half of the request envelope. Snapshotted per turn
+        // like the rest: a mid-turn settings change reaches the next turn,
+        // and the envelope must describe the request that was sent.
+        let envelope_options = {
+            let opts = self.llm_opts.lock().await;
+            envelope_options_json(&model_name, &opts, window)
+        };
         tokio::spawn(async move {
             let mut hops: u8 = 0;
             // Retry budget for the *current* step; reset once a step lands.
@@ -2133,6 +2145,17 @@ impl ChatHub {
                         .get(&session_id)
                         .and_then(|m| m.estimate(wh.envelope, &wh.entries));
                 }
+
+                // The envelope this request goes out with, recorded before
+                // it does — and before the trimmer consumes `wh.messages`.
+                // It is appended only when it differs from the last one in
+                // the log, so a session whose prompt never changes stores
+                // one copy, and one whose `memory.md` changed mid-session
+                // stores the before and the after, which is the only way the
+                // ledger can say which rows read which. The trimmer never
+                // touches the system prompt or the tools array, so recording
+                // ahead of it describes exactly what goes on the wire.
+                record_envelope(&sessions_map, session_id, &wh, &envelope_options).await;
 
                 // The trimmer's "context notice" marker is wire-only: it is
                 // inserted here and never enters the log.
@@ -2714,6 +2737,63 @@ fn one_line(text: &str, cap: usize) -> String {
 /// `None` when the session no longer exists. A flush failure is logged and
 /// the in-memory log keeps going — the next successful flush writes every
 /// line still pending.
+/// The sampling and mode facts that shaped a request, as JSON — the
+/// inspector's Options tab. Deliberately not the whole `LlmOptions`: the
+/// base URL and the API key are provider configuration, not part of what
+/// the model was asked, and one of them is a secret.
+fn envelope_options_json(model: &str, opts: &protocol::LlmOptions, window: u32) -> String {
+    serde_json::json!({
+        "model":          model,
+        "temperature":    opts.temperature,
+        "max_tokens":     opts.max_tokens,
+        "context_window": window,
+        "native_tools":   opts.native_tools,
+        "thinking":       opts.thinking,
+        "compact": {
+            "threshold_pct": opts.compact.threshold_pct,
+            "retain_pct":    opts.compact.retain_pct,
+        },
+    })
+    .to_string()
+}
+
+/// Append the request envelope for the hop about to run, unless the log
+/// already ends on an identical one.
+///
+/// The comparison is against the *log* rather than against a cache: a
+/// restart, a fork or a session reloaded from disk must not re-record an
+/// envelope that is already there, and the log is the only thing that
+/// survives all three.
+async fn record_envelope(
+    sessions: &Sessions,
+    session_id: u64,
+    wh: &WireHistory,
+    options: &str,
+) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(wh.envelope, options), &mut hasher);
+    let fingerprint = std::hash::Hasher::finish(&hasher);
+    {
+        let g = sessions.lock().await;
+        match g.get(&session_id) {
+            Some(log) if log.latest_envelope() == Some(fingerprint) => return,
+            Some(_) => {}
+            None => return,
+        }
+    }
+    append_event(
+        sessions,
+        session_id,
+        EventKind::RequestEnvelope {
+            fingerprint,
+            system: wh.system_body.clone(),
+            tools: wh.tools_body.clone(),
+            options: options.to_string(),
+        },
+    )
+    .await;
+}
+
 pub(crate) async fn append_event(
     sessions: &Sessions,
     session_id: u64,
@@ -3249,6 +3329,9 @@ pub struct WireHistory {
     pub entries:     Vec<SurfaceEntry>,
     /// The composed system-prompt body (empty when nothing was composed).
     pub system_body: String,
+    /// The `tools` array as it goes on the wire, pretty-printed. Empty in
+    /// text-protocol mode, where the catalogue is inside `system_body`.
+    pub tools_body:  String,
     /// Fingerprint of system body + tools array — the meter's anchor key.
     pub envelope:    u64,
     /// Approximate per-part token counts for the status bar.
@@ -3291,10 +3374,15 @@ fn build_wire_history(
     };
 
     let envelope = agents::meter::envelope_hash(&rendered.system, tools_json.as_ref());
+    let tools_body = tools_json
+        .as_ref()
+        .and_then(|t| serde_json::to_string_pretty(t).ok())
+        .unwrap_or_default();
     Ok(WireHistory {
         messages: out,
         entries: Vec::new(), // filled by build_history
         system_body: rendered.system,
+        tools_body,
         envelope,
         breakdown,
     })
