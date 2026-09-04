@@ -294,6 +294,13 @@ impl ToolSubAgent {
         }
 
         let id = next_tool_id();
+        let started = std::time::Instant::now();
+        // The UI payloads are bounded before they ever reach the pipe. A
+        // `write-file` argument or a `read-file` result can be megabytes, and
+        // neither the transcript row nor the frontend's chip needs more than
+        // a screenful — but a truncated payload must announce itself rather
+        // than look like the whole thing.
+        let args_json = ui_args_json(&args);
         let args_preview = parse_tool_call::render(skill.name(), &raw_args);
         info!(
             tool_id = id,
@@ -328,6 +335,7 @@ impl ToolSubAgent {
             name:         skill.name().to_string(),
             args_preview: args_preview.clone(),
             expectation:  expectation.clone(),
+            args_json,
         });
         let mut notices: Vec<String> = Vec::new();
         let mut veto = false;
@@ -354,7 +362,8 @@ impl ToolSubAgent {
             notices.extend(extra);
             veto = true;
             let outcome = SkillOutcome { ok: false, summary: if blocked { summary } else { outcome.summary } };
-            self.finish_call(id, skill.name(), args_preview, &outcome, veto);
+            let output = ui_output(&outcome.summary);
+            self.finish_call(id, skill.name(), args_preview, &outcome, veto, output, started);
             return RunReport { outcome, notices, approval };
         }
 
@@ -408,6 +417,11 @@ impl ToolSubAgent {
         // outputs too big to re-ingest are worth the lossy focused summary.
         // Skipped outright on interrupt — the summary feeds the next hop, and
         // there is no next hop.
+        // What the model actually received from the tool, before the
+        // expectation summariser had a chance to paraphrase it. The expanded
+        // row shows this; `summary` is what went into the context.
+        let output = ui_output(&outcome.summary);
+
         const SUMMARIZE_THRESHOLD: usize = 2000;
         if outcome.ok
             && !self.cancelled()
@@ -452,7 +466,7 @@ impl ToolSubAgent {
             }
         }
 
-        self.finish_call(id, skill.name(), args_preview, &outcome, veto);
+        self.finish_call(id, skill.name(), args_preview, &outcome, veto, output, started);
 
         RunReport { outcome, notices, approval }
     }
@@ -564,6 +578,7 @@ impl ToolSubAgent {
     /// Shared tail for the body and deny paths: finish logging, the
     /// `ToolCallFinished` chip event, and the failure-sink report (skipped
     /// for interrupts and policy vetoes — neither is a defect).
+    #[allow(clippy::too_many_arguments)]
     fn finish_call(
         &self,
         id: u64,
@@ -571,6 +586,8 @@ impl ToolSubAgent {
         args_preview: String,
         outcome: &SkillOutcome,
         veto: bool,
+        output: String,
+        started: std::time::Instant,
     ) {
         if outcome.ok {
             info!(
@@ -603,6 +620,8 @@ impl ToolSubAgent {
             id,
             ok: outcome.ok,
             summary: outcome.summary.clone(),
+            output,
+            duration_ms: started.elapsed().as_millis() as u64,
         });
         if !outcome.ok && !veto && !self.cancelled() {
             if let Some(sink) = &self.failure_sink {
@@ -715,6 +734,41 @@ async fn summarize(
         Ok(s) if !s.is_empty() => Some(s),
         _ => None,
     }
+}
+
+/// Largest argument blob worth putting on the wire for the UI. A
+/// `write-file` body can be megabytes; the expanded row shows a few hundred
+/// pixels of it. Over the cap the field goes out empty and the frontend falls
+/// back to `args_preview` — a truncated JSON string would not parse, and a
+/// row that silently showed half an argument would be worse than one that
+/// shows the summary line.
+const UI_ARGS_JSON_MAX: usize = 64 * 1024;
+
+/// Largest tool output worth putting on the wire. Shell results are already
+/// capped at 32 KiB and oversized successes spill to disk, but `read-file` is
+/// exempt from spilling (so a follow-up read cannot spill again) and can
+/// return up to 1 MiB.
+const UI_OUTPUT_MAX: usize = 256 * 1024;
+
+fn ui_args_json(args: &serde_json::Value) -> String {
+    let text = args.to_string();
+    if text.len() > UI_ARGS_JSON_MAX { String::new() } else { text }
+}
+
+/// The output as the model received it, bounded for the UI. When it is cut,
+/// the shared omission sentence says so — the row must never imply it is
+/// showing everything.
+fn ui_output(summary: &str) -> String {
+    if summary.len() <= UI_OUTPUT_MAX {
+        return summary.to_string();
+    }
+    let window = sica_core::retain::head_tail(summary, UI_OUTPUT_MAX * 3 / 4, UI_OUTPUT_MAX / 4);
+    format!(
+        "{}\n{}\n{}",
+        window.head,
+        sica_core::retain::notice(window.omitted, ""),
+        window.tail
+    )
 }
 
 #[cfg(test)]
@@ -1012,6 +1066,25 @@ mod tests {
         assert!(r.outcome.ok, "the reminder advises, never blocks");
         assert_eq!(r.notices.len(), 1);
         assert!(r.notices[0].contains("3 times"));
+    }
+
+    /// A payload too big for a row must not silently become "half the
+    /// arguments" or "half the output".
+    #[test]
+    fn ui_payloads_are_bounded_and_say_when_they_were_cut() {
+        let small = serde_json::json!({"path": "a.rs"});
+        assert_eq!(ui_args_json(&small), small.to_string());
+        let huge = serde_json::json!({"content": "x".repeat(UI_ARGS_JSON_MAX)});
+        assert!(
+            ui_args_json(&huge).is_empty(),
+            "an oversized argument blob is dropped, not truncated into unparsable JSON"
+        );
+
+        assert_eq!(ui_output("hello"), "hello");
+        let long = "y".repeat(UI_OUTPUT_MAX + 5_000);
+        let cut = ui_output(&long);
+        assert!(cut.len() < long.len());
+        assert!(cut.contains("omitted"), "the cut must announce itself: {}", &cut[..200]);
     }
 
     #[tokio::test]

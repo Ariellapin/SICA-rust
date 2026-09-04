@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -230,7 +230,29 @@ pub enum Request {
     ListSessions,
     LoadSession   { session_id: u64 },
     DeleteSession { session_id: u64 },
+    /// Give a session a title of the user's own. The auto-titler only fires
+    /// while the title is still the one it wrote, so this pins it.
+    RenameSession { session_id: u64, title: String },
+    /// Copy a session's *completed* turns into a fresh session — the same cut
+    /// `subagent-fork` uses, so an in-flight turn never crosses. Answers
+    /// `SessionCreated` with the new id.
+    ForkSession   { session_id: u64 },
+    /// Hide a session from the list. The log stays on disk; unlike
+    /// `DeleteSession` nothing is lost.
+    ArchiveSession { session_id: u64 },
+    /// Substring search over every session's stored messages. Answers
+    /// `SessionSearch`.
+    SearchSessions { query: String },
     ConnectLlm    { base_url: String, model: String, api_key: Option<String>, options: LlmOptions },
+    /// Ask a provider what models it serves (`GET /v1/models`). Answered
+    /// `Ok` immediately and reported by `ModelsListed` — the guide sketches a
+    /// `Response::Models`, but a provider that is slow to answer would then
+    /// stall the whole dispatcher loop, which the codebase forbids.
+    ///
+    /// The guide names the field `provider`; provider configs live on the
+    /// frontend side here, so the frontend sends what the backend actually
+    /// needs to make the call.
+    ListModels    { base_url: String, api_key: Option<String> },
     DisconnectLlm,
 
     /// Everything the workspace can offer the "/" palette: the live skill
@@ -274,6 +296,8 @@ pub enum Response {
     Ok,
     Error        { message: String },
     SessionList    { sessions: Vec<SessionMeta> },
+    /// Content-search hits, newest first, capped by the backend.
+    SessionSearch  { hits: Vec<SessionHit> },
     SessionCreated { id: u64 },
     SessionLoaded  { session: SessionDump },
     Catalog        { entries: Vec<CatalogEntry> },
@@ -315,6 +339,21 @@ pub struct SessionMeta {
     pub id: u64,
     pub title: String,
     pub created_at: i64,
+    /// Timestamp of the session's newest event (falls back to `created_at`
+    /// for a session that has none yet). The sidebar orders on this and
+    /// renders it as a relative bucket (§4.2).
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// One content-search hit: the session that matched plus the line it matched
+/// on, so the result row can show why it is there (§4.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHit {
+    pub id: u64,
+    pub title: String,
+    pub snippet: String,
+    pub updated_at: i64,
 }
 
 /// Wire-format dump of a full session's history. Kept separate from
@@ -356,6 +395,22 @@ pub struct MessageDump {
     pub tool_args_preview: Option<String>,
     #[serde(default)]
     pub tool_expectation: Option<String>,
+    /// Identity of the call within its session, so a reloaded transcript can
+    /// rebuild the same rows a live `ToolCallStarted` would. This is the seq
+    /// of the durable `ToolCall` event, not the process-local tool id — the
+    /// latter does not survive a restart.
+    #[serde(default)]
+    pub tool_call_id: Option<u64>,
+    /// Parent call, when the log recorded one. Only top-level calls reach the
+    /// session log today (nested `SkillContext::sub` calls are live events
+    /// only), so this is `None` on reload and the rows render flat.
+    #[serde(default)]
+    pub tool_parent_id: Option<u64>,
+    #[serde(default)]
+    pub tool_depth: u8,
+    /// Resolved arguments as JSON text — the expanded row's body (§3.4).
+    #[serde(default)]
+    pub tool_args_json: Option<String>,
     /// On `context`-role messages: why the harness injected them — the
     /// `ContextSource` label (`/name`, `instructions`, `runtime context`,
     /// `tool notice`…). Lets the FE present each kind without re-parsing
@@ -441,6 +496,47 @@ pub enum Event {
         breakdown: Option<TokenBreakdown>,
     },
 
+    /// Answer to [`Request::ListModels`]. `models` is empty when the fetch
+    /// failed; `error` then says why.
+    ModelsListed {
+        base_url: String,
+        models:   Vec<String>,
+        error:    Option<String>,
+    },
+
+    /// A step-level LLM retry is under way (`chat.rs` classified the failure
+    /// as retryable and is sleeping out the backoff). The durable `LlmRetry`
+    /// log event is the record; this is the live push that lets the FE draw
+    /// the retry chain on the turn instead of leaving it to the log panel.
+    LlmRetry {
+        session_id: u64,
+        attempt:    u32,
+        max:        u32,
+        delay_ms:   u64,
+        reason:     String,
+    },
+
+    /// One completed turn's accounting, emitted once at `TurnEnd`. Unlike
+    /// [`Event::TokenUsage`] — which is the live per-session meter — these are
+    /// the totals for this turn alone, summed over its hops, and they feed the
+    /// turn tail's usage and time pills.
+    TurnUsage {
+        session_id:  u64,
+        turn_id:     u64,
+        /// Prompt tokens, summed over the turn's hops (provider `usage` when
+        /// the provider sent one; 0 when it never did).
+        prompt:      u32,
+        /// Completion tokens, summed the same way.
+        completion:  u32,
+        /// Characters of reasoning the turn produced — a proxy the FE renders
+        /// as a "(+reasoning)" note; providers do not break it out.
+        reasoning:   u32,
+        /// Wall-clock time of the whole turn, hops and tool calls included.
+        duration_ms: u64,
+        /// Time to the first streamed token of the turn's first hop.
+        ttft_ms:     u64,
+    },
+
     /// Auto-compaction started: the assembled prompt crossed
     /// [`COMPACT_TRIGGER_PCT`] of the prompt budget and the older half of the
     /// history is being summarised.
@@ -478,11 +574,28 @@ pub enum Event {
         name: String,
         args_preview: String,
         expectation: String,
+        /// The resolved arguments as JSON text — what the expanded row needs
+        /// to render a real body (the command for a terminal block, the
+        /// `old`/`new` pair for a diff, the path for a read). `args_preview`
+        /// is a one-line rendering and is truncated; this is not.
+        #[serde(default)]
+        args_json: String,
     },
     ToolCallFinished {
         id: u64,
         ok: bool,
+        /// The model-visible outcome: the expectation summariser's paraphrase
+        /// when one ran, else the same text as `output`.
         summary: String,
+        /// The tool's own output as the model received it — spill-aware (the
+        /// head/tail digest when the raw text went to disk) but *before* the
+        /// expectation summariser paraphrased it. This is what the expanded
+        /// row shows.
+        #[serde(default)]
+        output: String,
+        /// Wall-clock time of the whole dispatch, pipeline included.
+        #[serde(default)]
+        duration_ms: u64,
     },
 
     // Idealist daemon signals.
@@ -714,6 +827,7 @@ mod tests {
             name: "cmd".into(),
             args_preview: "cmd 'echo hi'".into(),
             expectation: "confirm it ran".into(),
+            args_json: r#"{"command":"echo hi"}"#.into(),
         });
         let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();

@@ -116,6 +116,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 Response::CommandResult { text } => {
                                     bridge.send(UiEvent::CommandResult { text });
                                 }
+                                Response::SessionSearch { hits } => {
+                                    bridge.send(UiEvent::SessionSearch { hits });
+                                }
                                 _ => {}
                             }
                         }

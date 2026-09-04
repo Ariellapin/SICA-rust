@@ -6,39 +6,67 @@
 //! is pinned to the first slot so the user's working config is always
 //! visible without scrolling.
 
-use egui::{RichText, Vec2};
+use egui::Vec2;
 
 use protocol::{LlmState, Request};
 
-use sica_core::theme::Palette;
+use sica_core::theme::Theme;
 
-use crate::app::{rgb, App};
+use crate::app::App;
 use crate::supervisor::UiCommand;
-use crate::ui::widgets::{
-    caps_label, card, ghost_button, ghost_button_enabled, muted_italic, primary_button_enabled,
-    section_heading, status_pill,
-};
+use crate::ui::kit::{self, Size, Variant, Weight};
 
-const GRID_COLS: usize = 2;
+/// One card per provider, full width — the modal's content column is 588 px,
+/// so a second column would squeeze the fields dsh gives a whole row.
+const GRID_COLS: usize = 1;
 const GRID_GUTTER: f32 = 12.0;
 
+fn label_cell(ui: &mut egui::Ui, t: &Theme, text: &str) {
+    ui.allocate_ui(Vec2::new(88.0, 22.0), |ui| {
+        kit::label(
+            ui,
+            kit::txt(text, 12.0, Weight::Medium, kit::col(t.alias.label[2])),
+        );
+    });
+}
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
-    let p = app.palette;
+    let t = app.theme;
+    ui.add_space(12.0);
+    kit::label(
+        ui,
+        kit::txt(
+            "Enter your API keys to use models from the following providers.",
+            13.0,
+            Weight::Regular,
+            kit::col(t.alias.label[2]),
+        ),
+    );
+    ui.add_space(10.0);
 
     if !app.ipc_state.connected {
-        ui.label(
-            RichText::new("BE service must be running to manage the LLM connection.")
-                .color(rgb(p.danger)),
+        kit::label(
+            ui,
+            kit::txt(
+                "The backend must be running to connect a model.",
+                13.0,
+                Weight::Regular,
+                kit::col(t.alias.error),
+            ),
         );
         ui.add_space(6.0);
     }
 
     if app.providers.is_empty() {
-        ui.label(muted_italic(
-            &p,
-            "No provider configs found. Add TOML files under \
-             `sica-settings/llm-providers/` and restart.",
-        ));
+        kit::label(
+            ui,
+            kit::txt(
+                "No provider configs found. Add TOML files under sica-settings/llm-providers/ and restart.",
+                13.0,
+                Weight::Regular,
+                kit::col(t.alias.label[2]),
+            ),
+        );
         return;
     }
 
@@ -56,9 +84,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     let mut clicked_connect: Option<String> = None;
     let mut clicked_disconnect = false;
+    // Base URL whose model list the user asked for this frame.
+    let mut clicked_fetch: Option<String> = None;
 
     let llm_state = app.llm_state.state.clone();
     let ipc_connected = app.ipc_state.connected;
+    // Read-only snapshots: the loop below borrows `app.providers` mutably.
+    let models = app.provider_models.clone();
+    let pending = app.models_pending.clone();
 
     for row in order.chunks(GRID_COLS) {
         ui.columns(GRID_COLS, |ui_cols| {
@@ -68,14 +101,34 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 let is_active = active_id.as_deref() == Some(cfg.id.as_str());
                 let panel_state = if is_active { Some(&llm_state) } else { None };
 
-                card(ui, &p, |ui| {
-                    section_heading(ui, &p, &cfg.title);
-                    ui.label(muted_italic(&p, &cfg.description));
+                kit::card_frame(&t)
+                    .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+                    .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        kit::label(
+                            ui,
+                            kit::txt(&cfg.title, 15.0, Weight::Medium, kit::col(t.alias.label[0])),
+                        );
+                        kit::label(ui, kit::mono(&cfg.id, 11.0, kit::col(t.alias.label[3])));
+                    });
+                    kit::label(
+                        ui,
+                        kit::txt(
+                            &cfg.description,
+                            12.0,
+                            Weight::Regular,
+                            kit::col(t.alias.label[2]),
+                        ),
+                    );
                     ui.add_space(10.0);
 
-                    field_row(ui, &p, "Base URL", &mut cfg.base_url, false);
-                    field_row(ui, &p, "Model",    &mut cfg.model,    false);
-                    field_row(ui, &p, "API key",  &mut cfg.api_key,  true);
+                    field_row(ui, &t, "Base URL", &mut cfg.base_url, false);
+                    field_row(ui, &t, "Model",    &mut cfg.model,    false);
+                    field_row(ui, &t, "API key",  &mut cfg.api_key,  true);
+                    if models_row(ui, &t, cfg, &models, &pending, ipc_connected) {
+                        clicked_fetch = Some(cfg.base_url.clone());
+                    }
 
                     // Per-model recommendation matched from the model string.
                     // One click aligns temperature / thinking / tool mode;
@@ -84,18 +137,33 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         let preset = llm::preset::preset_for_provider(&cfg.base_url, &cfg.model);
                         let drift = cfg.preset_drift();
                         ui.horizontal(|ui| {
-                            caps_label(ui, "Preset", rgb(p.muted));
-                            ui.label(
-                                RichText::new(format!("{}: {}", preset.label, preset.note))
-                                    .color(rgb(p.muted))
-                                    .small(),
+                            label_cell(ui, &t, "Preset");
+                            kit::label(
+                                ui,
+                                kit::txt(
+                                    format!("{}: {}", preset.label, preset.note),
+                                    12.0,
+                                    Weight::Regular,
+                                    kit::col(t.alias.label[2]),
+                                ),
                             )
                             .on_hover_text(preset.note);
                         });
                         if !drift.is_empty() {
                             ui.horizontal(|ui| {
-                                caps_label(ui, &format!("differs: {}", drift.join(", ")), rgb(p.warn));
-                                if ghost_button(ui, &p, "Apply preset").clicked() {
+                                label_cell(ui, &t, "Differs");
+                                kit::label(
+                                    ui,
+                                    kit::txt(
+                                        drift.join(", "),
+                                        12.0,
+                                        Weight::Regular,
+                                        kit::col(t.alias.warn_label),
+                                    ),
+                                );
+                                if kit::button(ui, "Apply preset", Variant::Outline, Size::Sm)
+                                    .clicked()
+                                {
                                     cfg.apply_preset(&preset);
                                     let _ = crate::llm_providers::save(cfg);
                                 }
@@ -106,9 +174,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     // Sampling / context tuning. 0 on the token fields means
                     // "auto" (server default / auto-detect) — see hover text.
                     ui.horizontal(|ui| {
-                        ui.allocate_ui(Vec2::new(72.0, 22.0), |ui| {
-                            caps_label(ui, "Temp", rgb(p.muted));
-                        });
+                        label_cell(ui, &t, "Temp");
                         ui.add(
                             egui::DragValue::new(&mut cfg.temperature)
                                 .range(0.0..=2.0)
@@ -121,7 +187,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                              variety.",
                         );
                         ui.add_space(10.0);
-                        caps_label(ui, "Max tok", rgb(p.muted));
+                        label_cell(ui, &t, "Max tok");
                         ui.add(
                             egui::DragValue::new(&mut cfg.max_tokens)
                                 .range(0..=262_144)
@@ -131,7 +197,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             "Per-response completion cap. 0 = server default.",
                         );
                         ui.add_space(10.0);
-                        caps_label(ui, "Ctx", rgb(p.muted));
+                        label_cell(ui, &t, "Ctx");
                         ui.add(
                             egui::DragValue::new(&mut cfg.context_window)
                                 .range(0..=1_048_576)
@@ -171,10 +237,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.allocate_ui(Vec2::new(72.0, 22.0), |ui| {
-                            caps_label(ui, "Compact", rgb(p.muted));
-                        });
-                        caps_label(ui, "at", rgb(p.muted));
+                        label_cell(ui, &t, "Compact at");
                         ui.add(
                             egui::DragValue::new(&mut cfg.compact_threshold_pct)
                                 .range(0..=99)
@@ -186,7 +249,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                              0 = default (80).",
                         );
                         ui.add_space(6.0);
-                        caps_label(ui, "keep tail", rgb(p.muted));
+                        label_cell(ui, &t, "Keep tail");
                         ui.add(
                             egui::DragValue::new(&mut cfg.compact_retain_pct)
                                 .range(0..=90)
@@ -197,7 +260,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                              tail when compacting. 0 = default (16).",
                         );
                         ui.add_space(6.0);
-                        caps_label(ui, "sum tok", rgb(p.muted));
+                        label_cell(ui, &t, "Sum tok");
                         ui.add(
                             egui::DragValue::new(&mut cfg.compact_max_tokens)
                                 .range(0..=65_536)
@@ -218,7 +281,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         let connect_enabled  = ipc_connected && !panel_connecting && !panel_ready;
                         let connect_label    = if panel_connecting { "Connecting" } else { "Connect" };
 
-                        let connect_resp = primary_button_enabled(ui, &p, connect_label, connect_enabled);
+                        let connect_resp = kit::button_enabled(
+                            ui,
+                            connect_label,
+                            Variant::Primary,
+                            Size::Sm,
+                            connect_enabled,
+                        );
                         if !connect_enabled {
                             let hint = if !ipc_connected {
                                 "BE service must be running first."
@@ -235,12 +304,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                         let disc_enabled = is_active
                             && matches!(panel_state, Some(LlmState::Ready { .. } | LlmState::Connecting));
-                        if ghost_button_enabled(ui, &p, "Disconnect", disc_enabled).clicked() {
+                        if kit::button_enabled(
+                            ui,
+                            "Disconnect",
+                            Variant::Outline,
+                            Size::Sm,
+                            disc_enabled,
+                        )
+                        .clicked()
+                        {
                             clicked_disconnect = true;
                         }
 
                         ui.add_space(12.0);
-                        draw_status(ui, &p, panel_state);
+                        draw_status(ui, &t, panel_state);
                     });
                 });
             }
@@ -248,6 +325,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(GRID_GUTTER);
     }
 
+    if let Some(base_url) = clicked_fetch {
+        let api_key = app
+            .providers
+            .iter()
+            .find(|c| c.base_url == base_url)
+            .map(|c| c.api_key.clone())
+            .filter(|k| !k.is_empty());
+        app.models_pending.insert(base_url.clone());
+        app.send(UiCommand::SendRequest(Request::ListModels { base_url, api_key }));
+    }
     if let Some(id) = clicked_connect {
         app.connect_provider(&id);
     } else if clicked_disconnect {
@@ -256,20 +343,107 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         app.persist_settings();
     }
 
-    let _ = ghost_button; // exposed for future "Add provider" affordance.
+    ui.add_space(4.0);
+    if kit::button(ui, "Open provider folder", Variant::Outline, Size::Sm)
+        .on_hover_text("One TOML per provider; the filename stem is its id")
+        .clicked()
+    {
+        let dir = sica_core::paths::llm_providers_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = super::open_path(&dir);
+    }
+    ui.add_space(24.0);
+}
+
+/// "Fetch available models" (7): a button that asks the provider what it
+/// serves, and the answer as pickable chips. Returns `true` when the user
+/// asked for a fetch — the request goes out after the loop, which is where
+/// `app` is free to be borrowed again.
+fn models_row(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    cfg: &mut crate::llm_providers::ProviderConfig,
+    models: &std::collections::HashMap<String, Result<Vec<String>, String>>,
+    pending: &std::collections::HashSet<String>,
+    ipc_connected: bool,
+) -> bool {
+    let mut fetch = false;
+    let busy = pending.contains(&cfg.base_url);
+    ui.horizontal(|ui| {
+        label_cell(ui, t, "");
+        let label = if busy { "Fetching…" } else { "Fetch available models" };
+        if kit::button_enabled(
+            ui,
+            label,
+            Variant::Outline,
+            Size::Sm,
+            ipc_connected && !busy && !cfg.base_url.trim().is_empty(),
+        )
+        .on_hover_text("GET /v1/models on this provider")
+        .clicked()
+        {
+            fetch = true;
+        }
+    });
+    match models.get(&cfg.base_url) {
+        Some(Err(e)) => {
+            ui.horizontal(|ui| {
+                label_cell(ui, t, "");
+                kit::label(
+                    ui,
+                    kit::txt(
+                        kit::one_line(e, 90),
+                        12.0,
+                        Weight::Regular,
+                        kit::col(t.alias.error),
+                    ),
+                );
+            });
+        }
+        Some(Ok(list)) if list.is_empty() => {
+            ui.horizontal(|ui| {
+                label_cell(ui, t, "");
+                kit::label(
+                    ui,
+                    kit::txt(
+                        "The provider reported no models.",
+                        12.0,
+                        Weight::Regular,
+                        kit::col(t.alias.label[2]),
+                    ),
+                );
+            });
+        }
+        Some(Ok(list)) => {
+            let mut picked: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(88.0);
+                for m in list {
+                    if kit::pill(ui, m, *m == cfg.model).clicked() {
+                        picked = Some(m.clone());
+                    }
+                }
+            });
+            if let Some(m) = picked {
+                cfg.model = m;
+                let _ = crate::llm_providers::save(cfg);
+            }
+        }
+        None => {}
+    }
+    ui.add_space(2.0);
+    fetch
 }
 
 fn field_row(
     ui: &mut egui::Ui,
-    p: &Palette,
+    t: &Theme,
     label: &str,
     value: &mut String,
     password: bool,
 ) {
     ui.horizontal(|ui| {
-        ui.allocate_ui(Vec2::new(72.0, 22.0), |ui| {
-            caps_label(ui, label, rgb(p.muted));
-        });
+        label_cell(ui, t, label);
         // Fill the remaining card width so the input scales with the grid
         // cell rather than being clipped by fixed widths from the old
         // single-column layout.
@@ -283,23 +457,45 @@ fn field_row(
     ui.add_space(4.0);
 }
 
-fn draw_status(ui: &mut egui::Ui, p: &Palette, state: Option<&LlmState>) {
-    let (text, color) = match state {
-        Some(LlmState::Connecting) => ("Connecting", rgb(p.warn)),
+fn draw_status(ui: &mut egui::Ui, t: &Theme, state: Option<&LlmState>) {
+    let (text, fill, fg) = match state {
+        Some(LlmState::Connecting) => (
+            "Connecting",
+            kit::col(t.alias.warn_tertiary),
+            kit::col(t.alias.warn_label),
+        ),
         Some(LlmState::Ready { model, .. }) => {
-            // Render the model name as a tracked caps label after the OK pill.
-            status_pill(ui, p, "Ready", rgb(p.ok));
+            kit::tinted_pill(
+                ui,
+                "Ready",
+                kit::col(t.alias.success_tertiary),
+                kit::col(t.alias.success),
+                11.0,
+            );
             ui.add_space(6.0);
-            caps_label(ui, model, rgb(p.muted));
+            kit::label(ui, kit::mono(model, 11.0, kit::col(t.alias.label[2])));
             return;
         }
         Some(LlmState::Error { message }) => {
-            status_pill(ui, p, "Error", rgb(p.danger));
+            kit::tinted_pill(
+                ui,
+                "Error",
+                kit::col(t.alias.error).linear_multiply(if t.dark { 0.35 } else { 0.14 }),
+                kit::col(t.alias.error),
+                11.0,
+            );
             ui.add_space(6.0);
-            ui.label(RichText::new(message).color(rgb(p.danger)).small());
+            kit::label(
+                ui,
+                kit::txt(message, 12.0, Weight::Regular, kit::col(t.alias.error)),
+            );
             return;
         }
-        Some(LlmState::Disconnected) | None => ("Idle", rgb(p.muted)),
+        Some(LlmState::Disconnected) | None => (
+            "Idle",
+            kit::cola(t.alias.hover),
+            kit::col(t.alias.label[2]),
+        ),
     };
-    status_pill(ui, p, text, color);
+    kit::tinted_pill(ui, text, fill, fg, 11.0);
 }

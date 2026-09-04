@@ -24,17 +24,17 @@
 //! at the end so the user can type arguments. The trailing space is what closes
 //! the palette — a query containing whitespace is no longer a palette query.
 
-use egui::{Align, Color32, Rounding, Sense, Stroke, Vec2};
+use egui::{Align, Align2, Color32, Rounding, Sense, Vec2};
 
 use protocol::{CatalogEntry, CatalogKind, Request};
-use sica_core::theme::tokens::{HAIRLINE, RADIUS_2};
+use sica_core::theme::tokens::{RADIUS_ITEM, RADIUS_MENU};
 
-use crate::app::{rgb, App, AppView, SettingsTab};
+use crate::app::{App, SettingsTab};
 use crate::supervisor::UiCommand;
-use crate::ui::widgets::caps_label;
+use crate::ui::kit::{self, Level, Weight};
 
 /// Tallest the list gets before it scrolls internally.
-const MAX_LIST_HEIGHT: f32 = 260.0;
+const MAX_LIST_HEIGHT: f32 = 320.0;
 
 /// An app action the frontend performs itself — no LLM turn involved. These
 /// mirror controls that already exist elsewhere in the UI, so the palette is a
@@ -48,6 +48,7 @@ pub enum AppCommand {
     PermissionHint,
     GoalHint,
     ClearDraft,
+    AttachImage,
     OpenSettings,
     OpenLlmSettings,
     OpenSkillSettings,
@@ -63,9 +64,10 @@ const APP_COMMANDS: &[(&str, &str, AppCommand)] = &[
     ("permission", "Switch permission mode: /permission <read-only|workspace-write|danger-full-access>.", AppCommand::PermissionHint),
     ("goal", "Show or change this session's objective: /goal [continue|pause|complete|block <why>].", AppCommand::GoalHint),
     ("clear", "Empty the composer and drop attachments.", AppCommand::ClearDraft),
-    ("settings", "Open the Settings view.", AppCommand::OpenSettings),
-    ("llm", "Open Settings → LLM to pick a provider.", AppCommand::OpenLlmSettings),
-    ("skills", "Open Settings → General, where the skills folder lives.", AppCommand::OpenSkillSettings),
+    ("attach", "Pick an image to send with the next message.", AppCommand::AttachImage),
+    ("settings", "Open Settings.", AppCommand::OpenSettings),
+    ("llm", "Open Settings → Models to pick a provider.", AppCommand::OpenLlmSettings),
+    ("skills", "Open Settings → Skills: the catalogue and its folders.", AppCommand::OpenSkillSettings),
     ("rebuild", "Rebuild the backend and restart it.", AppCommand::RebuildBackend),
 ];
 
@@ -183,22 +185,63 @@ fn candidates(entries: &[CatalogEntry], query: &str) -> Vec<Row> {
     rows.into_iter().map(|(_, row)| row).collect()
 }
 
-/// Match rank, or `None` when the row doesn't match at all.
+/// Match rank, or `None` when the row doesn't match at all. Lower is
+/// better. dsh scores a fuzzy subsequence with a `+8` bonus at a name start
+/// or after a `-`/`_` boundary, `+4` for adjacency and a penalty per skipped
+/// character; the rank here is that score inverted into a sort key, with
+/// description-only matches ranked behind every name match.
 fn rank(row: &Row, query_lower: &str) -> Option<u8> {
     if query_lower.is_empty() {
         return Some(0);
     }
     let name = row.name.to_lowercase();
-    if name.starts_with(query_lower) {
-        Some(0)
-    } else if name.contains(query_lower) {
-        Some(1)
-    } else if row.description.to_lowercase().contains(query_lower) {
-        Some(2)
-    } else {
-        None
+    if let Some(score) = fuzzy_score(&name, query_lower) {
+        // 0 is the best possible key; a perfect prefix match scores highest.
+        let best = (query_lower.chars().count() as i32) * 12;
+        let key = ((best - score).max(0) / 6).min(200) as u8;
+        return Some(key);
     }
+    if row.description.to_lowercase().contains(query_lower) {
+        return Some(220);
+    }
+    None
 }
+
+/// Subsequence match with dsh's bonuses. `None` when `query` is not a
+/// subsequence of `text` at all.
+fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
+    let text: Vec<char> = text.chars().collect();
+    let mut score = 0i32;
+    let mut ti = 0usize;
+    let mut last_hit: Option<usize> = None;
+    for qc in query.chars() {
+        let mut found = None;
+        while ti < text.len() {
+            if text[ti] == qc {
+                found = Some(ti);
+                break;
+            }
+            ti += 1;
+        }
+        let hit = found?;
+        let boundary = hit == 0 || matches!(text.get(hit - 1), Some('-') | Some('_') | Some(' '));
+        score += if boundary { 8 } else { 0 };
+        if last_hit == Some(hit.wrapping_sub(1)) {
+            score += 4;
+        }
+        // Every skipped character costs one point.
+        if let Some(prev) = last_hit {
+            score -= (hit - prev - 1).min(6) as i32;
+        } else {
+            score -= (hit).min(6) as i32;
+        }
+        score += 4;
+        last_hit = Some(hit);
+        ti = hit + 1;
+    }
+    Some(score)
+}
+
 
 fn group_order(kind: CatalogKind) -> u8 {
     match kind {
@@ -291,10 +334,11 @@ fn draw_list(
     selected: usize,
     scroll_to_selected: bool,
 ) -> Option<usize> {
-    let p = app.palette;
+    let t = app.theme;
     let mut clicked = None;
 
-    frame(&p).show(ui, |ui| {
+    frame(&t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
         egui::ScrollArea::vertical()
             .id_source("slash_menu_scroll")
             .max_height(MAX_LIST_HEIGHT)
@@ -305,7 +349,15 @@ fn draw_list(
                         if last_kind.is_some() {
                             ui.add_space(6.0);
                         }
-                        caps_label(ui, group_label(row.kind), rgb(p.muted));
+                        kit::label(
+                            ui,
+                            kit::txt(
+                                group_label(row.kind),
+                                12.0,
+                                Weight::Medium,
+                                kit::col(t.alias.label[2]),
+                            ),
+                        );
                         ui.add_space(2.0);
                         last_kind = Some(row.kind);
                     }
@@ -315,17 +367,22 @@ fn draw_list(
                 }
             });
         ui.add_space(6.0);
-        caps_label(
+        kit::label(
             ui,
-            "↑↓ move · enter accept · esc dismiss",
-            rgb(p.muted),
+            kit::txt(
+                "\u{2191}\u{2193} move · enter accept · esc dismiss",
+                11.0,
+                Weight::Regular,
+                kit::col(t.alias.label[3]),
+            ),
         );
     });
     ui.add_space(6.0);
     clicked
 }
 
-/// One row. Returns `true` when it was clicked.
+/// One row: min-h 40, r=10, `[kind icon] [name] [args] [description]`, the
+/// highlight shown as a wash rather than an edge slab (§6.3).
 fn draw_row(
     app: &App,
     ui: &mut egui::Ui,
@@ -334,66 +391,84 @@ fn draw_row(
     selected: bool,
     scroll_to_selected: bool,
 ) -> bool {
-    let p = app.palette;
-    // The background depends on hover, which isn't known until the row has
-    // been laid out — so reserve a shape slot now and fill it in after.
-    let bg_slot = ui.painter().add(egui::Shape::Noop);
-
-    let row_h = 22.0;
-    let inner = ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), row_h),
-        egui::Layout::left_to_right(Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.add_space(8.0);
-            let name_color = if selected { rgb(p.accent) } else { rgb(p.ink) };
-            ui.label(
-                egui::RichText::new(format!("/{}", row.name))
-                    .monospace()
-                    .color(name_color),
-            );
-            if !row.args.is_empty() {
-                let hint = row
-                    .args
-                    .iter()
-                    .map(|a| format!("<{a}>"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                ui.label(egui::RichText::new(hint).monospace().small().color(rgb(p.muted)));
-            }
-            if !row.description.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&row.description).small().color(rgb(p.muted)),
-                    )
-                    .truncate(),
-                );
-            }
-        },
+    let t = app.theme;
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 40.0),
+        Sense::click(),
     );
-
-    let rect = inner.response.rect;
-    let resp = ui.interact(rect, ui.id().with(("slash_row", index)), Sense::click());
     let fill = if selected {
-        rgb(p.accent_subtle)
+        kit::cola(t.alias.active)
     } else if resp.hovered() {
-        rgb(p.surface_sunk)
+        kit::cola(t.alias.hover)
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().set(
-        bg_slot,
-        egui::epaint::RectShape::filled(rect, Rounding::same(RADIUS_2), fill),
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(RADIUS_ITEM), fill);
+    crate::ui::icons::paint(
+        painter,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.min.x + 16.0, rect.center().y),
+            Vec2::splat(14.0),
+        ),
+        match row.kind {
+            CatalogKind::Command => crate::ui::icons::Icon::Code,
+            CatalogKind::Skill => crate::ui::icons::Icon::Sparkle,
+            CatalogKind::Agent => crate::ui::icons::Icon::Model,
+        },
+        kit::col(t.alias.label[2]),
     );
-    if selected {
-        // 2px accent slab on the left edge — the same "you are here" mark the
-        // protocol banner and sidebar use.
-        let slab = egui::Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height()));
-        ui.painter().rect_filled(slab, 0.0, rgb(p.accent));
-        if scroll_to_selected {
-            resp.scroll_to_me(Some(Align::Center));
-        }
+    let name = format!("/{}", row.name);
+    let name_font = kit::mono_font(13.0);
+    let name_w = painter
+        .layout_no_wrap(name.clone(), name_font.clone(), Color32::WHITE)
+        .size()
+        .x;
+    painter.text(
+        egui::pos2(rect.min.x + 30.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &name,
+        name_font,
+        kit::col(t.alias.label[0]),
+    );
+    let mut x = rect.min.x + 30.0 + name_w + 8.0;
+    if !row.args.is_empty() {
+        let hint = row
+            .args
+            .iter()
+            .map(|a| format!("<{a}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let f = kit::mono_font(11.0);
+        let w = ui
+            .fonts(|fo| fo.layout_no_wrap(hint.clone(), f.clone(), Color32::WHITE))
+            .size()
+            .x;
+        ui.painter().text(
+            egui::pos2(x, rect.center().y),
+            Align2::LEFT_CENTER,
+            hint,
+            f,
+            kit::col(t.alias.label[3]),
+        );
+        x += w + 8.0;
     }
+    if !row.description.is_empty() {
+        let f = kit::font(13.0, Weight::Regular);
+        let avail = (rect.max.x - 12.0 - x).max(0.0);
+        let shown = kit::elide(ui, &row.description, &f, avail);
+        ui.painter().text(
+            egui::pos2(x, rect.center().y),
+            Align2::LEFT_CENTER,
+            shown,
+            f,
+            kit::col(t.alias.label[2]),
+        );
+    }
+    if selected && scroll_to_selected {
+        resp.scroll_to_me(Some(Align::Center));
+    }
+    let _ = index;
     if let Some(src) = &row.source {
         return resp.on_hover_text(src).clicked();
     }
@@ -403,7 +478,7 @@ fn draw_row(
 /// Nothing matched: say so rather than leaving a bare frame, and remind the
 /// user how to get out of the query.
 fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
-    let p = app.palette;
+    let t = app.theme;
     // Esc has to be claimed here too — otherwise the only way out of a
     // no-match query is deleting it by hand. Enter/Tab are swallowed with it
     // so a typo can't leak through to the composer as a sent message.
@@ -416,18 +491,33 @@ fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
         app.chat.slash.dismissed = true;
         return;
     }
-    frame(&p).show(ui, |ui| {
-        caps_label(ui, &format!("no match for /{query}"), rgb(p.muted));
+    frame(&t).show(ui, |ui| {
+        kit::label(
+            ui,
+            kit::txt(
+                format!("no match for /{query}"),
+                13.0,
+                Weight::Regular,
+                kit::col(t.alias.label[2]),
+            ),
+        );
     });
     ui.add_space(6.0);
 }
 
-fn frame(p: &sica_core::theme::Palette) -> egui::Frame {
-    egui::Frame::none()
-        .fill(rgb(p.surface))
-        .stroke(Stroke::new(HAIRLINE, rgb(p.hairline)))
-        .rounding(Rounding::same(RADIUS_2))
-        .inner_margin(egui::Margin::symmetric(8.0, 8.0))
+/// Menu chrome: r=20 card on `menu`, elevation-prominent with a `border-l1`
+/// stroke. dsh anchors this in an overlay 4 px above the composer card; here
+/// it sits directly above the card in the same bottom panel, which lands in
+/// the same place on screen without a second layout pass.
+fn frame(t: &sica_core::theme::Theme) -> egui::Frame {
+    kit::elevated_frame(
+        t,
+        kit::Elevation::Prominent,
+        Level::L1,
+        kit::col(t.alias.menu),
+        RADIUS_MENU,
+    )
+    .inner_margin(egui::Margin::symmetric(4.0, 6.0))
 }
 
 /// Commit the highlighted row: run app commands, insert everything else.
@@ -490,14 +580,15 @@ fn run_app_command(app: &mut App, cmd: AppCommand) {
             app.chat.draft.clear();
             app.chat.pending_images.clear();
         }
-        AppCommand::OpenSettings => app.view = AppView::Settings,
+        AppCommand::AttachImage => super::composer::pick_file_and_attach(app),
+        AppCommand::OpenSettings => app.settings_open = true,
         AppCommand::OpenLlmSettings => {
-            app.view = AppView::Settings;
-            app.settings_tab = SettingsTab::Llm;
+            app.settings_open = true;
+            app.settings_tab = SettingsTab::Models;
         }
         AppCommand::OpenSkillSettings => {
-            app.view = AppView::Settings;
-            app.settings_tab = SettingsTab::General;
+            app.settings_open = true;
+            app.settings_tab = SettingsTab::Skills;
         }
         AppCommand::RebuildBackend => {
             app.send(UiCommand::RebuildAndRestart { release: app.release_profile });

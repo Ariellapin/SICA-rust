@@ -44,6 +44,38 @@ impl SessionLog {
         log
     }
 
+    /// A fork: a fresh session carrying `src`'s events up to and including
+    /// `cut` (the caller cuts at the last `TurnEnd`, so an in-flight turn
+    /// never crosses — the same rule `subagent-fork` follows).
+    ///
+    /// The copied events keep their original seqs. That is deliberate:
+    /// `ToolResult.call_seq` points at the `ToolCall` that produced it, and
+    /// renumbering would silently break every one of those joins. Only the
+    /// source's own `SessionCreated` / `SessionTitle` lines are dropped, and
+    /// neither is ever referenced by seq.
+    pub fn fork(id: u64, title: impl Into<String>, src: &[SessionEvent], cut: usize) -> Self {
+        let created_at = chrono::Utc::now().timestamp();
+        let mut events = vec![SessionEvent::now(
+            1,
+            EventKind::SessionCreated { id, title: title.into(), created_at },
+        )];
+        events.extend(
+            src[..=cut]
+                .iter()
+                .filter(|e| {
+                    !matches!(
+                        e.kind,
+                        EventKind::SessionCreated { .. }
+                            | EventKind::SessionTitle { .. }
+                            | EventKind::SessionArchived
+                    )
+                })
+                .cloned(),
+        );
+        let next_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+        Self { id, events, next_seq, flushed: 0 }
+    }
+
     /// A session restored from disk — every event is already persisted.
     fn from_events(id: u64, events: Vec<SessionEvent>) -> Self {
         let next_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
@@ -83,6 +115,27 @@ impl SessionLog {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    /// Archived sessions stay on disk and stay loadable; they simply leave
+    /// the list. There is no un-archive door yet, matching dsh.
+    pub fn archived(&self) -> bool {
+        self.events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::SessionArchived))
+    }
+
+    /// Timestamp of the newest event — what the sidebar orders on (§4.2).
+    /// In unix **seconds**, like `created_at`; the log's own `ts` is in
+    /// milliseconds. Falls back to `created_at` for a log whose events carry
+    /// no usable timestamp.
+    pub fn updated_at(&self) -> i64 {
+        self.events
+            .iter()
+            .rev()
+            .map(|e| e.ts / 1000)
+            .find(|ts| *ts > 0)
+            .unwrap_or_else(|| self.created_at())
     }
 
     pub fn derive_surface(&self) -> Vec<SurfaceEntry> {
@@ -280,6 +333,87 @@ mod tests {
 
     fn user(text: &str) -> EventKind {
         EventKind::UserMessage { surface: SurfaceOp::Append, content: text.into(), images: Vec::new() }
+    }
+
+    /// A fork must keep `ToolResult.call_seq` pointing at its `ToolCall`.
+    /// Renumbering the copied events would break that join silently, which
+    /// is why `fork` copies seqs verbatim.
+    #[test]
+    fn fork_copies_completed_turns_and_keeps_call_seq_joins() {
+        let mut src = SessionLog::new(3, "Original");
+        src.append(EventKind::TurnStart { turn_id: 1, source: Default::default() });
+        src.append(user("do it"));
+        let call_seq = src.append(EventKind::ToolCall {
+            name: "read-file".into(),
+            args_preview: "read-file 'a.rs'".into(),
+            expectation: String::new(),
+            call_id: None,
+            args_json: Some(r#"{"path":"a.rs"}"#.into()),
+        });
+        src.append(EventKind::ToolResult {
+            surface: SurfaceOp::Append,
+            call_seq,
+            skill: "read-file".into(),
+            tool_call_id: None,
+            ok: true,
+            summary: "1\tfn main() {}".into(),
+            trusted: false,
+            pruned: false,
+        });
+        src.append(EventKind::TurnEnd {
+            turn_id: 1,
+            finish_reason: "done".into(),
+            hops: 1,
+        });
+        // Everything after the cut belongs to a turn still in flight.
+        src.append(user("and this too"));
+        let cut = src
+            .events
+            .iter()
+            .rposition(|e| matches!(e.kind, EventKind::TurnEnd { .. }))
+            .unwrap();
+
+        let fork = SessionLog::fork(9, "Original (fork)", &src.events, cut);
+        assert_eq!(fork.id, 9);
+        assert_eq!(fork.title(), "Original (fork)");
+        // Exactly one SessionCreated, and it is the fork's own.
+        let created = fork
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::SessionCreated { .. }))
+            .count();
+        assert_eq!(created, 1);
+        // The in-flight message did not cross.
+        assert_eq!(fork.user_message_count(), 1);
+        // The join still resolves: the derived tool entry names the skill
+        // from its `ToolCall`, not the fallback.
+        let tool = fork
+            .derive_surface()
+            .into_iter()
+            .find_map(|e| e.tool)
+            .expect("tool entry");
+        assert_eq!(tool.args_preview, "read-file 'a.rs'");
+        assert_eq!(tool.args_json.as_deref(), Some(r#"{"path":"a.rs"}"#));
+        // Nothing is on disk yet, so the fork flushes whole.
+        assert_eq!(fork.last_seq(), fork.events.iter().map(|e| e.seq).max().unwrap());
+    }
+
+    #[test]
+    fn archived_is_sticky_and_updated_at_is_seconds() {
+        let mut log = SessionLog::new(4, "t");
+        assert!(!log.archived());
+        // `created_at` is seconds and event `ts` is milliseconds; the two
+        // must come back on the same scale or the sidebar's relative time
+        // reads "56y ago".
+        log.append(user("hi"));
+        let updated = log.updated_at();
+        assert!(
+            (updated - log.created_at()).abs() < 5,
+            "updated_at {updated} is not on the same scale as created_at {}",
+            log.created_at()
+        );
+        log.append(EventKind::SessionArchived);
+        assert!(log.archived());
     }
 
     #[test]

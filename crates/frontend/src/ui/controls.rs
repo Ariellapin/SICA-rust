@@ -1,54 +1,9 @@
+//! The legacy demo-request row, kept because `smoke` drives the same
+//! requests and because a live round-trip through the pipe is the quickest
+//! proof the dispatcher is healthy. Rehoused in Settings > Diagnostics.
+
 use crate::app::{App, RequestKind};
 use crate::supervisor::UiCommand;
-
-pub fn draw_top(app: &mut App, ui: &mut egui::Ui) {
-    ui.horizontal_wrapped(|ui| {
-        ui.heading("sica-rust");
-        ui.separator();
-
-        let be_running = app.be_state.running;
-        let build_busy = app.build_state.in_flight;
-
-        if ui
-            .add_enabled(!be_running && !build_busy, egui::Button::new("▶ Start BE"))
-            .clicked()
-        {
-            app.send(UiCommand::StartBe);
-        }
-        if ui
-            .add_enabled(be_running, egui::Button::new("■ Stop BE"))
-            .clicked()
-        {
-            app.send(UiCommand::StopBe);
-        }
-        ui.separator();
-        if ui
-            .add_enabled(!build_busy, egui::Button::new("⟳ Rebuild"))
-            .clicked()
-        {
-            app.send(UiCommand::Rebuild { release: app.release_profile });
-        }
-        if ui
-            .add_enabled(!build_busy, egui::Button::new("⟳ Rebuild & Restart"))
-            .clicked()
-        {
-            app.send(UiCommand::RebuildAndRestart { release: app.release_profile });
-        }
-
-        ui.separator();
-        if ui
-            .checkbox(&mut app.auto_watch, "Auto-watch")
-            .changed()
-        {
-            app.send(UiCommand::SetAutoWatch(app.auto_watch));
-        }
-        ui.checkbox(&mut app.release_profile, "Release profile");
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.checkbox(&mut app.autoscroll, "Autoscroll");
-        });
-    });
-}
 
 pub fn draw_request(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {

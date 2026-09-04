@@ -60,8 +60,11 @@ pub enum SurfaceOp {
 pub enum EventKind {
     /// First line of every log.
     SessionCreated { id: u64, title: String, created_at: i64 },
-    /// Rename (auto-title or, later, manual). Latest wins.
+    /// Rename (auto-title or manual). Latest wins.
     SessionTitle { title: String },
+    /// The user archived the session: it leaves the list but the log stays on
+    /// disk, which is the whole difference from deleting it.
+    SessionArchived,
     /// One user message opens a turn; `turn_id` groups the hops under it.
     /// `source` says who opened it — a human, a goal round, or a queued
     /// followup — which is what the goal skills' authority check reads:
@@ -96,6 +99,12 @@ pub enum EventKind {
         expectation: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        /// Resolved arguments as JSON text. `args_preview` is a one-line
+        /// rendering that truncates; a UI rebuilding the call's body from
+        /// the log needs the real arguments. Absent in logs written before
+        /// the field existed — those rows fall back to the preview.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args_json: Option<String>,
     },
     /// The outcome of the `ToolCall` at `call_seq`. Derives to the
     /// ```` ```tool_result ```` block the model reads.
@@ -316,6 +325,8 @@ pub struct ToolMeta {
     pub summary: String,
     pub trusted: bool,
     pub pruned: bool,
+    /// Resolved arguments as JSON text, when the `ToolCall` recorded them.
+    pub args_json: Option<String>,
 }
 
 /// One entry of the derived history: the message plus the seq of the event
@@ -356,13 +367,13 @@ pub fn tool_result_message(skill: &str, ok: bool, summary: &str, trusted: bool) 
 
 /// Fold the log into the model-visible history.
 pub fn derive_surface(events: &[SessionEvent]) -> Vec<SurfaceEntry> {
-    let mut calls: HashMap<u64, (&str, &str, &str)> = HashMap::new();
+    let mut calls: HashMap<u64, (&str, &str, &str, Option<&str>)> = HashMap::new();
     let mut out: Vec<SurfaceEntry> = Vec::new();
 
     for ev in events {
         let (surface, message, tool, context) = match &ev.kind {
-            EventKind::ToolCall { name, args_preview, expectation, .. } => {
-                calls.insert(ev.seq, (name, args_preview, expectation));
+            EventKind::ToolCall { name, args_preview, expectation, args_json, .. } => {
+                calls.insert(ev.seq, (name, args_preview, expectation, args_json.as_deref()));
                 continue;
             }
             EventKind::UserMessage { surface, content, images } => (
@@ -387,14 +398,20 @@ pub fn derive_surface(events: &[SessionEvent]) -> Vec<SurfaceEntry> {
             EventKind::ToolResult {
                 surface, call_seq, skill, tool_call_id, ok, summary, trusted, pruned,
             } => {
-                let (name, args_preview, expectation) = match calls.get(call_seq) {
-                    Some((name, args, exp)) => ((*name).to_string(), (*args).to_string(), (*exp).to_string()),
-                    None => (skill.clone(), skill.clone(), String::new()),
+                let (name, args_preview, expectation, args_json) = match calls.get(call_seq) {
+                    Some((name, args, exp, json)) => (
+                        (*name).to_string(),
+                        (*args).to_string(),
+                        (*exp).to_string(),
+                        json.map(|s| s.to_string()),
+                    ),
+                    None => (skill.clone(), skill.clone(), String::new(), None),
                 };
                 let tool = ToolMeta {
                     name,
                     args_preview,
                     expectation,
+                    args_json,
                     ok: *ok,
                     call_seq: *call_seq,
                     summary: summary.clone(),
@@ -540,6 +557,7 @@ mod tests {
                 args_preview: "run-cli 'dir'".into(),
                 expectation: "list files".into(),
                 call_id: None,
+                args_json: None,
             }),
             ev(2, EventKind::ToolResult {
                 surface: SurfaceOp::Append,
@@ -689,6 +707,7 @@ mod tests {
             EventKind::ToolCall {
                 name: "run-cli".into(), args_preview: "run-cli 'x'".into(),
                 expectation: "e".into(), call_id: Some("c".into()),
+                args_json: None,
             },
             EventKind::ToolResult {
                 surface: SurfaceOp::Append, call_seq: 7, skill: "run-cli".into(),

@@ -1,241 +1,676 @@
-//! Scrollable list of turns. Editorial form — no bubbles. User messages
-//! right-align in a subtle sunk-surface rect; assistant messages run full-
-//! width below an "ASSISTANT" caps label and a hairline rule; reasoning is
-//! inset 24px with a left-edge info-blue hairline and italic serif body.
+//! The transcript (§3): one column of flow items, 16 px apart, no avatars
+//! and no role labels anywhere.
+//!
+//! * **User** — right-aligned bubble, `specific-bubble`, r=22, pad 10 16,
+//!   max 70 % of the column; `/name` and `@path` runs decorated.
+//! * **Assistant** — flat, full column width, markdown, no streaming caret.
+//!   While the turn runs the tail shows the shimmering `TurnStatus` line with
+//!   a mono clock after 15 s; an interrupted reply ends with a "Stopped" tag.
+//! * **Reasoning** — a disclosure row titled "Think" whose summary is the
+//!   latest line while running and the first line once settled.
+//! * **Tool calls** — [`super::tool_row`].
+//! * **Markers** — compaction / injection / steer rows, also disclosures.
+//! * **Turn tail** — copy + timestamp, revealed on the newest turn always and
+//!   on hover for older ones.
+//!
+//! Scroll behaviour keeps sica-rust's own strengths that dsh lacks (middle-
+//! click pan, Ctrl+A/Ctrl+C message copy) and adopts dsh's 24 px "at bottom"
+//! threshold and floating back-to-bottom circle.
 
 use egui::{
-    Align, Color32, Key, Layout, Modifiers, PointerButton, Pos2, Rect, RichText, Rounding,
-    Sense, Shape, Stroke, Vec2,
+    Align, Key, Layout, Modifiers, PointerButton, Pos2, Rect, Rounding, Sense, Shape, Stroke,
+    Vec2,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-use sica_core::theme::Palette;
-
-use crate::app::{rgb, App, Notice, ToolChip};
-use crate::ui::widgets::{
-    blade_mark, caps_button, caps_job, caps_label, display_text, hairline, working_sweep,
+use sica_core::theme::{
+    tokens::{RADIUS_BUBBLE, RADIUS_ROW},
+    Theme,
 };
 
+use crate::app::{App, Notice, NoticeKind};
+use crate::ui::icons::Icon;
+use crate::ui::kit::{self, DotState, Leading, Weight};
+
+/// dsh's "at bottom" tolerance.
+const BOTTOM_EPS: f32 = 24.0;
+/// Horizontal padding inside the user bubble (§3.1: pad 10 16).
+const BUBBLE_PAD_X: f32 = 16.0;
+/// The turn-status clock appears after this long.
+const CLOCK_AFTER_SECS: f32 = 15.0;
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
-    let palette = app.palette;
-    // The composer sits in its own bottom panel, so everything still
-    // available here belongs to the transcript.
+    let t = app.theme;
     let height = ui.available_height();
-    // Follow-the-stream only while the user hasn't taken the viewport
-    // (clicked into the transcript / scrolled up). The flag is still drained
-    // every frame so a stale snap doesn't fire when auto-follow resumes.
     let force_scroll =
         std::mem::take(&mut app.chat.scroll_to_bottom) && !app.chat.autoscroll_paused;
-    // An interrupt has been sent but the backend hasn't confirmed the turn is
-    // over yet — the strip says so instead of implying work is progressing.
-    let stopping = app.chat.interrupt_requested;
-    // Screen rect of each rendered assistant body, for Ctrl+A targeting.
     let mut assistant_rects: Vec<(usize, Rect)> = Vec::new();
     let selected = app.chat.selected_turn;
+
     let output = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(!app.chat.autoscroll_paused)
-        // Disable drag-to-scroll so a click-drag selects text instead of
-        // panning the viewport — otherwise message text can't be highlighted.
-        // Wheel and scrollbar scrolling are unaffected.
+        // Click-drag selects text instead of panning; wheel and scrollbar are
+        // unaffected.
         .drag_to_scroll(false)
-        // We drive the bottom-snap by writing the offset ourselves (see
-        // `transcript_input`). Animated targets would fight that write, and
-        // an animated snap rubber-bands on every streamed delta anyway.
         .animated(false)
         .max_height(height.max(120.0))
         .show(ui, |ui| {
-            if app.chat.turns.is_empty() {
-                draw_empty(ui, &palette);
-                return;
-            }
+            // Flow items carry their own 16 px separation (§3); egui's default
+            // inter-widget spacing would double it.
+            ui.spacing_mut().item_spacing.y = 2.0;
             for i in 0..app.chat.turns.len() {
-                // Marker entries (auto-compaction records) carry no message
-                // body — draw the strip and move on.
                 if let Some(notice) = app.chat.turns[i].notice.clone() {
-                    draw_notice(ui, &notice, &palette);
+                    draw_marker(app, ui, i, &notice);
                     continue;
                 }
-                let (user, assistant, reasoning_text, finished, collapsed, errored) = {
-                    let t = &app.chat.turns[i];
-                    (
-                        t.user.clone(),
-                        t.assistant.clone(),
-                        t.reasoning.clone(),
-                        t.finished,
-                        t.reasoning_collapsed,
-                        t.finish_reason.as_deref().is_some_and(|r| r.starts_with("error")),
-                    )
-                };
-                let has_images = !app.chat.turns[i].images.is_empty();
-                if !user.is_empty() || has_images {
-                    draw_user(ui, &user, &palette);
-                }
-                // A message the backend queued behind a running turn: say
-                // so, or an empty reply that has not started yet reads as a
-                // stalled stream.
-                if app.chat.turns[i].queued {
-                    draw_queued(ui, &palette);
-                }
-                if has_images {
-                    draw_user_images(app, ui, i);
-                }
-                if !reasoning_text.is_empty() {
-                    if finished && collapsed {
-                        if reasoning_chip_collapsed(ui, &palette).clicked() {
-                            app.chat.turns[i].reasoning_collapsed = false;
-                        }
-                    } else {
-                        if reasoning_header(ui, finished, &palette).clicked() && finished {
-                            app.chat.turns[i].reasoning_collapsed = true;
-                        }
-                        draw_reasoning(ui, &reasoning_text, &palette);
-                    }
-                }
-                // No placeholder for an empty in-flight reply: the activity
-                // strip below already says work is happening, and says what.
-                if !assistant.is_empty() {
-                    let body = ui
-                        .scope(|ui| {
-                            draw_assistant(ui, &mut app.md_cache, i, &assistant, &palette);
-                        })
-                        .response
-                        .rect;
-                    assistant_rects.push((i, body));
-                    // Ctrl+A "selection" — a translucent wash over the whole
-                    // message so the selected state reads like a text
-                    // highlight (Ctrl+C then copies the message source).
-                    if selected == Some(i) {
-                        ui.painter().rect_filled(
-                            body.expand2(egui::vec2(6.0, 4.0)),
-                            2.0,
-                            rgb(palette.accent).linear_multiply(0.14),
-                        );
-                    }
-                }
-                let chips = app.chat.turns[i].tool_chips.clone();
-                if !chips.is_empty() {
-                    super::tool_chips::draw(ui, &chips, &palette);
-                }
-                if !finished {
-                    draw_working(ui, &chips, stopping, &palette);
-                } else if errored {
-                    // The request itself failed (after the backend's retries):
-                    // say so where the reply would have been, so an empty
-                    // bubble never reads as "the model chose silence". The
-                    // log panel carries the exact error.
-                    ui.add_space(6.0);
-                    caps_label(ui, "Request failed · see log", rgb(palette.danger));
-                }
-                ui.add_space(20.0);
+                draw_turn(app, ui, i, &mut assistant_rects, selected, &t);
             }
+            ui.add_space(24.0);
         });
+
     transcript_input(app, ui, &output, &assistant_rects, force_scroll);
-    // The pill is pointless while everything already fits on screen.
-    if output.content_size.y > output.inner_rect.height() {
-        resume_button(app, ui, visible_viewport(ui, &output));
+    // A floating control has no business painting over an open modal.
+    if output.content_size.y > output.inner_rect.height() && !app.settings_open {
+        back_to_bottom(app, ui, visible_viewport(ui, &output));
     }
 }
 
-/// The part of the transcript viewport actually on screen.
-///
-/// With horizontal scrolling off and `auto_shrink` off, egui grows the scroll
-/// area's `inner_rect` to whatever width the content demanded, so a single
-/// unwrappable line (a long path in a tool chip, say) can hand us a rect far
-/// wider than the window. Anything doing hit-testing or positioning has to
-/// clamp to the visible clip rect first, or it lands off-screen.
+fn draw_turn(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    i: usize,
+    assistant_rects: &mut Vec<(usize, Rect)>,
+    selected: Option<usize>,
+    t: &Theme,
+) {
+    let (user, assistant, reasoning, finished, collapsed, finish_reason, queued) = {
+        let turn = &app.chat.turns[i];
+        (
+            turn.user.clone(),
+            turn.assistant.clone(),
+            turn.reasoning.clone(),
+            turn.finished,
+            turn.reasoning_collapsed,
+            turn.finish_reason.clone(),
+            turn.queued,
+        )
+    };
+    let has_images = !app.chat.turns[i].images.is_empty();
+    if !user.is_empty() || has_images {
+        draw_user(ui, i, &user, t);
+    }
+    if has_images {
+        draw_user_images(app, ui, i);
+    }
+    if queued {
+        // A queued message has no turn yet — it waits in the composer dock,
+        // and the bubble above is the only trace until the BE admits it.
+        ui.add_space(2.0);
+        kit::footnote(ui, "queued — runs when the current turn ends");
+    }
+
+    // Process rows. In Compact display a *closed* turn folds them all behind
+    // one button; Normal shows every row.
+    let process_count = app.chat.turns[i].tool_chips.len()
+        + usize::from(!reasoning.is_empty());
+    let fold_id = ui.id().with(("fold", i));
+    let folded: bool = if app.transcript_compact && finished && process_count > 0 {
+        ui.ctx().data(|d| d.get_temp(fold_id).unwrap_or(true))
+    } else {
+        false
+    };
+    if app.transcript_compact && finished && process_count > 0 {
+        if process_fold(ui, app, i, folded) {
+            ui.ctx().data_mut(|d| d.insert_temp(fold_id, !folded));
+        }
+    }
+    if !folded {
+        if !reasoning.is_empty() {
+            let summary = if finished {
+                reasoning.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
+            } else {
+                reasoning.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")
+            }
+            .to_string();
+            let out = kit::disclosure_row(
+                ui,
+                Leading::Icon(Icon::Think),
+                "Think",
+                &kit::one_line(&summary, 200),
+                !collapsed,
+                !finished,
+                None,
+            );
+            if out.clicked {
+                app.chat.turns[i].reasoning_collapsed = !collapsed;
+            }
+            if !collapsed {
+                reasoning_body(ui, &reasoning, t);
+            }
+        }
+        super::tool_row::draw(app, ui, i);
+    }
+
+    retry_chain(app, ui, i, finished, t);
+
+    if !assistant.is_empty() {
+        ui.add_space(8.0);
+        let body = ui
+            .scope(|ui| draw_assistant(ui, &mut app.md_cache, i, &assistant, t))
+            .response
+            .rect;
+        assistant_rects.push((i, body));
+        if selected == Some(i) {
+            ui.painter().rect_filled(
+                body.expand2(egui::vec2(6.0, 4.0)),
+                RADIUS_ROW,
+                kit::col(t.alias.business).linear_multiply(0.12),
+            );
+        }
+    }
+
+    if !finished {
+        turn_status(app, ui, i, t);
+    } else {
+        match finish_reason.as_deref() {
+            Some(r) if r.starts_with("error") => turn_error(ui, t),
+            Some("interrupted") => stopped_tag(ui, t),
+            Some("max_tokens") | Some("length") => max_tokens_row(ui, t),
+            _ => {}
+        }
+        turn_tail(app, ui, i, &assistant, t);
+    }
+    ui.add_space(16.0);
+}
+
+// ---------------------------------------------------------------------------
+// User
+// ---------------------------------------------------------------------------
+
+fn draw_user(ui: &mut egui::Ui, i: usize, text: &str, t: &Theme) {
+    let avail = ui.available_width();
+    let max_w = (avail * 0.70).max(180.0);
+    // The frame's own horizontal margin is not available to the text.
+    let text_w = (max_w - 2.0 * BUBBLE_PAD_X).max(80.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail, 0.0),
+        Layout::right_to_left(Align::Min),
+        |ui| {
+            egui::Frame::none()
+                .fill(kit::col(t.alias.bubble))
+                .rounding(Rounding::same(RADIUS_BUBBLE))
+                .inner_margin(egui::Margin::symmetric(BUBBLE_PAD_X, 10.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(text_w);
+                    let mut job = super::user_text::job(
+                        text,
+                        kit::col(t.alias.label[0]),
+                        kit::col(t.alias.business),
+                        kit::font(t.content_px as f32, Weight::Regular),
+                    );
+                    job.wrap.max_width = text_w;
+                    // Lay the job out here instead of handing egui the job:
+                    // `Label` replaces `job.wrap` with the wrap mode it derives
+                    // from the ui's layout, and this right-to-left row resolves
+                    // to `Extend` — which is how a long message became one
+                    // endless line running off the right edge. A pre-laid
+                    // galley is used verbatim.
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    if galley.size().x <= text_w {
+                        ui.add(egui::Label::new(galley));
+                    } else {
+                        // Nothing to break on (one long path, URL or token):
+                        // scroll it rather than let it spill over the
+                        // transcript. The fixed-width box is what puts a
+                        // left-to-right scroll area inside a right-aligned row.
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_w, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                egui::ScrollArea::horizontal()
+                                    .id_source(("user_msg", i))
+                                    .show(ui, |ui| ui.add(egui::Label::new(galley)));
+                            },
+                        );
+                    }
+                });
+        },
+    );
+    ui.add_space(8.0);
+}
+
+fn draw_user_images(app: &mut App, ui: &mut egui::Ui, turn_idx: usize) {
+    const THUMB: f32 = 96.0;
+    let ctx = ui.ctx().clone();
+    let avail = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail, 0.0),
+        Layout::right_to_left(Align::Min),
+        |ui| {
+            let count = app.chat.turns[turn_idx].images.len();
+            for j in (0..count).rev() {
+                let att = &mut app.chat.turns[turn_idx].images[j];
+                let tex = super::composer::ensure_texture(
+                    &ctx,
+                    &mut att.texture,
+                    &att.mime,
+                    &att.data_base64,
+                    turn_idx * 1000 + j,
+                );
+                if let Some(handle) = tex {
+                    let natural = handle.size_vec2();
+                    let size = if natural.x <= 0.0 || natural.y <= 0.0 {
+                        Vec2::splat(THUMB)
+                    } else {
+                        let scale = (THUMB / natural.x).min(THUMB / natural.y);
+                        natural * scale
+                    };
+                    ui.image((handle.id(), size));
+                }
+            }
+        },
+    );
+    ui.add_space(6.0);
+}
+
+// ---------------------------------------------------------------------------
+// Assistant
+// ---------------------------------------------------------------------------
+
+fn draw_assistant(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    turn_idx: usize,
+    text: &str,
+    t: &Theme,
+) {
+    // egui_commonmark resolves `**bold**`, headings and bullets through
+    // `strong_text_color()` (which reads `widgets.active.fg_stroke.color`) —
+    // point it at the primary label so strong glyphs stay legible.
+    ui.scope(|ui| {
+        let ink = kit::col(t.alias.label[0]);
+        let v = &mut ui.style_mut().visuals.widgets;
+        v.active.fg_stroke.color = ink;
+        v.noninteractive.fg_stroke.color = ink;
+        ui.style_mut().visuals.extreme_bg_color = kit::col(t.alias.code_block);
+        CommonMarkViewer::new(format!("assistant_md_{turn_idx}")).show(ui, cache, text);
+    });
+}
+
+/// The live tail of a running turn: dsh's shimmering status line, plus a
+/// mono clock once the turn has been going for 15 s.
+fn turn_status(app: &mut App, ui: &mut egui::Ui, i: usize, t: &Theme) {
+    let chips = &app.chat.turns[i].tool_chips;
+    let active = chips.iter().filter(|c| !c.finished).max_by_key(|c| c.depth);
+    let text = if app.chat.interrupt_requested {
+        "Stopping…".to_string()
+    } else {
+        match active {
+            Some(c) if c.depth > 0 => format!("Sub-agent · {}", c.name),
+            Some(c) => format!("Running · {}", super::tool_row::title_of(&c.name).to_lowercase()),
+            None => "Working…".to_string(),
+        }
+    };
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if app.reduce_motion {
+            kit::label(
+                ui,
+                kit::txt(&text, 14.0, Weight::Medium, kit::col(t.alias.business)),
+            );
+        } else {
+            kit::shimmer_text(ui, &text, 14.0);
+        }
+        let elapsed = app.gen_speed.elapsed_secs;
+        if elapsed >= CLOCK_AFTER_SECS {
+            ui.add_space(8.0);
+            let secs = elapsed as u32;
+            let clock = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            };
+            kit::label(ui, kit::mono(clock, 12.0, kit::col(t.alias.label[3])));
+        }
+    });
+}
+
+/// `Stopped` tag: pad 0 6, r=6, hover fill, `label[2]`, fixed 11/18.
+fn stopped_tag(ui: &mut egui::Ui, t: &Theme) {
+    ui.add_space(4.0);
+    let font = kit::font(11.0, Weight::Regular);
+    let galley = ui.fonts(|f| f.layout_no_wrap("Stopped".into(), font.clone(), egui::Color32::WHITE));
+    let (rect, _) =
+        ui.allocate_exact_size(galley.size() + Vec2::new(12.0, 4.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::same(RADIUS_ROW), kit::cola(t.alias.hover));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Stopped",
+        font,
+        kit::col(t.alias.label[2]),
+    );
+}
+
+/// `[10px dot] "This turn failed" [message]` — grid 10px 1fr auto (§3.5).
+fn turn_error(ui: &mut egui::Ui, t: &Theme) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        kit::state_dot(ui, DotState::Error, 10.0);
+        ui.add_space(8.0);
+        kit::label(
+            ui,
+            kit::txt("This turn failed", 14.0, Weight::Semibold, kit::col(t.alias.error)),
+        );
+        ui.add_space(8.0);
+        kit::label(
+            ui,
+            kit::txt(
+                "the request did not complete — see Diagnostics for the error",
+                13.0,
+                Weight::Regular,
+                kit::col(t.alias.label[1]),
+            ),
+        );
+    });
+}
+
+fn max_tokens_row(ui: &mut egui::Ui, t: &Theme) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        kit::state_dot(ui, DotState::Warning, 10.0);
+        ui.add_space(8.0);
+        kit::label(
+            ui,
+            kit::txt(
+                "Output token limit reached",
+                14.0,
+                Weight::Semibold,
+                kit::col(t.alias.warn_label),
+            ),
+        );
+    });
+    kit::footnote(
+        ui,
+        "The reply was cut off; earlier output is preserved in the conversation. \
+         Send \"continue\" to let the model resume.",
+    );
+}
+
+/// The retry chain (§3.5): one `<details>` row per step-level LLM retry the
+/// backend performed inside this turn. The newest row of a still-running turn
+/// is the *pending* one — it counts down and shimmers; every earlier row is
+/// settled and reads "Retried model request".
+fn retry_chain(app: &mut App, ui: &mut egui::Ui, i: usize, finished: bool, t: &Theme) {
+    let rows = app.chat.turns[i].retries.clone();
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    for (n, r) in rows.iter().enumerate() {
+        let remaining = (r.delay_ms as f32 / 1000.0) - r.at.elapsed().as_secs_f32();
+        let pending = !finished && n == last && remaining > 0.0;
+        let (title, secs) = if pending {
+            ("Waiting to retry model request", remaining)
+        } else {
+            ("Retried model request", r.delay_ms as f32 / 1000.0)
+        };
+        let summary = format!("({}/{}) · {:.1}s", r.attempt, r.max, secs.max(0.0));
+        let id = ui.id().with(("retry", i, n));
+        let open: bool = ui.ctx().data(|d| d.get_temp(id).unwrap_or(false));
+        let out = kit::disclosure_row(
+            ui,
+            Leading::Icon(Icon::Refresh),
+            title,
+            &summary,
+            open,
+            pending,
+            None,
+        );
+        if out.clicked {
+            ui.ctx().data_mut(|d| d.insert_temp(id, !open));
+        }
+        if open {
+            ui.horizontal(|ui| {
+                ui.add_space(22.0 + t.delta());
+                ui.vertical(|ui| {
+                    kit::footnote(ui, &format!("Retry delay: {} ms", r.delay_ms));
+                    kit::footnote(ui, &format!("Failure reason: {}", r.reason));
+                });
+            });
+        }
+        // The countdown is only live while it is counting.
+        if pending {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+/// Compact token counts the way dsh does: `12.2K`, `980`, `1.4M`.
+fn fmt_tokens(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f32 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f32 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fmt_duration(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f32 / 1000.0)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// Copy + usage pill + time pill + generation speed, revealed on the newest
+/// turn always and on hover otherwise (§3.5).
+fn turn_tail(app: &mut App, ui: &mut egui::Ui, i: usize, assistant: &str, t: &Theme) {
+    if assistant.is_empty() {
+        return;
+    }
+    let newest = i + 1 == app.chat.turns.len();
+    let row = ui.horizontal(|ui| {
+        let hovered = ui.rect_contains_pointer(ui.max_rect());
+        if !(newest || hovered) {
+            ui.add_space(24.0);
+            return;
+        }
+        if kit::icon_button(ui, Icon::Copy, 28.0)
+            .on_hover_text("Copy response")
+            .clicked()
+        {
+            ui.output_mut(|o| o.copied_text = assistant.to_owned());
+        }
+        if let Some(u) = app.chat.turns[i].usage {
+            let total = u.prompt.saturating_add(u.completion);
+            // A provider that sent no `usage` trailer leaves zeroes; a pill
+            // reading "Usage 0" would be a lie, so it simply does not appear.
+            if total > 0 {
+                let mut detail = format!(
+                    "Input {}\nOutput {}\nTotal {}",
+                    u.prompt, u.completion, total
+                );
+                if u.reasoning > 0 {
+                    detail.push_str(&format!("\n(+{} chars of reasoning)", u.reasoning));
+                }
+                kit::pill(ui, &format!("Usage {}", fmt_tokens(total)), false)
+                    .on_hover_text(detail);
+            }
+            if u.duration_ms > 0 {
+                let mut detail = format!("Total {}", fmt_duration(u.duration_ms));
+                if u.ttft_ms > 0 {
+                    detail.push_str(&format!("\nTime to first token {}", fmt_duration(u.ttft_ms)));
+                }
+                if u.completion > 0 {
+                    detail.push_str(&format!(
+                        "\n{:.0} tok/s",
+                        u.completion as f32 / (u.duration_ms as f32 / 1000.0).max(0.001)
+                    ));
+                }
+                kit::pill(ui, &format!("Ran for {}", fmt_duration(u.duration_ms)), false)
+                    .on_hover_text(detail);
+            }
+        } else if app.gen_speed.completed > 0 && newest {
+            // No `TurnUsage` yet (an older backend, or a turn still settling):
+            // the live meter is what there is.
+            kit::label(
+                ui,
+                kit::txt(
+                    format!(
+                        "{} tok · {:.0} tok/s",
+                        app.gen_speed.completed, app.gen_speed.tps
+                    ),
+                    12.0,
+                    Weight::Regular,
+                    kit::col(t.alias.label[3]),
+                ),
+            );
+        }
+    });
+    let _ = row;
+}
+
+/// Compact display: one full-width 33 px button with a bottom rule
+/// summarising everything folded behind it.
+fn process_fold(ui: &mut egui::Ui, app: &App, i: usize, folded: bool) -> bool {
+    let t = app.theme;
+    let turn = &app.chat.turns[i];
+    let tools = turn.tool_chips.len();
+    let text = if tools == 0 {
+        "Thought for a while".to_string()
+    } else if turn.reasoning.is_empty() {
+        format!("{tools} tool call{}", if tools == 1 { "" } else { "s" })
+    } else {
+        format!(
+            "{tools} tool call{} · reasoning",
+            if tools == 1 { "" } else { "s" }
+        )
+    };
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 33.0), Sense::click());
+    let painter = ui.painter();
+    if resp.hovered() {
+        painter.rect_filled(rect, Rounding::same(RADIUS_ROW), kit::cola(t.alias.hover));
+    }
+    painter.text(
+        egui::pos2(rect.min.x + 22.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        kit::font(t.content_secondary_px(), Weight::Medium),
+        kit::col(t.alias.label[1]),
+    );
+    crate::ui::icons::paint(
+        painter,
+        Rect::from_center_size(
+            egui::pos2(rect.min.x + 8.0, rect.center().y),
+            Vec2::splat(12.0),
+        ),
+        if folded { Icon::ChevronRight } else { Icon::ChevronDown },
+        kit::col(t.alias.label[2]),
+    );
+    painter.hline(
+        rect.x_range(),
+        rect.max.y,
+        Stroke::new(sica_core::theme::tokens::HAIRLINE, kit::Level::L2.color(&t)),
+    );
+    resp.clicked()
+}
+
+fn reasoning_body(ui: &mut egui::Ui, text: &str, t: &Theme) {
+    ui.horizontal(|ui| {
+        ui.add_space(22.0 + t.delta());
+        ui.vertical(|ui| {
+            ui.set_max_width((ui.available_width() - 8.0).max(120.0));
+            ui.add(egui::Label::new(kit::txt(
+                text,
+                t.content_secondary_px(),
+                Weight::Regular,
+                kit::col(t.alias.label[2]),
+            )));
+        });
+    });
+    ui.add_space(4.0);
+}
+
+// ---------------------------------------------------------------------------
+// Markers
+// ---------------------------------------------------------------------------
+
+/// Compaction / injection / steer rows. A compaction marker is quiet
+/// (`label_dimmed`, no icon tint) and does **not** hide the rows it shadows.
+fn draw_marker(app: &mut App, ui: &mut egui::Ui, i: usize, n: &Notice) {
+    let t = app.theme;
+    let (icon, title) = match (n.kind, n.ok) {
+        // A failed compaction is not a quiet marker: the history it was
+        // meant to fold is about to be trimmed instead.
+        (NoticeKind::Compaction, false) => (Icon::Warning, "Context compaction failed"),
+        (NoticeKind::Compaction, true) => (Icon::Compact, "Context compacted"),
+        (NoticeKind::Injection, _) => (Icon::Inject, "Context injection"),
+        (NoticeKind::Steer, _) => (Icon::ArrowUp, "Steered"),
+    };
+    ui.add_space(4.0);
+    let out = kit::disclosure_row(
+        ui,
+        Leading::Icon(icon),
+        title,
+        &kit::one_line(&n.label, 160),
+        n.open,
+        false,
+        None,
+    );
+    if out.clicked {
+        if let Some(notice) = app.chat.turns[i].notice.as_mut() {
+            notice.open = !notice.open;
+        }
+    }
+    if n.open && !n.detail.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 8.0).max(120.0));
+                egui::Frame::none()
+                    .fill(kit::col(t.alias.code_block))
+                    .rounding(Rounding::same(sica_core::theme::tokens::RADIUS_INPUT))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_source(ui.id().with(("marker", i)))
+                            .max_height(141.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(kit::mono(
+                                        &n.detail,
+                                        11.0,
+                                        kit::col(t.alias.label[1]),
+                                    ))
+                                    .wrap(),
+                                );
+                            });
+                    });
+            });
+        });
+    }
+    ui.add_space(6.0);
+}
+
+// ---------------------------------------------------------------------------
+// Viewport
+// ---------------------------------------------------------------------------
+
 fn visible_viewport(ui: &egui::Ui, output: &egui::scroll_area::ScrollAreaOutput<()>) -> Rect {
     output.inner_rect.intersect(ui.clip_rect())
 }
 
-/// Live activity strip under the turn that is still running: the animated
-/// sweep plus a caps line naming what is currently executing. The innermost
-/// unfinished tool call is the one actually doing work, and a call nested
-/// below the main agent (`depth > 0`) is a sub-agent — so it is named as one.
-fn draw_working(ui: &mut egui::Ui, chips: &[ToolChip], stopping: bool, p: &Palette) {
-    let active = chips
-        .iter()
-        .filter(|c| !c.finished)
-        .max_by_key(|c| c.depth);
-    let (label, tint) = if stopping {
-        ("Stopping…".to_string(), rgb(p.caution))
-    } else {
-        match active {
-            Some(c) if c.depth > 0 => {
-                (format!("Sub-agent · {}", c.name), rgb(p.info))
-            }
-            Some(c) => (format!("Running · {}", c.name), rgb(p.accent)),
-            None => ("Thinking".to_string(), rgb(p.accent)),
-        }
-    };
-    ui.add_space(6.0);
-    let resp = ui.horizontal(|ui| {
-        working_sweep(ui, p, 13.0);
-        ui.add_space(6.0);
-        caps_label(ui, &label, tint);
-    });
-    // Hovering the strip explains what the sub-agent was asked to produce —
-    // the same expectation text the chip carries.
-    if let Some(c) = active {
-        if !c.expectation.is_empty() {
-            resp.response
-                .on_hover_text(format!("expect: {}", c.expectation));
-        }
-    }
-}
-
-// ---------- markers ----------
-
-/// Out-of-band transcript marker: a tracked-caps line flanked by tinted rules,
-/// info-blue when the operation succeeded and danger when it didn't. Hovering
-/// reveals `detail` — for a compaction that is the summary the model wrote, so
-/// the user can read exactly what replaced their history.
-fn draw_notice(ui: &mut egui::Ui, n: &Notice, p: &Palette) {
-    let tint = if n.ok { rgb(p.info) } else { rgb(p.danger) };
-    ui.add_space(10.0);
-    let row = ui.horizontal(|ui| {
-        notice_rule(ui, 20.0, tint);
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(caps_job(&n.label, tint, 9.0)).selectable(false));
-        ui.add_space(6.0);
-        // Fill whatever is left; `available_width` can be zero on a narrow
-        // window, and `allocate_exact_size` dislikes negative extents.
-        notice_rule(ui, (ui.available_width() - 4.0).max(0.0), tint);
-    });
-    if !n.detail.is_empty() {
-        let detail = n.detail.clone();
-        let muted = rgb(p.muted);
-        row.response.on_hover_ui(move |ui| {
-            ui.set_max_width(460.0);
-            ui.label(RichText::new(&detail).color(muted));
-        });
-    }
-    ui.add_space(14.0);
-}
-
-/// Half-strength horizontal rule used either side of a marker label.
-fn notice_rule(ui: &mut egui::Ui, width: f32, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 1.0), Sense::hover());
-    ui.painter().hline(
-        rect.x_range(),
-        rect.center().y,
-        Stroke::new(1.0, color.linear_multiply(0.45)),
-    );
-}
-
-// ---------- viewport input: pause/resume, keyboard + middle-click scroll ----------
-
-/// Post-layout input pass over the transcript viewport. Handles:
-///   * pausing auto-follow when the user clicks into the transcript or
-///     scrolls up (mirrored by the floating resume pill);
-///   * ArrowUp/ArrowDown line-scroll and PgUp/PgDn paging when no widget
-///     has keyboard focus (so the composer keeps its own key handling);
-///   * Windows-style middle-click pan: a middle click drops an anchor and
-///     vertical pointer displacement scrolls until any other click / Esc;
-///   * Ctrl+A selecting the hovered (else last) assistant message and
-///     Ctrl+C copying the selected one;
-///   * committing the viewport offset — the keyboard/pan delta, the hard
-///     bottom-snap when new content arrived, and the horizontal pin.
+/// Post-layout input pass: auto-follow pause, keyboard scrolling, middle-click
+/// pan, Ctrl+A/Ctrl+C message copy, and the offset commit.
 fn transcript_input(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -245,21 +680,17 @@ fn transcript_input(
 ) {
     let ctx = ui.ctx().clone();
     let rect = visible_viewport(ui, output);
-    // Include the scrollbar gutter so grabbing the bar also counts as the
-    // user taking control of the viewport.
     let hit_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x + 14.0, rect.max.y));
     let pointer = ctx.input(|i| i.pointer.hover_pos());
     let pointer_over = pointer.is_some_and(|p| hit_rect.contains(p));
     let no_focus = ctx.memory(|m| m.focused().is_none());
 
-    // --- pause auto-follow when the user takes the viewport ---
     let clicked_transcript = pointer_over && ctx.input(|i| i.pointer.primary_pressed());
     let wheeled_up = pointer_over && ctx.input(|i| i.raw_scroll_delta.y > 0.0);
     if !app.chat.turns.is_empty() && (clicked_transcript || wheeled_up) {
         app.chat.autoscroll_paused = true;
     }
 
-    // --- keyboard scrolling; only when no widget owns the keyboard ---
     let mut delta = 0.0f32;
     if no_focus {
         let line = 48.0;
@@ -280,7 +711,6 @@ fn transcript_input(
         });
     }
 
-    // --- middle-click pan: click toggles an anchor, displacement scrolls ---
     if ctx.input(|i| i.pointer.button_pressed(PointerButton::Middle)) {
         app.chat.middle_scroll_origin = match app.chat.middle_scroll_origin {
             Some(_) => None,
@@ -302,14 +732,10 @@ fn transcript_input(
                 delta += (dy - DEAD_ZONE * dy.signum()) * 6.0 * dt;
             }
         }
-        draw_pan_anchor(&ctx, origin, &app.palette);
+        draw_pan_anchor(&ctx, origin, &app.theme);
         ctx.request_repaint();
     }
 
-    // --- commit the viewport offset ---
-    // Every scroll this view performs is vertical. `offset.x` is pinned to
-    // zero so a horizontal scroll target leaking in from a nested widget can
-    // never shift the transcript sideways and cut the start off every line.
     let max_offset = (output.content_size.y - rect.height()).max(0.0);
     let mut state = output.state;
     let mut dirty = state.offset.x != 0.0;
@@ -320,22 +746,15 @@ fn transcript_input(
         }
         state.offset.y = (state.offset.y + delta).clamp(0.0, max_offset);
         dirty = true;
-    } else if force_scroll {
-        // Hard bottom-snap on new content. Covers the cases egui's
-        // `stick_to_bottom` heuristic misses — first render after a session
-        // switch, or streaming starting while the user sat mid-transcript.
-        // A keyboard/pan delta this frame wins: the user is steering.
-        if state.offset.y != max_offset {
-            state.offset.y = max_offset;
-            dirty = true;
-        }
+    } else if force_scroll && (max_offset - state.offset.y).abs() > BOTTOM_EPS {
+        state.offset.y = max_offset;
+        dirty = true;
     }
     if dirty {
         state.store(&ctx, output.id);
         ctx.request_repaint();
     }
 
-    // --- Ctrl+A selects one output, Ctrl+C copies it, click / Esc clears ---
     if clicked_transcript || ctx.input(|i| i.key_pressed(Key::Escape)) {
         app.chat.selected_turn = None;
     }
@@ -350,8 +769,6 @@ fn transcript_input(
             .or_else(|| assistant_rects.last().map(|(i, _)| *i));
     }
     if let Some(sel) = app.chat.selected_turn {
-        // Leave Ctrl+C to egui when a drag-selection exists in some label —
-        // that copy should win over the whole-message copy.
         let label_selection = egui::text_selection::LabelSelectionState::load(&ctx).has_selection();
         if no_focus
             && !label_selection
@@ -364,46 +781,53 @@ fn transcript_input(
     }
 }
 
-/// Floating "resume auto-scroll" pill, shown while auto-follow is paused.
-/// Sits centred just above the composer, over the transcript.
-fn resume_button(app: &mut App, ui: &mut egui::Ui, viewport: Rect) {
+/// 34 px circle in a zero-height slot 16 px above the composer.
+fn back_to_bottom(app: &mut App, ui: &mut egui::Ui, viewport: Rect) {
     if !app.chat.autoscroll_paused {
         return;
     }
-    let p = app.palette;
+    let t = app.theme;
     let ctx = ui.ctx().clone();
-    egui::Area::new(egui::Id::new("chat_autoscroll_resume"))
+    egui::Area::new(egui::Id::new("back_to_bottom"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(viewport.center().x - 48.0, viewport.max.y - 36.0))
+        .fixed_pos(egui::pos2(
+            viewport.center().x - 17.0,
+            viewport.max.y - 34.0 - 16.0,
+        ))
         .show(&ctx, |ui| {
-            let resp = egui::Frame::none()
-                .fill(rgb(p.accent))
-                .rounding(Rounding::same(12.0))
-                .inner_margin(egui::Margin::symmetric(12.0, 5.0))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(caps_job("↓ Follow", rgb(p.page_bg), 11.0))
-                            .selectable(false),
-                    );
-                })
-                .response
-                .interact(Sense::click());
-            if resp.on_hover_text("Resume auto-scroll").clicked() {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+            let painter = ui.painter();
+            painter.circle(
+                rect.center(),
+                17.0,
+                kit::col(t.alias.floating_fill),
+                Stroke::new(sica_core::theme::tokens::HAIRLINE, kit::Level::L3.color(&t)),
+            );
+            crate::ui::icons::paint(
+                painter,
+                Rect::from_center_size(rect.center(), Vec2::splat(16.0)),
+                Icon::ArrowDown,
+                kit::col(t.alias.label[1]),
+            );
+            if resp.on_hover_text("Back to bottom").clicked() {
                 app.chat.autoscroll_paused = false;
                 app.chat.scroll_to_bottom = true;
             }
         });
 }
 
-/// Windows-style pan anchor: a circle with up/down arrows at the middle-click
-/// origin, painted on the foreground layer so it rides above the transcript.
-fn draw_pan_anchor(ctx: &egui::Context, origin: Pos2, p: &Palette) {
+fn draw_pan_anchor(ctx: &egui::Context, origin: Pos2, t: &Theme) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("chat_pan_anchor"),
     ));
-    painter.circle(origin, 11.0, rgb(p.surface), Stroke::new(1.0, rgb(p.muted)));
-    let ink = rgb(p.ink);
+    painter.circle(
+        origin,
+        11.0,
+        kit::col(t.alias.bg_layer[1]),
+        Stroke::new(1.0, kit::col(t.alias.label[3])),
+    );
+    let ink = kit::col(t.alias.label[0]);
     for dir in [-1.0f32, 1.0] {
         let tip = Pos2::new(origin.x, origin.y + dir * 7.0);
         let base_y = origin.y + dir * 3.0;
@@ -418,196 +842,4 @@ fn draw_pan_anchor(ctx: &egui::Context, origin: Pos2, p: &Palette) {
         ));
     }
     painter.circle_filled(origin, 1.5, ink);
-}
-
-// ---------- empty state ----------
-
-fn draw_empty(ui: &mut egui::Ui, p: &Palette) {
-    let avail = ui.available_size();
-    ui.allocate_ui_with_layout(
-        avail,
-        Layout::centered_and_justified(egui::Direction::TopDown),
-        |ui| {
-            ui.vertical_centered(|ui| {
-                let watermark_size = Vec2::new(180.0, 90.0);
-                let (rect, _) = ui.allocate_exact_size(watermark_size, Sense::hover());
-                // Watermark — accent at low alpha.
-                let mark = rgb(p.accent).linear_multiply(0.18);
-                blade_mark(&ui.painter(), rect, mark);
-                ui.add_space(12.0);
-                ui.label(display_text("Begin.", 24.0).color(rgb(p.muted)));
-            });
-        },
-    );
-}
-
-// ---------- user ----------
-
-/// Right-aligned "queued" caption under a message the backend has accepted
-/// but not started — it runs as its own turn once the current one ends.
-fn draw_queued(ui: &mut egui::Ui, p: &Palette) {
-    let avail = ui.available_width();
-    ui.allocate_ui_with_layout(
-        Vec2::new(avail, 0.0),
-        Layout::right_to_left(Align::Min),
-        |ui| {
-            ui.add(egui::Label::new(
-                RichText::new("queued — runs when the current turn ends")
-                    .size(11.0)
-                    .color(rgb(p.muted)),
-            ));
-        },
-    );
-}
-
-fn draw_user(ui: &mut egui::Ui, text: &str, p: &Palette) {
-    let avail = ui.available_width();
-    let max_w = (avail * 0.78).max(160.0);
-    ui.allocate_ui_with_layout(
-        Vec2::new(avail, 0.0),
-        Layout::right_to_left(Align::Min),
-        |ui| {
-            egui::Frame::none()
-                .fill(rgb(p.surface_sunk))
-                .rounding(Rounding::same(2.0))
-                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                .show(ui, |ui| {
-                    ui.set_max_width(max_w);
-                    // Labels default to "extend" (no wrap) inside a horizontal
-                    // layout like `right_to_left`, so a long message would run
-                    // off-screen to the left. Force wrapping at `max_w`.
-                    ui.add(
-                        egui::Label::new(RichText::new(text).color(rgb(p.ink))).wrap(),
-                    );
-                });
-        },
-    );
-    ui.add_space(8.0);
-}
-
-/// Thumbnail strip rendered under a user message that had image attachments.
-/// Right-aligned to match `draw_user`. Lazy texture upload — first frame
-/// after a session load is the one that pays for image decoding.
-fn draw_user_images(app: &mut App, ui: &mut egui::Ui, turn_idx: usize) {
-    const HISTORY_THUMB: f32 = 96.0;
-    let ctx = ui.ctx().clone();
-    let avail = ui.available_width();
-    ui.allocate_ui_with_layout(
-        Vec2::new(avail, 0.0),
-        Layout::right_to_left(Align::Min),
-        |ui| {
-            // Reverse order: right_to_left places later children further left,
-            // so iterate in normal order and items will read left-to-right.
-            let count = app.chat.turns[turn_idx].images.len();
-            for j in (0..count).rev() {
-                let att = &mut app.chat.turns[turn_idx].images[j];
-                let tex = super::input_bar::ensure_texture(
-                    &ctx,
-                    &mut att.texture,
-                    &att.mime,
-                    &att.data_base64,
-                    turn_idx * 1000 + j,
-                );
-                if let Some(handle) = tex {
-                    let natural = handle.size_vec2();
-                    let size = if natural.x <= 0.0 || natural.y <= 0.0 {
-                        Vec2::new(HISTORY_THUMB, HISTORY_THUMB)
-                    } else {
-                        let scale = (HISTORY_THUMB / natural.x).min(HISTORY_THUMB / natural.y);
-                        Vec2::new(natural.x * scale, natural.y * scale)
-                    };
-                    ui.image((handle.id(), size));
-                }
-            }
-        },
-    );
-    ui.add_space(6.0);
-}
-
-// ---------- assistant ----------
-
-fn draw_assistant(
-    ui: &mut egui::Ui,
-    cache: &mut CommonMarkCache,
-    turn_idx: usize,
-    text: &str,
-    p: &Palette,
-) {
-    caps_label(ui, "ASSISTANT", rgb(p.muted));
-    ui.add_space(2.0);
-    hairline(ui, p);
-    ui.add_space(8.0);
-    // Render as CommonMark so headings, bold/italic, lists and code
-    // fences come through. The viewer ID has to be unique per turn so
-    // egui_commonmark can keep per-document state straight when the
-    // stream re-renders many of these blocks on the same frame.
-    //
-    // The scoped style swap below is load-bearing: egui_commonmark resolves
-    // `**bold**`, headings and list bullets through `strong_text_color()`,
-    // which reads `widgets.active.fg_stroke.color`. Our theme paints that
-    // with the page background so pressed buttons render inverse text — but
-    // that also makes every strong glyph invisible against the page. We
-    // override it to ink for the duration of the viewer.
-    ui.scope(|ui| {
-        let ink = rgb(p.ink);
-        let v = &mut ui.style_mut().visuals.widgets;
-        v.active.fg_stroke.color = ink;
-        v.noninteractive.fg_stroke.color = ink;
-        let viewer_id = format!("assistant_md_{turn_idx}");
-        CommonMarkViewer::new(viewer_id).show(ui, cache, text);
-    });
-    // Copy-to-clipboard affordance, right-aligned under the message body.
-    // CommonMark-rendered text isn't cleanly selectable, so this is the
-    // reliable path to grab the whole response. Hidden while the turn is
-    // still an empty "…" placeholder.
-    if text != "…" {
-        ui.add_space(4.0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if caps_button(ui, "Copy", rgb(p.muted))
-                .on_hover_text("Copy response")
-                .clicked()
-            {
-                ui.output_mut(|o| o.copied_text = text.to_owned());
-            }
-        });
-    }
-}
-
-// ---------- reasoning ----------
-
-fn draw_reasoning(ui: &mut egui::Ui, text: &str, p: &Palette) {
-    ui.add_space(6.0);
-    let resp = ui.horizontal(|ui| {
-        ui.add_space(24.0);
-        ui.vertical(|ui| {
-            ui.set_max_width(ui.available_width());
-            ui.label(display_text(text, 14.0).color(rgb(p.muted)));
-        });
-    });
-    // Paint the inset vertical hairline along the full body height.
-    let rect = resp.response.rect;
-    ui.painter().vline(
-        rect.min.x + 11.0,
-        rect.y_range(),
-        Stroke::new(1.0, rgb(p.info)),
-    );
-    ui.add_space(8.0);
-}
-
-/// Collapsed-state chip: a single tracked caps label that re-expands the
-/// hidden reasoning when clicked.
-fn reasoning_chip_collapsed(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
-    let resp = caps_button(ui, "+ Reasoning", rgb(p.info));
-    resp.on_hover_text("Show reasoning")
-}
-
-/// Expanded-state header above the inset reasoning body.
-fn reasoning_header(ui: &mut egui::Ui, finished: bool, p: &Palette) -> egui::Response {
-    let label = if finished { "− Reasoning" } else { "· Reasoning (live)" };
-    let resp = caps_button(ui, label, rgb(p.info));
-    if finished {
-        resp.on_hover_text("Hide reasoning")
-    } else {
-        resp
-    }
 }

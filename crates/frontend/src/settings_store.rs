@@ -8,7 +8,28 @@ use sica_core::paths::settings_file;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// Legacy light/dark flag, still written so an older build reads the
+    /// same preference. `theme_mode` is the authority.
     pub theme_dark:             bool,
+    /// `light | dark | system` — the Appearance cubes (§7.1).
+    #[serde(default = "default_theme_mode")]
+    pub theme_mode:             String,
+    /// Conversation content size, 12..=17. Chrome type never follows it.
+    #[serde(default = "default_content_px")]
+    pub content_px:             u8,
+    /// Conversation display: `false` = Normal (every row), `true` = Compact
+    /// (closed turns fold their process rows behind one button).
+    #[serde(default)]
+    pub transcript_compact:     bool,
+    /// What plain Enter does while a turn runs: `queue | steer`.
+    #[serde(default = "default_busy_enter")]
+    pub busy_enter:             String,
+    /// Freeze the ambient animations (shimmer, sweep, dot chase).
+    #[serde(default)]
+    pub reduce_motion:          bool,
+    /// User override of the conversation content width (680..=920).
+    #[serde(default)]
+    pub chat_content_width:     Option<f32>,
     pub log_raw_llm:            bool,
     pub idealist_auto_apply_be: bool,
     pub auto_start_be:          bool,
@@ -32,6 +53,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme_dark:             true,
+            theme_mode:             default_theme_mode(),
+            content_px:             default_content_px(),
+            transcript_compact:     false,
+            busy_enter:             default_busy_enter(),
+            reduce_motion:          false,
+            chat_content_width:     None,
             log_raw_llm:            false,
             idealist_auto_apply_be: false,
             auto_start_be:          true,
@@ -43,6 +70,18 @@ impl Default for Settings {
             default_permission_mode: default_permission_mode(),
         }
     }
+}
+
+fn default_theme_mode() -> String {
+    "dark".into()
+}
+
+fn default_content_px() -> u8 {
+    sica_core::theme::tokens::CONTENT_DEFAULT_PX
+}
+
+fn default_busy_enter() -> String {
+    "queue".into()
 }
 
 fn default_permission_mode() -> String {

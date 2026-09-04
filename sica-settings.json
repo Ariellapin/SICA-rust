@@ -1,11 +1,18 @@
 {
   "theme_dark": false,
-  "log_raw_llm": true,
+  "theme_mode": "light",
+  "content_px": 14,
+  "transcript_compact": false,
+  "busy_enter": "queue",
+  "reduce_motion": false,
+  "chat_content_width": null,
+  "log_raw_llm": false,
   "idealist_auto_apply_be": false,
   "auto_start_be": true,
   "auto_connect_llm": true,
   "autoscroll": true,
   "release_profile": false,
   "auto_watch": false,
-  "last_active_provider": "vllm"
+  "last_active_provider": "vllm",
+  "default_permission_mode": "workspace-write"
 }

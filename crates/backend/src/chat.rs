@@ -35,6 +35,12 @@ use crate::title_gen;
 /// `skills/*.md` contracts before the real calls.
 const MAX_TOOL_HOPS: u8 = 12;
 
+/// Largest resolved-argument blob recorded on a durable `ToolCall`. Past it
+/// the field is omitted and a rebuilt row falls back to `args_preview`; the
+/// whole log is parsed at every backend start, so a megabyte of `write-file`
+/// body would be paid for on every one.
+const LOGGED_ARGS_JSON_MAX: usize = 64 * 1024;
+
 /// Title given to a freshly minted session. Used both at creation time and
 /// as the trigger for the auto-title agent — if the title still matches
 /// this format after the first response, we replace it with a summary.
@@ -312,6 +318,7 @@ impl ControlState {
         cancel: &CancellationToken,
     ) -> (agents::SkillOutcome, bool) {
         let id = agents::subagent::next_tool_id();
+        let started = std::time::Instant::now();
         self.events.emit(Event::ToolCallStarted {
             id,
             parent_id: None,
@@ -319,6 +326,7 @@ impl ControlState {
             name: name.to_string(),
             args_preview: args_preview.to_string(),
             expectation: expectation.to_string(),
+            args_json: args.to_string(),
         });
         let (outcome, conclude) = self
             .handle_control_body(sessions, name, args, session_id, cancel)
@@ -327,6 +335,9 @@ impl ControlState {
             id,
             ok: outcome.ok,
             summary: outcome.summary.clone(),
+            // Harness controls have no summariser between them and the model.
+            output: outcome.summary.clone(),
+            duration_ms: started.elapsed().as_millis() as u64,
         });
         (outcome, conclude)
     }
@@ -571,6 +582,7 @@ impl ControlState {
             args_preview: format!("{} {}", call.name, call.arguments),
             expectation: String::new(),
             call_id: Some(call.id.clone()),
+            args_json: Some(call.arguments.clone()),
         })
         .await
         .unwrap_or(0);
@@ -702,6 +714,7 @@ impl ControlState {
                 args_preview: format!("{} {}", call.name, call.arguments),
                 expectation: String::new(),
                 call_id: Some(call.id.clone()),
+                args_json: Some(call.arguments.clone()),
             })
             .await
             .unwrap_or(0);
@@ -773,6 +786,7 @@ impl ControlState {
                         args_preview: format!("{} {}", call.name, call.arguments),
                         expectation: String::new(),
                         call_id: Some(call.id.clone()),
+                        args_json: Some(call.arguments.clone()),
                     })
                     .await
                     .unwrap_or(0);
@@ -953,10 +967,12 @@ impl ChatHub {
         let g = self.sessions.lock().await;
         let mut out: Vec<SessionMeta> = g
             .values()
+            .filter(|s| !s.archived())
             .map(|s| SessionMeta {
                 id: s.id,
                 title: s.title(),
                 created_at: s.created_at(),
+                updated_at: s.updated_at(),
             })
             .collect();
         out.sort_by_key(|s| s.created_at);
@@ -1008,19 +1024,27 @@ impl ChatHub {
                 } else {
                     role_to_str(e.message.role)
                 };
-                let (content, tool_name, tool_ok, tool_args_preview, tool_expectation) = match e.tool {
-                    Some(t) => (t.summary, Some(t.name), Some(t.ok), Some(t.args_preview), Some(t.expectation)),
-                    None => (e.message.content, None, None, None, None),
+                let tool = e.tool;
+                let content = match &tool {
+                    Some(t) => t.summary.clone(),
+                    None => e.message.content,
                 };
                 MessageDump {
                     role: role.into(),
                     content,
                     reasoning: e.message.reasoning,
                     images: e.message.images,
-                    tool_name,
-                    tool_ok,
-                    tool_args_preview,
-                    tool_expectation,
+                    tool_name: tool.as_ref().map(|t| t.name.clone()),
+                    tool_ok: tool.as_ref().map(|t| t.ok),
+                    tool_args_preview: tool.as_ref().map(|t| t.args_preview.clone()),
+                    tool_expectation: tool.as_ref().map(|t| t.expectation.clone()),
+                    // The `ToolCall` seq is the only identity that survives a
+                    // restart; nested calls never reach the log, so the
+                    // rebuilt rows are flat by construction.
+                    tool_call_id: tool.as_ref().map(|t| t.call_seq),
+                    tool_parent_id: None,
+                    tool_depth: 0,
+                    tool_args_json: tool.as_ref().and_then(|t| t.args_json.clone()),
                     context_source: e.context.as_ref().map(|c| c.label()),
                 }
             })
@@ -1068,6 +1092,121 @@ impl ChatHub {
             self.goal_armed.lock().await.remove(&id);
         }
         removed
+    }
+
+    /// Give a session a title of the user's own (§4.2). The auto-titler
+    /// only writes over the title it wrote itself, so this pins it without a
+    /// separate flag.
+    pub async fn rename_session(&self, id: u64, title: &str) -> bool {
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let mut g = self.sessions.lock().await;
+        let Some(log) = g.get_mut(&id) else { return false };
+        log.append(EventKind::SessionTitle { title: title.to_string() });
+        if let Err(e) = sessions_store::flush(log) {
+            warn!(error = %e, session_id = id, "flush session (after rename) failed");
+        }
+        drop(g);
+        self.event_sink.emit(Event::SessionTitleChanged {
+            session_id: id,
+            title: title.to_string(),
+        });
+        true
+    }
+
+    /// Copy a session's completed turns into a fresh one. Cut at the last
+    /// `TurnEnd`, so a turn still in flight never crosses — its tool results
+    /// have not landed, and half a turn is not a conversation to resume.
+    pub async fn fork_session(&self, id: u64) -> Option<u64> {
+        let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut g = self.sessions.lock().await;
+        let src = g.get(&id)?;
+        let cut = src
+            .events
+            .iter()
+            .rposition(|e| matches!(e.kind, EventKind::TurnEnd { .. }))?;
+        let title = format!("{} (fork)", src.title());
+        let mut forked = SessionLog::fork(new_id, title, &src.events, cut);
+        if let Err(e) = sessions_store::flush(&mut forked) {
+            warn!(error = %e, session_id = new_id, "flush session (fork) failed");
+        }
+        g.insert(new_id, forked);
+        Some(new_id)
+    }
+
+    /// Hide a session without losing it. Unlike `delete_session` the log
+    /// stays on disk and the session stays loadable by id.
+    pub async fn archive_session(&self, id: u64) -> bool {
+        let mut g = self.sessions.lock().await;
+        let Some(log) = g.get_mut(&id) else { return false };
+        if log.archived() {
+            return true;
+        }
+        log.append(EventKind::SessionArchived);
+        if let Err(e) = sessions_store::flush(log) {
+            warn!(error = %e, session_id = id, "flush session (archive) failed");
+        }
+        true
+    }
+
+    /// Case-insensitive substring search over what each session actually
+    /// said — the derived surface, so injected snapshots and fenced tool
+    /// blocks do not flood the results. Newest first, capped.
+    pub async fn search_sessions(&self, query: &str) -> Vec<protocol::SessionHit> {
+        const MAX_HITS: usize = 20;
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let g = self.sessions.lock().await;
+        let mut hits: Vec<protocol::SessionHit> = g
+            .values()
+            .filter(|log| !log.archived())
+            .filter_map(|log| {
+                let title = log.title();
+                let snippet = if title.to_lowercase().contains(&needle) {
+                    String::new()
+                } else {
+                    log.derive_surface()
+                        .iter()
+                        .filter(|e| e.tool.is_none() && e.context.is_none())
+                        .flat_map(|e| {
+                            e.message
+                                .content
+                                .lines()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .find(|line| line.to_lowercase().contains(&needle))?
+                };
+                Some(protocol::SessionHit {
+                    id: log.id,
+                    title,
+                    snippet: sica_core::retain::utf8_head(snippet.trim(), 160).to_string(),
+                    updated_at: log.updated_at(),
+                })
+            })
+            .collect();
+        hits.sort_by_key(|h| std::cmp::Reverse(h.updated_at));
+        hits.truncate(MAX_HITS);
+        hits
+    }
+
+    /// Fetch a provider's model list off the dispatcher loop and report it
+    /// as an event. A provider that is slow to answer must not stall every
+    /// other request behind it.
+    pub fn spawn_list_models(&self, base_url: String, api_key: Option<String>) {
+        let sink = self.event_sink.clone();
+        tokio::spawn(async move {
+            let client = LlmClient::new(base_url.clone(), String::new(), api_key);
+            let (models, error) = match client.list_models().await {
+                Ok(models) => (models, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            };
+            sink.emit(Event::ModelsListed { base_url, models, error });
+        });
     }
 
     pub async fn set_llm_state(&self, st: LlmState) {
@@ -1679,6 +1818,14 @@ impl ChatHub {
             // read; the initial value is just to satisfy definite assignment.
             #[allow(unused_assignments)]
             let mut last_assistant = String::new();
+            // Turn-level accounting for `Event::TurnUsage` (§3.5). The live
+            // `TokenUsage` meter is per-session and cumulative; the tail
+            // pills need this turn's own numbers, summed over its hops.
+            let turn_clock = std::time::Instant::now();
+            let mut turn_prompt: u32 = 0;
+            let mut turn_completion: u32 = 0;
+            let mut turn_reasoning: u32 = 0;
+            let mut turn_ttft_ms: u64 = 0;
             loop {
                 // Interrupts land between hops as often as mid-stream. Bailing
                 // here keeps a cancelled turn from opening another request —
@@ -1885,6 +2032,13 @@ impl ChatHub {
                         );
                         warn!(session_id, turn_id, "{msg}");
                         event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg });
+                        event_sink.emit(Event::LlmRetry {
+                            session_id,
+                            attempt:  retries,
+                            max:      llm::retry::RETRY_MAX,
+                            delay_ms: delay.as_millis() as u64,
+                            reason:   failure.reason().to_string(),
+                        });
                         append_event(&sessions_map, session_id, EventKind::LlmRetry {
                             attempt: retries,
                             max: llm::retry::RETRY_MAX,
@@ -1932,6 +2086,15 @@ impl ChatHub {
                     }
                 } else {
                     meters.lock().await.remove(&session_id);
+                }
+
+                if let Some(u) = out.usage.as_ref() {
+                    turn_prompt = turn_prompt.saturating_add(u.prompt_tokens);
+                    turn_completion = turn_completion.saturating_add(u.completion_tokens);
+                }
+                turn_reasoning = turn_reasoning.saturating_add(out.reasoning.len() as u32);
+                if turn_ttft_ms == 0 {
+                    turn_ttft_ms = out.ttft_ms.unwrap_or(0);
                 }
 
                 last_assistant = out.content.clone();
@@ -1982,6 +2145,16 @@ impl ChatHub {
                 // If the user hit Esc, drop out before we go shopping for a
                 // tool call on a half-completed assistant reply.
                 if cancel.is_cancelled() {
+                    break;
+                }
+
+                // The provider stopped at `max_tokens`. A truncated reply is
+                // not a place to go looking for a tool call, and looping would
+                // ask the model to continue from a sentence it never finished.
+                // End the turn under a reason the FE renders as its own row
+                // (§3.5); the partial output is already persisted.
+                if out.finish_reason == "max_tokens" {
+                    finish = "max_tokens";
                     break;
                 }
 
@@ -2053,11 +2226,22 @@ impl ChatHub {
                     }
                     break;
                 };
+                // Resolve once up front only to record the named arguments —
+                // the dispatch below resolves again for the skill handle. A
+                // reloaded transcript needs the real args to draw a body
+                // (§3.4); `args_preview` truncates and drops the names.
+                let call_args_json = skills
+                    .resolve(&call)
+                    .map(|(_, args)| args.to_string())
+                    // A log line is read back in full on every start, so an
+                    // outsized `write-file` body does not belong in one.
+                    .filter(|json| json.len() <= LOGGED_ARGS_JSON_MAX);
                 let call_seq = append_event(&sessions_map, session_id, EventKind::ToolCall {
                     name: call.skill.clone(),
                     args_preview: agents::parse_tool_call::render(&call.skill, &call.raw_args),
                     expectation: call.expectation.clone(),
                     call_id: None,
+                    args_json: call_args_json,
                 })
                 .await
                 .unwrap_or(0);
@@ -2166,6 +2350,15 @@ impl ChatHub {
                 hops,
             })
             .await;
+            event_sink.emit(Event::TurnUsage {
+                session_id,
+                turn_id:     outer_turn,
+                prompt:      turn_prompt,
+                completion:  turn_completion,
+                reasoning:   turn_reasoning,
+                duration_ms: turn_clock.elapsed().as_millis() as u64,
+                ttft_ms:     turn_ttft_ms,
+            });
 
             // What happens next, decided under the session's slot lock so
             // the slot is never released for a turn that is about to start
@@ -3229,6 +3422,7 @@ mod tests {
             args_preview: format!("{skill} 'x'"),
             expectation: String::new(),
             call_id: None,
+            args_json: None,
         });
         log.append(EventKind::ToolResult {
             surface: SurfaceOp::Append,
@@ -3491,6 +3685,55 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let hub = ChatHub::new(tx, Arc::new(SkillRegistry::new()), None);
         (hub, rx)
+    }
+
+    /// Search reads the derived surface, so it finds what was said and
+    /// skips the fenced tool blocks and injected snapshots around it.
+    /// Archived sessions are out of both the list and the results.
+    #[tokio::test]
+    async fn search_matches_messages_and_skips_archived() {
+        let (hub, _) = hub();
+        {
+            let mut g = hub.sessions.lock().await;
+            let mut a = SessionLog::new(101, "Renderer work");
+            a.append(EventKind::UserMessage {
+                surface: SurfaceOp::Append,
+                content: "the frobnicator is misaligned".into(),
+                images: Vec::new(),
+            });
+            let mut b = SessionLog::new(102, "Archived one");
+            b.append(EventKind::UserMessage {
+                surface: SurfaceOp::Append,
+                content: "the frobnicator again".into(),
+                images: Vec::new(),
+            });
+            b.append(EventKind::SessionArchived);
+            let mut c = SessionLog::new(103, "Frobnicator by title");
+            c.append(EventKind::UserMessage {
+                surface: SurfaceOp::Append,
+                content: "nothing to see".into(),
+                images: Vec::new(),
+            });
+            g.insert(101, a);
+            g.insert(102, b);
+            g.insert(103, c);
+        }
+
+        let hits = hub.search_sessions("frobnicator").await;
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&101), "content match missing: {ids:?}");
+        assert!(ids.contains(&103), "title match missing: {ids:?}");
+        assert!(!ids.contains(&102), "archived session must not be searchable");
+        // A content hit explains itself; a title hit needs no snippet.
+        let content_hit = hits.iter().find(|h| h.id == 101).unwrap();
+        assert!(content_hit.snippet.contains("frobnicator"), "{:?}", content_hit.snippet);
+        assert!(hits.iter().find(|h| h.id == 103).unwrap().snippet.is_empty());
+        // An empty query is not "match everything".
+        assert!(hub.search_sessions("   ").await.is_empty());
+
+        let listed: Vec<u64> = hub.list_sessions().await.iter().map(|s| s.id).collect();
+        assert!(listed.contains(&101));
+        assert!(!listed.contains(&102), "archived session must leave the list");
     }
 
     #[tokio::test]

@@ -20,6 +20,9 @@ use crate::watcher;
 pub enum UiCommand {
     StartBe,
     StopBe,
+    /// Build without respawning — the watcher's own path, and the Diagnostics
+    /// "Rebuild only" button.
+    #[allow(dead_code)]
     Rebuild { release: bool },
     RebuildAndRestart { release: bool },
     SendRequest(Request),
@@ -31,6 +34,10 @@ pub enum UiCommand {
 #[allow(dead_code)]
 pub enum UiEvent {
     Log(String),
+    /// A backend log line *with its level intact*. `Event::LogLine.level` used
+    /// to be dropped here, which made every BE line render as INF — including
+    /// the WARN a rejected tool call raises.
+    LogLine { level: String, message: String },
     BeStarted { pid: u32 },
     BeStopped { code: Option<i32> },
     BuildStarted,
@@ -79,6 +86,22 @@ pub enum UiEvent {
         pruned:        u32,
     },
 
+    /// A provider's model list came back (or failed to).
+    ModelsListed { base_url: String, models: Vec<String>, error: Option<String> },
+    /// A step-level LLM retry is in flight — drawn as a retry-chain row on
+    /// the turn (§3.5) rather than left to the log panel.
+    LlmRetry { session_id: u64, attempt: u32, max: u32, delay_ms: u64, reason: String },
+    /// One completed turn's own accounting — the tail's usage and time pills.
+    TurnUsage {
+        session_id:  u64,
+        turn_id:     u64,
+        prompt:      u32,
+        completion:  u32,
+        reasoning:   u32,
+        duration_ms: u64,
+        ttft_ms:     u64,
+    },
+
     // Tool chips.
     ToolCallStarted {
         id: u64,
@@ -87,11 +110,14 @@ pub enum UiEvent {
         name: String,
         args_preview: String,
         expectation: String,
+        args_json: String,
     },
-    ToolCallFinished { id: u64, ok: bool, summary: String },
+    ToolCallFinished { id: u64, ok: bool, summary: String, output: String, duration_ms: u64 },
 
     // Session list (forwarded from typed Responses).
     SessionList { sessions: Vec<SessionMeta> },
+    /// Content-search hits for the sidebar's search field.
+    SessionSearch { hits: Vec<protocol::SessionHit> },
     SessionCreated { id: u64 },
     SessionLoaded { session: SessionDump },
     SessionTitleChanged { session_id: u64, title: String },
@@ -262,7 +288,7 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
     let ui_ev = match ev {
         Event::Heartbeat { .. } => UiEvent::Heartbeat,
         Event::Progress { .. } => return,
-        Event::LogLine { level: _, message } => UiEvent::Log(message),
+        Event::LogLine { level, message } => UiEvent::LogLine { level, message },
         Event::LlmStateChanged { state } => UiEvent::LlmStateChanged(state),
         Event::TurnStarted { session_id, turn_id } => {
             UiEvent::TurnStarted { session_id, turn_id }
@@ -285,12 +311,25 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         } => UiEvent::ContextCompacted {
             session_id, ok, folded, before_tokens, after_tokens, summary, pruned,
         },
-        Event::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
-            UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation }
+        Event::ToolCallStarted {
+            id, parent_id, depth, name, args_preview, expectation, args_json,
+        } => UiEvent::ToolCallStarted {
+            id, parent_id, depth, name, args_preview, expectation, args_json,
+        },
+        Event::ToolCallFinished { id, ok, summary, output, duration_ms } => {
+            UiEvent::ToolCallFinished { id, ok, summary, output, duration_ms }
         }
-        Event::ToolCallFinished { id, ok, summary } => {
-            UiEvent::ToolCallFinished { id, ok, summary }
+        Event::ModelsListed { base_url, models, error } => {
+            UiEvent::ModelsListed { base_url, models, error }
         }
+        Event::LlmRetry { session_id, attempt, max, delay_ms, reason } => {
+            UiEvent::LlmRetry { session_id, attempt, max, delay_ms, reason }
+        }
+        Event::TurnUsage {
+            session_id, turn_id, prompt, completion, reasoning, duration_ms, ttft_ms,
+        } => UiEvent::TurnUsage {
+            session_id, turn_id, prompt, completion, reasoning, duration_ms, ttft_ms,
+        },
         Event::ApprovalRequested { id, session_id, skill, args_preview, reason } => {
             UiEvent::ApprovalRequested { id, session_id, skill, args_preview, reason }
         }

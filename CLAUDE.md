@@ -47,7 +47,7 @@ Seven crates, dependency direction strictly downward:
 | `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds). |
 | `idealist` | Classifies failures (`FeBug` vs `BeFix`), writes improvement tickets to `idealist_workspace/`, optional BE auto-patching (off by default). |
 | `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `be_core/` holds the legacy demo state. |
-| `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the panels. |
+| `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the surfaces — `kit` (the design-system primitives), `icons`, `sidebar`, `chat/` (transcript, tool rows, composer, dock, control takeovers), `settings/` (a modal). Styling is the dsh port described in [docs/harness-ui-guide.md](docs/harness-ui-guide.md); waves UI-1…UI-4 are in. |
 
 ## Wire protocol
 
@@ -55,9 +55,17 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 16) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 17) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
-Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, and the Wave-4 inbox pair `SteerTurn`/`InjectContext`).
+Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext`, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`).
+
+Two v17 events exist purely so the transcript can show what the log already
+records: `LlmRetry` (the retry chain row — the durable `EventKind::LlmRetry`
+was previously only a `LogLine`) and `TurnUsage` (one turn's own token and
+time totals, emitted at `TurnEnd`, distinct from the cumulative per-session
+`TokenUsage` meter). `ListModels` answers `Ok` and reports through
+`ModelsListed`, because the dispatcher loop is serial and a slow provider
+must not stall it.
 
 ## The agent loop (the heart of the app)
 
@@ -97,7 +105,7 @@ A `MarkdownSkill` returns its body as the outcome, i.e. instructions fed back to
 
 ### Control plane (Wave 3)
 
-Permission modes (`read-only | workspace-write | danger-full-access`, policy level — no OS enforcement) and plan mode are per-session state on `ChatHub`, restored from the log's latest `PermissionMode`/`PlanMode` event on load, and rebuilt into pipeline policies on every dispatch so a flip applies on the next hop. The model is told via the runtime-context line plus (for plan mode) the `PLAN_POLICY` prompt section loaded from `skills/plan-mode.md`. Destructive-looking shell commands under `workspace-write` emit `ApprovalRequested` and wait on the broker (5 min → deny); `ask-user` and plan review emit `QuestionAsked` (10 min → fail the call). The FE answers via `ResolveApproval`/`AnswerQuestion` (approval strip + modal), renders the `todo-write` checklist above the composer (cleared on the next turn start), and sends `/compact`/`/plan`/`permission` as `RunCommand` — harness commands that never create a model message and are audited as `Command` events. In native mode, consecutive `Parallel` calls (`read-file`, read-only shell) overlap in a bounded pool (cap 4) with model-order appends; everything else is an ordering barrier.
+Permission modes (`read-only | workspace-write | danger-full-access`, policy level — no OS enforcement) and plan mode are per-session state on `ChatHub`, restored from the log's latest `PermissionMode`/`PlanMode` event on load, and rebuilt into pipeline policies on every dispatch so a flip applies on the next hop. The model is told via the runtime-context line plus (for plan mode) the `PLAN_POLICY` prompt section loaded from `skills/plan-mode.md`. Destructive-looking shell commands under `workspace-write` emit `ApprovalRequested` and wait on the broker (5 min → deny); `ask-user` and plan review emit `QuestionAsked` (10 min → fail the call). The FE answers via `ResolveApproval`/`AnswerQuestion` — both are **composer takeovers**: while a call is blocked on a human the composer is replaced in place by the approval card or the question panel, and the transcript stays scrollable above it. It renders the `todo-write` checklist as a dock card over the composer (cleared on the next turn start), and sends `/compact`/`/plan`/`permission` as `RunCommand` — harness commands that never create a model message and are audited as `Command` events. In native mode, consecutive `Parallel` calls (`read-file`, read-only shell) overlap in a bounded pool (cap 4) with model-order appends; everything else is an ordering barrier.
 
 ### agent-team grounding
 
@@ -169,8 +177,10 @@ across the gap (so a send arriving mid-handoff still queues), and going
 back through the queue gate while holding it would re-queue the followup it
 just claimed. Interrupting drops steers and injects aimed at the dying turn
 but keeps queued user messages — sending a message and then pressing Stop
-is how a user says "do this instead". In the FE the composer stays live
-during a turn: Enter queues (rendered as "queued"), Ctrl+Enter steers.
+is how a user says "do this instead". In the FE the composer stays live during a
+turn: plain Enter follows the Settings > General "Enter behavior while busy"
+preference (Queue by default, so a send queues and shows in the queue dock)
+and Ctrl+Enter always does the other one - dsh's accelerated submit.
 
 ### Background jobs (Wave 4)
 
@@ -244,7 +254,7 @@ a queued human message wins, because the person is here now.
 | `skills/*.md` | `agents::md_skill` | Scanned at BE startup only — adding a skill needs a BE restart. `plan-mode.md` is the plan-policy config, excluded from the scan by name. |
 | `sessions/<id>.jsonl` | `backend::sessions_store` | One append-only event log per chat session (`sica_core::event::SessionEvent`, one JSON object per line). A torn final line or a bad line mid-file is skipped, never fatal. Loaded eagerly at startup by `ChatHub::new_loaded`; a fresh session is not written until its first user message. Legacy `<id>.toml` files are migrated once into `LegacyMessage` events and renamed `<id>.toml.bak` (never deleted). |
 | `spill/<session>/*.txt` | `agents::spill` | Full text of tool outputs too large to feed back into context; the model holds only a digest + this path. `.gitignore`d churn. |
-| `sica-settings.json` | `frontend::settings_store` | FE settings, read at startup / written on Apply. |
+| `sica-settings.json` | `frontend::settings_store` | FE settings, read at startup. Settings › General applies live (theme mode, content font size 12–17, Normal/Compact transcript, busy-Enter, reduce-motion) and writes through on every change; the other sections still have their own Apply / Connect buttons. |
 | `sica-settings/llm-providers/*.toml` | `frontend::llm_providers` | One panel per provider; filename stem is the id. `.gitignore`d — may hold API keys. In the UI, `0` means "auto" for `max_tokens`/`context_window`. Each card shows a per-model recommendation (`llm::preset`, matched from the model string: temperature / thinking / tool mode per family) with a one-click Apply that persists to the TOML. |
 | `idealist_workspace/Improvement-{BE,FE}-*.md` | `idealist` | Generated tickets. Append-only churn; don't treat as source. |
 | `evals/*.toml` | `agents::model_eval` | One prompt suite per file; `default.toml` seeded once at BE start, user-owned after. Read per run, so edits need no restart. |
@@ -267,7 +277,15 @@ Long-running handlers must not block the dispatcher loop — `ConnectLlm` spawns
 - `bincode` (v1) is the **pipe** format: types crossing the pipe must use externally-tagged enums — no `#[serde(tag/content)]`, no `untagged`, no `flatten` with maps. The `untagged`/`tag` attributes on `llm::client::ChatContent` and `ContentPart` are fine because those go out as JSON to the LLM, never over the pipe.
 - Session event logs are JSONL (`serde_json`, internally-tagged enums are fine there — they never cross the pipe); provider configs and eval suites are `toml`; the LLM wire format is `serde_json`. Three serialization formats coexist by design.
 - [docs/deepseek-harness-ideas.md](docs/deepseek-harness-ideas.md) catalogues the agent-harness ideas ported from DeepSeek's `dsh` (event log, step-level retry, tool timeouts, spill-to-file, and the Wave 1 hygiene set: repeat-tool reminder, untrusted-content frame, tool-result pruner, `retain`, `/name` expansion, fallback titles, Job Objects, provider `usage`) and the ones deliberately left for later.
-- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there.
-- Tracing logs go to stderr; the GUI captures backend stderr and renders it color-coded in the log panel. `Event::LogLine` is the deliberate channel for anything the operator should see in the GUI — a `warn!` alone is invisible unless it also emits a `LogLine`.
+- The FE's `SessionDump` carries injected context under the string role `"context"`; since protocol v13 each such message also carries `context_source` (the `ContextSource` label) so the FE can present runtime-context / instructions snapshots without re-parsing prose. [docs/harness-implementation-guide.md](docs/harness-implementation-guide.md) is the long form: every dsh feature/plugin, its mechanism, and a concrete sica-rust design (module, types, events, protocol impact) plus a five-wave roadmap and the list of `EventKind` variants each wave adds. Read the relevant section before adding a loop guard, prompt-assembly, approval, plan-mode, subagent, or jobs feature — the design is already sketched there. [docs/harness-ui-guide.md](docs/harness-ui-guide.md) is the FE counterpart: dsh's web-client design system (tokens, type, geometry, elevation), every shell/transcript/composer/control-plane/settings surface with its concrete values, the egui port for each, the additive protocol changes (v17), and a five-wave UI roadmap. Read it before restyling or adding a frontend surface — waves **UI-1 (foundation), UI-2 (transcript) and UI-3 (composer + control plane)** are implemented, along with the UI-4 settings modal and session rows; what is left needs the protocol v17 batch in its §11 (per-turn usage pills, the retry chain, the real queue dock, session verbs) or is the UI-5 trajectory view.
+- **The FE design system is `sica_core::theme` + `ui::kit`.** `theme` holds the
+  static ramps and the two semantic alias maps; every widget reads an alias
+  through `kit` and no module below it branches on light/dark or names a
+  literal colour. `App::apply_visuals` pours the tokens into `egui::Style` and
+  stashes the `Theme` in `Context` memory, which is how `kit` reaches it
+  without a palette threaded through every signature. Icons are painted by
+  `ui::icons` (no SVG dependency); the UI face is the platform sans loaded at
+  runtime and the code face is the vendored IBM Plex Mono.
+- Tracing logs go to stderr; the GUI captures backend stderr and renders it color-coded in the log panel, **at its own level** (`Event::LogLine.level` reaches `LogKind`, and a WARN/ERROR line also raises a toast over the conversation). `Event::LogLine` is the deliberate channel for anything the operator should see in the GUI — a `warn!` alone is invisible unless it also emits a `LogLine`.
 - The FE talks to the supervisor over `tokio::sync::mpsc` (commands) and back over `std::sync::mpsc` + `ctx.request_repaint()` (events). `App` state is only mutated while draining that channel on the UI thread.
 - Heartbeats arrive every 2 s and feed the IPC-dot watchdog; they are intentionally *not* logged to the user-visible panel.

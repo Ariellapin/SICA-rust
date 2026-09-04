@@ -69,6 +69,9 @@ pub struct TurnOutput {
     pub used_tokens:   u32,
     /// The provider's `usage` trailer, when it sent one.
     pub usage:         Option<llm::client::Usage>,
+    /// Milliseconds from the request going out to the first streamed token.
+    /// `None` when the stream carried nothing at all.
+    pub ttft_ms:       Option<u64>,
     /// Transport / server failure that ended the stream early (HTTP error,
     /// connection reset, SSE decode failure). `None` on a clean finish and
     /// on user interrupt. The caller decides whether it is retryable — a
@@ -126,6 +129,8 @@ pub async fn run_turn(
     // an index carries id/name, later fragments append argument text.
     let mut accum_tools: Vec<NativeToolCall> = Vec::new();
     let mut usage: Option<llm::client::Usage> = None;
+    let request_sent = Instant::now();
+    let mut ttft: Option<Duration> = None;
 
     let mut interrupted = false;
     loop {
@@ -142,6 +147,7 @@ pub async fn run_turn(
         };
         let Some(chunk) = next else { break };
         if !chunk.delta_content.is_empty() || !chunk.delta_reasoning.is_empty() {
+            ttft.get_or_insert_with(|| request_sent.elapsed());
             events.emit(Event::AssistantDelta {
                 session_id,
                 turn_id,
@@ -235,6 +241,12 @@ pub async fn run_turn(
     };
     events.emit(Event::TokenUsage { session_id, used: final_used, limit, budget, breakdown });
 
+    // Normalise the provider's cut-off reason to the stable wire string the
+    // FE renders as its own row (§3.5). `length` is the OpenAI spelling.
+    if final_reason == "length" {
+        final_reason = "max_tokens".into();
+    }
+
     events.emit(Event::TurnFinished {
         session_id,
         turn_id,
@@ -253,6 +265,7 @@ pub async fn run_turn(
         tool_calls:    accum_tools,
         used_tokens:   final_used,
         usage,
+        ttft_ms:       ttft.map(|d| d.as_millis() as u64),
         error,
     }
 }

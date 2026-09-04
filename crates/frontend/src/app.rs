@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use protocol::{CatalogEntry, LlmState, Request, SessionDump, SessionMeta, Severity, UserImage};
-use sica_core::theme::Palette;
+use sica_core::theme::{tokens, Theme};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::settings_store::{self, Settings};
@@ -13,18 +13,95 @@ use crate::ui;
 
 const LOG_CAPACITY: usize = 2000;
 
-/// Top-level view in the main window.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AppView {
-    Chat,
-    Settings,
-}
-
+/// Settings sections (§7.2). Settings is a modal, not a view — the sidebar
+/// has no view switch at all since UI-1.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
-    Llm,
-    Communication,
+    Models,
+    Skills,
+    Diagnostics,
+}
+
+/// Appearance preference — the three cubes in Settings › General.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+    System,
+}
+
+impl ThemeMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "light" => ThemeMode::Light,
+            "system" => ThemeMode::System,
+            _ => ThemeMode::Dark,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+            ThemeMode::System => "system",
+        }
+    }
+    /// Resolve to a concrete theme. `System` follows the OS preference
+    /// eframe reported at startup (`IntegrationInfo::system_theme`), which is
+    /// the only place the platform tells us; unknown means dark.
+    pub fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            ThemeMode::Light => false,
+            ThemeMode::Dark => true,
+            ThemeMode::System => system_dark,
+        }
+    }
+}
+
+/// What plain Enter does while a turn is running (Settings › General).
+/// Ctrl+Enter always does the other one — dsh's "accelerated" submit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BusyEnter {
+    Queue,
+    Steer,
+}
+
+impl BusyEnter {
+    pub fn parse(s: &str) -> Self {
+        if s == "steer" { BusyEnter::Steer } else { BusyEnter::Queue }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BusyEnter::Queue => "queue",
+            BusyEnter::Steer => "steer",
+        }
+    }
+}
+
+/// Shell column state (§2.2). Transient by design: dsh does not persist
+/// sidebar width or collapse, and neither do we — every launch opens at 280
+/// expanded with the details column closed.
+pub struct LayoutState {
+    pub sidebar_w: f32,
+    pub sidebar_collapsed: bool,
+    /// `Some` while the window is under the auto-collapse threshold, holding
+    /// the collapse state to restore when it widens again.
+    pub narrow_override: Option<bool>,
+    pub details_w: f32,
+    /// User override of the conversation content width, persisted.
+    pub content_w: Option<f32>,
+}
+
+impl Default for LayoutState {
+    fn default() -> Self {
+        Self {
+            sidebar_w: tokens::SIDEBAR_DEFAULT,
+            sidebar_collapsed: false,
+            narrow_override: None,
+            details_w: 0.0,
+            content_w: None,
+        }
+    }
 }
 
 pub struct App {
@@ -44,12 +121,17 @@ pub struct App {
     pub release_profile: bool,
     pub autoscroll: bool,
 
-    // View routing.
-    pub view: AppView,
+    // Settings modal (§7): open flag + active section.
+    pub settings_open: bool,
     pub settings_tab: SettingsTab,
 
-    // Settings — General tab.
+    // Settings — General.
+    pub theme_mode:            ThemeMode,
     pub theme_dark:            bool,
+    pub content_px:            u8,
+    pub transcript_compact:    bool,
+    pub busy_enter:            BusyEnter,
+    pub reduce_motion:         bool,
     pub log_raw_llm:           bool,
     pub idealist_auto_apply_be: bool,
 
@@ -59,6 +141,12 @@ pub struct App {
     /// determines which panel reflects `llm_state` and which "Disconnect"
     /// button is enabled. `None` means no panel is active.
     pub active_provider_id: Option<String>,
+    /// Models a provider reported, keyed by its base URL — the "Fetch
+    /// available models" list (7). An `Err` is the fetch's own message,
+    /// shown in place of the list rather than swallowed.
+    pub provider_models: std::collections::HashMap<String, Result<Vec<String>, String>>,
+    /// Base URLs with a fetch in flight, so the button can say so.
+    pub models_pending: std::collections::HashSet<String>,
 
     // Auto-bootstrap flags.
     pub auto_start_be:    bool,
@@ -68,9 +156,6 @@ pub struct App {
     pub did_auto_start_be: bool,
     /// Set once we've fired ConnectLlm for the current IPC connection.
     pub did_auto_connect_llm: bool,
-
-    // Toast feedback for the Apply button.
-    pub last_settings_status: Option<(Instant, Result<(), String>)>,
 
     // Chat state.
     pub chat: ChatState,
@@ -83,8 +168,23 @@ pub struct App {
     /// the footer) — no atomics needed, unlike `tokens`.
     pub gen_speed: GenSpeed,
 
-    // Active color palette (derived from `theme_dark`).
-    pub palette: Palette,
+    // Active design tokens (derived from `theme_mode` + `content_px`).
+    pub theme: Theme,
+
+    /// Shell columns — sidebar width / collapse, details width, content axis.
+    pub layout: LayoutState,
+
+    /// The one live toast (dsh shows one at a time; a new one replaces it).
+    pub toast: Option<crate::ui::kit::Toast>,
+    toast_seq: u64,
+
+    /// Set when the IPC link drops, cleared 2 s after it comes back — drives
+    /// the connection indicator's "Connected" confirmation.
+    pub had_outage: bool,
+    pub recovered_at: Option<Instant>,
+
+    /// Log-panel level filter (Diagnostics).
+    pub log_filter: LogKind2,
 
     /// Last path component of the workspace root, surfaced in the status
     /// bar so the user can see at a glance which project the BE is acting
@@ -120,6 +220,31 @@ pub struct App {
     pub last_command_session: Option<u64>,
     /// Permission mode for freshly minted sessions (Settings JSON).
     pub default_permission_mode: String,
+    /// Last prompt composition the BE reported — the context ring's panel is
+    /// the first surface to read it (`TokenBreakdown` has been on the wire
+    /// since v12 and was never drawn).
+    pub token_breakdown: Option<protocol::TokenBreakdown>,
+    /// Open state of the composer's toolbar menus.
+    pub menu_open: MenuOpen,
+    /// The Full-access risk gate (§6.7) and its mandatory acknowledgement.
+    pub risk_gate_open: bool,
+    pub risk_ack: bool,
+    /// Tool call shown in the details column, when it is open.
+    pub details_call: Option<u64>,
+    /// The OS light/dark preference eframe reported at startup; what
+    /// `ThemeMode::System` resolves to.
+    pub system_dark: bool,
+}
+
+/// Which composer / header menu is open. Only one at a time — egui has no
+/// z-index war because dsh's three overlay disciplines collapse to that rule.
+#[derive(Default)]
+pub struct MenuOpen {
+    pub permission: bool,
+    pub model: bool,
+    pub jobs: bool,
+    pub goal: bool,
+    pub context: bool,
 }
 
 /// One pipeline `Ask` waiting on the strip above the composer.
@@ -131,13 +256,17 @@ pub struct PendingApproval {
     pub reason: String,
 }
 
-/// One human question waiting on the modal.
+/// One human question waiting on the composer takeover (§6.2).
 pub struct PendingQuestion {
     pub id: u64,
     pub session_id: u64,
     pub question: String,
     pub options: Vec<String>,
     pub draft: String,
+    /// The BE frames a plan review as a question whose text opens with the
+    /// plan; the takeover then reads as "Plan review" with Approve / Refuse
+    /// instead of a generic answer field.
+    pub plan_review: bool,
 }
 
 pub struct TokenMeter {
@@ -247,14 +376,6 @@ impl GenSpeed {
         }
     }
 
-    /// Turn average (what the tooltip shows next to the live EMA).
-    pub fn avg(&self) -> f32 {
-        if self.elapsed_secs > 0.0 {
-            self.completed as f32 / self.elapsed_secs
-        } else {
-            0.0
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -273,7 +394,72 @@ pub enum LogKind {
     Be,
     Ipc,
     Event,
+    Warn,
     Error,
+    Debug,
+}
+
+impl LogKind {
+    pub fn tag(self) -> &'static str {
+        match self {
+            LogKind::Info => "INF",
+            LogKind::Build => "BLD",
+            LogKind::Be => "BE ",
+            LogKind::Ipc => "IPC",
+            LogKind::Event => "EVT",
+            LogKind::Warn => "WRN",
+            LogKind::Error => "ERR",
+            LogKind::Debug => "DBG",
+        }
+    }
+    /// Severity rank for the Diagnostics filter: 0 debug … 3 error.
+    pub fn rank(self) -> u8 {
+        match self {
+            LogKind::Debug => 0,
+            LogKind::Warn => 2,
+            LogKind::Error => 3,
+            _ => 1,
+        }
+    }
+    /// Map a backend `LogLine.level` (tracing's level names) onto a kind.
+    /// The level used to be dropped on the wire-to-UI hop, which made every
+    /// BE line read as INF — a rejected tool call included.
+    pub fn from_level(level: &str) -> Self {
+        match level.to_ascii_uppercase().as_str() {
+            "ERROR" => LogKind::Error,
+            "WARN" => LogKind::Warn,
+            "DEBUG" | "TRACE" => LogKind::Debug,
+            _ => LogKind::Info,
+        }
+    }
+}
+
+/// Minimum level shown in the log panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LogKind2 {
+    All,
+    InfoUp,
+    WarnUp,
+    ErrorOnly,
+}
+
+impl LogKind2 {
+    pub fn min_rank(self) -> u8 {
+        match self {
+            LogKind2::All => 0,
+            LogKind2::InfoUp => 1,
+            LogKind2::WarnUp => 2,
+            LogKind2::ErrorOnly => 3,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            LogKind2::All => "All",
+            LogKind2::InfoUp => "Info",
+            LogKind2::WarnUp => "Warn",
+            LogKind2::ErrorOnly => "Error",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -415,11 +601,6 @@ pub struct ChatState {
     /// into `Request::SendUserMessage` on send; rendered as a thumbnail
     /// strip above the input bar in the meantime.
     pub pending_images: Vec<PendingAttachment>,
-    /// Last-frame hover state of the composer frame. Cached so the next
-    /// frame can pick a brighter fill / accented stroke before the Frame
-    /// is painted — egui paints frame chrome up-front and cannot be
-    /// retinted retroactively.
-    pub input_hovered: bool,
     /// Session id awaiting delete confirmation. The first `×` click arms a
     /// row (one row at a time); the inline "Delete? / Keep" affordance then
     /// commits or cancels. Keeps an accidental click from dropping a session.
@@ -448,6 +629,32 @@ pub struct ChatState {
     pub compacting: bool,
     /// The "/" palette that opens when the draft starts with a slash.
     pub slash: SlashState,
+    /// Sessions with a turn in flight. `TurnStarted`/`TurnFinished` carry a
+    /// session id, so a background session's dot is live too (§4.1).
+    pub running_sessions: std::collections::HashSet<u64>,
+    /// Sessions blocked on a human (approval / question / plan review).
+    pub waiting_sessions: std::collections::HashSet<u64>,
+    /// Sessions that completed a turn while not on screen; cleared on open.
+    pub unseen_sessions: std::collections::HashSet<u64>,
+    /// Queued-but-not-started messages, newest last — the queue dock. Until
+    /// the BE exposes its inbox (§11) this mirrors what the FE itself sent.
+    pub queued: Vec<String>,
+    /// Session id whose row menu is open, and the row's screen rect.
+    pub row_menu: Option<(u64, egui::Rect)>,
+    /// Sidebar search (§4.2): the header icon expands into a field. Title
+    /// matches filter the list immediately; the backend's content search is
+    /// debounced behind them and its hits are merged in.
+    pub search_open: bool,
+    pub search_query: String,
+    pub search_hits: Vec<protocol::SessionHit>,
+    /// The query the last `SearchSessions` went out for, and when the field
+    /// last changed — dsh debounces the host search by 250 ms.
+    pub search_sent: String,
+    pub search_changed_at: Option<std::time::Instant>,
+    /// Session being renamed inline, and the draft. One row at a time, the
+    /// same discipline as the armed delete.
+    pub renaming: Option<u64>,
+    pub rename_draft: String,
 }
 
 /// State of the "/" palette in the composer. The catalogue is pulled once per
@@ -526,38 +733,103 @@ pub struct Turn {
     /// "queued" rather than as a stalled stream, and clears when the
     /// backend reports it running.
     pub queued:             bool,
+    /// Step-level LLM retries the backend performed inside this turn, in
+    /// arrival order. Each is a row on the turn (3.5); an empty vec is the
+    /// normal case and draws nothing.
+    pub retries:            Vec<RetryRow>,
+    /// This turn's own accounting, once `TurnUsage` lands. Drives the tail's
+    /// usage and time pills.
+    pub usage:              Option<TurnUsage>,
+}
+
+/// One step-level retry inside a turn: the backend classified an LLM failure
+/// as retryable, slept out the backoff, and rebuilt the identical request.
+#[derive(Clone)]
+pub struct RetryRow {
+    pub attempt:  u32,
+    pub max:      u32,
+    pub delay_ms: u64,
+    pub reason:   String,
+    /// When the row arrived — the anchor for the live countdown while the
+    /// backoff is still running.
+    pub at:       std::time::Instant,
+}
+
+/// A completed turn's own token and time accounting (`Event::TurnUsage`).
+#[derive(Clone, Copy)]
+pub struct TurnUsage {
+    pub prompt:      u32,
+    pub completion:  u32,
+    /// Characters of reasoning - providers do not break the tokens out.
+    pub reasoning:   u32,
+    pub duration_ms: u64,
+    pub ttft_ms:     u64,
 }
 
 impl Turn {
+    /// An empty turn. Every construction site starts here and overrides what
+    /// it knows, so a new field is one edit rather than six.
+    pub fn new(session_id: u64, turn_id: u64) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            user: String::new(),
+            assistant: String::new(),
+            reasoning: String::new(),
+            finished: false,
+            finish_reason: None,
+            tool_chips: Vec::new(),
+            reasoning_collapsed: false,
+            images: Vec::new(),
+            notice: None,
+            queued: false,
+            retries: Vec::new(),
+            usage: None,
+        }
+    }
+
     /// A marker entry in the transcript. `turn_id` is 0 — notices are not
     /// turns the backend knows about, and nothing correlates against them.
     pub fn marker(session_id: u64, notice: Notice) -> Self {
         Self {
-            session_id,
-            turn_id: 0,
-            user: String::new(),
-            assistant: String::new(),
-            reasoning: String::new(),
             finished: true,
-            finish_reason: None,
-            tool_chips: Vec::new(),
             reasoning_collapsed: true,
-            images: Vec::new(),
             notice: Some(notice),
-            queued: false,
+            ..Self::new(session_id, 0)
         }
     }
 }
 
-/// Out-of-band transcript marker. `detail` is the hover text — for a
+/// What kind of out-of-band row a [`Notice`] renders as (§3.5). Each maps to
+/// a disclosure row with its own icon and title; `detail` is the body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// "Context compacted" — the summary that shadowed the folded span.
+    Compaction,
+    /// "Context injection" — a `/name` load, a tool notice, a job notice.
+    Injection,
+    /// A steer the user aimed at the running turn.
+    Steer,
+}
+
+/// Out-of-band transcript marker. `detail` is the expanded body — for a
 /// compaction that is the summary the model wrote, so the user can read
 /// exactly what replaced their history.
 #[derive(Clone)]
 pub struct Notice {
+    pub kind:   NoticeKind,
     pub label:  String,
     pub detail: String,
     /// `false` tints the marker with the danger colour (the operation failed).
     pub ok:     bool,
+    /// Body open/closed. Rows start collapsed, like dsh's.
+    pub open:   bool,
+}
+
+impl Notice {
+    pub fn new(kind: NoticeKind, label: impl Into<String>, detail: impl Into<String>, ok: bool) -> Self {
+        Self { kind, label: label.into(), detail: detail.into(), ok, open: false }
+    }
 }
 
 /// In-history attachment, owned by a `Turn`. Mirrors `PendingAttachment` but
@@ -593,6 +865,17 @@ pub struct ToolChip {
     pub finished:     bool,
     pub ok:           bool,
     pub summary:      String,
+    /// The tool's own output as the model received it, before the expectation
+    /// summariser paraphrased it — what the expanded body renders. Equal to
+    /// `summary` when no summariser ran.
+    pub output:       String,
+    /// Resolved arguments as JSON text: the command for a terminal block, the
+    /// `old`/`new` pair for a diff, the path for a read.
+    pub args_json:    String,
+    /// Wall-clock time of the dispatch, pipeline included.
+    pub duration_ms:  u64,
+    /// Body open/closed (§3.4). Rows start collapsed.
+    pub expanded:     bool,
 }
 
 impl App {
@@ -608,9 +891,18 @@ impl App {
         let cmd_tx = supervisor::spawn(&rt, cc.egui_ctx.clone(), ui_tx);
 
         let settings = settings_store::load();
-        let palette = if settings.theme_dark { Palette::iron() } else { Palette::paper() };
+        let theme_mode = ThemeMode::parse(&settings.theme_mode);
+        let content_px = settings
+            .content_px
+            .clamp(tokens::CONTENT_MIN_PX, tokens::CONTENT_MAX_PX);
+        let system_dark = !matches!(
+            cc.integration_info.system_theme,
+            Some(eframe::Theme::Light)
+        );
+        let dark = theme_mode.is_dark(system_dark);
+        let theme = Theme { content_px, ..Theme::of(dark) };
         crate::ui::fonts::install(&cc.egui_ctx);
-        Self::apply_visuals(&cc.egui_ctx, &palette, settings.theme_dark);
+        Self::apply_visuals(&cc.egui_ctx, &theme);
 
         // Make sure the providers folder has at least the seed files so the
         // LLM tab is non-empty on first launch.
@@ -632,6 +924,8 @@ impl App {
             rt,
             cmd_tx,
             ui_rx,
+            provider_models: std::collections::HashMap::new(),
+            models_pending: std::collections::HashSet::new(),
             log: VecDeque::with_capacity(LOG_CAPACITY),
             be_state: BeState::default(),
             ipc_state: IpcState::default(),
@@ -641,9 +935,14 @@ impl App {
             request_draft: RequestDraft::default(),
             release_profile: settings.release_profile,
             autoscroll: settings.autoscroll,
-            view: AppView::Chat,
+            settings_open: false,
             settings_tab: SettingsTab::General,
-            theme_dark: settings.theme_dark,
+            theme_mode,
+            theme_dark: dark,
+            content_px,
+            transcript_compact: settings.transcript_compact,
+            busy_enter: BusyEnter::parse(&settings.busy_enter),
+            reduce_motion: settings.reduce_motion,
             log_raw_llm: settings.log_raw_llm,
             idealist_auto_apply_be: settings.idealist_auto_apply_be,
             providers,
@@ -652,7 +951,6 @@ impl App {
             auto_connect_llm: settings.auto_connect_llm,
             did_auto_start_be: auto_start_be,
             did_auto_connect_llm: false,
-            last_settings_status: None,
             chat: ChatState {
                 session_id: 1,
                 next_session: AtomicU64::new(2),
@@ -664,7 +962,16 @@ impl App {
                 budget: AtomicU32::new(0),
             }),
             gen_speed: GenSpeed::default(),
-            palette,
+            theme,
+            layout: LayoutState {
+                content_w: settings.chat_content_width,
+                ..LayoutState::default()
+            },
+            toast: None,
+            toast_seq: 0,
+            had_outage: false,
+            recovered_at: None,
+            log_filter: LogKind2::All,
             workspace_name: sica_core::paths::workspace_root()
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -679,25 +986,53 @@ impl App {
             plan_active: false,
             last_command_session: None,
             default_permission_mode: settings.default_permission_mode.clone(),
+            token_breakdown: None,
+            menu_open: MenuOpen::default(),
+            risk_gate_open: false,
+            risk_ack: false,
+            details_call: None,
+            system_dark,
         }
     }
 
-    /// Snapshot the live fields, persist them to disk, and re-apply runtime
-    /// state (theme, auto-watch, LLM endpoint). Surfaced to the user as a
-    /// small status line in the Settings panel.
-    pub fn apply_and_save_settings(&mut self, ctx: &egui::Context) {
-        let result = settings_store::save(&self.settings_snapshot()).map_err(|e| e.to_string());
-        self.palette = if self.theme_dark { Palette::iron() } else { Palette::paper() };
-        Self::apply_visuals(ctx, &self.palette, self.theme_dark);
+    /// Rebuild the token set from the live preferences and push it into the
+    /// egui style. General settings apply live (dsh has no Apply button
+    /// there), so this runs on every change rather than on a bar click.
+    pub fn refresh_theme(&mut self, ctx: &egui::Context) {
+        self.theme_dark = self.theme_mode.is_dark(self.system_dark);
+        self.content_px = self
+            .content_px
+            .clamp(tokens::CONTENT_MIN_PX, tokens::CONTENT_MAX_PX);
+        self.theme = Theme {
+            content_px: self.content_px,
+            ..Theme::of(self.theme_dark)
+        };
+        Self::apply_visuals(ctx, &self.theme);
+    }
 
-        self.send(UiCommand::SetAutoWatch(self.auto_watch));
+    /// Persist General-tab state without the status toast — those rows apply
+    /// live, so every change writes straight through.
+    pub fn save_general(&mut self, ctx: &egui::Context) {
+        self.refresh_theme(ctx);
+        let _ = settings_store::save(&self.settings_snapshot());
+    }
 
-        self.last_settings_status = Some((Instant::now(), result));
+    /// Show a toast, replacing whatever is on screen (dsh shows one at a
+    /// time; bumping the sequence restarts the fade).
+    pub fn show_toast(&mut self, icon: crate::ui::icons::Icon, text: impl Into<String>, hold_ms: u64) {
+        self.toast_seq += 1;
+        self.toast = Some(crate::ui::kit::Toast::new(self.toast_seq, icon, text, hold_ms));
     }
 
     fn settings_snapshot(&self) -> Settings {
         Settings {
             theme_dark:             self.theme_dark,
+            theme_mode:             self.theme_mode.as_str().to_string(),
+            content_px:             self.content_px,
+            transcript_compact:     self.transcript_compact,
+            busy_enter:             self.busy_enter.as_str().to_string(),
+            reduce_motion:          self.reduce_motion,
+            chat_content_width:     self.layout.content_w,
             log_raw_llm:            self.log_raw_llm,
             idealist_auto_apply_be: self.idealist_auto_apply_be,
             auto_start_be:          self.auto_start_be,
@@ -757,108 +1092,119 @@ impl App {
         }));
     }
 
-    fn apply_visuals(ctx: &egui::Context, palette: &Palette, dark: bool) {
-        use egui::{
-            epaint::Shadow,
-            FontFamily, FontId, Rounding, Stroke, TextStyle,
-        };
+    /// Pour the token set into `egui::Style`. Every colour below is an
+    /// alias — no literals, no theme branches (§1.3). The theme is also
+    /// stashed in `Context` memory so `ui::kit` can read it without a
+    /// palette threaded through every signature.
+    fn apply_visuals(ctx: &egui::Context, theme: &Theme) {
+        use egui::{FontFamily, FontId, Rounding, Stroke, TextStyle};
         use sica_core::theme::tokens::{
-            FAMILY_ITALIC, HAIRLINE, RADIUS_0, RADIUS_2, SPACE_2, SPACE_3,
+            FAMILY_MEDIUM, FAMILY_MONO, HAIRLINE, RADIUS_INPUT, RADIUS_MENU, RADIUS_MODAL,
         };
+
+        crate::ui::kit::set_theme(ctx, *theme);
+
+        let a = &theme.alias;
+        let col = crate::ui::kit::col;
+        let cola = crate::ui::kit::cola;
 
         let mut style = (*ctx.style()).clone();
-        style.visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+        style.visuals = if theme.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
 
-        // Typography — IBM Plex Mono for body / button / monospace; Newsreader
-        // italic for the two display roles. Custom `Caps` and `Display` styles
-        // are addressed by `widgets::caps_label` / `widgets::display_text`.
-        let mono     = FontFamily::Monospace;
-        let italic   = FontFamily::Name(FAMILY_ITALIC.into());
+        // Type. Chrome sizes are fixed; `content` follows the user's ladder.
+        let ui_font = FontFamily::Proportional;
+        let medium = FontFamily::Name(FAMILY_MEDIUM.into());
+        let mono = FontFamily::Name(FAMILY_MONO.into());
+        let content = theme.content_px as f32;
         style.text_styles = [
-            (TextStyle::Heading,                FontId::new(22.0, italic.clone())),
-            (TextStyle::Body,                   FontId::new(14.0, mono.clone())),
-            (TextStyle::Monospace,              FontId::new(13.0, mono.clone())),
-            (TextStyle::Button,                 FontId::new(13.0, mono.clone())),
-            (TextStyle::Small,                  FontId::new(12.0, mono.clone())),
-            (TextStyle::Name("Caps".into()),    FontId::new(11.0, mono.clone())),
-            (TextStyle::Name("Display".into()), FontId::new(28.0, italic.clone())),
+            (TextStyle::Heading, FontId::new(16.0, medium.clone())),
+            (TextStyle::Body, FontId::new(content, ui_font.clone())),
+            (TextStyle::Monospace, FontId::new(12.0, mono.clone())),
+            (TextStyle::Button, FontId::new(14.0, medium.clone())),
+            (TextStyle::Small, FontId::new(12.0, ui_font.clone())),
+            (
+                TextStyle::Name("row-title".into()),
+                FontId::new(theme.content_secondary_px(), medium.clone()),
+            ),
+            (TextStyle::Name("content".into()), FontId::new(content, ui_font.clone())),
+            (TextStyle::Name("code-block".into()), FontId::new(11.0, mono.clone())),
+            (TextStyle::Name("h1".into()), FontId::new(21.0 + theme.delta(), medium.clone())),
+            (TextStyle::Name("h2".into()), FontId::new(19.0 + theme.delta(), medium.clone())),
+            (TextStyle::Name("h3".into()), FontId::new(18.0 + theme.delta(), medium.clone())),
         ]
         .into();
 
-        // Spacing — 4px grid, generous vertical air, square button padding.
-        style.spacing.item_spacing   = egui::vec2(SPACE_2, SPACE_2);
-        style.spacing.button_padding = egui::vec2(SPACE_3, 6.0);
-        style.spacing.menu_margin    = egui::Margin::same(SPACE_2);
+        // Rhythm: dsh has no spacing token set — the scale is 2 4 6 8 …
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.menu_margin = egui::Margin::same(4.0);
+        style.spacing.scroll.bar_width = 8.0;
+        style.spacing.scroll.floating = true;
 
-        // Shape language — precise corners, no shadows.
-        let r2: Rounding = RADIUS_2.into();
-        style.visuals.window_rounding = RADIUS_0.into();
-        style.visuals.menu_rounding   = r2;
-        style.visuals.popup_shadow    = Shadow::NONE;
-        style.visuals.window_shadow   = Shadow::NONE;
+        // Surfaces.
+        style.visuals.panel_fill = col(a.bg_base);
+        style.visuals.window_fill = col(a.bg_layer[1]);
+        style.visuals.extreme_bg_color = col(a.code_block);
+        style.visuals.faint_bg_color = col(a.tip);
+        style.visuals.override_text_color = Some(col(a.label[0]));
+        style.visuals.hyperlink_color = col(a.business);
+        style.visuals.window_stroke = Stroke::new(HAIRLINE, cola(a.border[0]));
+        style.visuals.window_rounding = Rounding::same(RADIUS_MODAL);
+        style.visuals.menu_rounding = Rounding::same(RADIUS_MENU);
+        style.visuals.popup_shadow = egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 3.0),
+            blur: 12.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(if theme.dark { 40 } else { 24 }),
+        };
+        style.visuals.window_shadow = style.visuals.popup_shadow;
 
-        // Surface palette.
-        let page     = rgb(palette.page_bg);
-        let surface  = rgb(palette.surface);
-        let sunk     = rgb(palette.surface_sunk);
-        let ink      = rgb(palette.ink);
-        let hairline = rgb(palette.hairline);
-        let accent   = rgb(palette.accent);
-        let subtle   = rgb(palette.accent_subtle);
-        let on_accent = if dark { page } else { rgb(palette.page_bg) };
+        // Selection + caret are `business` — focus never shows as a fill.
+        style.visuals.selection.bg_fill = col(a.business).linear_multiply(0.18);
+        style.visuals.selection.stroke = Stroke::new(1.0, col(a.business));
+        style.visuals.text_cursor.stroke = Stroke::new(1.5, col(a.business));
 
-        style.visuals.panel_fill          = page;
-        style.visuals.window_fill         = surface;
-        style.visuals.extreme_bg_color    = sunk;
-        style.visuals.override_text_color = Some(ink);
-        style.visuals.hyperlink_color     = accent;
-        style.visuals.faint_bg_color      = sunk;
-        style.visuals.window_stroke       = Stroke::new(HAIRLINE, hairline);
-        style.visuals.menu_rounding       = r2;
-
-        // Selection — accent wash + hairline stroke. Replaces egui's default
-        // saturated blue on focused TextEdits.
-        style.visuals.selection.bg_fill = subtle;
-        style.visuals.selection.stroke  = Stroke::new(HAIRLINE, accent);
-
-        // Widget states. Buttons are ghost-by-default (hairline border on
-        // hover) and flip to a solid accent fill when active / pressed.
+        let r: Rounding = Rounding::same(RADIUS_INPUT);
         let widgets = &mut style.visuals.widgets;
-        widgets.noninteractive.rounding   = r2;
-        widgets.noninteractive.bg_stroke  = Stroke::new(HAIRLINE, hairline);
-        widgets.noninteractive.fg_stroke  = Stroke::new(HAIRLINE, ink);
-        widgets.noninteractive.bg_fill    = page;
-        widgets.noninteractive.weak_bg_fill = page;
+        widgets.noninteractive.rounding = r;
+        widgets.noninteractive.bg_fill = col(a.bg_base);
+        widgets.noninteractive.weak_bg_fill = col(a.bg_base);
+        widgets.noninteractive.bg_stroke = Stroke::new(HAIRLINE, cola(a.border[0]));
+        widgets.noninteractive.fg_stroke = Stroke::new(1.0, col(a.label[0]));
 
-        widgets.inactive.rounding       = r2;
-        widgets.inactive.bg_fill        = egui::Color32::TRANSPARENT;
-        widgets.inactive.weak_bg_fill   = egui::Color32::TRANSPARENT;
-        widgets.inactive.bg_stroke      = Stroke::new(HAIRLINE, hairline);
-        widgets.inactive.fg_stroke      = Stroke::new(HAIRLINE, ink);
-        widgets.inactive.expansion      = 0.0;
+        widgets.inactive.rounding = r;
+        widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+        widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        widgets.inactive.bg_stroke = Stroke::new(HAIRLINE, cola(a.border[2]));
+        widgets.inactive.fg_stroke = Stroke::new(1.0, col(a.label[0]));
+        widgets.inactive.expansion = 0.0;
 
-        widgets.hovered.rounding        = r2;
-        widgets.hovered.bg_fill         = subtle;
-        widgets.hovered.weak_bg_fill    = subtle;
-        widgets.hovered.bg_stroke       = Stroke::new(HAIRLINE, accent);
-        widgets.hovered.fg_stroke       = Stroke::new(HAIRLINE, accent);
-        widgets.hovered.expansion       = 0.0;
+        widgets.hovered.rounding = r;
+        widgets.hovered.bg_fill = cola(a.hover);
+        widgets.hovered.weak_bg_fill = cola(a.hover);
+        widgets.hovered.bg_stroke = Stroke::new(HAIRLINE, cola(a.border[2]));
+        widgets.hovered.fg_stroke = Stroke::new(1.0, col(a.label[0]));
+        widgets.hovered.expansion = 0.0;
 
-        widgets.active.rounding         = r2;
-        widgets.active.bg_fill          = accent;
-        widgets.active.weak_bg_fill     = subtle;
-        widgets.active.bg_stroke        = Stroke::new(HAIRLINE, accent);
-        widgets.active.fg_stroke        = Stroke::new(HAIRLINE, on_accent);
-        widgets.active.expansion        = 0.0;
+        widgets.active.rounding = r;
+        widgets.active.bg_fill = cola(a.active);
+        widgets.active.weak_bg_fill = cola(a.active);
+        widgets.active.bg_stroke = Stroke::new(HAIRLINE, cola(a.border[3]));
+        widgets.active.fg_stroke = Stroke::new(1.0, col(a.label[0]));
+        widgets.active.expansion = 0.0;
 
-        widgets.open.rounding           = r2;
-        widgets.open.bg_fill            = subtle;
-        widgets.open.weak_bg_fill       = subtle;
-        widgets.open.bg_stroke          = Stroke::new(HAIRLINE, accent);
-        widgets.open.fg_stroke          = Stroke::new(HAIRLINE, accent);
+        widgets.open.rounding = r;
+        widgets.open.bg_fill = cola(a.hover);
+        widgets.open.weak_bg_fill = cola(a.hover);
+        widgets.open.bg_stroke = Stroke::new(HAIRLINE, cola(a.border[2]));
+        widgets.open.fg_stroke = Stroke::new(1.0, col(a.label[0]));
 
-        style.visuals.warn_fg_color  = rgb(palette.warn);
-        style.visuals.error_fg_color = rgb(palette.danger);
+        style.visuals.warn_fg_color = col(a.warn);
+        style.visuals.error_fg_color = col(a.error);
 
         ctx.set_style(style);
     }
@@ -883,6 +1229,9 @@ impl App {
             return;
         }
         self.chat.session_id = id;
+        self.chat.unseen_sessions.remove(&id);
+        self.chat.row_menu = None;
+        self.chat.queued.clear();
         self.chat.turns.clear();
         self.chat.selected_turn = None;
         self.chat.autoscroll_paused = false;
@@ -934,6 +1283,22 @@ impl App {
     fn handle_event(&mut self, ev: UiEvent) {
         match ev {
             UiEvent::Log(s) => self.push_log(LogKind::Info, s),
+            // The BE's own level survives the hop now (§9): a WARN from the
+            // tool-call parser has to be visible without opening Settings,
+            // so it also raises a toast.
+            UiEvent::LogLine { level, message } => {
+                let kind = LogKind::from_level(&level);
+                match kind {
+                    LogKind::Error => {
+                        self.show_toast(crate::ui::icons::Icon::Warning, message.clone(), 6000)
+                    }
+                    LogKind::Warn => {
+                        self.show_toast(crate::ui::icons::Icon::Warning, message.clone(), 3000)
+                    }
+                    _ => {}
+                }
+                self.push_log(kind, message);
+            }
             UiEvent::BeStarted { pid } => {
                 self.be_state.running = true;
                 self.be_state.pid = Some(pid);
@@ -970,6 +1335,9 @@ impl App {
                 );
             }
             UiEvent::IpcConnected => {
+                if self.had_outage {
+                    self.recovered_at = Some(Instant::now());
+                }
                 self.ipc_state.connected = true;
                 self.ipc_state.last_error = None;
                 self.ipc_state.last_heartbeat = Some(Instant::now());
@@ -990,6 +1358,8 @@ impl App {
                 self.send(UiCommand::SendRequest(Request::ListCatalog));
             }
             UiEvent::IpcDisconnected { error } => {
+                self.had_outage = true;
+                self.recovered_at = None;
                 self.ipc_state.connected = false;
                 self.ipc_state.last_error = error.clone();
                 // Reset the LLM auto-connect guard so the next IPC reconnect
@@ -1055,25 +1425,17 @@ impl App {
             }
             UiEvent::TurnStarted { session_id, turn_id } => {
                 self.gen_speed.on_turn_started();
+                self.chat.running_sessions.insert(session_id);
+                self.chat.unseen_sessions.remove(&session_id);
+                if session_id == self.chat.session_id && !self.chat.queued.is_empty() {
+                    self.chat.queued.remove(0);
+                }
                 // A new turn retires the checklist (the projection clears
                 // on turn start; the log keeps the audit).
                 if session_id == self.chat.session_id {
                     self.todos.clear();
                 }
-                self.chat.turns.push(Turn {
-                    session_id,
-                    turn_id,
-                    user: String::new(),
-                    assistant: String::new(),
-                    reasoning: String::new(),
-                    finished: false,
-                    finish_reason: None,
-                    tool_chips: Vec::new(),
-                    reasoning_collapsed: false,
-                    images: Vec::new(),
-                    notice: None,
-            queued: false,
-                });
+                self.chat.turns.push(Turn::new(session_id, turn_id));
                 self.chat.scroll_to_bottom = true;
             }
             UiEvent::AssistantDelta { content, reasoning, .. } => {
@@ -1083,8 +1445,12 @@ impl App {
                 }
                 self.chat.scroll_to_bottom = true;
             }
-            UiEvent::TurnFinished { finish_reason, .. } => {
+            UiEvent::TurnFinished { session_id, finish_reason, .. } => {
                 self.gen_speed.on_turn_finished();
+                self.chat.running_sessions.remove(&session_id);
+                if session_id != self.chat.session_id {
+                    self.chat.unseen_sessions.insert(session_id);
+                }
                 if let Some(t) = self.active_turn_mut() {
                     t.finished = true;
                     t.finish_reason = Some(finish_reason);
@@ -1093,7 +1459,10 @@ impl App {
                 self.chat.interrupt_requested = false;
                 self.chat.scroll_to_bottom = true;
             }
-            UiEvent::TokenUsage { used, limit, budget, .. } => {
+            UiEvent::TokenUsage { used, limit, budget, breakdown, .. } => {
+                if breakdown.is_some() {
+                    self.token_breakdown = breakdown;
+                }
                 self.tokens.used.store(used, Ordering::Relaxed);
                 self.tokens.limit.store(limit, Ordering::Relaxed);
                 self.tokens.budget.store(budget, Ordering::Relaxed);
@@ -1142,27 +1511,66 @@ impl App {
                 if session_id == self.chat.session_id {
                     self.chat.turns.push(Turn::marker(
                         session_id,
-                        Notice { label, detail: summary, ok },
+                        Notice::new(NoticeKind::Compaction, label, summary, ok),
                     ));
                     self.chat.scroll_to_bottom = true;
                 }
             }
-            UiEvent::ToolCallStarted { id, parent_id, depth, name, args_preview, expectation } => {
+            UiEvent::ToolCallStarted {
+                id, parent_id, depth, name, args_preview, expectation, args_json,
+            } => {
                 if let Some(t) = self.active_turn_mut() {
                     t.tool_chips.push(ToolChip {
                         id, parent_id, depth, name,
-                        args_preview, expectation,
+                        args_preview, expectation, args_json,
                         finished: false, ok: true, summary: String::new(),
+                        output: String::new(), duration_ms: 0,
+                        expanded: false,
                     });
                 }
             }
-            UiEvent::ToolCallFinished { id, ok, summary } => {
+            UiEvent::ToolCallFinished { id, ok, summary, output, duration_ms } => {
                 if let Some(t) = self.active_turn_mut() {
                     if let Some(chip) = t.tool_chips.iter_mut().find(|c| c.id == id) {
                         chip.finished = true;
                         chip.ok = ok;
                         chip.summary = summary;
+                        chip.output = output;
+                        chip.duration_ms = duration_ms;
                     }
+                }
+            }
+            UiEvent::LlmRetry { session_id, attempt, max, delay_ms, reason } => {
+                if session_id == self.chat.session_id {
+                    if let Some(t) = self.active_turn_mut() {
+                        t.retries.push(RetryRow {
+                            attempt,
+                            max,
+                            delay_ms,
+                            reason,
+                            at: std::time::Instant::now(),
+                        });
+                    }
+                    self.chat.scroll_to_bottom = true;
+                }
+            }
+            UiEvent::TurnUsage {
+                session_id, prompt, completion, reasoning, duration_ms, ttft_ms, ..
+            } => {
+                // The backend counts one turn where the transcript shows one
+                // row per hop, so the accounting lands on the last row of that
+                // session — the one carrying the final answer, which is where
+                // the tail pills belong.
+                if let Some(t) = self
+                    .chat
+                    .turns
+                    .iter_mut()
+                    .rev()
+                    .find(|t| t.notice.is_none() && t.session_id == session_id)
+                {
+                    t.usage = Some(TurnUsage {
+                        prompt, completion, reasoning, duration_ms, ttft_ms,
+                    });
                 }
             }
             UiEvent::IdealistStatus { activity, severity, last_ticket } => {
@@ -1181,7 +1589,9 @@ impl App {
             }
             UiEvent::SessionList { mut sessions } => {
                 // Newest on top — the list reads most-recent-first.
-                sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+                // Last-updated order (§4.2). A session with no events yet
+                // falls back to its creation time rather than sorting last.
+                sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at.max(s.created_at)));
                 if sessions.is_empty() {
                     // First-run case: ask the BE to mint a session so the user
                     // has something to type into.
@@ -1201,6 +1611,20 @@ impl App {
                     self.chat.sessions = sessions;
                 }
             }
+            UiEvent::ModelsListed { base_url, models, error } => {
+                self.models_pending.remove(&base_url);
+                let entry = match error {
+                    Some(e) => {
+                        self.push_log(LogKind::Error, format!("models: {base_url} — {e}"));
+                        Err(e)
+                    }
+                    None => Ok(models),
+                };
+                self.provider_models.insert(base_url, entry);
+            }
+            UiEvent::SessionSearch { hits } => {
+                self.chat.search_hits = hits;
+            }
             UiEvent::SessionCreated { id } => {
                 if !self.chat.sessions.iter().any(|s| s.id == id) {
                     // Insert at the front — the list is most-recent-first.
@@ -1208,6 +1632,7 @@ impl App {
                         id,
                         title: format!("Session {id}"),
                         created_at: 0,
+                        updated_at: 0,
                     });
                 }
                 self.switch_session(id);
@@ -1268,15 +1693,23 @@ impl App {
                     LogKind::Event,
                     format!("approval requested: {skill} — {reason}"),
                 );
+                self.chat.waiting_sessions.insert(session_id);
                 self.pending_approval = Some(PendingApproval {
                     id, session_id, skill, args_preview, reason,
                 });
             }
             UiEvent::QuestionAsked { id, session_id, question, options } => {
-                self.push_log(LogKind::Event, "question asked — see modal".into());
+                self.push_log(LogKind::Event, "question asked — answer in the composer".into());
+                // `exit-plan-mode` asks its review as an Approve/Refuse
+                // question; the takeover renders it as a plan review.
+                let lowered = question.to_lowercase();
+                let plan_review = options.iter().any(|o| o.eq_ignore_ascii_case("approve"))
+                    && (lowered.contains("plan") || options.len() <= 3);
+                self.chat.waiting_sessions.insert(session_id);
                 self.pending_question = Some(PendingQuestion {
                     id, session_id, question, options,
                     draft: String::new(),
+                    plan_review,
                 });
             }
             UiEvent::TodosChanged { session_id, items } => {
@@ -1366,10 +1799,6 @@ impl App {
     }
 }
 
-pub fn rgb(c: sica_core::theme::Rgb) -> egui::Color32 {
-    egui::Color32::from_rgb(c.0, c.1, c.2)
-}
-
 /// Rebuild a `Vec<Turn>` from a session's persisted message list. Walks the
 /// messages, pairing each user message with the assistant message that
 /// follows it (if any). System messages are skipped — except the
@@ -1390,34 +1819,18 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     turns.push(t);
                 }
                 current = Some(Turn {
-                    session_id: session.id,
-                    turn_id: turns.len() as u64 + 1,
                     user: m.content.clone(),
-                    assistant: String::new(),
-                    reasoning: String::new(),
                     finished: true,
-                    finish_reason: None,
-                    tool_chips: Vec::new(),
                     reasoning_collapsed: true,
                     images: m.images.iter().map(Attachment::from_user_image).collect(),
-                    notice: None,
-            queued: false,
+                    ..Turn::new(session.id, turns.len() as u64 + 1)
                 });
             }
             "assistant" => {
                 let slot = current.get_or_insert_with(|| Turn {
-                    session_id: session.id,
-                    turn_id: turns.len() as u64 + 1,
-                    user: String::new(),
-                    assistant: String::new(),
-                    reasoning: String::new(),
                     finished: true,
-                    finish_reason: None,
-                    tool_chips: Vec::new(),
                     reasoning_collapsed: true,
-                    images: Vec::new(),
-                    notice: None,
-            queued: false,
+                    ..Turn::new(session.id, turns.len() as u64 + 1)
                 });
                 slot.assistant = m.content.clone();
                 if let Some(r) = &m.reasoning {
@@ -1429,17 +1842,29 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                 let Some(slot) = current.as_mut() else { continue };
                 // Synthetic id: no live `ToolCallFinished` will ever look it
                 // up, and chips only need ids to be distinct within a turn.
-                let id = u64::MAX - slot.tool_chips.len() as u64;
+                // The log's `ToolCall` seq is the identity that survives a
+                // restart; fall back to a synthetic id for logs written
+                // before the field existed. Either way ids only need to be
+                // distinct within the turn.
+                let id = m
+                    .tool_call_id
+                    .unwrap_or(u64::MAX - slot.tool_chips.len() as u64);
                 slot.tool_chips.push(ToolChip {
                     id,
-                    parent_id: None,
-                    depth: 0,
+                    parent_id: m.tool_parent_id,
+                    depth: m.tool_depth,
                     name: name.clone(),
                     args_preview: m.tool_args_preview.clone().unwrap_or(name),
                     expectation: m.tool_expectation.clone().unwrap_or_default(),
                     finished: true,
                     ok: m.tool_ok.unwrap_or(true),
+                    // On reload the stored outcome is all there is: the
+                    // pre-summariser output was never durable.
                     summary: m.content.clone(),
+                    output: m.content.clone(),
+                    args_json: m.tool_args_json.clone().unwrap_or_default(),
+                    duration_ms: 0,
+                    expanded: false,
                 });
             }
             "system" if m.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX) => {
@@ -1448,12 +1873,12 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                 }
                 turns.push(Turn::marker(
                     session.id,
-                    Notice {
-                        label: "Context compressed · earlier messages folded into a summary"
-                            .into(),
-                        detail: m.content.clone(),
-                        ok: true,
-                    },
+                    Notice::new(
+                        NoticeKind::Compaction,
+                        "Context compacted",
+                        m.content.clone(),
+                        true,
+                    ),
                 ));
             }
             // Harness-injected context. A `/name` load precedes the user
@@ -1473,11 +1898,12 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     .unwrap_or_default();
                 turns.push(Turn::marker(
                     session.id,
-                    Notice {
-                        label: format!("Loaded /{name} · instructions injected for the next message"),
-                        detail: m.content.clone(),
-                        ok: true,
-                    },
+                    Notice::new(
+                        NoticeKind::Injection,
+                        format!("/{name}"),
+                        m.content.clone(),
+                        true,
+                    ),
                 ));
             }
             _ => {}

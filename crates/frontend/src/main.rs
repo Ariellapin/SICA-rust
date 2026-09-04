@@ -24,6 +24,12 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([720.0, 480.0])
             .with_title("sica-rust")
             .with_icon(std::sync::Arc::new(icon::generate())),
+        // eframe would otherwise push `Visuals::light()/dark()` into the
+        // context whenever the OS theme is read or changes, wiping the token
+        // set `App::apply_visuals` installed. The Appearance preference owns
+        // the theme; `ThemeMode::System` reads the OS preference itself from
+        // `CreationContext::integration_info`.
+        follow_system_theme: false,
         ..Default::default()
     };
 

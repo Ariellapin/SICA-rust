@@ -56,11 +56,37 @@ pub async fn handle(
             chat.delete_session(session_id).await;
             Response::Ok
         }
+        Request::RenameSession { session_id, title } => {
+            if chat.rename_session(session_id, &title).await {
+                Response::Ok
+            } else {
+                Response::Error {
+                    message: format!("session {session_id} could not be renamed"),
+                }
+            }
+        }
+        Request::ForkSession { session_id } => match chat.fork_session(session_id).await {
+            Some(id) => Response::SessionCreated { id },
+            None => Response::Error {
+                message: format!("session {session_id} has no completed turn to fork"),
+            },
+        },
+        Request::ArchiveSession { session_id } => {
+            chat.archive_session(session_id).await;
+            Response::Ok
+        }
+        Request::SearchSessions { query } => Response::SessionSearch {
+            hits: chat.search_sessions(&query).await,
+        },
         Request::ConnectLlm { base_url, model, api_key, options } => {
             // Spawn so the dispatcher can keep handling other requests while
             // the HTTP round-trip completes. State changes flow back via
             // `LlmStateChanged` events.
             chat.spawn_connect_llm(base_url, model, api_key, options);
+            Response::Ok
+        }
+        Request::ListModels { base_url, api_key } => {
+            chat.spawn_list_models(base_url, api_key);
             Response::Ok
         }
         Request::DisconnectLlm => {
