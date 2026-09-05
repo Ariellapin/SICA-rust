@@ -145,6 +145,13 @@ pub enum UiEvent {
         next_seq:   Option<u64>,
     },
     SessionCreated { id: u64 },
+    /// The whole workspace projection (§4.3) — from `Response::Workspaces`
+    /// or the event the backend pushes after every mutation. Both carry the
+    /// same shape, so the sidebar has one place to reconcile.
+    WorkspacesChanged {
+        rows:      Vec<protocol::WorkspaceDump>,
+        ungrouped: Vec<u64>,
+    },
     SessionLoaded { session: SessionDump },
     SessionTitleChanged { session_id: u64, title: String },
     /// Outcome text of a harness `RunCommand` (`/compact` …).
@@ -328,10 +335,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
     let ui_ev = match ev {
         Event::Heartbeat { .. } => UiEvent::Heartbeat,
         Event::Progress { .. } => return,
-        // The workspace projection (harness guide §3.9) has no surface
-        // yet — the sidebar grouping that consumes it is UI guide §4.3.
-        // Dropped rather than queued so it cannot pile up unread.
-        Event::WorkspacesChanged { .. } => return,
+        Event::WorkspacesChanged { rows, ungrouped } => {
+            UiEvent::WorkspacesChanged { rows, ungrouped }
+        }
         Event::LogLine { level, message } => UiEvent::LogLine { level, message },
         Event::LlmStateChanged { state } => UiEvent::LlmStateChanged(state),
         Event::TurnStarted { session_id, turn_id } => {

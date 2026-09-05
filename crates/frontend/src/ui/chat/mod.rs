@@ -89,18 +89,13 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(32.0);
-                // Workspace crumb — one root, so it is the first crumb and
-                // its tooltip is the full path (click copies it).
-                let ws = crumb(ui, &app.workspace_name, false, &t);
-                if ws
-                    .on_hover_text(
-                        sica_core::paths::working_dir()
-                            .display()
-                            .to_string(),
-                    )
-                    .clicked()
-                {
-                    let path = sica_core::paths::working_dir().display().to_string();
+                // Workspace crumb: the *session's* workspace (§4.3), which
+                // is the folder it actually runs in — not whatever the app
+                // defaults to now. Tooltip is the full path; click copies it.
+                let (ws_name, ws_path) = app.session_workspace();
+                let ws = crumb(ui, &ws_name, false, &t);
+                let path = ws_path.display().to_string();
+                if ws.on_hover_text(&path).clicked() {
                     ui.ctx().output_mut(|o| o.copied_text = path);
                 }
                 kit::label(
@@ -409,22 +404,100 @@ fn hero_view(app: &mut App, ui: &mut egui::Ui, disabled: bool, content_w: f32) {
                 );
             });
             ui.add_space(10.0);
-            // Workspace chip — one root, so it names it rather than picking.
+            // Workspace chip — names the session's workspace, and opens the
+            // picker (§4.3). Picking one starts a session there rather than
+            // moving this one: a session's folder is stamped into its header
+            // when it is created and never changes after (harness §3.9).
+            let (ws_name, ws_path) = app.session_workspace();
             let resp = kit::tinted_pill(
                 ui,
-                &app.workspace_name,
+                &ws_name,
                 kit::col(t.alias.tip),
                 kit::col(t.alias.label[1]),
                 12.0,
             );
-            let path = sica_core::paths::working_dir().display().to_string();
-            if resp.on_hover_text(&path).clicked() {
-                ui.ctx().output_mut(|o| o.copied_text = path);
+            let chip = resp.rect;
+            if resp
+                .on_hover_text(format!("{}\nSwitch workspace", ws_path.display()))
+                .clicked()
+            {
+                app.workspaces.hero_menu = Some(chip);
             }
+            hero_picker(app, ui);
             ui.add_space(18.0);
         });
         composer::draw(app, ui, disabled);
     });
+}
+
+/// The hero chip's workspace menu (§4.3): every registered workspace, the
+/// session's own checked, then **Add workspace…**.
+///
+/// Picking one opens a *new* session in it. The empty session the user is
+/// looking at has never been flushed — a session reaches disk with its first
+/// message — so nothing is lost by leaving it behind, and this is the only
+/// honest reading of the pick: a session cannot change the folder its header
+/// names.
+fn hero_picker(app: &mut App, ui: &mut egui::Ui) {
+    let Some(rect) = app.workspaces.hero_menu else { return };
+    let current = app.workspaces.of_session(app.chat.session_id);
+    let mut items: Vec<kit::MenuItem> = app
+        .workspaces
+        .rows
+        .iter()
+        .map(|w| {
+            kit::MenuItem::new(w.title.clone())
+                .detail(w.path.display().to_string())
+                .checked(Some(w.id) == current)
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(kit::MenuItem::new("No workspaces yet").detail("Add one to group your sessions"));
+    }
+    items.push(kit::MenuItem::new("Add workspace…").sep_above(true));
+
+    let mut open = true;
+    let picked = kit::menu(
+        ui.ctx(),
+        egui::Id::new("hero_ws_menu"),
+        rect,
+        kit::MenuSide::Above,
+        260.0,
+        &items,
+        &mut open,
+    );
+    let last = items.len() - 1;
+    match picked {
+        Some(i) if i == last => {
+            app.workspaces.hero_menu = None;
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_directory(sica_core::paths::working_dir())
+                .pick_folder()
+            {
+                let path = dir.display().to_string();
+                app.workspaces.creating = Some(path.clone());
+                app.send(UiCommand::SendRequest(protocol::Request::CreateWorkspace {
+                    path,
+                    title: None,
+                }));
+            }
+        }
+        Some(i) => {
+            app.workspaces.hero_menu = None;
+            if let Some(w) = app.workspaces.rows.get(i) {
+                let (id, missing) = (w.id, w.missing);
+                if Some(id) != current && !missing {
+                    app.send(UiCommand::SendRequest(protocol::Request::NewSession {
+                        workspace_id: Some(id),
+                    }));
+                }
+            }
+        }
+        None => {}
+    }
+    if !open {
+        app.workspaces.hero_menu = None;
+    }
 }
 
 fn draw_no_be(app: &mut App, ui: &mut egui::Ui) {

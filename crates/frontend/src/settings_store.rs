@@ -56,6 +56,16 @@ pub struct Settings {
     /// offers them so switching between projects is one click.
     #[serde(default)]
     pub recent_working_dirs:    Vec<String>,
+    /// Sidebar grouping (§4.3): `workspace` groups sessions under the
+    /// directory they work in, `flat` is the one list this app had before
+    /// workspaces existed. Only the grouping is a preference — the order
+    /// inside a workspace is the backend's, because it is durable there.
+    #[serde(default = "default_sidebar_group")]
+    pub sidebar_group:          String,
+}
+
+fn default_sidebar_group() -> String {
+    "workspace".into()
 }
 
 impl Default for Settings {
@@ -79,6 +89,7 @@ impl Default for Settings {
             default_permission_mode: default_permission_mode(),
             working_dir:            None,
             recent_working_dirs:    Vec::new(),
+            sidebar_group:          default_sidebar_group(),
         }
     }
 }

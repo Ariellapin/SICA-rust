@@ -429,9 +429,12 @@ document, a corrupt one, and archived sessions vanishing from every surface.
 `smoke` walks the wire path end to end: create → new session in it →
 `ListWorkspaces` shows it → delete → it is Ungrouped and still loads.
 
-**The UI is UI guide §4.3 and has not landed.** Until it does the FE sends
-`workspace_id: None` and drops `Event::WorkspacesChanged`, so the registry is
-reachable over the wire and exercised by `smoke`, but invisible in the app.
+**The UI is UI guide §4.3**, which has since landed: the sidebar groups by
+workspace, Add workspace goes through `rfd`, and a session created in a
+group takes its directory. Building it added one backend rule — the
+projection is republished on *every* change to the session set, not only on
+an explicit attach, because membership follows the header and a session
+created with no workspace id can still join one.
 
 ---
 

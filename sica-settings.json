@@ -16,5 +16,6 @@
   "last_active_provider": "vllm",
   "default_permission_mode": "danger-full-access",
   "working_dir": null,
-  "recent_working_dirs": []
+  "recent_working_dirs": [],
+  "sidebar_group": "workspace"
 }

@@ -166,6 +166,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                         through_seq,
                                     });
                                 }
+                                Response::Workspaces { rows, ungrouped } => {
+                                    bridge.send(UiEvent::WorkspacesChanged { rows, ungrouped });
+                                }
                                 Response::Error { message } => {
                                     bridge.send(UiEvent::RequestFailed { message });
                                 }

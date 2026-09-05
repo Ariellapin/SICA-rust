@@ -191,6 +191,9 @@ pub struct App {
     pub build_state: BuildState,
     pub auto_watch:  bool,
 
+    /// Sidebar workspaces (§4.3).
+    pub workspaces: WorkspacesUi,
+
     pub request_draft: RequestDraft,
     pub release_profile: bool,
     pub autoscroll: bool,
@@ -688,6 +691,72 @@ impl RequestDraft {
     }
 }
 
+/// Sidebar workspace state (§4.3): the backend's projection plus the
+/// fold/menu bookkeeping that is nobody's business but this app's.
+///
+/// Membership, order and titles all belong to the backend — it owns the
+/// registry — so nothing here is ever edited locally and re-sent. What lives
+/// here is what the user is *looking at*: which groups are open, which menu
+/// is up, which row is armed for delete.
+#[derive(Default)]
+pub struct WorkspacesUi {
+    pub rows:      Vec<protocol::WorkspaceDump>,
+    pub ungrouped: Vec<u64>,
+    /// Group by workspace, or one flat list. Persisted (`sidebar_group`).
+    pub grouped:   bool,
+    /// Groups the user has folded shut. Absent = open, so a workspace that
+    /// appears while the app runs opens rather than hides.
+    pub collapsed: std::collections::HashSet<u64>,
+    /// Groups showing every session instead of the first five.
+    pub show_all:  std::collections::HashSet<u64>,
+    pub menu:      Option<(u64, egui::Rect)>,
+    pub view_menu: Option<egui::Rect>,
+    /// The hero chip's picker (§4.3): anchored to the chip, opened by it.
+    pub hero_menu: Option<egui::Rect>,
+    pub renaming:  Option<u64>,
+    pub rename_draft: String,
+    /// Armed for delete — the same two-step the session rows use.
+    pub pending_delete: Option<u64>,
+    /// Folder handed to `CreateWorkspace`, held until the answer arrives so
+    /// a refusal can name the folder the user actually picked.
+    pub creating:  Option<String>,
+    /// A refused `CreateWorkspace`, shown as "Couldn't open folder".
+    pub error:     Option<String>,
+}
+
+impl App {
+    /// Name and folder of the workspace the **active session** belongs to.
+    ///
+    /// A session that belongs to none — every session written before §3.9,
+    /// and any whose directory is not registered — answers with the app-wide
+    /// folder, which is where it actually runs. This is what the header
+    /// crumb and the hero chip name: the session's own place, not the
+    /// process default they used to show.
+    pub fn session_workspace(&self) -> (String, std::path::PathBuf) {
+        let id = self.chat.session_id;
+        if let Some(w) = self
+            .workspaces
+            .of_session(id)
+            .and_then(|wid| self.workspaces.rows.iter().find(|w| w.id == wid))
+        {
+            return (w.title.clone(), w.path.clone());
+        }
+        (self.workspace_name.clone(), sica_core::paths::working_dir())
+    }
+}
+
+impl WorkspacesUi {
+    /// The workspace a session belongs to, if any. Read from the projection
+    /// rather than from the session, because the projection is what already
+    /// applied the header rule.
+    pub fn of_session(&self, session_id: u64) -> Option<u64> {
+        self.rows
+            .iter()
+            .find(|w| w.sessions.contains(&session_id))
+            .map(|w| w.id)
+    }
+}
+
 #[derive(Default)]
 pub struct ChatState {
     pub session_id:    u64,
@@ -1129,6 +1198,11 @@ impl App {
             llm_state: LlmUiState::default(),
             build_state: BuildState::default(),
             auto_watch: settings.auto_watch,
+            workspaces: WorkspacesUi {
+                grouped: settings.sidebar_group != "flat",
+                ..Default::default()
+            },
+
             request_draft: RequestDraft::default(),
             release_profile: settings.release_profile,
             autoscroll: settings.autoscroll,
@@ -1287,6 +1361,11 @@ impl App {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            sidebar_group:          if self.workspaces.grouped {
+                "workspace".into()
+            } else {
+                "flat".into()
+            },
         }
     }
 
@@ -1730,6 +1809,9 @@ impl App {
                 // Pull the session list so the sidebar can populate. If the
                 // BE has none yet, the SessionList handler will create one.
                 self.send(UiCommand::SendRequest(Request::ListSessions));
+                // The workspace projection (§4.3). Pulled once per connect;
+                // every later change arrives as `WorkspacesChanged`.
+                self.send(UiCommand::SendRequest(Request::ListWorkspaces));
                 // Refresh the "/" palette: skills and markdown files are read
                 // by the BE at startup, so a reconnect is exactly when the
                 // catalogue can have changed.
@@ -1838,7 +1920,32 @@ impl App {
                     t.user_seq = Some(seq);
                 }
             }
+            UiEvent::WorkspacesChanged { rows, ungrouped } => {
+                // A folder the user just added: open a session in it, which
+                // is the whole reason they added it. Matched by path — the
+                // id is the backend's to mint, and registering a directory
+                // that was already known answers with the row it already had.
+                let created = self.workspaces.creating.take().and_then(|path| {
+                    rows.iter()
+                        .find(|w| w.path.display().to_string() == path)
+                        .map(|w| w.id)
+                });
+                self.workspaces.rows = rows;
+                self.workspaces.ungrouped = ungrouped;
+                if let Some(id) = created {
+                    self.workspaces.collapsed.remove(&id);
+                    self.send(UiCommand::SendRequest(Request::NewSession {
+                        workspace_id: Some(id),
+                    }));
+                }
+            }
             UiEvent::RequestFailed { message } => {
+                // A refused `CreateWorkspace` is the one failure with its own
+                // surface: the folder cannot be adopted, and the user has to
+                // pick another one.
+                if self.workspaces.creating.take().is_some() {
+                    self.workspaces.error = Some(message.clone());
+                }
                 self.show_toast(crate::ui::icons::Icon::Warning, message.clone(), 6000);
                 self.push_log(LogKind::Error, message);
                 // An edit truncated the transcript before the backend had

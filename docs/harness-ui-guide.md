@@ -719,7 +719,7 @@ the logs).
 The sidebar header row ("Sessions", search icon, `+`) uses h=36, `label[2]`;
 the 24 px bottom fade is a gradient rect painted over the scroll area.
 
-### 4.3 Workspaces — grouping, the picker, and "Add workspace" (**M**, on harness §3.9)
+### 4.3 Workspaces — grouping, the picker, and "Add workspace" — **done** (UI-8, on harness §3.9)
 
 **dsh** (`ui-workspace`, `ui-directory-picker-{native,browse}`):
 
@@ -812,6 +812,73 @@ names the folder and copies its path.
   none is selected — dsh's provisional "New Session" row under the group.
 - Not ported: drag reorder (Move up / down covers it) and browser-local
   session orders (one order, host-durable).
+
+**What shipped.**
+
+`App.workspaces: WorkspacesUi` holds the backend's projection plus the fold
+and menu bookkeeping; nothing about membership, order or titles is edited
+locally, because the registry is the backend's. `ListWorkspaces` goes out
+once per IPC connect and `Event::WorkspacesChanged` carries every later
+change — both land on the same `UiEvent`, so there is one reconciliation
+path.
+
+The header label reads **Workspaces** or **Sessions**, and the grouping only
+appears once a workspace exists: an app that has never registered one still
+shows the flat list it always did, rather than a single "Ungrouped" heading
+that explains nothing. Beside the search icon sit **View options** (Group by
+workspace · One flat list · Add workspace…, the choice persisted as
+`sidebar_group`) and **Add workspace**.
+
+A group row is 34 px: chevron, folder, title, and a trailing count that
+hover swaps for the `+` and `⋯` circles — the same trade a session row makes
+with its timestamp. A workspace whose folder is gone paints its title and
+icon in `warn`, says so in the hover card, and its `+` is dimmed and
+refuses. Groups fold at five sessions behind "Show {n} more sessions" /
+"Show less", **except that the active session is never folded away** — a
+fold that hides the selection reads as the session having vanished.
+Ungrouped is the last group and has no actions of its own.
+
+The `⋯` menu is New session here · Rename workspace (inline, like a session
+rename) · Copy path · Move up / Move down · Add workspace… · Remove
+workspace, the last one arming the same two-step Delete/Keep row the session
+rows use, with dsh's retention sentence as its tooltip. **Add workspace** is
+`rfd::FileDialog::pick_folder` → `CreateWorkspace`; the answer is a
+`WorkspacesChanged` carrying the new row, and the FE then opens a session in
+it — which is what the user pressed the button for. A refused folder becomes
+the **"Couldn't open folder"** modal with the host's own reason and **Choose
+again**. The sidebar's own New session button creates in the *active
+session's* workspace, or Ungrouped when it has none.
+
+One backend change fell out of building this: `ChatHub` now republishes the
+projection on **every** change to the session set — create, delete, archive,
+fork — not only when a workspace is explicitly attached. Membership follows
+the directory in a session's header, so a session created with no workspace
+id still joins the workspace whose path it names, and the first version of
+this missed exactly that: a new session appeared in no group until the next
+mutation.
+
+**Left for later.**
+
+- **Order by (Manual · Last updated)** is not offered. The order inside a
+  workspace is the backend's manual one and the flat list is last-updated;
+  a per-mode toggle needs somewhere durable to keep the choice per
+  workspace, which the registry does not have.
+- **The hover card does not copy on click** — an egui tooltip cannot take
+  one. The path is in the card and **Copy path** is in the `⋯` menu.
+- **The hero picker and the header crumb are in**, with one deliberate
+  difference from dsh. dsh stages the pick for a session that does not exist
+  yet; here the session is already open, and its folder is stamped into its
+  header when it is created and never changes after (harness §3.9). So
+  picking a workspace from the chip **starts a session there** rather than
+  moving the current one — which costs nothing, because the empty session
+  being looked at has never been flushed. The chip and the crumb both name
+  `App::session_workspace()`: the session's own workspace, or the app-wide
+  folder for an Ungrouped one.
+- **Settings › General** still says "Working directory" and still restarts
+  the backend. Renaming it to "Default folder for ungrouped sessions" *and*
+  dropping the restart needs a request that sets it on a live backend;
+  protocol v26 has none, and `SICA_WORKING_DIR` is read from the child's
+  environment at spawn.
 
 ---
 
@@ -1530,7 +1597,7 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
-| **UI-8 Workspaces, onboarding, integrations** ⏳ | Workspace grouping in the sidebar, the hero picker and Add workspace over `rfd` (§4.3) · the session's workspace as the header crumb (§8) · the first-run onboarding modal and "key missing" badges (§7.3) · Settings › Agents and Settings › Integrations (§7.2) · the attachment rail with file cards and the lightbox (§5.3) · markdown extras — math fallback, images, scrolling tables, file links (§3.8) · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
+| **UI-8 Workspaces, onboarding, integrations** ⏳ *(§4.3 done)* | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · the first-run onboarding modal and "key missing" badges (§7.3) · Settings › Agents and Settings › Integrations (§7.2) · the attachment rail with file cards and the lightbox (§5.3) · markdown extras — math fallback, images, scrolling tables, file links (§3.8) · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the

@@ -1300,10 +1300,12 @@ impl ChatHub {
         let s = SessionLog::new_in(id, default_title(id), Some(cwd));
         self.sessions.lock().await.insert(id, s);
         if let Some(w) = workspace_id {
-            if self.workspaces.attach(w, id) {
-                self.publish_workspaces().await;
-            }
+            self.workspaces.attach(w, id);
         }
+        // Even without a workspace id the new session may have joined one —
+        // membership follows the directory in its header, and the process
+        // default is very often a registered folder. Republish either way.
+        self.publish_workspaces().await;
         self.run_session_start_hooks(id).await;
         id
     }
@@ -1354,6 +1356,7 @@ impl ChatHub {
             self.jobs.clear(id);
             self.goals.lock().await.remove(&id);
             self.goal_armed.lock().await.remove(&id);
+            self.publish_workspaces().await;
         }
         removed
     }
@@ -1397,6 +1400,8 @@ impl ChatHub {
             warn!(error = %e, session_id = new_id, "flush session (fork) failed");
         }
         g.insert(new_id, forked);
+        drop(g);
+        self.publish_workspaces().await;
         Some(new_id)
     }
 
@@ -1412,6 +1417,10 @@ impl ChatHub {
         if let Err(e) = sessions_store::flush(log) {
             warn!(error = %e, session_id = id, "flush session (archive) failed");
         }
+        drop(g);
+        // An archived session leaves every grouping surface, so the sidebar
+        // has to be told even though nothing about the registry changed.
+        self.publish_workspaces().await;
         true
     }
 
