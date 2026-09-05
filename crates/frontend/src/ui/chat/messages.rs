@@ -75,6 +75,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if output.content_size.y > output.inner_rect.height() && !app.settings_open {
         back_to_bottom(app, ui, visible_viewport(ui, &output));
     }
+    // A "Run again" is applied here, after every reader of `turns` has run:
+    // `edit_user_message` truncates the vector, and both the loop above and
+    // the selection `transcript_input` just set index into it.
+    if let Some((idx, text)) = app.chat.pending_edit.take() {
+        app.edit_user_message(idx, text);
+    }
 }
 
 fn draw_turn(
@@ -358,8 +364,9 @@ fn draw_user_editor(app: &mut App, ui: &mut egui::Ui, i: usize, t: &Theme) {
         return;
     }
     if run || submit {
-        let text = app.chat.edit_draft.clone();
-        app.edit_user_message(i, text);
+        // Deferred, not applied: the transcript loop is iterating `turns`
+        // and this rewrites it. `draw` picks it up once the loop is done.
+        app.chat.pending_edit = Some((i, app.chat.edit_draft.clone()));
     }
     ui.add_space(8.0);
 }

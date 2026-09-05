@@ -864,6 +864,13 @@ pub struct ChatState {
     /// wrong message.
     pub editing_turn: Option<usize>,
     pub edit_draft: String,
+    /// A "Run again" the transcript has accepted but not yet applied. The
+    /// editor lives inside the loop over `turns`, and applying the edit
+    /// there truncates the vector the loop is indexing — which is how
+    /// rewriting any prompt but the last one panicked on the next row.
+    /// The loop records the request; `messages::draw` applies it after the
+    /// last row has been drawn.
+    pub pending_edit: Option<(usize, String)>,
     /// Screen rect the composer card occupied last frame. The `/` and `@`
     /// menus float 4 px above it (§6.3), and they are drawn *before* it —
     /// they have to claim the navigation keys before the text field sees
