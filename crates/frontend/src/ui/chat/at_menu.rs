@@ -369,7 +369,7 @@ fn read_keys(ui: &mut egui::Ui) -> Keys {
         Keys {
             down:    i.consume_key(none, egui::Key::ArrowDown),
             up:      i.consume_key(none, egui::Key::ArrowUp),
-            accept:  i.consume_key(none, egui::Key::Enter)
+            accept:  super::consume_enter(i, false)
                 | i.consume_key(none, egui::Key::Tab),
             dismiss: i.consume_key(none, egui::Key::Escape),
         }
@@ -531,7 +531,7 @@ fn draw_placeholder(app: &mut App, ui: &mut egui::Ui, indexing: bool, query: &st
     let t = app.theme;
     let dismiss = ui.input_mut(|i| {
         let none = egui::Modifiers::NONE;
-        let _ = i.consume_key(none, egui::Key::Enter) | i.consume_key(none, egui::Key::Tab);
+        let _ = super::consume_enter(i, false) | i.consume_key(none, egui::Key::Tab);
         i.consume_key(none, egui::Key::Escape)
     });
     if dismiss {

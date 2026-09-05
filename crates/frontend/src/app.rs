@@ -1894,6 +1894,9 @@ impl App {
             }
             UiEvent::TurnStarted { session_id, turn_id } => {
                 self.gen_speed.on_turn_started();
+                // The backend opens a turn per *hop*; only the first one of a
+                // request meets the bubble the composer pushed on send.
+                let first_hop = !self.chat.running_sessions.contains(&session_id);
                 self.chat.running_sessions.insert(session_id);
                 self.chat.unseen_sessions.remove(&session_id);
                 // A new turn retires the checklist (the projection clears
@@ -1906,7 +1909,26 @@ impl App {
                 if session_id == self.chat.session_id {
                     self.chat.editing_turn = None;
                 }
-                self.chat.turns.push(Turn::new(session_id, turn_id));
+                // That bubble is a real, unfinished turn already — adopting it
+                // instead of opening a second row is what keeps it from
+                // sitting there unfinished (and shimmering "Working…") long
+                // after the request ended.
+                let adopt = first_hop
+                    && self.chat.turns.last().is_some_and(|t| {
+                        t.notice.is_none()
+                            && !t.finished
+                            && t.session_id == session_id
+                            && t.assistant.is_empty()
+                            && t.reasoning.is_empty()
+                            && t.tool_chips.is_empty()
+                    });
+                match self.chat.turns.last_mut() {
+                    Some(t) if adopt => {
+                        t.turn_id = turn_id;
+                        t.queued = false;
+                    }
+                    _ => self.chat.turns.push(Turn::new(session_id, turn_id)),
+                }
                 self.chat.scroll_to_bottom = true;
             }
             // The prompt that just landed is the *oldest* one this session
@@ -1976,7 +1998,9 @@ impl App {
             }
             UiEvent::TurnFinished { session_id, finish_reason, .. } => {
                 self.gen_speed.on_turn_finished();
-                self.chat.running_sessions.remove(&session_id);
+                // `running_sessions` is *not* cleared here: this is the end of
+                // one hop, and the request goes on through the tool it just
+                // asked for. `TurnUsage` closes the request.
                 if session_id != self.chat.session_id {
                     self.chat.unseen_sessions.insert(session_id);
                 }
@@ -2091,6 +2115,14 @@ impl App {
             UiEvent::TurnUsage {
                 session_id, prompt, completion, reasoning, duration_ms, ttft_ms, ..
             } => {
+                // One `TurnUsage` per *request* — so this, not the last hop's
+                // `TurnFinished`, is where the session stops being busy. Stop
+                // pressed between two hops ends the request without a further
+                // `TurnFinished`, so the stopping flag is cleared here too.
+                self.chat.running_sessions.remove(&session_id);
+                if session_id == self.chat.session_id {
+                    self.chat.interrupt_requested = false;
+                }
                 // The backend counts one turn where the transcript shows one
                 // row per hop, so the accounting lands on the last row of that
                 // session — the one carrying the final answer, which is where

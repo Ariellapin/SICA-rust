@@ -30,6 +30,7 @@ use crate::hooks;
 use crate::inbox::{Inbound, Inbox};
 use crate::sessions_store::{self, SessionLog};
 use crate::title_gen;
+use crate::verdict;
 
 /// Hard cap on tool hops within one user message. Stops a model from
 /// ping-ponging skill calls forever when it cannot decide a final answer.
@@ -117,6 +118,11 @@ pub struct ChatHub {
     /// backend restart must never resume an autonomous loop on its own, so
     /// a restored active goal waits for `/goal continue`.
     pub goal_armed:    Arc<Mutex<HashSet<u64>>>,
+    /// Continuation turns the completion check has opened per session,
+    /// since that session's last human message (`backend::verdict`).
+    /// Process-local for the same reason `goal_armed` is: a restart must
+    /// not resume a continuation the person never saw.
+    pub auto_cont:     Arc<Mutex<HashMap<u64, u8>>>,
     pub next_goal_id:  Arc<AtomicU64>,
     /// User hooks from `.sica/hooks.json` (guide §13.1). Read once at
     /// startup: a hooks file that could change under a running turn
@@ -148,6 +154,8 @@ struct ControlState {
     /// Sessions whose goal is *armed*. Process-local by design (§12.3) —
     /// see `ControlState::armed`.
     arm_set:      Arc<Mutex<HashSet<u64>>>,
+    /// See [`ChatHub::auto_cont`].
+    auto_cont:    Arc<Mutex<HashMap<u64, u8>>>,
     next_goal:    Arc<AtomicU64>,
     /// User hooks, so a dispatch can put `HooksPolicy` in the pipeline.
     hooks:        Arc<hooks::HookConfig>,
@@ -297,6 +305,22 @@ impl ControlState {
     /// restart and waits for a human to say continue.
     async fn armed(&self, session_id: u64) -> bool {
         self.arm_set.lock().await.contains(&session_id)
+    }
+
+    /// Continuation turns already opened for the human message the current
+    /// turn descends from.
+    async fn auto_continues(&self, session_id: u64) -> u8 {
+        self.auto_cont.lock().await.get(&session_id).copied().unwrap_or(0)
+    }
+
+    /// Count one continuation, returning its 1-based attempt number. Bumped
+    /// *before* the turn runs, so a continuation that crashes still costs an
+    /// attempt — the same reasoning that records a goal round up front.
+    async fn bump_auto_continue(&self, session_id: u64) -> u8 {
+        let mut g = self.auto_cont.lock().await;
+        let n = g.entry(session_id).or_insert(0);
+        *n = n.saturating_add(1);
+        *n
     }
 
     async fn set_armed(&self, session_id: u64, on: bool) {
@@ -953,6 +977,7 @@ impl ChatHub {
             jobs:         Arc::new(agents::JobRegistry::new()),
             goals:        Arc::new(Mutex::new(HashMap::new())),
             goal_armed:   Arc::new(Mutex::new(HashSet::new())),
+            auto_cont:    Arc::new(Mutex::new(HashMap::new())),
             next_goal_id: Arc::new(AtomicU64::new(1)),
             hooks:        Arc::new(hooks::HookConfig::default()),
             workspaces:   Arc::new(crate::workspaces::Registry::load(
@@ -1072,6 +1097,7 @@ impl ChatHub {
             brokers:      self.brokers.clone(),
             goals:        self.goals.clone(),
             arm_set:      self.goal_armed.clone(),
+            auto_cont:    self.auto_cont.clone(),
             next_goal:    self.next_goal_id.clone(),
             hooks:        self.hooks.clone(),
             // Harness commands are the user acting directly; a turn task
@@ -2431,6 +2457,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 warn!(error = %e, session_id, "flush session (after user msg) failed");
             }
         }
+        // A person asking for something is a fresh mandate: the completion
+        // check gets its full allowance of continuations again. Reset here
+        // rather than at turn end so a human message arriving *between* two
+        // continuations also clears what they had spent.
+        if source.is_human() {
+            self.auto_cont.lock().await.remove(&session_id);
+        }
         // The agent a typed `/name` picked, now that the log exists and any
         // rewind has been recorded ahead of it. A refusal never costs the
         // user their message: it is logged, and the turn goes out under
@@ -3110,6 +3143,76 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 ttft_ms:     turn_ttft_ms,
             });
 
+            // The completion check (`crate::verdict`): a turn the harness
+            // cut short says nothing about whether the person got what they
+            // asked for, so ask before going idle. `finish` is already
+            // "interrupted" when the user pressed Stop, and that is not an
+            // abnormal stop — Stop has answered the question. A `done` turn
+            // is not checked either, so ordinary conversation costs what it
+            // always did.
+            let mut auto_continue: Option<String> = None;
+            if verdict::abnormal(finish) {
+                let (objective, digest) = {
+                    let g = sessions_map.lock().await;
+                    match g.get(&session_id) {
+                        Some(log) => (
+                            verdict::objective(&log.events, outer_turn),
+                            verdict::digest(&log.events, outer_turn),
+                        ),
+                        None => (String::new(), String::new()),
+                    }
+                };
+                // No human turn behind this one means nothing to check
+                // against; the verdict would be auditing the machine's own
+                // prompt. `check` returning `None` (no connection, timeout,
+                // unparseable reply) lands here too and ends the turn as it
+                // would have ended anyway.
+                let v = if objective.is_empty() {
+                    None
+                } else {
+                    verdict::check(&client, &objective, finish, &digest).await
+                };
+                if let Some(v) = v {
+                    append_event(&sessions_map, session_id, EventKind::TurnVerdict {
+                        turn_id:   outer_turn,
+                        reached:   v.reached,
+                        reason:    v.reason.clone(),
+                        next_step: v.next_step.clone(),
+                    })
+                    .await;
+                    let spent = control.auto_continues(session_id).await;
+                    let budget_left = spent < verdict::MAX_AUTO_CONTINUES;
+                    let (level, message) = if v.reached {
+                        ("INFO", format!(
+                            "turn {outer_turn} stopped ({finish}) but the request was met — {}",
+                            v.reason
+                        ))
+                    } else if budget_left {
+                        ("WARN", format!(
+                            "turn {outer_turn} stopped ({finish}) with the request \
+                             unfinished — {} · continuing automatically",
+                            v.reason
+                        ))
+                    } else {
+                        ("WARN", format!(
+                            "turn {outer_turn} stopped ({finish}) with the request \
+                             unfinished — {} · {spent} of {} auto-continues spent, \
+                             say `continue` to resume",
+                            v.reason,
+                            verdict::MAX_AUTO_CONTINUES
+                        ))
+                    };
+                    event_sink.emit(Event::LogLine { level: level.into(), message });
+                    if !v.reached && budget_left {
+                        // Counted before the turn runs: a continuation that
+                        // crashes must still cost an attempt, or a request
+                        // that crashes every time would loop.
+                        let attempt = control.bump_auto_continue(session_id).await;
+                        auto_continue = Some(verdict::continue_prompt(&v, finish, attempt));
+                    }
+                }
+            }
+
             // What happens next, decided under the session's slot lock so
             // the slot is never released for a turn that is about to start
             // anyway — a send arriving in that gap would otherwise race the
@@ -3119,6 +3222,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
             // The person is here now; the objective can wait a turn.
             enum Next {
                 Followup(String, Vec<UserImage>),
+                AutoContinue(String),
                 GoalRound(Goal),
                 Idle,
             }
@@ -3139,6 +3243,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     // explicit and durable until they say continue.
                     control.set_armed(session_id, false).await;
                     Next::Idle
+                } else if let Some(prompt) = auto_continue.take() {
+                    // Above a goal round, below a queued message. The
+                    // person waiting wins; the objective can wait a turn,
+                    // but finishing the request it interrupted cannot —
+                    // a round opened here would leave the cut-short work
+                    // unfinished *and* burn a round.
+                    Next::AutoContinue(prompt)
                 } else {
                     match control.goal(session_id).await {
                         Some(goal)
@@ -3172,6 +3283,19 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         next_text,
                         next_images,
                         TurnSource::Followup,
+                    ));
+                }
+                // Completion check (`crate::verdict`): the previous turn was
+                // cut short with the request unfinished, so reopen it with
+                // what the check said is missing. Machine authority — the
+                // goal skills' check must not read this as the person
+                // speaking, which is what `TurnSource::AutoContinue` says.
+                Next::AutoContinue(prompt) => {
+                    tokio::spawn(hub.start_boxed(
+                        session_id,
+                        prompt,
+                        Vec::new(),
+                        TurnSource::AutoContinue,
                     ));
                 }
                 // Round driver (§12.3): with an active, armed goal and
@@ -4479,6 +4603,7 @@ mod tests {
             brokers: Arc::new(BrokerSet::new()),
             goals: Arc::new(Mutex::new(HashMap::new())),
             arm_set: Arc::new(Mutex::new(HashSet::new())),
+            auto_cont: Arc::new(Mutex::new(HashMap::new())),
             next_goal: Arc::new(AtomicU64::new(1)),
             turn_source: source,
             hooks: Arc::new(crate::hooks::HookConfig::default()),

@@ -650,7 +650,8 @@ fn read_submit_keys(ui: &mut egui::Ui, active: bool) -> SubmitKeys {
         return SubmitKeys::default();
     }
     ui.input_mut(|i| SubmitKeys {
-        submit: i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+        // Shift+Enter is the newline and must reach the editor untouched.
+        submit: super::consume_enter(i, false),
         accelerated: i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
             || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter),
     })
@@ -768,8 +769,20 @@ fn send_message(app: &mut App, steer: bool) {
     }));
 }
 
+/// Is the agent still working on the active session's request?
+///
+/// The backend opens one `TurnStarted`/`TurnFinished` pair *per LLM hop*, so
+/// the last row's `finished` flag goes true between hops while the tool it
+/// asked for is still running. `running_sessions` spans the whole request
+/// (it clears on `TurnUsage`), and the trailing unfinished row covers the
+/// gap between the optimistic send and the first hop.
 pub fn last_turn_in_flight(app: &App) -> bool {
-    app.chat.turns.last().map(|t| !t.finished).unwrap_or(false)
+    app.chat.running_sessions.contains(&app.chat.session_id)
+        || app
+            .chat
+            .turns
+            .last()
+            .is_some_and(|t| t.notice.is_none() && !t.finished)
 }
 
 /// Visual rows `text` occupies when wrapped at `width`; a trailing newline

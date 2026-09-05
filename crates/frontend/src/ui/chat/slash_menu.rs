@@ -326,7 +326,7 @@ fn read_keys(ui: &mut egui::Ui) -> Keys {
         Keys {
             down:    i.consume_key(none, egui::Key::ArrowDown),
             up:      i.consume_key(none, egui::Key::ArrowUp),
-            accept:  i.consume_key(none, egui::Key::Enter)
+            accept:  super::consume_enter(i, false)
                 | i.consume_key(none, egui::Key::Tab),
             dismiss: i.consume_key(none, egui::Key::Escape),
         }
@@ -491,7 +491,7 @@ fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
     // so a typo can't leak through to the composer as a sent message.
     let dismiss = ui.input_mut(|i| {
         let none = egui::Modifiers::NONE;
-        let _ = i.consume_key(none, egui::Key::Enter) | i.consume_key(none, egui::Key::Tab);
+        let _ = super::consume_enter(i, false) | i.consume_key(none, egui::Key::Tab);
         i.consume_key(none, egui::Key::Escape)
     });
     if dismiss {

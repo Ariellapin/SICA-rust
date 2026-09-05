@@ -25,6 +25,11 @@
 //! and returns the first one that looks like a tool call. The skill name is
 //! the first whitespace-separated token and must look like `[a-z][a-z0-9-]*`
 //! — known-skill validation happens later, in the dispatcher.
+//!
+//! A quoted argument may also run past its line break, for the models that
+//! write a `write-file` body with real newlines rather than the `\n` escape
+//! above. See [`parse_multiline`] for the shape and the guard that keeps it
+//! from swallowing prose.
 
 // `Eq` is not derived because `serde_json::Value` only implements `PartialEq`
 // (`f64` inside `Value::Number` rules out total equality).
@@ -66,13 +71,25 @@ pub fn extract_known(text: &str, is_known: impl Fn(&str) -> bool) -> Option<Tool
     if let Some(tc) = extract_json_fence(text) {
         return Some(tc);
     }
-    for line in text.lines() {
+    let mut offset = 0usize;
+    for line in text.split('\n') {
         let trimmed = strip_fence_indent(line);
         if let Some(tc) = parse_line(trimmed) {
             if is_known(&tc.skill) {
                 return Some(tc);
             }
+        } else if !trimmed.is_empty() {
+            // The one-line parse failed. When the line opens a quote it never
+            // closes, the argument body continues on the lines below, so
+            // retry from this line's start over the rest of the text.
+            let indent = line.len() - line.trim_start().len();
+            if let Some(tc) = parse_multiline(&text[offset + indent..]) {
+                if is_known(&tc.skill) {
+                    return Some(tc);
+                }
+            }
         }
+        offset += line.len() + 1;
     }
     None
 }
@@ -244,6 +261,61 @@ fn parse_line(line: &str) -> Option<ToolCall> {
         expectation: expectation.trim().to_string(),
         args_json: None,
     })
+}
+
+/// Parse a call whose quoted argument runs across several physical lines.
+///
+/// The contract asks the model to escape a body as `\n`, but a `write-file`
+/// of any real size comes back with literal newlines instead — the call then
+/// fails [`parse_line`], is dropped, and the model, never seeing a result,
+/// retries the same unparseable text turn after turn (`sessions/79.jsonl`).
+/// Accepting the shape is cheaper than fighting it.
+///
+/// Only attempted when the first line leaves a quote open, which is what
+/// separates a wrapped argument body from prose that merely happens to start
+/// with a skill name. The expectation still ends at its own line break.
+fn parse_multiline(text: &str) -> Option<ToolCall> {
+    let (skill, rest) = take_skill_name(text)?;
+    let rest = rest.trim_start();
+    if !quote_open_at_eol(rest) {
+        return None;
+    }
+    let (args_part, expectation) = split_on_expectation(rest)?;
+    let raw_args = tokenize_args(args_part)?;
+    Some(ToolCall {
+        skill,
+        raw_args,
+        expectation: expectation.lines().next().unwrap_or("").trim().to_string(),
+        args_json: None,
+    })
+}
+
+/// True when the first physical line of `s` opens a quote it never closes.
+fn quote_open_at_eol(s: &str) -> bool {
+    let line = s.split('\n').next().unwrap_or("");
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        match quote {
+            // Inside a quote a backslash escapes the next byte, so a line
+            // ending in an escaped quote does not read as closed.
+            Some(q) => {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                } else if bytes[i] == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote = Some(bytes[i]);
+                }
+            }
+        }
+        i += 1;
+    }
+    quote.is_some()
 }
 
 /// Pull off a leading `[a-z][a-z0-9-]*` identifier followed by whitespace.
@@ -454,6 +526,59 @@ mod tests {
         // up to the ` > ` becomes one positional value.
         let tc = extract("run-cli echo hi > does echo work").unwrap();
         assert_eq!(tc.raw_args, vec!["echo hi".to_string()]);
+    }
+
+    #[test]
+    fn accepts_multiline_quoted_body() {
+        // The shape `sessions/79.jsonl` died on three turns running: a
+        // well-formed call whose body carries real newlines instead of `\n`.
+        let s = "I'll create the file.\n\n\
+                 write-file 'a/b.txt' 'line one\nline two\nline three\n' \
+                 > confirm bytes written\n";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.skill, "write-file");
+        assert_eq!(
+            tc.raw_args,
+            vec!["a/b.txt".to_string(), "line one\nline two\nline three\n".to_string()]
+        );
+        assert_eq!(tc.expectation, "confirm bytes written");
+    }
+
+    #[test]
+    fn multiline_expectation_stops_at_its_line_break() {
+        // Trailing prose after the call must not be swallowed into the
+        // expectation the sub-agent is briefed with.
+        let s = "write-file 'a.txt' 'x\ny' > confirm the write\n\nI'll verify it next.";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.expectation, "confirm the write");
+    }
+
+    #[test]
+    fn multiline_body_keeps_inner_gt_out_of_the_split() {
+        // A wildcard body is full of `<random: … >`; none of them is the
+        // expectation separator because they sit inside the quotes.
+        let s = "write-file 'w.txt' 'Maya, <random: a || b >, 85mm lens\nNia, <random: c || d >, 85mm lens\n' > confirm first blocks written";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.expectation, "confirm first blocks written");
+        assert!(tc.raw_args[1].contains("<random: a || b >"));
+        assert!(tc.raw_args[1].contains("85mm lens\nNia"));
+    }
+
+    #[test]
+    fn multiline_never_fires_without_an_open_quote() {
+        // Prose starting with a skill name and a *closed* quote must not glue
+        // itself to the ` > ` on a later line. Without the open-quote guard
+        // this parses as `write-file` with the prose as its body.
+        let s = "write-file 'a.txt' is what you want.\nrun-cli 'x' > y";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.skill, "run-cli", "must match the real call, not the prose");
+        assert_eq!(tc.raw_args, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn unterminated_multiline_body_is_still_rejected() {
+        // A quote that never closes anywhere is not a recoverable call.
+        assert!(extract("write-file 'a.txt' 'body starts\nand never ends").is_none());
     }
 
     #[test]

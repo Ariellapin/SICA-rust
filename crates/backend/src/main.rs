@@ -25,6 +25,7 @@ mod parent_watch;
 mod sessions_store;
 mod title_gen;
 mod trajectory;
+mod verdict;
 mod workspaces;
 
 use be_core::BeState;

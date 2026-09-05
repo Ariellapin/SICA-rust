@@ -28,6 +28,36 @@ use crate::ui::icons::{self, Icon};
 use crate::ui::kit::{self, Weight};
 use crate::ui::{centered_column, content_width};
 
+/// Consume one `Enter` key press whose Shift state matches `shift`, and
+/// report whether there was one.
+///
+/// `InputState::consume_key(Modifiers::NONE, …)` matches *logically*, which
+/// by egui's own definition ignores an extra Shift or Alt — so a plain-Enter
+/// consumer swallows Shift+Enter too, and the newline binding (§5.1) never
+/// sees it. This matches the modifiers exactly and leaves every other Enter
+/// in the queue.
+pub(crate) fn consume_enter(i: &mut egui::InputState, shift: bool) -> bool {
+    let mut hit = false;
+    i.events.retain(|e| {
+        let is_match = matches!(
+            e,
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.shift == shift
+                && !modifiers.ctrl
+                && !modifiers.command
+                && !modifiers.mac_cmd
+                && !modifiers.alt
+        );
+        hit |= is_match;
+        !is_match
+    });
+    hit
+}
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if !app.ipc_state.connected {
         draw_no_be(app, ui);

@@ -171,9 +171,9 @@ fn draw_turn(
         }
     }
 
-    if !finished {
+    if !finished && is_tail_turn(app, i) {
         turn_status(app, ui, i, t);
-    } else {
+    } else if finished {
         match finish_reason.as_deref() {
             Some(r) if r.starts_with("error") => turn_error(ui, t),
             Some("interrupted") => stopped_tag(ui, t),
@@ -417,6 +417,15 @@ fn draw_assistant(
         ui.style_mut().visuals.extreme_bg_color = kit::col(t.alias.code_block);
         CommonMarkViewer::new(format!("assistant_md_{turn_idx}")).show(ui, cache, text);
     });
+}
+
+/// Is `i` the last non-marker row — the one the loop is working on?
+///
+/// Only that row carries the status line. An older unfinished row (a bubble
+/// the backend opened its own turn for instead of claiming) would otherwise
+/// shimmer "Working…" for the rest of the session.
+fn is_tail_turn(app: &App, i: usize) -> bool {
+    app.chat.turns.iter().rposition(|t| t.notice.is_none()) == Some(i)
 }
 
 /// The live tail of a running turn: dsh's shimmering status line, plus a

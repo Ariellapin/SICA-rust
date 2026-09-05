@@ -209,6 +209,17 @@ fn describe(kind: &EventKind) -> Described {
             format!("turn {turn_id} ended · {finish_reason} · {hops} hop(s)"),
         )
         .ok(finish_reason != "error"),
+        // Not-reached is the row worth finding in a long ledger, so it is
+        // the one marked failed — the check itself succeeded either way.
+        EventKind::TurnVerdict { turn_id, reached, reason, next_step } => row(
+            EventTag::Turn,
+            format!(
+                "turn {turn_id} check · {} · {reason}",
+                if *reached { "goal reached" } else { "GOAL NOT REACHED" }
+            ),
+        )
+        .ok(*reached)
+        .result(next_step.clone().unwrap_or_default()),
         EventKind::UserMessage { content, images, .. } => {
             let text = if images.is_empty() {
                 one_line(content)

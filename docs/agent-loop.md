@@ -194,8 +194,53 @@ Four rules bound it, and each answers a specific way autonomy goes wrong:
 
 The round is recorded *before* it runs, so an objective that crashes every
 time still exhausts its budget. At turn end the continuation — queued
-followup, goal round, or idle — is decided under one `active_turns` lock;
-a queued human message wins, because the person is here now.
+followup, auto-continue, goal round, or idle — is decided under one
+`active_turns` lock; a queued human message wins, because the person is
+here now.
+
+## The completion check (stopping is not finishing)
+
+A turn can end for reasons that say nothing about whether the work is
+done: `hop-limit`, `max_tokens`, `error`. Those stops used to be silent —
+the session went idle mid-task and the person had to notice, guess why,
+and type "continue".
+
+So `backend::verdict` gives every **abnormal** stop one tool-less LLM
+round-trip. It is shown the human objective
+(`verdict::objective` — the last user message that opened a turn with
+human authority, so a continuation turn is audited against the original
+request rather than against the prompt the harness wrote for it) and a
+digest of the turn's tool *calls* and their outcomes (`verdict::digest`;
+results are omitted — the judge needs to know lines 65-70 were read, not
+what was on them). It answers `{ reached, reason, next_step }`, recorded
+as `EventKind::TurnVerdict` and surfaced as a `LogLine`.
+
+When `reached` is false and budget remains, the harness opens one more
+turn carrying `verdict::continue_prompt` under
+`TurnSource::AutoContinue`. Five rules bound it:
+
+- **Abnormal stops only.** A `done` turn is never checked, so ordinary
+  conversation costs exactly what it did before.
+- **Never after an interrupt.** `finish` is already `interrupted` when the
+  user pressed Stop, and that is not abnormal — Stop has answered the
+  question this check asks, the same reasoning that disarms the goal
+  driver there.
+- **`MAX_AUTO_CONTINUES = 2` per human message**, counted *before* the
+  continuation runs so one that crashes still costs an attempt, and reset
+  only by a human message — never by a continuation.
+- **Machine authority.** `TurnSource::AutoContinue` is not `is_human()`,
+  so a continuation cannot create, pause or resume a goal.
+- **The check never fails a turn.** No connection, a timeout, an
+  unparseable reply, or a `reached` the model would not state plainly all
+  return `None`, and the turn ends exactly as it would have. Defaulting
+  `reached` either way is worse than not checking: `true` hides
+  unfinished work, `false` auto-continues finished work.
+
+Ordering matters at the continuation point: a queued human message beats
+an auto-continue, which beats a goal round. The person waiting wins; but
+finishing the request a limit interrupted comes before starting a fresh
+objective round, which would otherwise leave the cut-short work undone
+*and* spend a round.
 
 ## model-eval (measuring the prompt configuration)
 

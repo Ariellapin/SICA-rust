@@ -90,6 +90,21 @@ pub enum EventKind {
         source: TurnSource,
     },
     TurnEnd { turn_id: u64, finish_reason: String, hops: u8 },
+    /// The completion check's reading of a turn that stopped abnormally
+    /// (`backend::verdict`). Durable, because the interesting case is the
+    /// one nobody acted on: a `reached: false` that ran out of
+    /// auto-continues must still be on the record when the log is reopened.
+    ///
+    /// Deliberately *not* a surface event. The model learns what is left
+    /// through the continuation turn's prompt, so a verdict on a session
+    /// that then goes idle never becomes unattributed context.
+    TurnVerdict {
+        turn_id: u64,
+        reached: bool,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_step: Option<String>,
+    },
     UserMessage {
         surface: SurfaceOp,
         content: String,
@@ -305,6 +320,10 @@ pub enum TurnSource {
     /// A user message that had been queued behind a running turn. Still a
     /// human's words, but it did not arrive at the moment it ran.
     Followup,
+    /// The completion check reopened the turn: the previous one stopped
+    /// abnormally with the request unfinished. Machine authority, like a
+    /// goal round — a turn that opened itself may not claim a human's say.
+    AutoContinue,
 }
 
 impl TurnSource {
@@ -313,6 +332,7 @@ impl TurnSource {
             TurnSource::Human => "human",
             TurnSource::GoalRound => "goal round",
             TurnSource::Followup => "followup",
+            TurnSource::AutoContinue => "auto-continue",
         }
     }
 
