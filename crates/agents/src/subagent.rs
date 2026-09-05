@@ -110,6 +110,15 @@ pub trait RunNotifier: Send + Sync {
     fn edge(&self, session_id: u64, edge: RunEdge);
 }
 
+/// Run ids are per process and monotonic, and **shared by every kind of
+/// orchestrator**: a `workflow` and an `agent-team` in one session must not
+/// be able to mint the same id, or their rows would fold into one tree.
+static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_run_id() -> u64 {
+    NEXT_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 pub struct ToolSubAgent {
     pub depth:         u8,
@@ -186,6 +195,33 @@ impl ToolSubAgent {
             cwd:          None,
             log_seq:      None,
         }
+    }
+
+    /// Report one edge of an orchestrated run (§6.11): the run starting, a
+    /// member starting, a member ending, or the run ending.
+    ///
+    /// Silently does nothing without a notifier or a session — a run
+    /// outside a session (a test, an eval) has no log to be durable in, and
+    /// that is not a failure. `member` is `(id, label)`; the id is what lets
+    /// an end find its own start when two members share a label.
+    pub fn run_edge(
+        &self,
+        run_id: u64,
+        phase: Option<&str>,
+        member: Option<(u64, &str)>,
+        state: sica_core::event::RunState,
+    ) {
+        let (Some(runs), Some(session_id)) = (self.runs.as_ref(), self.session_id) else {
+            return;
+        };
+        runs.edge(session_id, RunEdge {
+            run_id,
+            call_seq: self.log_seq.unwrap_or(0),
+            phase: phase.filter(|p| !p.is_empty()).map(str::to_string),
+            member: member.map(|(_, l)| l.to_string()),
+            member_id: member.map(|(id, _)| id),
+            state,
+        });
     }
 
     /// Attach the sink that makes an orchestrated run durable (§6.11).

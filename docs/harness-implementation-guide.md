@@ -1601,6 +1601,11 @@ peer mailbox and a shared task DAG. S: log teammate reports as
 `ToolResult { parent_seq }` so the board is reconstructable; `send_message`/
 `interrupt_agent` need continuable children (§12.4) first.
 
+
+Since protocol v27 a team also writes the durable `WorkflowRun` rows
+(§12.5, UI guide §6.11): its **rounds are the phases** and each teammate
+is a member of the round it ran in, so a finished team rebuilds as a tree
+rather than a chip and a wall of log lines.
 ### 12.8 `dsh-schedule` — after/at/fixed-rate reminders over the log
 
 **Implement (S, optional).** `EventKind::Schedule { id, fire_at, prompt }` +

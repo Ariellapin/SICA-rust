@@ -31,6 +31,7 @@ use crate::registry::SkillRegistry;
 use crate::runner;
 use crate::skill::{Skill, SkillContext, SkillOutcome};
 use crate::subagent::ToolSubAgent;
+use sica_core::event::RunState;
 
 pub const AGENT_TEAM_NAME: &str = "agent-team";
 
@@ -199,6 +200,13 @@ fn citation_id(raw: &str) -> String {
         .unwrap_or("")
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
         .to_string()
+}
+
+/// A member's id within the run: unique across rounds, so a round-2 row
+/// cannot close a round-1 member, and derived rather than counted so the
+/// same teammate keeps a recognisable identity.
+fn member_id(round: u8, index: usize) -> u64 {
+    round as u64 * 1_000 + index as u64
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -384,10 +392,17 @@ impl Skill for AgentTeam {
         let mut trails: Vec<Vec<runner::CallRecord>> =
             vec![Vec::new(); spec.teammates.len()];
 
+        // The run opens before the first round (§6.11). A team's rounds are
+        // its phases — they are stages of one run, which is what a phase is
+        // — and each teammate is a member of the round it ran in.
+        let run_id = crate::subagent::next_run_id();
+        ctx.sub.run_edge(run_id, None, None, RunState::Started);
+
         for round in 1..=spec.rounds {
             if runner::is_cancelled(&cancel) {
                 break;
             }
+            let phase = format!("round {round}");
             if round > 1 {
                 let board = render_board(round - 1, &spec.teammates, &reports);
                 for t in transcripts.iter_mut() {
@@ -428,8 +443,30 @@ impl Skill for AgentTeam {
                     )
                 })
                 .collect();
+            // Every member of this round opens before any of them runs:
+            // they are concurrent, and a reader watching the tree should see
+            // the whole round light up at once rather than in completion
+            // order.
+            for (i, mate) in spec.teammates.iter().enumerate() {
+                ctx.sub.run_edge(
+                    run_id,
+                    Some(&phase),
+                    Some((member_id(round, i), &mate.role)),
+                    RunState::Started,
+                );
+            }
             let results = join_all(round_futs).await;
-            for (slot, res) in reports.iter_mut().zip(results) {
+            for (i, (slot, res)) in reports.iter_mut().zip(results).enumerate() {
+                let role = spec.teammates[i].role.as_str();
+                // A round that produced nothing is a failed member; the
+                // previous round's report stands, which is why the *run* can
+                // still succeed with a failed member in it.
+                ctx.sub.run_edge(
+                    run_id,
+                    Some(&phase),
+                    Some((member_id(round, i), role)),
+                    if res.is_some() { RunState::Done } else { RunState::Failed },
+                );
                 // A failed refinement round keeps the previous round's report.
                 if let Some(r) = res {
                     *slot = Some(r);
@@ -448,15 +485,20 @@ impl Skill for AgentTeam {
         }
 
         if runner::is_cancelled(&cancel) {
+            // The run is left **open**: an interrupted run is visible
+            // because its terminal row is missing, which is the whole
+            // reason there are four rows rather than one summary (§6.11).
             return fail("agent-team interrupted".into());
         }
         if reports.iter().all(Option::is_none) {
+            ctx.sub.run_edge(run_id, None, None, RunState::Failed);
             return fail(
                 "agent-team: no teammate produced a report (every LLM call \
                  failed or returned nothing)"
                     .into(),
             );
         }
+        ctx.sub.run_edge(run_id, None, None, RunState::Done);
 
         // Lead synthesis merges the reports; pointless for a team of one.
         let synthesis = if spec.teammates.len() > 1 {
@@ -813,6 +855,23 @@ fn fail(msg: String) -> SkillOutcome {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A round-2 row must not be able to close a round-1 member: the ids
+    /// are what an end matches its start by, and a team runs the same
+    /// roles again every round (§6.11).
+    #[test]
+    fn member_ids_are_unique_across_rounds() {
+        let mut seen = std::collections::HashSet::new();
+        for round in 1..=4u8 {
+            for index in 0..8usize {
+                assert!(seen.insert(member_id(round, index)), "collision at {round}/{index}");
+            }
+        }
+        // Same teammate, different round: different member.
+        assert_ne!(member_id(1, 0), member_id(2, 0));
+        // Same round, different teammate: different member.
+        assert_ne!(member_id(1, 0), member_id(1, 1));
+    }
 
     fn ctx() -> SkillContext {
         struct NullSink;

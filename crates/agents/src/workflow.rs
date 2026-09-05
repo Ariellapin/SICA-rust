@@ -50,7 +50,7 @@ use crate::registry::SkillRegistry;
 use crate::runner::{self, RunSpec};
 use crate::script::{self, throw};
 use crate::skill::{Skill, SkillContext, SkillOutcome};
-use crate::subagent::{RunEdge, ToolSubAgent};
+use crate::subagent::ToolSubAgent;
 
 pub const WORKFLOW_NAME: &str = "workflow";
 
@@ -160,26 +160,14 @@ impl Deps {
     /// no notifier or no session — a workflow run outside a session (a test,
     /// an eval) has no log to be durable in, and that is not a failure.
     fn edge(&self, member: Option<&Member>, state: RunState) {
-        let (Some(runs), Some(session_id)) = (self.sub.runs.as_ref(), self.sub.session_id) else {
-            return;
-        };
-        runs.edge(session_id, RunEdge {
-            run_id:    self.run_id,
-            call_seq:  self.sub.log_seq.unwrap_or(0),
-            phase:     member
-                .map(|m| m.phase.clone())
-                .filter(|p| !p.is_empty()),
-            member:    member.map(|m| m.label.clone()),
-            member_id: member.map(|m| m.id),
+        self.sub.run_edge(
+            self.run_id,
+            member.map(|m| m.phase.as_str()),
+            member.map(|m| (m.id, m.label.as_str())),
             state,
-        });
+        );
     }
 }
-
-/// Run ids are per process and monotonic: two runs in one session must not
-/// collide, and a reader comparing two logs should not see the same id mean
-/// two things within a run of the app.
-static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Script-lifetime bookkeeping. Single-threaded by construction (one script,
 /// one blocking thread), hence `Cell`/`RefCell`.
@@ -314,7 +302,7 @@ impl Skill for Workflow {
             cancel: ctx.sub.cancel.clone(),
             sub: ctx.sub,
             handle: Handle::current(),
-            run_id: NEXT_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            run_id: crate::subagent::next_run_id(),
         };
         // The run opens before the script does. If the turn is interrupted
         // from here on, this row stands alone — which is what makes an

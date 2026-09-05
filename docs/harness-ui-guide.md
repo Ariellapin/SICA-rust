@@ -1426,9 +1426,17 @@ so a completed run collapses to a line and a broken one does not make the
 reader go looking. A run whose rows stop while it still says *running*, with
 nothing running under it, reads as **interrupted**.
 
+**`agent-team` reports the same edges**, and its rounds are its phases —
+they are stages of one run, which is what a phase is. Every member of a
+round opens before any of them runs, because they are concurrent and the
+tree should light up at once rather than in completion order; a round that
+produced nothing is a failed member, while the run can still succeed,
+since the previous round's report stands. An interrupted team leaves its
+run open, exactly as a workflow does.
+
 The phase list from the interim is still there and still useful: it is what
-`agent-team` shows, since only `workflow` is instrumented, and it is what a
-run shows before its first member starts.
+a run shows before its first member starts, and what a `ralph` run — which
+has no members to report — shows throughout.
 
 ### 6.12 `@session` references — **done** (UI-8)
 
