@@ -18,6 +18,7 @@ mod settings;
 mod sidebar;
 
 pub use onboarding::wanted as onboarding_wanted;
+pub use settings::open_path as open_path_public;
 
 use egui::{Rect, Vec2};
 use sica_core::theme::tokens::{

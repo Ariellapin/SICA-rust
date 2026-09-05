@@ -157,8 +157,11 @@ fn draw_turn(
 
     if !assistant.is_empty() {
         ui.add_space(8.0);
+        // Image targets resolve against the session's folder, not the
+        // process's (§3.8).
+        let cwd = app.session_workspace().1;
         let body = ui
-            .scope(|ui| draw_assistant(ui, &mut app.md_cache, i, &assistant, t))
+            .scope(|ui| draw_assistant(ui, &mut app.md_cache, i, &assistant, t, &cwd))
             .response
             .rect;
         assistant_rects.push((i, body));
@@ -405,6 +408,7 @@ fn draw_assistant(
     turn_idx: usize,
     text: &str,
     t: &Theme,
+    cwd: &std::path::Path,
 ) {
     // egui_commonmark resolves `**bold**`, headings and bullets through
     // `strong_text_color()` (which reads `widgets.active.fg_stroke.color`) —
@@ -423,6 +427,8 @@ fn draw_assistant(
             match block {
                 super::md_blocks::Block::Prose(body) => {
                     let body = super::md_blocks::inline_math_to_code(&body);
+                    let body = super::md_blocks::rewrite_image_uris(&body, cwd);
+                    let body = super::md_blocks::linkify_file_paths(&body, cwd);
                     CommonMarkViewer::new(id).show(ui, cache, &body);
                 }
                 super::md_blocks::Block::Math(src) => {

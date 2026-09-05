@@ -348,8 +348,19 @@ pub fn runtime_context_text(vars: &BTreeMap<String, String>) -> String {
     if let Some(plan) = vars.get("plan") {
         out.push_str(&format!("\n- Plan mode: {plan}"));
     }
+    out.push_str(OUTPUT_NAMING);
     out
 }
+
+/// dsh's file-naming line. It exists so a reader can *get to* what the turn
+/// produced: the frontend turns inline code that names a real file under the
+/// working directory into a link (UI guide §3.8), and it can only do that
+/// for paths the model actually writes down.
+pub const OUTPUT_NAMING: &str = concat!(
+    "\n- When you create or change files, name the primary ones in your ",
+    "final answer as inline code with the exact path you used, so they ",
+    "can be opened from the answer.",
+);
 
 #[cfg(test)]
 mod tests {

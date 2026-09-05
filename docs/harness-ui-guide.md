@@ -630,7 +630,7 @@ sessions". The composer is *not* remounted between hero and active phases.
 **Port (S):** `draw_empty` → the hero described in §2.2; the placeholder
 swaps per phase (§5).
 
-### 3.8 Markdown extras — math, images, wide tables, file links — **math and tables done**
+### 3.8 Markdown extras — math, images, wide tables, file links — **done** (UI-8)
 
 **dsh** (`ui-renderer` and the markdown pipeline behind §3.2): **math** —
 inline `$…$` and `\(…\)`, display `$$…$$` and `\[…\]` typeset with KaTeX,
@@ -690,9 +690,33 @@ a half-typeset formula is worse than none, because CommonMark's `_` and `*`
 rules turn `x_1` into italics and the reader cannot recover what was
 written. The source, legible and copyable, is the honest fallback.
 
-Still to do here: **images** (needs `egui_extras`' loaders and the §4.3
-cwd fence on local paths) and **file links** (needs the runtime-context
-line in `agents::prompt` as well as the viewer half).
+**Images and file links, as shipped.** `egui_commonmark`'s `load-images`
+feature turns the loaders on; the work is the fence. Left alone, a bare
+`![x](a.png)` becomes `file://a.png` resolved against **the process's**
+directory — wherever the app was launched from — which is never what the
+model meant, since it writes paths relative to the folder it works in. So
+`rewrite_image_uris` resolves local targets under the session's `cwd`
+(§4.3), and **refuses anything that climbs out**: prose is not a
+capability, and an assistant writing `![](../../secrets.png)` must not
+thereby get the app to open it. A refused target is left visible as inline
+code rather than silently not appearing.
+
+File links are the same fence pointed the other way. `linkify_file_paths`
+turns inline code into a link **only** when it names a file that is really
+there and really inside `cwd`, and it declines anything that does not look
+like a path at all (a space, no dot, a leading dash) — guessing wrong turns
+ordinary prose into a wall of links. The click is intercepted in
+`App::take_file_link` *before* the platform sees it, because the platform
+would hand a local file to the browser: a plain click opens it the way the
+OS would, and a modified click (egui reports it as "new tab") puts
+`@path` in the composer instead — reading it versus bringing it into the
+next message.
+
+The prompt half is `prompt::OUTPUT_NAMING`, one runtime-context line asking
+the model to name what it produced as inline code with the exact path. It
+costs **~40 tokens per request**, which is what re-blessed all five replay
+recordings; that diff — the line and the token count, and nothing else —
+is what a prompt change should look like.
 
 ---
 
@@ -1692,7 +1716,7 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
-| **UI-8 Workspaces, onboarding, integrations** ⏳ *(§4.3 done)* | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · the attachment rail with file cards and the lightbox (§5.3) · markdown extras — ~~math fallback and scrolling tables~~, images, file links (§3.8) · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
+| **UI-8 Workspaces, onboarding, integrations** ⏳ *(§4.3 done)* | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · the attachment rail with file cards and the lightbox (§5.3) · ~~markdown extras (§3.8)~~ · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the

@@ -238,6 +238,189 @@ fn find_seq(chars: &[char], from: usize, a: char, b: char) -> Option<usize> {
         .find(|&k| chars[k] == a && chars[k + 1] == b)
 }
 
+/// Resolve the image targets in a message against the session's working
+/// directory, and refuse the ones that reach outside it.
+///
+/// `egui_commonmark` turns a bare `![x](a.png)` into `file://a.png`, which
+/// resolves against **the process's** current directory — wherever the app
+/// happened to be launched from. That is never what the model meant: it
+/// writes paths relative to the folder it is working in (§4.3). So local
+/// targets are rewritten to an absolute `file://` URI under `cwd`.
+///
+/// A target that escapes `cwd` is **not** rewritten into something that
+/// loads. The model's prose is not a capability: an assistant that writes
+/// `![](../../../secrets.png)` must not thereby get the app to open it. Such
+/// a target is left visible as inline code, so the reader can see exactly
+/// what was asked for rather than watching an image silently not appear.
+/// `http://` and `https://` are left alone — a remote image is the model
+/// quoting the web, and the loader treats it as remote either way.
+pub fn rewrite_image_uris(text: &str, cwd: &std::path::Path) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fenced = false;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if fence_marker(trimmed).is_some() {
+            fenced = !fenced;
+            out.push_str(line);
+            continue;
+        }
+        if fenced {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&rewrite_line(line, cwd));
+    }
+    out
+}
+
+fn rewrite_line(line: &str, cwd: &std::path::Path) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find("![") {
+        let (before, from) = rest.split_at(open);
+        out.push_str(before);
+        let Some(alt_end) = from.find("](") else {
+            out.push_str(from);
+            return out;
+        };
+        let Some(close) = from[alt_end..].find(')').map(|k| k + alt_end) else {
+            out.push_str(from);
+            return out;
+        };
+        let alt = &from[2..alt_end];
+        let target = from[alt_end + 2..close].trim();
+        out.push_str(&rewritten(alt, target, cwd));
+        rest = &from[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn rewritten(alt: &str, target: &str, cwd: &std::path::Path) -> String {
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return format!("![{alt}]({target})");
+    }
+    let raw = target.strip_prefix("file://").unwrap_or(target);
+    // Windows `file:///C:/x` keeps a leading slash the path parser does not
+    // want.
+    let raw = raw.strip_prefix('/').filter(|r| r.chars().nth(1) == Some(':')).unwrap_or(raw);
+    match resolve_under(cwd, raw) {
+        Some(path) => format!("![{alt}](file://{})", path.display().to_string().replace('\\', "/")),
+        None => {
+            // Refused, and said so: the alt text plus the path as written.
+            if alt.is_empty() {
+                format!("`{target}`")
+            } else {
+                format!("{alt} (`{target}`)")
+            }
+        }
+    }
+}
+
+/// Join `rel` onto `root` without letting it climb out. Lexical, like the
+/// backend's own `resolve` (harness §6.6): a path is refused for what it
+/// says, not for what the filesystem would make of it.
+fn resolve_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path};
+    let candidate = Path::new(rel);
+    if candidate.is_absolute() {
+        return candidate.starts_with(root).then(|| candidate.to_path_buf());
+    }
+    let mut depth: i32 = 0;
+    for c in candidate.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            // A rooted-but-driveless `\foo` or a fresh prefix is not a
+            // relative path at all.
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(root.join(candidate))
+}
+
+/// Turn inline code that names a real file under `cwd` into a link.
+///
+/// The model is asked to name what it produced as inline code with the
+/// exact path (harness §5.1); this is the half that makes that useful. The
+/// same fence as images applies, and for the same reason: prose is not a
+/// capability, so only a path that stays inside the session's folder — and
+/// that actually exists — becomes something the app will open. Everything
+/// else stays exactly as the model wrote it.
+pub fn linkify_file_paths(text: &str, cwd: &std::path::Path) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fenced = false;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if fence_marker(trimmed).is_some() {
+            fenced = !fenced;
+            out.push_str(line);
+            continue;
+        }
+        if fenced {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&linkify_line(line, cwd));
+    }
+    out
+}
+
+fn linkify_line(line: &str, cwd: &std::path::Path) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let (before, from) = rest.split_at(open);
+        out.push_str(before);
+        let Some(close) = from[1..].find('`').map(|k| k + 1) else {
+            out.push_str(from);
+            return out;
+        };
+        let body = &from[1..close];
+        // An image or link target that already has the code in it must not
+        // be wrapped again.
+        let already_linked = before.ends_with('[') || before.ends_with('(');
+        match (already_linked, file_link(body, cwd)) {
+            (false, Some(uri)) => out.push_str(&format!("[`{body}`]({uri})")),
+            _ => out.push_str(&from[..=close]),
+        }
+        rest = &from[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The `file://` URI for an inline-code span, when it names a file that is
+/// really there and really inside `cwd`.
+fn file_link(body: &str, cwd: &std::path::Path) -> Option<String> {
+    let candidate = body.trim();
+    // A command line, a symbol, a sentence — none of these are paths, and
+    // guessing wrong turns ordinary prose into a wall of links.
+    if candidate.is_empty()
+        || candidate.contains(char::is_whitespace)
+        || !candidate.contains('.')
+        || candidate.starts_with('-')
+    {
+        return None;
+    }
+    let path = resolve_under(cwd, candidate)?;
+    path.is_file()
+        .then(|| format!("file://{}", path.display().to_string().replace('\\', "/")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +502,97 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `/proj` is not an absolute path on Windows — it is rooted but
+    /// driveless, which is one of the shapes §3.9 refuses — so the fixture
+    /// is a real absolute path on whichever platform is running.
+    fn root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn uri(path: &std::path::Path) -> String {
+        format!("file://{}", path.display().to_string().replace('\\', "/"))
+    }
+
+    #[test]
+    fn a_local_image_resolves_against_the_session_folder() {
+        let cwd = root();
+        let out = rewrite_image_uris("see ![chart](out/chart.png) here", &cwd);
+        assert_eq!(out, format!("see ![chart]({}) here", uri(&cwd.join("out/chart.png"))));
+        // Already absolute and inside: kept.
+        let inside = cwd.join("a.png");
+        let abs = rewrite_image_uris(&format!("![x]({})", inside.display()), &cwd);
+        assert_eq!(abs, format!("![x]({})", uri(&inside)));
+        // Remote is left exactly as written.
+        let remote = "![logo](https://example.com/a.png)";
+        assert_eq!(rewrite_image_uris(remote, &cwd), remote);
+    }
+
+    /// Prose is not a capability: a path that climbs out of the session's
+    /// folder must not become something the app will open.
+    #[test]
+    fn an_image_reaching_outside_the_folder_is_refused_visibly() {
+        let cwd = root();
+        let out = rewrite_image_uris("![secret](../../etc/shadow.png)", &cwd);
+        assert_eq!(out, "secret (`../../etc/shadow.png`)");
+        assert!(!out.contains("file://"), "a refused target must not load");
+        // Elsewhere on disk, spelled absolutely.
+        let elsewhere = cwd.parent().unwrap().join("elsewhere.png");
+        let abs = rewrite_image_uris(&format!("![x]({})", elsewhere.display()), &cwd);
+        assert!(!abs.contains("file://"), "{abs}");
+        // A rooted-but-driveless path resolves against the process drive on
+        // Windows, so it is refused rather than rebased (§3.9).
+        assert!(!rewrite_image_uris("![x](/etc/shadow.png)", &cwd).contains("file://"));
+        // No alt text still shows the path rather than vanishing.
+        assert_eq!(rewrite_image_uris("![](../x.png)", &cwd), "`../x.png`");
+    }
+
+    #[test]
+    fn image_syntax_inside_a_fence_is_left_alone() {
+        let cwd = root();
+        let cwd = cwd.as_path();
+        let text = "```md\n![x](a.png)\n```\n![y](b.png)";
+        let out = rewrite_image_uris(text, cwd);
+        assert!(out.contains("```md\n![x](a.png)"), "{out}");
+        assert!(out.contains(&format!("![y]({})", uri(&cwd.join("b.png")))), "{out}");
+    }
+
+    #[test]
+    fn only_a_real_file_inside_the_folder_becomes_a_link() {
+        let cwd = root();
+        // This very file, named the way the model is asked to name it.
+        let rel = "src/ui/chat/md_blocks.rs";
+        assert!(cwd.join(rel).is_file(), "fixture moved");
+        let out = linkify_file_paths(&format!("wrote `{rel}` today"), &cwd);
+        assert_eq!(out, format!("wrote [`{rel}`]({}) today", uri(&cwd.join(rel))));
+
+        // A file that does not exist stays prose: a link that opens nothing
+        // is worse than no link.
+        let missing = "src/nope.rs";
+        assert_eq!(
+            linkify_file_paths(&format!("`{missing}`"), &cwd),
+            format!("`{missing}`")
+        );
+        // Outside the folder, even if it exists.
+        assert_eq!(linkify_file_paths("`../Cargo.toml`", &cwd), "`../Cargo.toml`");
+        // Not a path at all.
+        for code in ["cargo test", "String", "-v", "x.y"] {
+            let src = format!("`{code}`");
+            assert_eq!(linkify_file_paths(&src, &cwd), src, "{code} was linkified");
+        }
+    }
+
+    #[test]
+    fn linkifying_leaves_fences_and_existing_links_alone() {
+        let cwd = root();
+        let rel = "Cargo.toml";
+        assert!(cwd.join(rel).is_file());
+        let fenced = format!("```\n`{rel}`\n```");
+        assert_eq!(linkify_file_paths(&fenced, &cwd), fenced);
+        // Already a link target: not wrapped a second time.
+        let linked = format!("[`{rel}`](file://x)");
+        assert_eq!(linkify_file_paths(&linked, &cwd), linked);
     }
 
     #[test]

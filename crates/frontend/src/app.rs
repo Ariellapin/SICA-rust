@@ -1351,6 +1351,38 @@ impl App {
         self.toast = Some(crate::ui::kit::Toast::new(self.toast_seq, icon, text, hold_ms));
     }
 
+    /// A `file://` link the transcript emitted (§3.8) — an inline-code path
+    /// the model named, which the renderer turned into a link.
+    ///
+    /// Taken back out of egui's output before the platform sees it, because
+    /// the platform would hand a local file to the *browser*. A plain click
+    /// opens it the way the OS would; a modified click (egui reports it as
+    /// "new tab") puts `@path` in the composer instead, which is how the
+    /// user brings the file into the next message rather than reading it.
+    fn take_file_link(&mut self, ctx: &egui::Context) {
+        let Some(open) = ctx.output_mut(|o| o.open_url.take()) else { return };
+        let Some(raw) = open.url.strip_prefix("file://") else {
+            // Not ours: put it back for the platform to open.
+            ctx.output_mut(|o| o.open_url = Some(open));
+            return;
+        };
+        let path = std::path::PathBuf::from(raw);
+        if open.new_tab {
+            let cwd = self.session_workspace().1;
+            let rel = path.strip_prefix(&cwd).unwrap_or(&path);
+            let at = format!("@{}", rel.display().to_string().replace('\\', "/"));
+            if !self.chat.draft.is_empty() && !self.chat.draft.ends_with(' ') {
+                self.chat.draft.push(' ');
+            }
+            self.chat.draft.push_str(&at);
+            self.chat.draft.push(' ');
+            return;
+        }
+        if let Err(e) = crate::ui::open_path_public(&path) {
+            self.push_log(LogKind::Error, format!("open {}: {e}", path.display()));
+        }
+    }
+
     fn settings_snapshot(&self) -> Settings {
         Settings {
             theme_dark:             self.theme_dark,
@@ -2579,6 +2611,7 @@ impl eframe::App for App {
         self.drain_events();
         self.tick_heartbeat_watchdog();
         ui::draw(self, ctx);
+        self.take_file_link(ctx);
         if self.build_state.in_flight {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
