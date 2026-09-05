@@ -415,7 +415,31 @@ fn draw_assistant(
         v.active.fg_stroke.color = ink;
         v.noninteractive.fg_stroke.color = ink;
         ui.style_mut().visuals.extreme_bg_color = kit::col(t.alias.code_block);
-        CommonMarkViewer::new(format!("assistant_md_{turn_idx}")).show(ui, cache, text);
+        // Math and wide tables are split out before the viewer sees them
+        // (§3.8): the parser would mangle TeX, and a wide table left to the
+        // viewer widens the whole conversation column instead of itself.
+        for (i, block) in super::md_blocks::split(text).into_iter().enumerate() {
+            let id = format!("assistant_md_{turn_idx}_{i}");
+            match block {
+                super::md_blocks::Block::Prose(body) => {
+                    let body = super::md_blocks::inline_math_to_code(&body);
+                    CommonMarkViewer::new(id).show(ui, cache, &body);
+                }
+                super::md_blocks::Block::Math(src) => {
+                    // No KaTeX for egui: the source, legible and copyable,
+                    // beats a formula the parser has eaten.
+                    kit::code_block(ui, "math", &src);
+                }
+                super::md_blocks::Block::Table(src) => {
+                    egui::ScrollArea::horizontal()
+                        .id_source(("md_table", &id))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            CommonMarkViewer::new(id.clone()).show(ui, cache, &src);
+                        });
+                }
+            }
+        }
     });
 }
 

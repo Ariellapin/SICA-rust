@@ -13,6 +13,7 @@ mod composer;
 mod control;
 pub mod details;
 mod dock;
+mod md_blocks;
 mod messages;
 mod meter;
 mod slash_menu;
