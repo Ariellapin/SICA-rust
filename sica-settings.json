@@ -18,5 +18,7 @@
   "working_dir": null,
   "recent_working_dirs": [],
   "sidebar_group": "workspace",
-  "default_agent": null
+  "sidebar_order": "updated",
+  "default_agent": null,
+  "onboarded": false
 }

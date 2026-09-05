@@ -39,7 +39,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // Foot first (bottom-up), then the session region takes what is left —
     // egui has no `flex: 1`, so the column is laid out from both ends.
     let foot_h = if collapsed { 84.0 } else { 84.0 };
-    let before = ui.available_height();
     // Measure against the **clip** rect, not `available_height()`.
     //
     // A panel's content `max_rect` runs past what is actually visible by
