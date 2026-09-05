@@ -223,9 +223,18 @@ scans `sessions/*.jsonl` for a substring/regex across `UserMessage`/
 wrapped in the untrusted-content frame (§9.4). Export is already a file copy;
 add `Request::ExportSession` → path only if the FE wants a button.
 
-### 3.6 `dsh-session-reference` — `@session` untrusted snapshots
+### 3.6 `dsh-session-reference` — `@session` untrusted snapshots — **done**
 
-See §9.4.
+See §9.4 for the frame. `@session:<id>` in a user message is resolved by
+`ChatHub::resolve_session_refs` before the turn's first append, into
+`ContextInjected { source: ContextSource::SessionReference { id } }` — the
+referenced log's derived transcript through `retain` (6 KiB head + 2 KiB
+tail) inside `UNTRUSTED_NOTICE`. Resolved to **content, not a pointer**:
+the referenced session goes on changing, and a prompt that meant one thing
+when it was sent must not mean something else on replay. An id that names
+nothing is a `LogLine` and a skipped reference rather than a failed turn —
+dsh ends the turn there, but that would cost the user their whole message
+over a typo. The picker half is UI guide §6.12.
 
 ### 3.7 `dsh-session-telemetry(-otel)`, `dsh-message-feedback`, `dsh-command-feedback`, `dsh-anonymous-user-id` — n/a / optional
 
