@@ -62,6 +62,12 @@ pub struct Settings {
     /// inside a workspace is the backend's, because it is durable there.
     #[serde(default = "default_sidebar_group")]
     pub sidebar_group:          String,
+    /// Order of the sessions *inside* a workspace (§4.3): `manual` is the
+    /// backend's own order — the one dragging and Move would edit, and the
+    /// only one that is durable — and `updated` sorts by the newest event,
+    /// which is what the flat list has always done.
+    #[serde(default = "default_sidebar_order")]
+    pub sidebar_order:          String,
     /// Agent preset applied to every freshly minted session (§7.2). `None`
     /// is the persona-less prompt, which is what the app did before presets
     /// existed.
@@ -75,6 +81,10 @@ pub struct Settings {
 
 fn default_sidebar_group() -> String {
     "workspace".into()
+}
+
+fn default_sidebar_order() -> String {
+    "updated".into()
 }
 
 impl Default for Settings {
@@ -99,6 +109,7 @@ impl Default for Settings {
             working_dir:            None,
             recent_working_dirs:    Vec::new(),
             sidebar_group:          default_sidebar_group(),
+            sidebar_order:          default_sidebar_order(),
             default_agent:          None,
             onboarded:              false,
         }

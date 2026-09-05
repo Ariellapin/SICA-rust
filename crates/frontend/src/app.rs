@@ -195,6 +195,8 @@ pub struct App {
 
     /// Sidebar workspaces (§4.3).
     pub workspaces: WorkspacesUi,
+    /// The hero's agent-preset picker (§7.2): anchored to its chip.
+    pub preset_menu: Option<egui::Rect>,
     /// First-run key dialog (§7.3): open now, and answered once ever.
     pub onboarding_open: bool,
     pub onboarded: bool,
@@ -713,6 +715,9 @@ pub struct WorkspacesUi {
     pub ungrouped: Vec<u64>,
     /// Group by workspace, or one flat list. Persisted (`sidebar_group`).
     pub grouped:   bool,
+    /// `true` orders the sessions inside a group by their newest event
+    /// instead of the backend's manual order (`sidebar_order`).
+    pub by_updated: bool,
     /// Groups the user has folded shut. Absent = open, so a workspace that
     /// appears while the app runs opens rather than hides.
     pub collapsed: std::collections::HashSet<u64>,
@@ -1209,9 +1214,11 @@ impl App {
             auto_watch: settings.auto_watch,
             workspaces: WorkspacesUi {
                 grouped: settings.sidebar_group != "flat",
+                by_updated: settings.sidebar_order != "manual",
                 ..Default::default()
             },
 
+            preset_menu: None,
             onboarding_open: crate::ui::onboarding_wanted(
                 &providers,
                 settings.last_active_provider.as_deref(),
@@ -1416,6 +1423,11 @@ impl App {
                 "workspace".into()
             } else {
                 "flat".into()
+            },
+            sidebar_order:          if self.workspaces.by_updated {
+                "updated".into()
+            } else {
+                "manual".into()
             },
         }
     }

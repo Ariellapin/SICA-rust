@@ -134,6 +134,20 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                     kit::txt("/", 14.0, Weight::Regular, kit::col(t.alias.label[3])),
                 );
                 crumb(ui, &title, true, &t);
+                // The preset this session runs (§7.2). Read-only on purpose:
+                // it is fixed once the session has produced anything, and a
+                // control that pretends otherwise would fail on click.
+                if let Some(agent) = app.session_agent.clone() {
+                    ui.add_space(6.0);
+                    kit::tinted_pill(
+                        ui,
+                        &agent,
+                        kit::col(t.alias.tip),
+                        kit::col(t.alias.label[2]),
+                        11.0,
+                    )
+                    .on_hover_text("Agent preset · fixed when this session started");
+                }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     jobs_action(app, ui);
@@ -455,6 +469,30 @@ fn hero_view(app: &mut App, ui: &mut egui::Ui, disabled: bool, content_w: f32) {
                 app.workspaces.hero_menu = Some(chip);
             }
             hero_picker(app, ui);
+            ui.add_space(8.0);
+            // The preset for the session about to start (§7.2). This session
+            // is empty — nothing has been produced in it — so the backend
+            // still accepts a preset for it.
+            let preset = app
+                .session_agent
+                .clone()
+                .or_else(|| app.default_agent.clone())
+                .unwrap_or_else(|| "No preset".into());
+            let chip = kit::tinted_pill(
+                ui,
+                &preset,
+                kit::col(t.alias.tip),
+                kit::col(t.alias.label[1]),
+                12.0,
+            );
+            let rect = chip.rect;
+            if chip
+                .on_hover_text("Agent preset for the session you are about to start")
+                .clicked()
+            {
+                app.preset_menu = Some(rect);
+            }
+            preset_picker(app, ui);
             ui.add_space(18.0);
         });
         composer::draw(app, ui, disabled);
@@ -528,6 +566,53 @@ fn hero_picker(app: &mut App, ui: &mut egui::Ui) {
     }
     if !open {
         app.workspaces.hero_menu = None;
+    }
+}
+
+/// The hero's agent-preset menu (§7.2): every `agents/*.md`, "No preset"
+/// first, the session's own checked.
+///
+/// Applied to *this* session rather than staged for a later one. A session's
+/// preset is fixed once it has produced anything (harness §5.2), and this
+/// chip only exists on an empty session — so now is exactly when it can
+/// still be set, and setting it is what the user meant.
+fn preset_picker(app: &mut App, ui: &mut egui::Ui) {
+    let Some(rect) = app.preset_menu else { return };
+    let (presets, _) = agents::preset::load_dir(&sica_core::paths::agents_dir());
+    let current = app.session_agent.clone();
+    let mut items = vec![kit::MenuItem::new("No preset")
+        .detail("The default prompt, with no persona")
+        .checked(current.is_none())];
+    for p in &presets {
+        items.push(
+            kit::MenuItem::new(p.name.clone())
+                .detail(p.description.clone())
+                .checked(current.as_deref() == Some(p.name.as_str())),
+        );
+    }
+    let mut open = true;
+    let picked = kit::menu(
+        ui.ctx(),
+        egui::Id::new("hero_preset_menu"),
+        rect,
+        kit::MenuSide::Above,
+        280.0,
+        &items,
+        &mut open,
+    );
+    if let Some(i) = picked {
+        app.preset_menu = None;
+        let name = (i > 0).then(|| presets[i - 1].name.clone());
+        app.send(UiCommand::SendRequest(protocol::Request::SetSessionAgent {
+            session_id: app.chat.session_id,
+            name: name.clone(),
+        }));
+        // Answered by `SessionAgentChanged`; shown immediately so the chip
+        // does not lag a round trip behind the click.
+        app.session_agent = name;
+    }
+    if !open {
+        app.preset_menu = None;
     }
 }
 

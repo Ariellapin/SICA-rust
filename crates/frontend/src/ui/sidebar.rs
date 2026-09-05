@@ -433,6 +433,7 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         .collect();
     let active_id = app.chat.session_id;
     let grouped = app.workspaces.grouped && !app.workspaces.rows.is_empty();
+    let by_updated = app.workspaces.by_updated;
     let pending = app.chat.pending_delete;
     let allow_delete = rows.len() > 1;
     let mut action: Option<RowAction> = None;
@@ -525,12 +526,16 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
 
                 for group in &groups {
                     // Only the sessions the search left standing, in the
-                    // group's own order.
-                    let members: Vec<&(u64, String, i64, String)> = group
+                    // group's own order — or by recency, when that is what
+                    // the user asked for.
+                    let mut members: Vec<&(u64, String, i64, String)> = group
                         .members
                         .iter()
                         .filter_map(|sid| rows.iter().find(|r| r.0 == *sid))
                         .collect();
+                    if by_updated || group.id.is_none() {
+                        members.sort_by_key(|r| std::cmp::Reverse(r.2));
+                    }
                     if members.is_empty() && !query.is_empty() {
                         continue;
                     }
@@ -676,9 +681,16 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
     }
     if let Some(rect) = app.workspaces.view_menu {
         let grouped_now = app.workspaces.grouped;
+        let by_updated = app.workspaces.by_updated;
         let items = vec![
             kit::MenuItem::new("Group by workspace").checked(grouped_now),
             kit::MenuItem::new("One flat list").checked(!grouped_now),
+            kit::MenuItem::new("Order by last updated")
+                .checked(by_updated)
+                .sep_above(true),
+            kit::MenuItem::new("Order manually")
+                .detail("The order Move up / Move down sets, kept by the backend")
+                .checked(!by_updated),
             kit::MenuItem::new("Add workspace…").sep_above(true),
         ];
         let mut open = true;
@@ -694,7 +706,9 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         match picked {
             Some(0) => ws_action = Some(WsAction::Grouped(true)),
             Some(1) => ws_action = Some(WsAction::Grouped(false)),
-            Some(2) => ws_action = Some(WsAction::Add),
+            Some(2) => ws_action = Some(WsAction::ByUpdated(true)),
+            Some(3) => ws_action = Some(WsAction::ByUpdated(false)),
+            Some(4) => ws_action = Some(WsAction::Add),
             _ => {}
         }
         if !open {
@@ -804,6 +818,9 @@ enum WsAction {
     CopyPath(u64),
     Add,
     Grouped(bool),
+    /// Order sessions inside a group by recency (`true`) or by the
+    /// backend's manual order.
+    ByUpdated(bool),
 }
 
 /// The 34 px group header: `[chevron] [folder] [title] … [⋯] [+]`.
@@ -1132,6 +1149,11 @@ fn apply_ws_action(app: &mut App, ctx: &egui::Context, action: WsAction) {
         WsAction::Grouped(on) => {
             app.workspaces.view_menu = None;
             app.workspaces.grouped = on;
+            app.persist_settings();
+        }
+        WsAction::ByUpdated(on) => {
+            app.workspaces.view_menu = None;
+            app.workspaces.by_updated = on;
             app.persist_settings();
         }
     }

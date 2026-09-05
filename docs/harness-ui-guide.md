@@ -908,10 +908,12 @@ mutation.
 
 **Left for later.**
 
-- **Order by (Manual · Last updated)** is not offered. The order inside a
-  workspace is the backend's manual one and the flat list is last-updated;
-  a per-mode toggle needs somewhere durable to keep the choice per
-  workspace, which the registry does not have.
+- **Order by (Manual · Last updated)** is in the View menu, kept as
+  `sidebar_order`. It is one choice for the whole sidebar rather than
+  dsh's per-workspace one, because the registry has nowhere durable to
+  keep a per-workspace answer — and **Ungrouped stays newest-first**
+  either way, since it has no manual order to honour: `MoveSession`
+  reorders a workspace's account, and Ungrouped has none.
 - **The hover card does not copy on click** — an egui tooltip cannot take
   one. The path is in the card and **Copy path** is in the `⋯` menu.
 - **The hero picker and the header crumb are in**, with one deliberate
@@ -1490,10 +1492,18 @@ name. `default_agent` is a setting the frontend applies through
 can be set: a session's preset is fixed once the session has produced
 anything (harness §5.2).
 
-Not shipped from this section: the hero **new-session preset chip** and the
-read-only header label that names the preset a session is fixed on, and
-General's Working-directory relabel (harness §3.9's leftover — it needs a
-request that sets the default on a live backend).
+The **hero preset chip** and the read-only **header label** are in too.
+The chip applies its pick to *this* session rather than staging it for a
+later one, which is the same reasoning as §4.3's workspace picker turned
+around: a session's preset is fixed once it has produced anything
+(harness §5.2), and the chip only appears on an empty session — so now
+is exactly when it can still be set. The header label is deliberately
+not a control: it names what the session is fixed on, and a control
+there would fail on click.
+
+Not shipped from this section: General's Working-directory relabel
+(harness §3.9's leftover — it needs a request that sets the default on a
+live backend).
 
 ### 7.3 Onboarding — **done** (UI-8)
 
