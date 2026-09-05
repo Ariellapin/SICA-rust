@@ -67,6 +67,10 @@ pub struct Settings {
     /// existed.
     #[serde(default)]
     pub default_agent:          Option<String>,
+    /// The first-run key dialog (§7.3) has been answered — with a key or
+    /// with "later". Either way it is not asked again.
+    #[serde(default)]
+    pub onboarded:              bool,
 }
 
 fn default_sidebar_group() -> String {
@@ -96,6 +100,7 @@ impl Default for Settings {
             recent_working_dirs:    Vec::new(),
             sidebar_group:          default_sidebar_group(),
             default_agent:          None,
+            onboarded:              false,
         }
     }
 }

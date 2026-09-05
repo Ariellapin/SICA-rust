@@ -111,6 +111,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             kit::txt(&cfg.title, 15.0, Weight::Medium, kit::col(t.alias.label[0])),
                         );
                         kit::label(ui, kit::mono(&cfg.id, 11.0, kit::col(t.alias.label[3])));
+                        // "API key missing" (§7.3) — but only where a key is
+                        // actually needed. A local server has none by design,
+                        // and badging it would be reporting a fault that is
+                        // the correct configuration.
+                        if key_missing(cfg) {
+                            kit::label(
+                                ui,
+                                kit::txt(
+                                    "· API key missing",
+                                    11.0,
+                                    Weight::Medium,
+                                    kit::col(t.alias.warn),
+                                ),
+                            )
+                            .on_hover_text(
+                                "This provider is remote, so it needs a key.                                  Paste one below, or use ${VAR} to read it                                  from the environment.",
+                            );
+                        }
                     });
                     kit::label(
                         ui,
@@ -450,6 +468,32 @@ fn models_row(
     fetch
 }
 
+/// Does this provider need a key it does not have?
+///
+/// A loopback base URL is a local server — vLLM, llama.cpp — which takes no
+/// key at all, so an empty field there is the right configuration and not a
+/// fault to report. A `${VAR}` that resolves counts as present (§14.6).
+fn key_missing(cfg: &crate::llm_providers::ProviderConfig) -> bool {
+    needs_key(&cfg.base_url) && sica_core::creds::resolve(&cfg.api_key).trim().is_empty()
+}
+
+/// `true` for anything that is not loopback.
+fn needs_key(base_url: &str) -> bool {
+    let host = base_url
+        .split("//")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| base_url.split("//").nth(1).unwrap_or(base_url))
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    !matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "")
+}
+
 /// The API-key row (§14.6). The value is **write-only**: what is on screen
 /// is a state — configured, and from where — never the key. A key that is
 /// already stored stays stored unless something is typed over it, and a
@@ -553,4 +597,30 @@ fn draw_status(ui: &mut egui::Ui, t: &Theme, state: Option<&LlmState>) {
         ),
     };
     kit::tinted_pill(ui, text, fill, fg, 11.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A local server takes no key, so an empty field there is the right
+    /// configuration — the badge must not call it a fault.
+    #[test]
+    fn only_a_remote_provider_needs_a_key() {
+        for local in [
+            "http://localhost:8000/v1",
+            "http://127.0.0.1:11434",
+            "http://[::1]:8080/v1",
+            "",
+        ] {
+            assert!(!needs_key(local), "{local} was treated as remote");
+        }
+        for remote in [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com",
+            "http://gpu-box.lan:8000/v1",
+        ] {
+            assert!(needs_key(remote), "{remote} was treated as local");
+        }
+    }
 }

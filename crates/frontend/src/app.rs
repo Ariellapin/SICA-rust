@@ -195,6 +195,9 @@ pub struct App {
 
     /// Sidebar workspaces (§4.3).
     pub workspaces: WorkspacesUi,
+    /// First-run key dialog (§7.3): open now, and answered once ever.
+    pub onboarding_open: bool,
+    pub onboarded: bool,
     /// Preset a *new* session starts with (§7.2). Applied through
     /// `SetSessionAgent` right after `SessionCreated`; `None` means the
     /// persona-less default prompt.
@@ -1209,6 +1212,12 @@ impl App {
                 ..Default::default()
             },
 
+            onboarding_open: crate::ui::onboarding_wanted(
+                &providers,
+                settings.last_active_provider.as_deref(),
+                settings.onboarded,
+            ),
+            onboarded: settings.onboarded,
             default_agent: settings.default_agent.clone(),
 
             request_draft: RequestDraft::default(),
@@ -1370,6 +1379,7 @@ impl App {
                 .map(|p| p.display().to_string())
                 .collect(),
             default_agent:          self.default_agent.clone(),
+            onboarded:              self.onboarded,
             sidebar_group:          if self.workspaces.grouped {
                 "workspace".into()
             } else {

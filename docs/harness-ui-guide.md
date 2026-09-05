@@ -1471,7 +1471,7 @@ read-only header label that names the preset a session is fixed on, and
 General's Working-directory relabel (harness §3.9's leftover — it needs a
 request that sets the default on a live backend).
 
-### 7.3 Onboarding (**S**)
+### 7.3 Onboarding — **done** (UI-8)
 
 **dsh:** on a first run with no usable provider the app root is made inert
 behind a body-level stage: a **welcome** dialog (the preview notice,
@@ -1493,6 +1493,27 @@ later** / **Save and continue** → writes the key into that provider's TOML,
 sets `last_active_provider`, connects. The Models cards get the **key
 missing** badge (`warn` `StateDot` + tooltip). No welcome dialog — the
 preview badge on the hero already says what the build is.
+
+**As shipped, with one deliberate departure.** dsh is a hosted product
+where a key is required, so it makes the app inert until one is entered.
+Here a local provider — vLLM, llama.cpp — needs **no key at all**, and
+blocking a local-only user behind a key field would be nagging them for
+something they must not supply. So: the dialog says a local server needs no
+key, *Configure later* is a real answer that is remembered (`onboarded`),
+and nothing is made inert — the composer behind it is the §6.8 blocked
+composer, which already explains itself.
+
+It offers itself only when **nothing has ever worked**: no provider carries
+a key *that resolves* (a `${VAR}` pointing at an unset variable is exactly
+the state it is for, §14.6) and no provider was ever connected — having
+connected once is proof the user knows where the setting lives. Saving
+writes the key into that provider's TOML and connects, because the user
+came to make the app work rather than to fill in a form.
+
+The **API key missing** badge follows the same rule: it appears only on a
+provider whose base URL is not loopback, since an empty key on a local
+server is the correct configuration and badging it would report a fault
+that is not one.
 
 ---
 
@@ -1671,7 +1692,7 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
-| **UI-8 Workspaces, onboarding, integrations** ⏳ *(§4.3 done)* | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · the first-run onboarding modal and "key missing" badges (§7.3) · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · the attachment rail with file cards and the lightbox (§5.3) · markdown extras — ~~math fallback and scrolling tables~~, images, file links (§3.8) · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
+| **UI-8 Workspaces, onboarding, integrations** ⏳ *(§4.3 done)* | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · the attachment rail with file cards and the lightbox (§5.3) · markdown extras — ~~math fallback and scrolling tables~~, images, file links (§3.8) · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the

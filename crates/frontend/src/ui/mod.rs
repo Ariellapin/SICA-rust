@@ -13,8 +13,11 @@ pub mod fonts;
 pub mod icons;
 pub mod kit;
 pub mod log_panel;
+mod onboarding;
 mod settings;
 mod sidebar;
+
+pub use onboarding::wanted as onboarding_wanted;
 
 use egui::{Rect, Vec2};
 use sica_core::theme::tokens::{
@@ -87,6 +90,8 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     }
 
     settings::draw(app, ctx);
+    // Last, so it sits over everything the first run has no use for yet.
+    onboarding::draw(app, ctx);
     draw_toast(app, ctx, central);
 }
 

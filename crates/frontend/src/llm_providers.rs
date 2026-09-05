@@ -210,7 +210,7 @@ pub fn seed_defaults_if_empty() -> io::Result<()> {
     Ok(())
 }
 
-fn defaults() -> Vec<ProviderConfig> {
+pub(crate) fn defaults() -> Vec<ProviderConfig> {
     let base = ProviderConfig {
         id: String::new(),
         title: String::new(),
