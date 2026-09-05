@@ -1014,7 +1014,7 @@ fn ws_rename_row(app: &mut App, ui: &mut egui::Ui, id: u64, on_action: &mut dyn 
 }
 
 /// `~/project` for a path under the home directory.
-fn tilde(path: &std::path::Path) -> String {
+pub fn tilde(path: &std::path::Path) -> String {
     let text = path.display().to_string();
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))

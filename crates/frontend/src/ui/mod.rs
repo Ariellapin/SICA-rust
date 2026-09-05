@@ -19,6 +19,7 @@ mod sidebar;
 
 pub use onboarding::wanted as onboarding_wanted;
 pub use settings::open_path as open_path_public;
+pub use sidebar::{relative_time, tilde};
 
 use egui::{Rect, Vec2};
 use sica_core::theme::tokens::{

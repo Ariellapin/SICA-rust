@@ -354,6 +354,10 @@ pub enum ContextSource {
     SkillInvocation { name: String },
     /// An `@file` reference expanded inline.
     FileReference { path: String },
+    /// An `@session:<id>` reference expanded inline (guide §3.6 / §9.4):
+    /// another session's transcript, framed untrusted like any other text
+    /// the model did not write.
+    SessionReference { id: u64 },
     /// A post-execute advisory from a loop guard (repeat-tool reminder).
     ToolNotice,
     /// A background job finished.
@@ -374,6 +378,7 @@ impl ContextSource {
             ContextSource::Instructions => "instructions".into(),
             ContextSource::SkillInvocation { name } => format!("/{name}"),
             ContextSource::FileReference { path } => format!("@{path}"),
+            ContextSource::SessionReference { id } => format!("@session:{id}"),
             ContextSource::ToolNotice => "tool notice".into(),
             ContextSource::JobNotice => "job notice".into(),
             ContextSource::GoalRound => "goal round".into(),

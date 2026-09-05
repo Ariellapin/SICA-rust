@@ -942,6 +942,37 @@ impl ControlState {
     }
 }
 
+/// How much of a referenced session travels with the message that mentions
+/// it. Head and tail, so both what it was about and where it got to
+/// survive — the middle of somebody else's conversation is the least
+/// useful part of it.
+const SESSION_REF_BYTES: usize = 8 * 1024;
+
+/// The session ids `@session:<id>` names in `text`, in order, without
+/// repeats.
+///
+/// Deliberately strict: only a bare decimal id right after the token, so an
+/// email address or a `@session` written in prose resolves to nothing
+/// rather than to a session the user never meant.
+fn parse_session_refs(text: &str) -> Vec<u64> {
+    const TOKEN: &str = "@session:";
+    let mut out: Vec<u64> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(TOKEN) {
+        rest = &rest[at + TOKEN.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            if let Ok(id) = digits.parse::<u64>() {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        rest = &rest[digits.len()..];
+    }
+    out
+}
+
 /// Fallback prompt window when neither the user nor the server reports one.
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 24_000;
 
@@ -2238,6 +2269,62 @@ available: {}  (`/agent off` clears)", names.join(", "))
         self.start_turn(session_id, text, images, TurnSource::Human, None).await;
     }
 
+    /// Capture the transcripts named by `@session:<id>` in `text`.
+    ///
+    /// The reference is resolved to **content**, not kept as a pointer: the
+    /// referenced session goes on changing, and a prompt that meant one
+    /// thing when it was sent must not mean something else when the log is
+    /// replayed. Each capture is bounded by `retain` (head + tail) — a
+    /// long session must not be able to blow up the turn that mentions it —
+    /// and framed with [`UNTRUSTED_NOTICE`], because another session's
+    /// transcript is text this conversation did not write.
+    ///
+    /// A session that mentions itself is skipped: its own history is
+    /// already the conversation. An unknown id is reported and skipped
+    /// rather than failing the turn, which would cost the user their
+    /// message over a typo.
+    async fn resolve_session_refs(&self, current: u64, text: &str) -> Vec<(u64, String)> {
+        let wanted = parse_session_refs(text);
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let sessions = self.sessions.lock().await;
+        let mut out = Vec::new();
+        for id in wanted {
+            if id == current {
+                continue;
+            }
+            let Some(log) = sessions.get(&id) else {
+                self.event_sink.emit(Event::LogLine {
+                    level:   "WARN".into(),
+                    message: format!("@session:{id} names no session — reference skipped"),
+                });
+                continue;
+            };
+            let title = log.title();
+            let body: String = log
+                .derive_surface()
+                .iter()
+                .map(|e| format!("{:?}: {}", e.message.role, e.message.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let bounded = sica_core::retain::head_tail(
+                &body,
+                SESSION_REF_BYTES * 3 / 4,
+                SESSION_REF_BYTES / 4,
+            )
+            .render("[… middle of the referenced session omitted …]");
+            out.push((
+                id,
+                format!(
+                    "{}\nSession {id} — {title}\n\n{bounded}",
+                    sica_core::event::UNTRUSTED_NOTICE
+                ),
+            ));
+        }
+        out
+    }
+
     /// Rewrite an earlier prompt and re-run the conversation from it.
     ///
     /// The edited message keeps the original's images — this is an edit of
@@ -2378,6 +2465,12 @@ available: {}  (`/agent off` clears)", names.join(", "))
             None => {}
         }
 
+        // `@session:<id>` mentions are resolved *before* the log block, so
+        // the snapshot is taken while nothing of this turn has been written
+        // yet — and so an id that names nothing can be reported without
+        // half a turn already on disk.
+        let session_refs = self.resolve_session_refs(session_id, &text).await;
+
         // Ensure the session exists and record the user message straight
         // away — the log is flushed on every append, so the session is
         // recoverable even if the LLM call dies mid-stream.
@@ -2417,6 +2510,18 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     surface: SurfaceOp::Append,
                     source: ContextSource::SkillInvocation { name: exp.name },
                     content: exp.content,
+                });
+            }
+            // `@session:<id>` — another session's transcript, captured now
+            // rather than referenced, because "now" is the only moment both
+            // sessions are in a known state. It is somebody else's writing
+            // as far as this conversation is concerned, so it arrives inside
+            // the untrusted frame (§9.4).
+            for (id, content) in &session_refs {
+                log.append(EventKind::ContextInjected {
+                    surface: SurfaceOp::Append,
+                    source:  ContextSource::SessionReference { id: *id },
+                    content: content.clone(),
                 });
             }
             // A `UserPromptSubmit` hook's context sits with the turn's other
@@ -4266,6 +4371,26 @@ mod tests {
     /// the fresh runtime context is not swept away with the span — and it
     /// still lands ahead of the edited message, exactly where an ordinary
     /// send would put it.
+    /// The token is read strictly: a bare decimal id and nothing else, so
+    /// prose that happens to contain "@session" resolves to nothing rather
+    /// than to a session the user never meant.
+    #[test]
+    fn session_references_are_read_strictly_and_deduplicated() {
+        assert_eq!(parse_session_refs("compare @session:7 with @session:12"), vec![7, 12]);
+        // The same session twice is one capture, not two.
+        assert_eq!(parse_session_refs("@session:7 and @session:7"), vec![7]);
+        // Nothing to resolve.
+        for text in [
+            "no references here",
+            "@session: with no id",
+            "@sessions:4 is not the token",
+            "mail me at bob@session.com",
+        ] {
+            assert!(parse_session_refs(text).is_empty(), "{text} resolved");
+        }
+        // Punctuation ends the id, which is how it survives a sentence.
+        assert_eq!(parse_session_refs("see @session:3, then stop"), vec![3]);
+    }
     #[test]
     fn a_rewind_keeps_this_turn_s_runtime_context_ahead_of_the_prompt() {
         let mut log = SessionLog::new(1, "t");

@@ -76,14 +76,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
     }
 
     poll_index(app);
-    if app.chat.at.entries.is_empty() {
+    if app.chat.at.entries.is_empty() && app.chat.sessions.len() <= 1 {
         // Nothing to pick from yet. Say which of the two reasons it is, and
         // hold the keys either way so Enter cannot send a half-typed `@`.
         let indexing = app.chat.at.scanned_at.is_none();
         return draw_placeholder(app, ui, indexing, &token.query);
     }
 
-    let rows = candidates(&app.chat.at.entries, &token.query);
+    let mut rows = candidates(&app.chat.at.entries, &token.query);
+    // One list, files first — dsh's order (§6.12).
+    rows.extend(session_rows(
+        &app.chat.sessions,
+        app.chat.session_id,
+        &token.query,
+    ));
     if rows.is_empty() {
         return draw_placeholder(app, ui, false, &token.query);
     }
@@ -112,8 +118,23 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
     });
 
     if let Some(i) = accepted {
-        let (path, is_dir) = (rows[i].path.clone(), rows[i].is_dir);
-        accept(app, ui, &token, &path, is_dir);
+        match &rows[i].session {
+            // `@session:<id>` is resolved by the backend on send: the
+            // referenced transcript is captured *then*, inside the untrusted
+            // frame, because that is the only moment both sessions are in a
+            // known state (harness §3.6).
+            Some(sr) => {
+                let insert = format!("session:{} ", sr.id);
+                let (draft, caret) = splice(&app.chat.draft, &token, &insert);
+                app.chat.draft = draft;
+                set_caret(ui, caret);
+                app.chat.at.dismissed = true;
+            }
+            None => {
+                let (path, is_dir) = (rows[i].path.clone(), rows[i].is_dir);
+                accept(app, ui, &token, &path, is_dir);
+            }
+        }
     }
     Outcome { open: true }
 }
@@ -287,6 +308,45 @@ fn scan(root: &std::path::Path) -> Vec<FileEntry> {
 struct Row {
     path:   String,
     is_dir: bool,
+    /// A session rather than a path (§6.12). `path` is its title, and the
+    /// second line names where it works and how old it is.
+    session: Option<SessionRow>,
+}
+
+#[derive(Clone)]
+struct SessionRow {
+    id:      u64,
+    /// `~`-shortened working directory, empty for a session that has none.
+    cwd:     String,
+    updated: i64,
+}
+
+/// How many sessions the picker offers. The list is a way to reach one you
+/// were just in, not a second sidebar.
+const MAX_SESSIONS: usize = 5;
+
+/// Sessions matching `query` by title, newest first, excluding the one being
+/// typed in — a session cannot usefully reference itself.
+fn session_rows(sessions: &[protocol::SessionMeta], current: u64, query: &str) -> Vec<Row> {
+    let q = query.to_lowercase();
+    let mut hits: Vec<&protocol::SessionMeta> = sessions
+        .iter()
+        .filter(|s| s.id != current)
+        .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
+        .collect();
+    hits.sort_by_key(|s| std::cmp::Reverse(s.updated_at.max(s.created_at)));
+    hits.into_iter()
+        .take(MAX_SESSIONS)
+        .map(|s| Row {
+            path:   s.title.clone(),
+            is_dir: false,
+            session: Some(SessionRow {
+                id:      s.id,
+                cwd:     s.cwd.as_deref().map(crate::ui::tilde).unwrap_or_default(),
+                updated: s.updated_at.max(s.created_at),
+            }),
+        })
+        .collect()
 }
 
 /// Filter and order the index for `query`, capped at [`MAX_ROWS`].
@@ -310,6 +370,7 @@ fn candidates(entries: &[FileEntry], query: &str) -> Vec<Row> {
         .map(|(_, e)| Row {
             path:   e.path.clone(),
             is_dir: e.is_dir,
+            session: None,
         })
         .collect()
 }
@@ -435,7 +496,22 @@ fn draw_list(
             .id_source("at_menu_scroll")
             .max_height(MAX_LIST_HEIGHT)
             .show(ui, |ui| {
+                let mut headed = false;
                 for (i, row) in rows.iter().enumerate() {
+                    if row.session.is_some() && !headed {
+                        headed = true;
+                        ui.add_space(4.0);
+                        kit::label(
+                            ui,
+                            kit::txt(
+                                "Sessions",
+                                12.0,
+                                Weight::Medium,
+                                kit::col(t.alias.label[2]),
+                            ),
+                        );
+                        ui.add_space(2.0);
+                    }
                     if draw_row(app, ui, row, i == selected, scroll_to_selected) {
                         clicked = Some(i);
                     }
@@ -480,9 +556,59 @@ fn draw_row(
             egui::pos2(rect.min.x + 16.0, rect.center().y),
             Vec2::splat(14.0),
         ),
-        if row.is_dir { Icon::Folder } else { Icon::Read },
+        match (&row.session, row.is_dir) {
+            (Some(_), _) => Icon::NewChat,
+            (None, true) => Icon::Folder,
+            (None, false) => Icon::Read,
+        },
         kit::col(t.alias.label[2]),
     );
+    // A session row reads `title · ~cwd · age`: which conversation, where it
+    // was working, and how stale it is — the three things that tell you
+    // whether it is the one you meant.
+    if let Some(sr) = &row.session {
+        let title_font = kit::font(13.0, Weight::Medium);
+        let title_w = painter
+            .layout_no_wrap(row.path.clone(), title_font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        painter.text(
+            egui::pos2(rect.min.x + 30.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            &row.path,
+            title_font,
+            kit::col(t.alias.label[0]),
+        );
+        let age = crate::ui::relative_time(sr.updated);
+        let detail = match (sr.cwd.is_empty(), age.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => age,
+            (false, true) => sr.cwd.clone(),
+            (false, false) => format!("{} · {age}", sr.cwd),
+        };
+        if !detail.is_empty() {
+            let x = rect.min.x + 30.0 + title_w + 8.0;
+            let f = kit::font(12.0, Weight::Regular);
+            let avail = (rect.max.x - 12.0 - x).max(0.0);
+            let shown = kit::elide(ui, &detail, &f, avail);
+            ui.painter().text(
+                egui::pos2(x, rect.center().y),
+                Align2::LEFT_CENTER,
+                shown,
+                f,
+                kit::col(t.alias.label[3]),
+            );
+        }
+        if selected && scroll_to_selected {
+            resp.scroll_to_me(Some(Align::Center));
+        }
+        return resp
+            .on_hover_text(format!(
+                "Reference session {} — its transcript travels with your message",
+                sr.id
+            ))
+            .clicked();
+    }
     let (parent, name) = split_path(&row.path);
     let name_font = kit::mono_font(13.0);
     let name_w = painter
