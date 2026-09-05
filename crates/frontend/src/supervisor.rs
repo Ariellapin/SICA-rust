@@ -145,6 +145,11 @@ pub enum UiEvent {
         next_seq:   Option<u64>,
     },
     SessionCreated { id: u64 },
+    /// One orchestrated run changed (§6.11) — the whole run, not the edge.
+    WorkflowRunChanged {
+        session_id: u64,
+        run:        protocol::WorkflowRunDump,
+    },
     /// The whole workspace projection (§4.3) — from `Response::Workspaces`
     /// or the event the backend pushes after every mutation. Both carry the
     /// same shape, so the sidebar has one place to reconcile.
@@ -337,6 +342,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::Progress { .. } => return,
         Event::WorkspacesChanged { rows, ungrouped } => {
             UiEvent::WorkspacesChanged { rows, ungrouped }
+        }
+        Event::WorkflowRunChanged { session_id, run } => {
+            UiEvent::WorkflowRunChanged { session_id, run }
         }
         Event::LogLine { level, message } => UiEvent::LogLine { level, message },
         Event::LlmStateChanged { state } => UiEvent::LlmStateChanged(state),

@@ -159,6 +159,8 @@ struct ControlState {
     next_goal:    Arc<AtomicU64>,
     /// User hooks, so a dispatch can put `HooksPolicy` in the pipeline.
     hooks:        Arc<hooks::HookConfig>,
+    /// Where an orchestrated run's durable rows go (§6.11).
+    runs:         Arc<dyn agents::subagent::RunNotifier>,
 }
 
 impl ControlState {
@@ -235,6 +237,7 @@ impl ControlState {
             .with_session(session_id)
             .with_plan_active(plan)
             .with_cwd(Some(root))
+            .with_runs(self.runs.clone())
             .with_policies(policies);
         if let Some(fs) = self.failure_sink.clone() {
             sub = sub.with_failure_sink(fs);
@@ -1131,6 +1134,10 @@ impl ChatHub {
             auto_cont:    self.auto_cont.clone(),
             next_goal:    self.next_goal_id.clone(),
             hooks:        self.hooks.clone(),
+            runs:         Arc::new(WorkflowBridge::new(
+                self.sessions.clone(),
+                self.event_sink.clone(),
+            )),
             // Harness commands are the user acting directly; a turn task
             // overrides this with its own source.
             turn_source:  TurnSource::Human,
@@ -1324,6 +1331,10 @@ impl ChatHub {
             })
             .last()
             .unwrap_or_default();
+        let runs = sica_core::project::workflow_runs(&log.events)
+            .into_iter()
+            .map(run_dump)
+            .collect();
         Some(SessionDump {
             id: log.id,
             title: log.title(),
@@ -1333,6 +1344,7 @@ impl ChatHub {
             plan_active,
             todos,
             agent,
+            runs,
         })
     }
 
@@ -3586,6 +3598,83 @@ pub(crate) async fn append_event(
     Some(seq)
 }
 
+/// Bridge from `agents::workflow` back into the session log (§6.11).
+///
+/// `agents` knows how to run a workflow and nothing about where its history
+/// lives, so it hands edges to this — the same split `JobsBridge` makes for
+/// background jobs. Each edge is appended as a durable `WorkflowRun` row and
+/// the *whole* run is pushed to the frontend, rebuilt from the log rather
+/// than accumulated in memory, so the live tree and the one a reload draws
+/// cannot disagree.
+pub struct WorkflowBridge {
+    sessions: Sessions,
+    events:   Arc<dyn EventSink>,
+}
+
+impl WorkflowBridge {
+    pub fn new(sessions: Sessions, events: Arc<dyn EventSink>) -> Self {
+        Self { sessions, events }
+    }
+}
+
+impl agents::subagent::RunNotifier for WorkflowBridge {
+    fn edge(&self, session_id: u64, edge: agents::subagent::RunEdge) {
+        let sessions = self.sessions.clone();
+        let events = self.events.clone();
+        let run_id = edge.run_id;
+        // Called from the workflow's own thread, which must not block on the
+        // session lock — the same reason `JobsBridge` spawns.
+        tokio::spawn(async move {
+            append_event(&sessions, session_id, EventKind::WorkflowRun {
+                run_id:    edge.run_id,
+                call_seq:  edge.call_seq,
+                phase:     edge.phase,
+                member:    edge.member,
+                member_id: edge.member_id,
+                state:     edge.state,
+            })
+            .await;
+            let run = {
+                let g = sessions.lock().await;
+                g.get(&session_id).and_then(|log| {
+                    sica_core::project::workflow_runs(&log.events)
+                        .into_iter()
+                        .find(|r| r.run_id == run_id)
+                        .map(run_dump)
+                })
+            };
+            if let Some(run) = run {
+                events.emit(Event::WorkflowRunChanged { session_id, run });
+            }
+        });
+    }
+}
+
+/// One folded run on the wire.
+pub fn run_dump(run: sica_core::project::Run) -> protocol::WorkflowRunDump {
+    protocol::WorkflowRunDump {
+        run_id:   run.run_id,
+        call_seq: run.call_seq,
+        state:    run.state.label().to_string(),
+        open:     run.open,
+        phases:   run
+            .phases
+            .into_iter()
+            .map(|p| protocol::RunPhaseDump {
+                title:   p.title,
+                members: p
+                    .members
+                    .into_iter()
+                    .map(|m| protocol::RunMemberDump {
+                        label: m.label,
+                        state: m.state.label().to_string(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 /// The directory a session works in: the one stamped into its header when
 /// it was created (guide §3.9), falling back to the process default for a
 /// session written before sessions had their own — and for one that is not
@@ -4732,10 +4821,78 @@ mod tests {
             next_goal: Arc::new(AtomicU64::new(1)),
             turn_source: source,
             hooks: Arc::new(crate::hooks::HookConfig::default()),
+            runs: Arc::new(NoRuns),
         };
         (cs, Arc::new(Mutex::new(HashMap::new())), cap)
     }
 
+    /// A notifier that drops every edge — these tests drive the control
+    /// state directly and have no session log behind them.
+    struct NoRuns;
+    impl agents::subagent::RunNotifier for NoRuns {
+        fn edge(&self, _session_id: u64, _edge: agents::subagent::RunEdge) {}
+    }
+
+    /// The four rows, and the tree they fold back into. This is the whole
+    /// contract between `agents::workflow` and the log: the run's shape
+    /// survives a reload because it was written down as it happened.
+    #[tokio::test]
+    async fn a_run_becomes_four_durable_rows_and_folds_back() {
+        use agents::subagent::{RunEdge, RunNotifier};
+        use sica_core::event::RunState;
+
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        with_log(&sessions, 1).await;
+        let cap = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let bridge = WorkflowBridge::new(sessions.clone(), cap.clone());
+
+        let edge = |member: Option<(u64, &str)>, state| RunEdge {
+            run_id: 9,
+            call_seq: 5,
+            phase: member.map(|_| "Review".to_string()),
+            member: member.map(|(_, l)| l.to_string()),
+            member_id: member.map(|(id, _)| id),
+            state,
+        };
+        bridge.edge(1, edge(None, RunState::Started));
+        bridge.edge(1, edge(Some((1, "review:bugs")), RunState::Started));
+        bridge.edge(1, edge(Some((1, "review:bugs")), RunState::Done));
+        bridge.edge(1, edge(None, RunState::Done));
+        // Each edge is appended from its own task; let them land.
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            if sessions.lock().await[&1]
+                .events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::WorkflowRun { .. }))
+                .count()
+                == 4
+            {
+                break;
+            }
+        }
+
+        let log = sessions.lock().await;
+        let rows: Vec<&sica_core::event::SessionEvent> = log[&1]
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::WorkflowRun { .. }))
+            .collect();
+        assert_eq!(rows.len(), 4, "run start, member start, member end, run end");
+        // None of them is a surface event: a workflow's children are
+        // deliberately absent from the model's history.
+        assert!(rows.iter().all(|e| e.kind.surface().is_none()));
+
+        let runs = sica_core::project::workflow_runs(&log[&1].events);
+        assert_eq!(runs.len(), 1);
+        let dump = run_dump(runs.into_iter().next().unwrap());
+        assert_eq!(dump.call_seq, 5, "the row it belongs to");
+        assert_eq!(dump.state, "done");
+        assert!(!dump.open);
+        assert_eq!(dump.phases.len(), 1);
+        assert_eq!(dump.phases[0].title, "Review");
+        assert_eq!(dump.phases[0].members[0].state, "done");
+    }
     async fn with_log(sessions: &Sessions, id: u64) {
         sessions.lock().await.insert(id, SessionLog::new(id, default_title(id)));
     }

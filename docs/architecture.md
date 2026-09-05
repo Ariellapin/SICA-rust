@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 26) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 27) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -192,8 +192,25 @@ Ungrouped. The wire gains `ListWorkspaces` / `CreateWorkspace` /
 `SessionMeta.cwd`, and `NewSession` becomes
 `NewSession { workspace_id: Option<u64> }`. The subsystem is invisible to
 models: no skill reads it and nothing about it reaches a session log. Its
-frontend surface is UI guide §4.3; until that lands the FE sends
-`workspace_id: None` and drops the event.
+frontend surface is UI guide §4.3, which has since landed: the sidebar
+groups by workspace, and a session created in a group takes its
+directory.
+
+v27 adds **durable orchestrated runs** (UI guide §6.11). A `workflow` run
+writes four kinds of row — run start, member start, member end, run end —
+as `EventKind::WorkflowRun { run_id, call_seq, phase, member, member_id,
+state }`. Four rather than one summary at the end, because the run worth
+seeing is the one that did not finish: an interrupted run is visible
+*because* its terminal rows are missing. The rows are **non-surface** — a
+workflow's children are deliberately absent from the model's history, and
+only what the script printed reaches it.
+
+`agents::workflow` reports edges through `subagent::RunNotifier`, which
+`backend::chat::WorkflowBridge` implements — the same split `JobNotifier`
+makes for background jobs. Each edge is appended and the whole run is
+pushed as `Event::WorkflowRunChanged`, rebuilt from the log by
+`sica_core::project::workflow_runs`; `SessionDump.runs` carries the same
+fold on reload, so the live tree and the reloaded one cannot drift.
 
 ## On-disk surfaces (all at workspace root)
 

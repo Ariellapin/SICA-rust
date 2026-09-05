@@ -199,6 +199,10 @@ pub struct App {
     pub preset_menu: Option<egui::Rect>,
     /// Image open in the lightbox (§5.3): `(turn, index)`.
     pub lightbox: Option<(usize, usize)>,
+    /// Orchestrated runs of the open session (§6.11), keyed by the
+    /// `ToolCall` seq they belong to. Live pushes and the session dump land
+    /// in the same place, so a reload draws what the run drew.
+    pub runs: std::collections::HashMap<u64, protocol::WorkflowRunDump>,
     /// First-run key dialog (§7.3): open now, and answered once ever.
     pub onboarding_open: bool,
     pub onboarded: bool,
@@ -1230,6 +1234,7 @@ impl App {
 
             preset_menu: None,
             lightbox: None,
+            runs: std::collections::HashMap::new(),
             onboarding_open: crate::ui::onboarding_wanted(
                 &providers,
                 settings.last_active_provider.as_deref(),
@@ -2053,6 +2058,11 @@ impl App {
                     t.user_seq = Some(seq);
                 }
             }
+            UiEvent::WorkflowRunChanged { session_id, run } => {
+                if session_id == self.chat.session_id {
+                    self.runs.insert(run.call_seq, run);
+                }
+            }
             UiEvent::WorkspacesChanged { rows, ungrouped } => {
                 // A folder the user just added: open a session in it, which
                 // is the whole reason they added it. Matched by path — the
@@ -2334,6 +2344,13 @@ impl App {
                     return;
                 }
                 self.chat.turns = rebuild_turns(&session);
+                // The runs a reload has to draw again (§6.11). Replaced
+                // wholesale: they belong to the session being opened.
+                self.runs = session
+                    .runs
+                    .iter()
+                    .map(|r| (r.call_seq, r.clone()))
+                    .collect();
                 self.chat.scroll_to_bottom = true;
                 self.load_session_stats();
                 self.permission_mode = session.permission_mode;

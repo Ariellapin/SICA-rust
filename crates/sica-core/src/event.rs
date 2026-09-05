@@ -44,6 +44,25 @@ impl SessionEvent {
     }
 }
 
+/// Where a run, or one of its members, got to (§6.11).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Started,
+    Done,
+    Failed,
+}
+
+impl RunState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunState::Started => "running",
+            RunState::Done => "done",
+            RunState::Failed => "failed",
+        }
+    }
+}
+
 /// How a surface event lands on the derived history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -76,6 +95,37 @@ pub enum EventKind {
     },
     /// Rename (auto-title or manual). Latest wins.
     SessionTitle { title: String },
+    /// One edge of an orchestrated run — `workflow` or `agent-team`
+    /// (UI guide §6.11). Four rows per run: the run starting, each member
+    /// starting, each member ending, and the run ending.
+    ///
+    /// **Not a surface event.** A workflow's children are deliberately
+    /// absent from the model's history — only what the script printed
+    /// reaches it — so these rows are for the *reader*, and the fold skips
+    /// them like any other bookkeeping.
+    ///
+    /// Four rows rather than one summary at the end, because the case most
+    /// worth seeing is the run that did not finish: an interrupted run is
+    /// visible precisely because its terminal rows are missing, and a
+    /// summary written at the end would leave nothing at all behind.
+    WorkflowRun {
+        run_id: u64,
+        /// Seq of the `ToolCall` that started this run, so the row it
+        /// belongs to can be found again after a reload.
+        call_seq: u64,
+        /// The phase the script had declared when this happened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        /// The member (child agent) this row is about; absent on the two
+        /// run-level rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<String>,
+        /// Identity of that member within the run — labels repeat, and an
+        /// end must find its own start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member_id: Option<u64>,
+        state: RunState,
+    },
     /// The user archived the session: it leaves the list but the log stays on
     /// disk, which is the whole difference from deleting it.
     SessionArchived,

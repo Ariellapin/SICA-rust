@@ -42,6 +42,7 @@ use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, ImmutableString, NativeCallCon
 use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
+use sica_core::event::RunState;
 use tracing::{info, warn};
 
 use crate::agent::EventSink;
@@ -49,7 +50,7 @@ use crate::registry::SkillRegistry;
 use crate::runner::{self, RunSpec};
 use crate::script::{self, throw};
 use crate::skill::{Skill, SkillContext, SkillOutcome};
-use crate::subagent::ToolSubAgent;
+use crate::subagent::{RunEdge, ToolSubAgent};
 
 pub const WORKFLOW_NAME: &str = "workflow";
 
@@ -150,13 +151,51 @@ struct Deps {
     sub:       ToolSubAgent,
     handle:    Handle,
     cancel:    Option<CancellationToken>,
+    /// Identity of this run for the durable rows (§6.11).
+    run_id:    u64,
 }
+
+impl Deps {
+    /// Report one edge of the run. Silently does nothing when the call has
+    /// no notifier or no session — a workflow run outside a session (a test,
+    /// an eval) has no log to be durable in, and that is not a failure.
+    fn edge(&self, member: Option<&Member>, state: RunState) {
+        let (Some(runs), Some(session_id)) = (self.sub.runs.as_ref(), self.sub.session_id) else {
+            return;
+        };
+        runs.edge(session_id, RunEdge {
+            run_id:    self.run_id,
+            call_seq:  self.sub.log_seq.unwrap_or(0),
+            phase:     member
+                .map(|m| m.phase.clone())
+                .filter(|p| !p.is_empty()),
+            member:    member.map(|m| m.label.clone()),
+            member_id: member.map(|m| m.id),
+            state,
+        });
+    }
+}
+
+/// Run ids are per process and monotonic: two runs in one session must not
+/// collide, and a reader comparing two logs should not see the same id mean
+/// two things within a run of the app.
+static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Script-lifetime bookkeeping. Single-threaded by construction (one script,
 /// one blocking thread), hence `Cell`/`RefCell`.
 struct State {
     spent: Cell<u32>,
     phase: RefCell<String>,
+}
+
+/// One child's identity for the durable rows (§6.11): the phase it belongs
+/// to, the label the reader sees, and an id so its *end* finds its own
+/// start even when two members share a label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Member {
+    id:    u64,
+    phase: String,
+    label: String,
 }
 
 /// What one finished script produced.
@@ -275,7 +314,12 @@ impl Skill for Workflow {
             cancel: ctx.sub.cancel.clone(),
             sub: ctx.sub,
             handle: Handle::current(),
+            run_id: NEXT_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
+        // The run opens before the script does. If the turn is interrupted
+        // from here on, this row stands alone — which is what makes an
+        // interrupted run visible instead of absent (§6.11).
+        deps.edge(None, RunState::Started);
         let deadline = Instant::now() + WORKFLOW_BUDGET;
 
         // Rhai is synchronous and every host function blocks on child
@@ -283,6 +327,7 @@ impl Skill for Workflow {
         // lifetime. `spawn_blocking` cannot be cancelled from outside, which
         // is why the deadline and the interrupt token are polled from
         // inside by the sandbox's progress hook.
+        let deps_for_close = deps.clone();
         let joined =
             tokio::task::spawn_blocking(move || run_script(&code, &input, deps, deadline)).await;
 
@@ -291,6 +336,10 @@ impl Skill for Workflow {
             Err(e) => return fail(&format!("the workflow's runtime thread failed: {e}")),
         };
         info!(agents = result.agents, failed = result.error.is_some(), "workflow: finished");
+        deps_for_close.edge(
+            None,
+            if result.error.is_some() { RunState::Failed } else { RunState::Done },
+        );
         events.emit(protocol::Event::LogLine {
             level:   "INFO".into(),
             message: format!("workflow: finished after {} agent(s)", result.agents),
@@ -505,15 +554,25 @@ fn claim(state: &State, n: u32) -> Result<u32, Box<EvalAltResult>> {
 }
 
 /// Budget and name one child before it is spawned.
-fn plan_one(state: &State, spec: &AgentSpec) -> Result<String, Box<EvalAltResult>> {
+fn plan_one(state: &State, spec: &AgentSpec) -> Result<Member, Box<EvalAltResult>> {
     let index = claim(state, 1)?;
-    Ok(label_for(state, spec, index))
+    Ok(member_of(state, spec, index))
+}
+
+/// The index a child was budgeted at is already unique within the run, so
+/// it is also its member id — no second counter to keep in step.
+fn member_of(state: &State, spec: &AgentSpec, index: u32) -> Member {
+    Member {
+        id:    index as u64 + 1,
+        phase: state.phase.borrow().clone(),
+        label: label_for(state, spec, index),
+    }
 }
 
 /// Validate, budget and name a whole fan-out before any of it is spawned.
 /// Separate from [`many`] so the caps, the spec parsing and the labels are
 /// reachable without an LLM behind them.
-fn plan(state: &State, items: &rhai::Array) -> Result<Vec<(AgentSpec, String)>, Box<EvalAltResult>> {
+fn plan(state: &State, items: &rhai::Array) -> Result<Vec<(AgentSpec, Member)>, Box<EvalAltResult>> {
     if items.len() > MAX_PARALLEL {
         return Err(throw(format!(
             "`parallel` runs at most {MAX_PARALLEL} agents at once; got {} — split the \
@@ -530,17 +589,18 @@ fn plan(state: &State, items: &rhai::Array) -> Result<Vec<(AgentSpec, String)>, 
         .into_iter()
         .enumerate()
         .map(|(i, spec)| {
-            let label = label_for(state, &spec, first + i as u32);
-            (spec, label)
+            let member = member_of(state, &spec, first + i as u32);
+            (spec, member)
         })
         .collect())
 }
 
 /// `agent(…)`: one child, blocking, throwing on failure.
 fn one(deps: &Deps, state: &Rc<State>, spec: AgentSpec) -> Result<Dynamic, Box<EvalAltResult>> {
-    let label = plan_one(state, &spec)?;
+    let member = plan_one(state, &spec)?;
+    let label = member.label.clone();
     note(&deps.sub.events, &format!("{label} — starting"));
-    match deps.handle.block_on(drive(deps, spec, label.clone())) {
+    match deps.handle.block_on(drive(deps, spec, member)) {
         Ok(value) => {
             note(&deps.sub.events, &format!("{label} — reported"));
             Ok(value)
@@ -570,9 +630,10 @@ fn many(
     );
 
     let results = deps.handle.block_on(async {
-        join_all(labelled.into_iter().map(|(spec, label)| {
+        join_all(labelled.into_iter().map(|(spec, member)| {
             let deps = deps.clone();
-            async move { (label.clone(), drive(&deps, spec, label).await) }
+            let label = member.label.clone();
+            async move { (label, drive(&deps, spec, member).await) }
         }))
         .await
     });
@@ -637,7 +698,18 @@ fn label_for(state: &State, spec: &AgentSpec, index: u32) -> String {
 /// Run one child conversation to its report. `Err` is a message the script
 /// can read — either as a thrown error or, inside `parallel`, as a log line
 /// standing behind a `()`.
-async fn drive(deps: &Deps, spec: AgentSpec, label: String) -> Result<Dynamic, String> {
+async fn drive(deps: &Deps, spec: AgentSpec, member: Member) -> Result<Dynamic, String> {
+    let label = member.label.clone();
+    deps.edge(Some(&member), RunState::Started);
+    let outcome = drive_inner(deps, spec, &label).await;
+    deps.edge(
+        Some(&member),
+        if outcome.is_ok() { RunState::Done } else { RunState::Failed },
+    );
+    outcome
+}
+
+async fn drive_inner(deps: &Deps, spec: AgentSpec, label: &str) -> Result<Dynamic, String> {
     let structured = spec.schema.is_some();
     let run = RunSpec {
         label:          format!("workflow {label}"),
@@ -777,7 +849,7 @@ mod tests {
             engine.register_fn("agent", move |p: ImmutableString| {
                 let spec = spec_from(&p, None)?;
                 let label = plan_one(&state, &spec)?;
-                stub_drive(&spec, &label).map_err(throw)
+                stub_drive(&spec, &label.label).map_err(throw)
             });
         }
         {
@@ -785,7 +857,7 @@ mod tests {
             engine.register_fn("agent", move |p: ImmutableString, o: rhai::Map| {
                 let spec = spec_from(&p, Some(&o))?;
                 let label = plan_one(&state, &spec)?;
-                stub_drive(&spec, &label).map_err(throw)
+                stub_drive(&spec, &label.label).map_err(throw)
             });
         }
         {
@@ -793,7 +865,7 @@ mod tests {
             engine.register_fn("parallel", move |items: rhai::Array| {
                 let mut out = rhai::Array::new();
                 for (spec, label) in plan(&state, &items)? {
-                    out.push(stub_drive(&spec, &label).unwrap_or(Dynamic::UNIT));
+                    out.push(stub_drive(&spec, &label.label).unwrap_or(Dynamic::UNIT));
                 }
                 Ok::<Dynamic, Box<EvalAltResult>>(Dynamic::from(out))
             });

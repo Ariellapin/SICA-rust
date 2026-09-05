@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -668,6 +668,38 @@ pub struct SessionMeta {
     pub cwd: Option<PathBuf>,
 }
 
+/// One orchestrated run as the transcript draws it (UI guide §6.11):
+/// `workflow` or `agent-team`, rebuilt from the four durable rows the
+/// backend writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRunDump {
+    pub run_id: u64,
+    /// The `ToolCall` seq this run belongs to — how the frontend finds the
+    /// row to draw it under.
+    pub call_seq: u64,
+    /// `running | done | failed`.
+    pub state: String,
+    /// The run started and never ended. Live that means running; once the
+    /// turn is over it means **interrupted**, which is the case the four
+    /// rows exist to make visible.
+    pub open: bool,
+    pub phases: Vec<RunPhaseDump>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunPhaseDump {
+    /// Empty for a script that never called `phase()`.
+    pub title: String,
+    pub members: Vec<RunMemberDump>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunMemberDump {
+    pub label: String,
+    /// `running | done | failed`.
+    pub state: String,
+}
+
 /// One registered workspace (§3.9).
 ///
 /// `sessions` is a **manual** order — a new session is prepended, activity
@@ -720,6 +752,10 @@ pub struct SessionDump {
     /// one — drives the FE composer chip without a second round-trip.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Orchestrated runs this session holds (§6.11), rebuilt from the log
+    /// so a reload draws the same tree the live events drew.
+    #[serde(default)]
+    pub runs: Vec<WorkflowRunDump>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -839,6 +875,12 @@ pub enum Event {
     /// Pushed after every workspace mutation, carrying the whole projection
     /// (§3.9). Same shape as `Response::Workspaces`.
     WorkspacesChanged { rows: Vec<WorkspaceDump>, ungrouped: Vec<u64> },
+
+    /// One orchestrated run changed (§6.11), carrying the whole run rather
+    /// than the edge that moved it: a run is a handful of rows, and a
+    /// frontend that reconciled edges could drift from the log the same
+    /// tree is rebuilt from on reload.
+    WorkflowRunChanged { session_id: u64, run: WorkflowRunDump },
 
     // Live token meter (fixes the stale-meter bug from Python).
     //

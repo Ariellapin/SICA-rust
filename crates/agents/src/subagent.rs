@@ -89,6 +89,27 @@ pub struct RunReport {
     pub approval: Option<ApprovalRecord>,
 }
 
+/// One edge of an orchestrated run: the run starting, a member starting, a
+/// member ending, or the run ending (UI guide §6.11).
+#[derive(Debug, Clone)]
+pub struct RunEdge {
+    pub run_id:    u64,
+    /// Seq of the `ToolCall` that started the run.
+    pub call_seq:  u64,
+    pub phase:     Option<String>,
+    pub member:    Option<String>,
+    pub member_id: Option<u64>,
+    pub state:     sica_core::event::RunState,
+}
+
+/// Who turns a [`RunEdge`] into a durable row. Implemented by the backend,
+/// which owns the session log — `agents` knows how to run a workflow and
+/// nothing about where its history lives, the same split `JobNotifier`
+/// makes for background jobs.
+pub trait RunNotifier: Send + Sync {
+    fn edge(&self, session_id: u64, edge: RunEdge);
+}
+
 #[derive(Clone)]
 pub struct ToolSubAgent {
     pub depth:         u8,
@@ -126,6 +147,11 @@ pub struct ToolSubAgent {
     /// turn is excluded by construction, so a fork never inherits a
     /// half-written exchange.
     pub fork_seed:     Option<Arc<Vec<ChatMessage>>>,
+    /// Where the durable rows of an orchestrated run go (UI guide §6.11).
+    /// `None` outside a live session, which is also where there is no log to
+    /// write them to. Inherited by `child()` so a nested orchestrator would
+    /// report through the same sink.
+    pub runs:          Option<Arc<dyn RunNotifier>>,
     /// Directory the owning session works in (guide §3.9). `None` means
     /// "whatever the process defaults to" — a session created before
     /// sessions had their own directory, or a sub-agent running outside one
@@ -156,9 +182,16 @@ impl ToolSubAgent {
             session_id:   None,
             plan_active:  false,
             fork_seed:    None,
+            runs:         None,
             cwd:          None,
             log_seq:      None,
         }
+    }
+
+    /// Attach the sink that makes an orchestrated run durable (§6.11).
+    pub fn with_runs(mut self, runs: Arc<dyn RunNotifier>) -> Self {
+        self.runs = Some(runs);
+        self
     }
 
     /// Bind this call (and its children) to the session's working
@@ -254,6 +287,7 @@ impl ToolSubAgent {
             session_id:   self.session_id,
             plan_active:  self.plan_active,
             fork_seed:    self.fork_seed.clone(),
+            runs:         self.runs.clone(),
             cwd:          self.cwd.clone(),
             // A nested call is a live event only — it never reaches the
             // session log, so it inherits no seq.

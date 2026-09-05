@@ -108,9 +108,13 @@ fn draw_one(
     if expanded {
         // The body is a sibling of the row, so clicks inside it never toggle.
         let chip = chip.clone();
+        // The run this row is, when it is one (§6.11). Keyed by the
+        // durable `ToolCall` seq, which is what the backend stamps on
+        // every row of the run.
+        let run = app.runs.get(&chip.log_seq).cloned();
         let mut action = None;
         indented(ui, 22.0, &t, |ui| {
-            body(ui, &chip, state);
+            body(ui, &chip, state, run.as_ref());
             action = row_actions(ui, &chip, &t);
         });
         match action {
@@ -137,6 +141,84 @@ fn draw_one(
             }
         });
     }
+}
+
+/// The run → phase → member tree of an orchestrated run (§6.11), rebuilt
+/// from the four durable rows the backend writes.
+///
+/// It replaces the phase list whenever it is there: the list is a
+/// transcript of what was printed, the tree is the run's actual shape, and
+/// the tree survives a reload. dsh's open/close rule is kept — a phase that
+/// is running or has anything abnormal in it stays open, a wholly finished
+/// one closes — because a completed run should collapse to a single line and
+/// a broken one should not make the reader go looking.
+///
+/// Returns `true` when it drew anything.
+fn run_tree(ui: &mut egui::Ui, run: Option<&protocol::WorkflowRunDump>) -> bool {
+    let Some(run) = run else { return false };
+    let t = kit::theme(ui);
+    // A run that started and never ended is *interrupted* once nothing is
+    // running any more — that is the whole reason its start is a row of its
+    // own rather than part of a summary written at the end.
+    let interrupted = run.open && run.state == "running" && !any_running(run);
+    let headline = if interrupted {
+        "interrupted".to_string()
+    } else {
+        run.state.clone()
+    };
+    kit::footnote(ui, &format!("run · {headline}"));
+    for phase in &run.phases {
+        let failed = phase.members.iter().any(|m| m.state == "failed");
+        let running = phase.members.iter().any(|m| m.state == "running");
+        let open = failed || running || interrupted;
+        let title = if phase.title.is_empty() { "members" } else { &phase.title };
+        let counts = format!(
+            "{}/{} done{}",
+            phase.members.iter().filter(|m| m.state == "done").count(),
+            phase.members.len(),
+            if failed { " · failed" } else { "" },
+        );
+        kit::footnote(ui, &format!("  {title} — {counts}"));
+        if !open {
+            continue;
+        }
+        for m in &phase.members {
+            let mark = match m.state.as_str() {
+                "done" => "✓",
+                "failed" => "✕",
+                // Still running when the run is over means it never got to
+                // report — the member half of "interrupted".
+                _ if interrupted => "⋯",
+                _ => "•",
+            };
+            let colour = match m.state.as_str() {
+                "failed" => t.alias.error,
+                "done" => t.alias.label[2],
+                _ => t.alias.business,
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                kit::label(
+                    ui,
+                    kit::txt(
+                        format!("{mark} {}", kit::one_line(&m.label, 120)),
+                        11.0,
+                        Weight::Regular,
+                        kit::col(colour),
+                    ),
+                );
+            });
+        }
+    }
+    ui.add_space(4.0);
+    true
+}
+
+fn any_running(run: &protocol::WorkflowRunDump) -> bool {
+    run.phases
+        .iter()
+        .flat_map(|p| p.members.iter())
+        .any(|m| m.state == "running")
 }
 
 /// The phase list of an orchestrating run (§6.11): what `workflow`'s
@@ -317,13 +399,18 @@ fn hover_of(chip: &ToolChip) -> String {
 // Bodies
 // ---------------------------------------------------------------------------
 
-fn body(ui: &mut egui::Ui, chip: &ToolChip, state: ToolState) {
+fn body(
+    ui: &mut egui::Ui,
+    chip: &ToolChip,
+    state: ToolState,
+    run: Option<&protocol::WorkflowRunDump>,
+) {
     ui.add_space(4.0);
     if state == ToolState::Running {
         // A running orchestrator has something to say: its own progress.
         // Everything else has only "running…", which is what the chip's dot
         // already says.
-        if progress(ui, chip) {
+        if run_tree(ui, run) || progress(ui, chip) {
             ui.add_space(4.0);
             return;
         }
@@ -331,7 +418,9 @@ fn body(ui: &mut egui::Ui, chip: &ToolChip, state: ToolState) {
         ui.add_space(4.0);
         return;
     }
-    progress(ui, chip);
+    if !run_tree(ui, run) {
+        progress(ui, chip);
+    }
     // What the tool itself produced. Older sessions (and harness controls)
     // carry only the outcome, which is then the same text.
     let out = if chip.output.is_empty() { &chip.summary } else { &chip.output };

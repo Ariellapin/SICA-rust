@@ -200,6 +200,20 @@ fn describe(kind: &EventKind) -> Described {
             row(EventTag::System, format!("retitled · {title}")).payload(title.clone())
         }
         EventKind::SessionArchived => row(EventTag::System, "archived".into()),
+        // One edge of an orchestrated run (§6.11). The ledger shows the
+        // edges; the transcript shows the tree they fold into.
+        EventKind::WorkflowRun { run_id, phase, member, state, .. } => {
+            let what = match (phase.as_deref(), member.as_deref()) {
+                (_, Some(m)) => format!("member {m}"),
+                (Some(p), None) => format!("phase {p}"),
+                (None, None) => "run".to_string(),
+            };
+            row(
+                EventTag::System,
+                format!("workflow {run_id} · {what} · {}", state.label()),
+            )
+            .ok(*state != sica_core::event::RunState::Failed)
+        }
         EventKind::TurnStart { turn_id, source } => row(
             EventTag::Turn,
             format!("turn {turn_id} started · {}", source.label()),

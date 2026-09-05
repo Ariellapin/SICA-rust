@@ -19,7 +19,7 @@
 //! - [`TurnOutline`] — one row per turn, the "jump to turn" list.
 //! - [`LastTokenUsage`] — the newest `TokenUsage`, for the context meter.
 
-use crate::event::{EventKind, SessionEvent};
+use crate::event::{EventKind, RunState, SessionEvent};
 
 /// A pure fold over the log.
 ///
@@ -243,11 +243,194 @@ impl Projection for LastTokenUsage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Orchestrated runs (UI guide §6.11)
+// ---------------------------------------------------------------------------
+
+/// One member of a run: a child agent the script drove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMember {
+    pub id:    u64,
+    pub label: String,
+    pub state: RunState,
+}
+
+/// A phase of a run. The unnamed phase — a script that never called
+/// `phase()` — carries an empty title, and the reader sees its members
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPhase {
+    pub title:   String,
+    pub members: Vec<RunMember>,
+}
+
+/// One orchestrated run, rebuilt from its four kinds of row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub run_id:   u64,
+    /// The `ToolCall` this run belongs to.
+    pub call_seq: u64,
+    pub state:    RunState,
+    /// `true` when the run started and neither finished nor failed. Live,
+    /// that means running; after the turn it means **interrupted** — which
+    /// is exactly the case four rows exist to make visible.
+    pub open:     bool,
+    pub phases:   Vec<RunPhase>,
+}
+
+/// Rebuild every orchestrated run in `events` (§6.11).
+///
+/// The rows are an append-only account of edges, so the fold is a replay:
+/// a run row opens or closes the run, a member row opens or closes a member
+/// inside the phase it named. A member end with no start is ignored rather
+/// than invented — the log is the truth about what happened, and a row that
+/// contradicts it is a bug to see, not to paper over.
+pub fn workflow_runs(events: &[SessionEvent]) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for ev in events {
+        let EventKind::WorkflowRun { run_id, call_seq, phase, member, member_id, state } = &ev.kind
+        else {
+            continue;
+        };
+        let idx = match out.iter().position(|r| r.run_id == *run_id) {
+            Some(i) => i,
+            None => {
+                // Only a run-level `Started` opens a run. A member row for a
+                // run this build never saw the start of is a torn log, and
+                // inventing the run around it would hide that.
+                if member.is_some() {
+                    continue;
+                }
+                out.push(Run {
+                    run_id:   *run_id,
+                    call_seq: *call_seq,
+                    state:    RunState::Started,
+                    open:     true,
+                    phases:   Vec::new(),
+                });
+                out.len() - 1
+            }
+        };
+        let run = &mut out[idx];
+        let Some(label) = member.clone() else {
+            // A run-level row: the run's own state.
+            run.state = *state;
+            run.open = matches!(state, RunState::Started);
+            continue;
+        };
+        let title = phase.clone().unwrap_or_default();
+        let phase_idx = match run.phases.iter().position(|p| p.title == title) {
+            Some(i) => i,
+            None => {
+                run.phases.push(RunPhase { title, members: Vec::new() });
+                run.phases.len() - 1
+            }
+        };
+        let members = &mut run.phases[phase_idx].members;
+        match state {
+            RunState::Started => members.push(RunMember {
+                id: member_id.unwrap_or(0),
+                label,
+                state: RunState::Started,
+            }),
+            done => {
+                // An end finds its own start by id, falling back to the
+                // newest still-running member of the same label.
+                let at = member_id
+                    .and_then(|id| members.iter().position(|m| m.id == id))
+                    .or_else(|| {
+                        members
+                            .iter()
+                            .rposition(|m| m.label == label && m.state == RunState::Started)
+                    });
+                if let Some(at) = at {
+                    members[at].state = *done;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::{SurfaceOp, TurnSource};
 
+    fn run_row(seq: u64, phase: Option<&str>, member: Option<(u64, &str)>, state: RunState) -> SessionEvent {
+        ev(seq, 1_000, EventKind::WorkflowRun {
+            run_id: 1,
+            call_seq: 42,
+            phase: phase.map(str::to_string),
+            member: member.map(|(_, l)| l.to_string()),
+            member_id: member.map(|(id, _)| id),
+            state,
+        })
+    }
+
+    #[test]
+    fn a_finished_run_rebuilds_its_phases_and_members() {
+        let log = vec![
+            run_row(1, None, None, RunState::Started),
+            run_row(2, Some("Review"), Some((1, "review:bugs")), RunState::Started),
+            run_row(3, Some("Review"), Some((2, "review:perf")), RunState::Started),
+            run_row(4, Some("Review"), Some((1, "review:bugs")), RunState::Done),
+            run_row(5, Some("Review"), Some((2, "review:perf")), RunState::Failed),
+            run_row(6, Some("Verify"), Some((3, "verify:a")), RunState::Started),
+            run_row(7, Some("Verify"), Some((3, "verify:a")), RunState::Done),
+            run_row(8, None, None, RunState::Done),
+        ];
+        let runs = workflow_runs(&log);
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.call_seq, 42);
+        assert_eq!(run.state, RunState::Done);
+        assert!(!run.open);
+        assert_eq!(run.phases.len(), 2);
+        assert_eq!(run.phases[0].title, "Review");
+        assert_eq!(run.phases[0].members.len(), 2);
+        assert_eq!(run.phases[0].members[0].state, RunState::Done);
+        assert_eq!(run.phases[0].members[1].state, RunState::Failed);
+        assert_eq!(run.phases[1].members[0].label, "verify:a");
+    }
+
+    /// The reason there are four rows and not one summary: a run that was
+    /// interrupted left its start behind and nothing else, and that has to
+    /// read as interrupted rather than as never having happened.
+    #[test]
+    fn an_interrupted_run_stays_open_with_its_member_still_running() {
+        let log = vec![
+            run_row(1, None, None, RunState::Started),
+            run_row(2, Some("Review"), Some((1, "review:bugs")), RunState::Started),
+        ];
+        let runs = workflow_runs(&log);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].open, "a run with no terminal row is still open");
+        assert_eq!(runs[0].state, RunState::Started);
+        assert_eq!(runs[0].phases[0].members[0].state, RunState::Started);
+    }
+
+    #[test]
+    fn a_script_without_phases_puts_its_members_in_one_unnamed_phase() {
+        let log = vec![
+            run_row(1, None, None, RunState::Started),
+            run_row(2, None, Some((1, "agent-1")), RunState::Started),
+            run_row(3, None, Some((1, "agent-1")), RunState::Done),
+            run_row(4, None, None, RunState::Done),
+        ];
+        let runs = workflow_runs(&log);
+        assert_eq!(runs[0].phases.len(), 1);
+        assert_eq!(runs[0].phases[0].title, "");
+        assert_eq!(runs[0].phases[0].members.len(), 1);
+    }
+
+    /// A member row for a run whose start is not in the log is a torn log.
+    /// Inventing the run around it would hide that.
+    #[test]
+    fn a_member_without_its_run_is_dropped() {
+        let log = vec![run_row(1, Some("P"), Some((1, "m")), RunState::Started)];
+        assert!(workflow_runs(&log).is_empty());
+    }
     fn ev(seq: u64, ts: i64, kind: EventKind) -> SessionEvent {
         SessionEvent { seq, ts, kind }
     }

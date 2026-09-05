@@ -1529,11 +1529,17 @@ end through `spawn_blocking` with a script that calls no agent.
   property of the replay design, not of this feature. Fixing it means
   recording child conversations in a sidecar the way `replay.override.json`
   already carries what the log cannot express.
-- **A `WorkflowRun` structure and durable nesting.** Progress is `LogLine`s
-  and the children's live chips, the same shape `ralph` uses. Reconstructing
-  a finished workflow after a reload needs `ToolResult.parent_seq`
-  (Appendix A) — still unused, still the same one change for §7, §12.6 and
-  this.
+- **A `WorkflowRun` structure — done** (protocol v27, UI guide §6.11).
+  `EventKind::WorkflowRun { run_id, call_seq, phase, member, member_id,
+  state }` is written on run start, member start, member end and run end;
+  `agents::workflow` reports the edges through `subagent::RunNotifier` and
+  `backend::chat::WorkflowBridge` makes them durable. Four rows rather than
+  one summary, because an interrupted run is then visible *because* its
+  terminal rows are missing. They are **non-surface**, so the children stay
+  out of the model's history. This did **not** need `ToolResult.parent_seq`:
+  a run names its own `ToolCall` seq, which is a weaker join than nesting
+  every child result and enough for what the reader wants. `parent_seq` is
+  still unused, and still the change §7 and §12.6 would want.
 - **`provider` / `model` per agent.** dsh lets a script pick a cheaper model
   per step. Here every child runs on the session's connection.
 - **Thunk-style `parallel`** if the runtime ever gains concurrency (a JS
@@ -1835,7 +1841,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | **7 — PTC** — **done** (protocol v25) | programmatic tool calling (§7, `agents::ptc` on `rhai` + `prompt::order::PTC_SDK` + `ToolMode` + the `ptc-program` replay scenario) | XL×1 | yes (v25) |
 | **8 — workflows** — **done** | model-written orchestration scripts (§12.5, `agents::workflow` on the shared `agents::script` sandbox + `prompt::order::WORKFLOW_SDK`, opt-in on `skills/workflow.md`) | L×1 | no |
 | **9 — workspaces & durability** — **done** (protocol v26) | per-session `cwd` + the format header and its migration chain (§3.8, `event::migrate` + `sessions_store::list_headers`) · workspace registry `backend::workspaces` + `NewSession { workspace_id }` (§3.9) · `sica_core::atomic::atomic_write` · credential references + `sica-settings/.env` (§14.6, `sica_core::creds`) | M×3 + S×2 | yes (v26) — `ListWorkspaces` … `MoveSession`, `Event::WorkspacesChanged`, `SessionMeta.cwd`; log-only `SessionCreated.format` / `.cwd` |
-| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · durable `WorkflowRun` events (§12.5, needed by UI guide §6.11) · lazy session bodies (§3.8) · settings-file watch and the write-only Models card (§14.6, both frontend surfaces — they belong with a UI wave) · content-addressed images (§9.6, its own shape change to `UserImage` and so its own bump) | L/XL | — |
+| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · lazy session bodies (§3.8) · the settings-file watch (§14.6, a frontend surface) · content-addressed images (§9.6, its own shape change to `UserImage` and so its own bump) | L/XL | — |
 
 ---
 
@@ -1857,6 +1863,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | `AgentPreset { name: Option<String> }` — **done** (Wave 6) | no | §5.2 |
 | `SessionCreated += format: u16, cwd: Option<PathBuf>` — **done** (Wave 9) | (existing; line 1 stays the header) | §3.8, §3.9 |
 | `MessageFeedback { seq_ref, rating, note }` | no | §3.7 |
+| `WorkflowRun { run_id, call_seq, phase, member, member_id, state }` — **done** (v27) | no | §12.5, UI §6.11 |
 | `Schedule { id, fire_at, prompt }` | no | §12.8 |
 
 All are additive; `derive_surface` ignores unknown non-surface kinds. Give
@@ -1875,6 +1882,7 @@ by a newer backend still loads on an older one.
 | 7 — shipped as v25 | — | `LlmOptions.native_tools: bool` → `LlmOptions.tool_mode: ToolMode { Text, Native, Ptc }`. No new variant: PTC rides the native `tools` array with a narrowed catalogue, and a program's sub-calls are live events only |
 | 8 — no bump | — | —. `workflow` (§12.5) is one more skill: its children reuse the delegation events Wave 4 already added, and its progress is `LogLine`s. `ToolResult.parent_seq` stays reserved and unused |
 | 9 — shipped as v26 | `ListWorkspaces`, `CreateWorkspace`, `RenameWorkspace`, `DeleteWorkspace`, `MoveWorkspace`, `MoveSession`; `NewSession { workspace_id }` | `Response::Workspaces` (`WorkspaceDump`); `Event::WorkspacesChanged`; `SessionMeta.cwd`. Log-only: `SessionCreated.format`, `SessionCreated.cwd`. Nothing for the registry itself — dsh logs no workspace event either |
+| 10 — shipped as v27 | — | `Event::WorkflowRunChanged` (`WorkflowRunDump`, `RunPhaseDump`, `RunMemberDump`); `SessionDump.runs`. Log-only: `EventKind::WorkflowRun`, `RunState` |
 
 Every bump: `.\run.ps1 build --workspace`, restart the GUI, run
 `.\run.ps1 run -p frontend --bin smoke`, and update CLAUDE.md's version note.

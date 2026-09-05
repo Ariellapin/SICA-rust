@@ -1348,7 +1348,7 @@ put `UNVERIFIED` (which dsh does not have) as an amber `StateDot` +
 files need `write-file` path collection at `TurnEnd` — **S**, worth doing:
 the tail row `Produced [chip] [chip] + 2 files`, click opens in Explorer).
 
-### 6.11 Workflow runs and the agent-team panel — **interim done**
+### 6.11 Workflow runs and the agent-team panel — **done** (UI-8, protocol v27)
 
 **dsh** (`ui-workflow-run`, the experimental `client-ui-agent-team`): a
 top-level workflow run is its **own conversation node**, rebuilt from four
@@ -1397,15 +1397,31 @@ phases, because nothing about the run reaches the log. That is exactly what
 the durable `WorkflowRun` events would fix, and they are still the
 prerequisite for the full run → phase → member tree.
 
-**The design fork that is left**, since it is the reason this is parked:
-dsh writes four events (run start, member start, member end, run end) so a
-reload rebuilds the same tree the live events built, and an interrupted run
-is visible *because* its terminal events are missing. The cheaper option is
-one summary event at the end — smaller logs, but an interrupted run leaves
-no record at all, which is the case most worth seeing. Either way the rows
-must be **non-surface**: a workflow's children are deliberately absent from
-the model's history, and logging them as `ToolResult` would put them back
-in it.
+**The fork was settled: four events.** `EventKind::WorkflowRun { run_id,
+call_seq, phase, member, member_id, state }` is written on run start, member
+start, member end and run end. The deciding case is the run that did not
+finish: with four rows an interrupted run is visible *because* its terminal
+rows are missing, where a summary written at the end would have left nothing
+behind at all — and that is the run a reader most needs to see. The rows are
+**non-surface**, so a workflow's children stay out of the model's history;
+only what the script printed reaches it, exactly as before.
+
+`agents::workflow` reports edges through `RunNotifier`, the same split
+`JobNotifier` makes for background jobs — `agents` knows how to run a
+workflow and nothing about where its history lives. `backend::chat::
+WorkflowBridge` appends each edge and pushes the **whole run**, rebuilt from
+the log by `sica_core::project::workflow_runs`, so the live tree and the one
+a reload draws cannot drift: both are folds of the same rows.
+
+The body renders run → phase → member with dsh's open/close rule — a phase
+that is running or holds a failure stays open, a wholly finished one closes,
+so a completed run collapses to a line and a broken one does not make the
+reader go looking. A run whose rows stop while it still says *running*, with
+nothing running under it, reads as **interrupted**.
+
+The phase list from the interim is still there and still useful: it is what
+`agent-team` shows, since only `workflow` is instrumented, and it is what a
+run shows before its first member starts.
 
 ### 6.12 `@session` references — **done** (UI-8)
 
@@ -1791,7 +1807,7 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
-| **UI-8 Workspaces, onboarding, integrations** — **done** | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · ~~the lightbox and history sizing (§5.3)~~; file cards need harness §9.6 · ~~markdown extras (§3.8)~~ · ~~`@session` (§6.12)~~ · the workflow run body (§6.11: the live phase list is in; the run → phase → member tree waits on the durable `WorkflowRun` event) | **L** | v26 (harness Wave 9) |
+| **UI-8 Workspaces, onboarding, integrations** — **done** | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · ~~the lightbox and history sizing (§5.3)~~; file cards need harness §9.6 · ~~markdown extras (§3.8)~~ · ~~`@session` (§6.12)~~ · ~~the workflow run body (§6.11)~~ | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the
@@ -1799,11 +1815,10 @@ power-user view.
 
 ---
 
-**UI-8 is done except for two things that are not UI work.** The §5.3
-file cards need generic file attachments to exist (harness §9.6), and the
-§6.11 run tree needs the durable `WorkflowRun` events (harness §12.5's
-"left for later"). Both have a shipped interim in their place: text files
-enter as `@path` references, and a running orchestrator lists its phases.
+**UI-8 is done except for one thing that is not UI work.** The §5.3
+file cards need generic file attachments to exist (harness §9.6); text files
+enter as `@path` references in their place. §6.11's durable events were
+built rather than deferred — see below.
 One more carry-over sits in §7.1 rather than UI-8: Settings › General still
 says "Working directory" and still restarts the backend, because renaming
 it to the default-for-ungrouped-sessions *and* dropping the restart needs a
