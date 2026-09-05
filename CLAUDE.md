@@ -64,7 +64,7 @@ Seven crates, dependency direction strictly downward. Details in
 ## Reference docs
 
 - **[docs/architecture.md](docs/architecture.md)** — the crate graph, the wire
-  protocol (framing, `PROTOCOL_VERSION` history v17–v27), every on-disk surface,
+  protocol (framing, `PROTOCOL_VERSION` history v17–v28), every on-disk surface,
   how to add a new request, and the conventions to respect when editing.
 - **[docs/agent-loop.md](docs/agent-loop.md)** — one turn end to end: history
   derivation, prune/compact/trim, retry classification, the two tool-calling

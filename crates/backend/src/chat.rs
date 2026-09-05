@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use protocol::{Event, Frame, LlmOptions, LlmState, MessageDump, PermissionMode, SessionDump, SessionMeta, UserImage};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -2477,6 +2478,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
             None => {}
         }
 
+        // Images are stored before anything is written: the log records a
+        // reference, not megabytes of base64 that would be re-read on every
+        // load and re-derived on every turn (§9.6). A store that fails
+        // leaves the image inline — the message the user sent matters more
+        // than the tidiness of the log.
+        let images = store_images(session_id, images);
+
         // `@session:<id>` mentions are resolved *before* the log block, so
         // the snapshot is taken while nothing of this turn has been written
         // yet — and so an id that names nothing can be reported without
@@ -3598,6 +3606,30 @@ pub(crate) async fn append_event(
     Some(seq)
 }
 
+/// Put every image in the session's attachment store, and hand back the
+/// references that go in the log (§9.6).
+///
+/// Over the admission cap the extras are dropped with a `WARN`: twenty
+/// images is already more than any provider will look at, and silently
+/// sending a twenty-first is worse than saying so.
+fn store_images(session_id: u64, images: Vec<UserImage>) -> Vec<UserImage> {
+    if images.is_empty() {
+        return images;
+    }
+    let dir = sica_core::paths::attachments_dir(session_id);
+    let mut out = Vec::with_capacity(images.len());
+    for image in images.into_iter().take(sica_core::attachments::limits::IMAGES_PER_MESSAGE) {
+        match sica_core::attachments::store(&dir, &image) {
+            Ok(stored) => out.push(stored),
+            Err(e) => {
+                warn!(session_id, error = %e, "could not store an image — kept inline");
+                out.push(image);
+            }
+        }
+    }
+    out
+}
+
 /// Bridge from `agents::workflow` back into the session log (§6.11).
 ///
 /// `agents` knows how to run a workflow and nothing about where its history
@@ -4375,6 +4407,31 @@ fn native_calls_to_json(calls: &[agents::turn::NativeToolCall]) -> String {
 /// servers); otherwise we send the OpenAI-vision `Parts` array with each
 /// image inlined as a `data:` URL. Caller should only pass images on user
 /// messages — other roles get empty `Vec`.
+/// The base64 bytes of an image, read back from the store when the message
+/// carries only a reference (§9.6).
+fn image_data(image: &UserImage) -> Option<String> {
+    if !image.is_reference() {
+        return Some(image.data_base64.clone());
+    }
+    // The session id is not in scope here, so the file is found by hash
+    // across the store — which is what content addressing is *for*: the
+    // name is the content, and the same bytes are the same file wherever
+    // they were first seen.
+    let sessions = sica_core::paths::sessions_dir();
+    let name = format!("{}.{}", image.sha, image.extension());
+    let dirs = std::fs::read_dir(&sessions).ok()?;
+    for entry in dirs.flatten() {
+        let candidate = entry.path().join("attachments").join(&name);
+        if candidate.is_file() {
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                return Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+            }
+        }
+    }
+    warn!(sha = %image.sha, "image bytes are not in the attachment store — skipped");
+    None
+}
+
 fn build_chat_content(text: &str, images: &[UserImage]) -> ChatContent {
     if images.is_empty() {
         return ChatContent::Text(text.to_string());
@@ -4384,10 +4441,13 @@ fn build_chat_content(text: &str, images: &[UserImage]) -> ChatContent {
         parts.push(ContentPart::Text { text: text.to_string() });
     }
     for img in images {
+        // A stored image is a reference; the model needs the bytes. An
+        // image whose file has gone is skipped rather than sent as an empty
+        // data URI, which providers reject and which would cost the whole
+        // turn.
+        let Some(data) = image_data(img) else { continue };
         parts.push(ContentPart::ImageUrl {
-            image_url: ImageUrl {
-                url: format!("data:{};base64,{}", img.mime, img.data_base64),
-            },
+            image_url: ImageUrl { url: format!("data:{};base64,{}", img.mime, data) },
         });
     }
     ChatContent::Parts(parts)
@@ -4596,7 +4656,7 @@ mod tests {
     fn wire_history_inlines_images_as_parts() {
         let msgs = vec![Message::user_with_images(
             "look",
-            vec![UserImage { mime: "image/png".into(), data_base64: "AAAA".into() }],
+            vec![UserImage { mime: "image/png".into(), data_base64: "AAAA".into(), ..Default::default() }],
         )];
         let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None, &sica_core::paths::working_dir()).unwrap().messages;
         let last = wire.last().unwrap();

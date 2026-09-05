@@ -250,8 +250,8 @@ mod tests {
             .push(1, Inbound::Followup {
                 text:   "look at these".into(),
                 images: vec![
-                    UserImage { mime: "image/png".into(), data_base64: "a".into() },
-                    UserImage { mime: "image/png".into(), data_base64: "b".into() },
+                    UserImage { mime: "image/png".into(), data_base64: "a".into(), ..Default::default() },
+                    UserImage { mime: "image/png".into(), data_base64: "b".into(), ..Default::default() },
                 ],
             })
             .await;

@@ -956,13 +956,25 @@ pub struct PendingAttachment {
     /// if the chip doesn't currently render it.
     pub size_bytes:  usize,
     pub texture:     Option<egui::TextureHandle>,
+    /// Set for a **text file** (§5.3): the path it will be referenced by.
+    ///
+    /// A text file is not carried as bytes — the agent can already read a
+    /// file — so the card is a promise that `@path` will be appended to the
+    /// message when it is sent. Removing the card takes the promise back,
+    /// which is the whole reason it is a card and not text typed into the
+    /// draft the moment the file is dropped.
+    pub file_path:   Option<std::path::PathBuf>,
 }
 
 impl PendingAttachment {
     pub fn to_user_image(&self) -> UserImage {
+        // Bytes on the way out; the backend stores them and the log
+        // keeps the reference it hands back (§9.6).
         UserImage {
             mime: self.mime.clone(),
             data_base64: self.data_base64.clone(),
+            sha: String::new(),
+            bytes: self.size_bytes as u64,
         }
     }
 }
@@ -1113,7 +1125,13 @@ impl Notice {
 /// caches per turn rather than being drained.
 pub struct Attachment {
     pub mime:        String,
+    /// Inline bytes, for a message logged before the attachment store
+    /// existed. A stored image leaves this empty and carries `sha` instead.
     pub data_base64: String,
+    /// `sha256` of the bytes (§9.6). The frontend reads the file itself —
+    /// it shares a machine with the backend, so the alternative would be
+    /// asking for bytes that are already on this disk.
+    pub sha:         String,
     pub texture:     Option<egui::TextureHandle>,
 }
 
@@ -1122,6 +1140,7 @@ impl Attachment {
         Self {
             mime: img.mime.clone(),
             data_base64: img.data_base64.clone(),
+            sha: img.sha.clone(),
             texture: None,
         }
     }
@@ -1799,6 +1818,7 @@ impl App {
             .map(|a| Attachment {
                 mime: a.mime.clone(),
                 data_base64: a.data_base64.clone(),
+                sha: String::new(),
                 texture: None,
             })
             .collect();

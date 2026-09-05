@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 27) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 28) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -212,6 +212,17 @@ pushed as `Event::WorkflowRunChanged`, rebuilt from the log by
 `sica_core::project::workflow_runs`; `SessionDump.runs` carries the same
 fold on reload, so the live tree and the reloaded one cannot drift.
 
+v28 adds **content-addressed attachments** (harness §9.6). An image is
+stored once under `sessions/<id>/attachments/<sha256>.<ext>` and
+`UserImage` carries `{ mime, sha, bytes }` instead of base64, so a session
+with twenty screenshots is a log of references rather than megabytes
+re-read on every load. Identical bytes are one file — the name is the
+content — and the store is append-only. A message logged before the store
+still carries its bytes inline and is read as it is, which is why this
+needed no session-format migration. The request builder resolves a
+reference back to base64; the frontend reads the file directly, sharing a
+disk with the backend.
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
@@ -224,6 +235,7 @@ fold on reload, so the live tree and the reloaded one cannot drift.
 | `agents/*.md` | `agents::preset`, `agents::invoke`, `backend::catalog` | Session personas (v24): body → `PERSONA` prompt section, frontmatter `skills:` → registry view. A typed `/name` *selects* one rather than injecting it. Seeded once with `reviewer.md`. Read at selection and once per turn — no restart needed. |
 | `skills/*.md` | `agents::md_skill` | Scanned at BE startup only — adding a skill needs a BE restart. `plan-mode.md` is the plan-policy config, excluded from the scan by name. |
 | `sessions/<id>.jsonl` | `backend::sessions_store` | One append-only event log per chat session (`sica_core::event::SessionEvent`, one JSON object per line). Line 1 is the `SessionCreated` **header**: id, title, created_at, `format` and the session's `cwd` (v26). A torn final line or a bad line mid-file is skipped, never fatal; a future `format` is skipped whole. Loaded eagerly at startup by `ChatHub::new_loaded`; `list_headers` answers from line 1 plus a scan for the rows that can change a listing, without deriving anything. A fresh session is not written until its first user message. Legacy `<id>.toml` files are migrated once into `LegacyMessage` events and renamed `<id>.toml.bak` (never deleted). |
+| `sessions/<id>/attachments/<sha256>.<ext>` | `sica_core::attachments` | Every image a message carried (v28), named by the SHA-256 of its bytes. Written once, never rewritten, deduplicated by content; removed only with the session. |
 | `spill/<session>/*.txt` | `agents::spill` | Full text of tool outputs too large to feed back into context; the model holds only a digest + this path. `.gitignore`d churn. |
 | `sica-settings.json` | `frontend::settings_store` | FE settings, read at startup. Settings › General applies live (theme mode, content font size 12–17, Normal/Compact transcript, busy-Enter, reduce-motion) and writes through on every change; the other sections still have their own Apply / Connect buttons. |
 | `sica-settings/llm-providers/*.toml` | `frontend::llm_providers` | One panel per provider; filename stem is the id. `.gitignore`d — may hold API keys. In the UI, `0` means "auto" for `max_tokens`/`context_window`. Each card shows a per-model recommendation (`llm::preset`, matched from the model string: temperature / thinking / tool mode per family) with a one-click Apply that persists to the TOML. |

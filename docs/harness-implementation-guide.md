@@ -1169,7 +1169,7 @@ query }` (walk with `ignore`, cap 200). On send, the BE expands `@path` into
 `ContextInjected { source: FileReference, content: <file body, framed
 untrusted, 32 KiB cap> }`.
 
-### 9.6 `dsh-attachment(-local)`, `dsh-client-file-upload` — **present (variant)**
+### 9.6 `dsh-attachment(-local)`, `dsh-client-file-upload` — **done** (protocol v28)
 
 **Mechanism.** Bytes go to `ctx.attachments` first, and the log gets an
 immutable content-addressed reference (`sha256:<digest>` plus verified
@@ -1199,6 +1199,30 @@ files need no store: a dropped `.txt` / `.md` / `.csv` becomes
 `ContextInjected { source: FileReference }` with the file's text through
 `retain` (§6.10), which is what `@path` already produces. The UI is UI guide
 §5.3.
+
+**As shipped.** `sica_core::attachments` stores an image once under
+`sessions/<id>/attachments/<sha256>.<ext>` and the log keeps
+`UserImage { mime, sha, bytes }` with no base64 at all. Three things follow,
+and they are the reason for the store: a session with twenty screenshots
+stops being twenty base64 blobs re-read on every load and re-derived on
+every turn; **identical bytes are one file**, because the name *is* the
+content, so the same screenshot pasted three times is stored once; and the
+store is append-only, so a reference in an old message cannot be
+invalidated by a later one.
+
+Both directions keep working. A message logged before the store carries its
+bytes inline and is left alone — `is_reference()` is the whole test — so no
+session-format migration was needed; the tolerance §3.8 built for is exactly
+this case. The request builder resolves a reference back to base64, and the
+frontend reads the file itself rather than asking for bytes already on its
+own disk.
+
+Deliberately *not* taken from dsh: the digest is not re-verified on every
+read (the file is named by its hash and nothing else writes there), and
+there is no signature, no width/height in the event, and no upload receipt
+— those exist because dsh streams bytes to a server across a trust
+boundary, and here the two processes share a disk. The admission limits are
+constants in `attachments::limits`.
 
 ---
 
@@ -1841,7 +1865,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | **7 — PTC** — **done** (protocol v25) | programmatic tool calling (§7, `agents::ptc` on `rhai` + `prompt::order::PTC_SDK` + `ToolMode` + the `ptc-program` replay scenario) | XL×1 | yes (v25) |
 | **8 — workflows** — **done** | model-written orchestration scripts (§12.5, `agents::workflow` on the shared `agents::script` sandbox + `prompt::order::WORKFLOW_SDK`, opt-in on `skills/workflow.md`) | L×1 | no |
 | **9 — workspaces & durability** — **done** (protocol v26) | per-session `cwd` + the format header and its migration chain (§3.8, `event::migrate` + `sessions_store::list_headers`) · workspace registry `backend::workspaces` + `NewSession { workspace_id }` (§3.9) · `sica_core::atomic::atomic_write` · credential references + `sica-settings/.env` (§14.6, `sica_core::creds`) | M×3 + S×2 | yes (v26) — `ListWorkspaces` … `MoveSession`, `Event::WorkspacesChanged`, `SessionMeta.cwd`; log-only `SessionCreated.format` / `.cwd` |
-| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · lazy session bodies (§3.8) · the settings-file watch (§14.6, a frontend surface) · content-addressed images (§9.6, its own shape change to `UserImage` and so its own bump) | L/XL | — |
+| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · lazy session bodies (§3.8) · the settings-file watch (§14.6, a frontend surface) | L/XL | — |
 
 ---
 
@@ -1883,6 +1907,7 @@ by a newer backend still loads on an older one.
 | 8 — no bump | — | —. `workflow` (§12.5) is one more skill: its children reuse the delegation events Wave 4 already added, and its progress is `LogLine`s. `ToolResult.parent_seq` stays reserved and unused |
 | 9 — shipped as v26 | `ListWorkspaces`, `CreateWorkspace`, `RenameWorkspace`, `DeleteWorkspace`, `MoveWorkspace`, `MoveSession`; `NewSession { workspace_id }` | `Response::Workspaces` (`WorkspaceDump`); `Event::WorkspacesChanged`; `SessionMeta.cwd`. Log-only: `SessionCreated.format`, `SessionCreated.cwd`. Nothing for the registry itself — dsh logs no workspace event either |
 | 10 — shipped as v27 | — | `Event::WorkflowRunChanged` (`WorkflowRunDump`, `RunPhaseDump`, `RunMemberDump`); `SessionDump.runs`. Log-only: `EventKind::WorkflowRun`, `RunState` |
+| 11 — shipped as v28 | — | `UserImage += sha, bytes`, `data_base64` now empty in every dump. Log-only: the same shape, plus `sessions/<id>/attachments/` beside the log |
 
 Every bump: `.\run.ps1 build --workspace`, restart the GUI, run
 `.\run.ps1 run -p frontend --bin smoke`, and update CLAUDE.md's version note.

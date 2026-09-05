@@ -689,17 +689,34 @@ fn parse_harness_command(text: &str) -> Option<(String, String)> {
 }
 
 fn send_message(app: &mut App, steer: bool) {
-    let text = std::mem::take(&mut app.chat.draft);
+    let mut text = std::mem::take(&mut app.chat.draft);
     let attachments = std::mem::take(&mut app.chat.pending_images);
+    // A text file's card becomes `@path` in the message (§5.3): the agent
+    // can already read a file, so referencing it is one mechanism instead
+    // of two — and it keeps a megabyte of CSV out of the session log.
+    let refs: Vec<String> = attachments
+        .iter()
+        .filter_map(|a| a.file_path.as_deref())
+        .map(|p| reference_for(app, p))
+        .collect();
+    if !refs.is_empty() {
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
+        }
+        text.push_str(&refs.join(" "));
+    }
     let images = attachments
         .iter()
+        .filter(|a| a.file_path.is_none())
         .map(PendingAttachment::to_user_image)
         .collect::<Vec<_>>();
     let history_images = attachments
         .iter()
+        .filter(|a| a.file_path.is_none())
         .map(|a| crate::app::Attachment {
             mime: a.mime.clone(),
             data_base64: a.data_base64.clone(),
+            sha: String::new(),
             texture: None,
         })
         .collect::<Vec<_>>();
@@ -821,9 +838,22 @@ fn handle_escape(app: &mut App, ui: &mut egui::Ui) {
 fn draw_pending_strip(app: &mut App, ui: &mut egui::Ui) {
     let t = app.theme;
     let ctx = ui.ctx().clone();
-    ui.horizontal_wrapped(|ui| {
+    // One row that scrolls, not a wrapping block: dsh's rail. A dropped
+    // folder of screenshots should push the composer sideways, never
+    // downwards into the transcript.
+    egui::ScrollArea::horizontal()
+        .id_source("pending_rail")
+        .max_height(THUMB_SIZE + 8.0)
+        .show(ui, |ui| {
+    ui.horizontal(|ui| {
         let mut remove_idx: Option<usize> = None;
         for (i, att) in app.chat.pending_images.iter_mut().enumerate() {
+            if att.file_path.is_some() {
+                if file_card(ui, &t, att) {
+                    remove_idx = Some(i);
+                }
+                continue;
+            }
             let tex = ensure_texture(&ctx, &mut att.texture, &att.mime, &att.data_base64, i);
             let (rect, resp) = ui.allocate_exact_size(Vec2::splat(THUMB_SIZE), Sense::hover());
             match tex {
@@ -880,6 +910,103 @@ fn draw_pending_strip(app: &mut App, ui: &mut egui::Ui) {
             app.chat.pending_images.remove(i);
         }
     });
+        });
+}
+
+/// A text file waiting to be referenced: dsh's 240 × 64 card (§5.3).
+/// `[doc glyph] filename` over `EXT · size`, with the same hover × the
+/// image tiles carry. Returns `true` when it was removed.
+fn file_card(ui: &mut egui::Ui, t: &sica_core::theme::Theme, att: &PendingAttachment) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(240.0, THUMB_SIZE), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(16.0), kit::col(t.alias.code_block));
+    painter.rect_stroke(
+        rect,
+        Rounding::same(16.0),
+        Stroke::new(HAIRLINE, Level::L2.color(&t)),
+    );
+    icons::paint(
+        painter,
+        Rect::from_center_size(
+            egui::pos2(rect.min.x + 24.0, rect.center().y),
+            Vec2::splat(18.0),
+        ),
+        Icon::Read,
+        kit::col(t.alias.business),
+    );
+    let name_font = kit::font(13.0, Weight::Medium);
+    let name = kit::elide(ui, &att.filename, &name_font, rect.width() - 68.0);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 42.0, rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        name,
+        name_font,
+        kit::col(t.alias.label[0]),
+    );
+    let ext = std::path::Path::new(&att.filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("file")
+        .to_ascii_uppercase();
+    ui.painter().text(
+        egui::pos2(rect.min.x + 42.0, rect.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        format!("{ext} · {}", human_bytes(att.size_bytes)),
+        kit::font(11.0, Weight::Regular),
+        kit::col(t.alias.label[3]),
+    );
+
+    let x_rect = Rect::from_center_size(
+        egui::pos2(rect.max.x - 12.0, rect.min.y + 12.0),
+        Vec2::splat(16.0),
+    );
+    let x_resp = ui.interact(x_rect, ui.id().with(("rm_file", &att.filename)), Sense::click());
+    ui.painter()
+        .circle_filled(x_rect.center(), 8.0, kit::col(t.alias.toast_bg));
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(x_rect.center(), Vec2::splat(9.0)),
+        Icon::Close,
+        egui::Color32::WHITE,
+    );
+    ui.add_space(6.0);
+    let removed = x_resp.on_hover_text("Remove").clicked();
+    // The card is a promise that `@path` joins the message on send, so the
+    // hover says which path that is.
+    if let Some(p) = att.file_path.as_deref() {
+        resp.on_hover_text(format!("Sent as a reference: {}", p.display()));
+    }
+    removed
+}
+
+/// `12 KB`, `3.4 MB` — enough to tell a note from a dump.
+fn human_bytes(n: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    match n {
+        0..=1023 => format!("{n} B"),
+        b if b < MB => format!("{} KB", b / KB),
+        b => format!("{:.1} MB", b as f32 / MB as f32),
+    }
+}
+
+/// The bytes of a stored attachment, found by hash under any session's
+/// store (§9.6). The name *is* the content, so the same screenshot sent in
+/// two sessions is one file and either path finds it.
+///
+/// Missing bytes are `None` rather than a panic: an attachment can outlive
+/// its file if a session directory was deleted by hand, and the row then
+/// shows its alt state instead of taking the app down.
+fn read_attachment(mime: &str, sha: &str) -> Option<Vec<u8>> {
+    let ext = protocol::UserImage { mime: mime.to_string(), ..Default::default() }.extension();
+    let name = format!("{sha}.{ext}");
+    for entry in std::fs::read_dir(sica_core::paths::sessions_dir()).ok()?.flatten() {
+        let candidate = entry.path().join("attachments").join(&name);
+        if candidate.is_file() {
+            return std::fs::read(candidate).ok();
+        }
+    }
+    None
 }
 
 pub fn ensure_texture(
@@ -889,18 +1016,39 @@ pub fn ensure_texture(
     data_base64: &str,
     nonce: usize,
 ) -> Option<egui::TextureHandle> {
+    ensure_texture_ref(ctx, slot, mime, data_base64, "", nonce)
+}
+
+/// [`ensure_texture`], for an image that may be a **reference** rather than
+/// bytes (§9.6).
+///
+/// A stored image names a file under `sessions/<id>/attachments/`; the
+/// frontend reads it directly, because it shares a machine with the backend
+/// and asking over the pipe for bytes already on this disk would be a round
+/// trip for nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_texture_ref(
+    ctx: &egui::Context,
+    slot: &mut Option<egui::TextureHandle>,
+    mime: &str,
+    data_base64: &str,
+    sha: &str,
+    nonce: usize,
+) -> Option<egui::TextureHandle> {
     if let Some(h) = slot {
         return Some(h.clone());
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_base64)
-        .ok()?;
+    let bytes = if data_base64.is_empty() && !sha.is_empty() {
+        read_attachment(mime, sha)?
+    } else {
+        base64::engine::general_purpose::STANDARD.decode(data_base64).ok()?
+    };
     let img = image::load_from_memory(&bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
     let handle = ctx.load_texture(
-        format!("attach-{mime}-{nonce}-{}", data_base64.len()),
+        format!("attach-{mime}-{nonce}-{}-{sha}", data_base64.len()),
         color,
         Default::default(),
     );
@@ -937,23 +1085,38 @@ pub fn is_text_attachment(path: &Path) -> bool {
         .is_some_and(|e| TEXT_EXTS.contains(&e.as_str()))
 }
 
-/// Put `@path` in the draft, relative to the session's folder when it is
-/// under it — the shorter form is the one the user recognises, and the
-/// backend resolves both.
-fn reference_in_draft(app: &mut App, path: &Path) {
+/// `@path` for a file, relative to the session's folder when it is under
+/// it — the shorter form is the one the user recognises, and the backend
+/// resolves both.
+pub fn reference_for(app: &App, path: &Path) -> String {
     let cwd = app.session_workspace().1;
     let shown = path.strip_prefix(&cwd).unwrap_or(path);
-    let at = format!("@{}", shown.display().to_string().replace('\\', "/"));
-    if !app.chat.draft.is_empty() && !app.chat.draft.ends_with(' ') {
-        app.chat.draft.push(' ');
-    }
-    app.chat.draft.push_str(&at);
-    app.chat.draft.push(' ');
+    format!("@{}", shown.display().to_string().replace('\\', "/"))
+}
+
+/// Add a text file to the rail as a card (§5.3). It becomes `@path` in the
+/// message on send, not now: a card can be removed, and text already typed
+/// into the draft cannot be taken back without guessing which words were
+/// the app's.
+fn attach_text_file(app: &mut App, path: &Path) {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let size = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+    app.chat.pending_images.push(PendingAttachment {
+        mime: "text/plain".into(),
+        data_base64: String::new(),
+        filename: name,
+        size_bytes: size,
+        texture: None,
+        file_path: Some(path.to_path_buf()),
+    });
 }
 
 fn attach_from_path(app: &mut App, path: &Path) -> std::io::Result<()> {
     if is_text_attachment(path) {
-        reference_in_draft(app, path);
+        attach_text_file(app, path);
         return Ok(());
     }
     let bytes = std::fs::read(path)?;
@@ -983,6 +1146,7 @@ fn attach_from_path(app: &mut App, path: &Path) -> std::io::Result<()> {
         filename,
         size_bytes: bytes.len(),
         texture: None,
+        file_path: None,
     });
     Ok(())
 }
@@ -1051,6 +1215,7 @@ fn handle_paste(app: &mut App, ui: &mut egui::Ui) {
         filename: "clipboard.png".into(),
         size_bytes: png.len(),
         texture: None,
+        file_path: None,
     });
 }
 

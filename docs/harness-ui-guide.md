@@ -1055,7 +1055,7 @@ queue, stats, context_ring}.rs`.
   progress: reuse the ring with a rotating arc and the tooltip "Compacting
   context…"; the `⟳ COMPRESSING` status text goes.
 
-### 5.3 Attachments — the rail, files, the lightbox — **mostly done** (UI-8)
+### 5.3 Attachments — the rail, files, the lightbox — **done**
 
 **dsh** (`ui-attachment`, `client/file-upload`): one ordered **draft rail**
 under the text, non-wrapping, horizontal; edge arrows page the overflow, the
@@ -1104,10 +1104,17 @@ backend expands them the way it already expands a typed `@path`. That is
 one mechanism instead of two, and it keeps a megabyte of CSV out of the
 session log.
 
-Left here: the **240 × 64 file cards** and the paging rail. With text files
-entering as references there is nothing pending to draw a card *for* — a
-card would need generic file attachments to exist first, which is harness
-§9.6's other half.
+**The rail and the file cards are in.** The pending strip is one
+horizontally scrolling row rather than a wrapping block — a dropped folder
+of screenshots should push the composer sideways, never downwards into the
+transcript — and a text file draws dsh's **240 × 64 card**:
+`[doc glyph] filename` over `EXT · size`, with the same hover × the image
+tiles carry.
+
+The card is a **promise, not a paste**: the file becomes `@path` in the
+message when it is sent, not when it is dropped. That is what makes the
+card removable — text already typed into the draft cannot be taken back
+without guessing which words the app put there.
 
 ---
 
@@ -1807,7 +1814,7 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
-| **UI-8 Workspaces, onboarding, integrations** — **done** | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · ~~the lightbox and history sizing (§5.3)~~; file cards need harness §9.6 · ~~markdown extras (§3.8)~~ · ~~`@session` (§6.12)~~ · ~~the workflow run body (§6.11)~~ | **L** | v26 (harness Wave 9) |
+| **UI-8 Workspaces, onboarding, integrations** — **done** | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · ~~attachments: rail, file cards, lightbox, history sizing (§5.3)~~ · ~~markdown extras (§3.8)~~ · ~~`@session` (§6.12)~~ · ~~the workflow run body (§6.11)~~ | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the
@@ -1815,10 +1822,9 @@ power-user view.
 
 ---
 
-**UI-8 is done except for one thing that is not UI work.** The §5.3
-file cards need generic file attachments to exist (harness §9.6); text files
-enter as `@path` references in their place. §6.11's durable events were
-built rather than deferred — see below.
+**UI-8 is done.** Both of the things it once waited on were built rather
+than deferred: §6.11's durable `WorkflowRun` events (protocol v27) and
+§9.6's content-addressed attachment store (v28).
 One more carry-over sits in §7.1 rather than UI-8: Settings › General still
 says "Working directory" and still restarts the backend, because renaming
 it to the default-for-ungrouped-sessions *and* dropping the restart needs a

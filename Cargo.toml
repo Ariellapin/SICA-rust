@@ -55,6 +55,7 @@ ignore                 = "0.4"
 async-trait            = "0.1"
 toml                   = "0.8"
 base64                 = "0.22"
+sha2                   = { version = "0.10", default-features = false }
 rfd                    = { version = "0.14", default-features = false }
 arboard                = { version = "3", default-features = false, features = ["image-data"] }
 image                  = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

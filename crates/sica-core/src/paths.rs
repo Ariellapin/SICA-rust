@@ -12,6 +12,16 @@ pub fn sessions_dir() -> PathBuf {
     workspace_root().join("sessions")
 }
 
+/// Content-addressed attachments for one session (§9.6): every image a
+/// message carried, named by the SHA-256 of its bytes.
+///
+/// Beside the log rather than inside it, because bytes are not history:
+/// the log records *that* an image was sent and what it hashes to, and the
+/// bytes are read back only by whoever needs to look at them.
+pub fn attachments_dir(session_id: u64) -> PathBuf {
+    sessions_dir().join(session_id.to_string()).join("attachments")
+}
+
 /// Where raw-LLM logs are written when `log_raw_llm` is on (Python parity).
 pub fn raw_llm_log_dir() -> PathBuf {
     workspace_root().join("logs").join("model")

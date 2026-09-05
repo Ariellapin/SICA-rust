@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -227,10 +227,45 @@ impl Default for LlmOptions {
 /// base64-encoded (no `data:` URL prefix). `mime` is the MIME type, e.g.
 /// `image/png`, `image/jpeg`. Used both on the wire (`SendUserMessage`) and
 /// in persisted session storage (via `sica_core::message::Message`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UserImage {
     pub mime: String,
+    /// The bytes, base64. Present on the way **in** — the frontend sends an
+    /// image once — and empty everywhere after: the backend stores it and
+    /// the log keeps `sha` instead, so a session that pasted twenty
+    /// screenshots is a log of references rather than megabytes of base64
+    /// re-read on every load (§9.6).
+    #[serde(default)]
     pub data_base64: String,
+    /// `<64 hex>` — the SHA-256 of the bytes, and the file's name under
+    /// `sessions/<id>/attachments/`. Empty for a message logged before the
+    /// store existed, which still carries its bytes inline.
+    #[serde(default)]
+    pub sha: String,
+    /// Size of the stored bytes. Shown by the UI and used by nothing else.
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+impl UserImage {
+    /// The bytes are somewhere else — `sha` names the file that holds them.
+    pub fn is_reference(&self) -> bool {
+        self.data_base64.is_empty() && !self.sha.is_empty()
+    }
+
+    /// Extension for the stored file. The mime is what the sender declared,
+    /// so an unknown one keeps its bytes under `.bin` rather than being
+    /// refused: the image is already in the conversation either way.
+    pub fn extension(&self) -> &'static str {
+        match self.mime.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "image/bmp" => "bmp",
+            _ => "bin",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

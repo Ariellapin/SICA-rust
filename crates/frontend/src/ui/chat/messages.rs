@@ -383,11 +383,12 @@ fn draw_user_images(app: &mut App, ui: &mut egui::Ui, turn_idx: usize) {
             let count = app.chat.turns[turn_idx].images.len();
             for j in (0..count).rev() {
                 let att = &mut app.chat.turns[turn_idx].images[j];
-                let tex = super::composer::ensure_texture(
+                let tex = super::composer::ensure_texture_ref(
                     &ctx,
                     &mut att.texture,
                     &att.mime,
                     &att.data_base64,
+                    &att.sha,
                     turn_idx * 1000 + j,
                 );
                 if let Some(handle) = tex {
@@ -427,7 +428,15 @@ pub fn lightbox(app: &mut App, ctx: &egui::Context) {
     let name = format!("Attachment {}", idx + 1);
     let mime = att.mime.clone();
     let data = att.data_base64.clone();
-    let tex = super::composer::ensure_texture(ctx, &mut att.texture, &mime, &data, turn * 1000 + idx);
+    let sha = att.sha.clone();
+    let tex = super::composer::ensure_texture_ref(
+        ctx,
+        &mut att.texture,
+        &mime,
+        &data,
+        &sha,
+        turn * 1000 + idx,
+    );
     let mut copy = false;
     let out = kit::modal(ctx, egui::Id::new("image_lightbox"), &name, 960.0, true, |ui| {
         match &tex {
@@ -460,7 +469,12 @@ pub fn lightbox(app: &mut App, ctx: &egui::Context) {
     if copy {
         // The bytes are base64 in the log; the useful thing to put on the
         // clipboard is the data URI, which pastes into a browser.
-        ctx.output_mut(|o| o.copied_text = format!("data:{mime};base64,{data}"));
+        let uri = if data.is_empty() {
+            format!("sha256:{sha}")
+        } else {
+            format!("data:{mime};base64,{data}")
+        };
+        ctx.output_mut(|o| o.copied_text = uri);
     }
     if out.dismissed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.lightbox = None;
