@@ -39,17 +39,42 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // Foot first (bottom-up), then the session region takes what is left —
     // egui has no `flex: 1`, so the column is laid out from both ends.
     let foot_h = if collapsed { 84.0 } else { 84.0 };
-    let region_h = (ui.available_height() - foot_h).max(60.0);
+    let before = ui.available_height();
+    // Measure against the **clip** rect, not `available_height()`.
+    //
+    // A panel's content `max_rect` runs past what is actually visible by
+    // the frame's own margins — measured here as 6..732 against a 0..720
+    // clip — so sizing the session region from `available_height()` put
+    // the foot at y=690..732 on a 720 px window: laid out, painted, and
+    // entirely below the bottom edge. The Settings button was reachable
+    // only by resizing the window taller than the screen. The clip rect
+    // is the honest bound, because it is the one painting obeys.
+    // The foot is placed at an explicit rect rather than stacked after the
+    // session region, and both are measured against the **clip** rect
+    // rather than `available_height()`.
+    //
+    // Two things made the stacked version put the Settings button off
+    // screen. A panel's content `max_rect` runs past what is visible by the
+    // frame's margins — measured here as 6..732 against a 0..720 clip — and
+    // `allocate_ui` does not clip, so the session region overflowed its
+    // request by another ~18 px. Between them the foot landed at y=702..744
+    // on a 720 px window: laid out, painted, and entirely below the bottom
+    // edge, so Settings was unreachable unless the window was dragged
+    // taller than the screen. The clip rect is the honest bound because it
+    // is the one painting obeys, and an explicit rect cannot be pushed down
+    // by whatever the region above it did.
+    let top = ui.cursor().top();
+    let bottom = ui.clip_rect().max.y;
+    let region_h = (bottom - foot_h - top).max(60.0);
     ui.allocate_ui(Vec2::new(ui.available_width(), region_h), |ui| {
         session_region(app, ui, collapsed);
     });
-    ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), ui.available_height()),
-        Layout::bottom_up(Align::Min),
-        |ui| {
-            foot(app, ui, collapsed);
-        },
+    let foot_rect = Rect::from_min_max(
+        egui::pos2(ui.max_rect().min.x, bottom - foot_h),
+        egui::pos2(ui.max_rect().max.x, bottom),
     );
+    let mut foot_ui = ui.child_ui(foot_rect, Layout::top_down(Align::Min), None);
+    foot(app, &mut foot_ui, collapsed);
 }
 
 /// "Couldn't open folder" — a `CreateWorkspace` the backend refused, with

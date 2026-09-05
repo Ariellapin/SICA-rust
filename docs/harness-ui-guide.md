@@ -1824,6 +1824,22 @@ says "Working directory" and still restarts the backend, because renaming
 it to the default-for-ungrouped-sessions *and* dropping the restart needs a
 request that sets it on a live backend, which protocol v26 does not have.
 
+**One layout bug found while finishing UI-8, worth remembering.** The
+sidebar foot — the connection chip and the **Settings** button — was laid
+out, painted, and entirely below the window's bottom edge, so Settings was
+unreachable by clicking at all. Two things compounded: a panel's content
+`max_rect` runs past what is visible by the frame's own margins (measured
+6..732 against a 0..720 clip), and `allocate_ui` does not clip, so the
+session region overflowed its request by ~18 px on top of that. Sizing from
+`available_height()` and stacking the foot after the region therefore put it
+at y=702..744.
+
+The fix is the rule to keep: **measure against `clip_rect()`, not
+`available_height()`, and place a bottom-anchored region at an explicit
+rect** rather than stacking it after something whose height you only asked
+for. `clip_rect` is the honest bound because it is the one painting obeys,
+and an explicit rect cannot be pushed down by whatever ran above it.
+
 ## 13. Deliberately not ported
 
 - **Superellipse corners** — egui paints arcs; dsh degrades to arcs on
