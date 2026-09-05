@@ -153,6 +153,19 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 // panel. It is an error the operator has to
                                 // see, so it goes through the same channel a
                                 // backend ERROR does.
+                                Response::SessionStats {
+                                    session_id,
+                                    stats,
+                                    outline,
+                                    through_seq,
+                                } => {
+                                    bridge.send(UiEvent::SessionStats {
+                                        session_id,
+                                        stats,
+                                        outline,
+                                        through_seq,
+                                    });
+                                }
                                 Response::Error { message } => {
                                     bridge.send(UiEvent::RequestFailed { message });
                                 }

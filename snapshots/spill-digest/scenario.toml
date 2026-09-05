@@ -1,0 +1,2 @@
+description = "a tool result over the spill threshold reaches the model as a head/tail digest naming the file on disk"
+window = 32768

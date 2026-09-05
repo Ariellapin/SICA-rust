@@ -199,6 +199,34 @@ async fn main() -> Result<()> {
     assert!(envelopes.is_empty(), "nothing has been sent in this session yet");
     assert!(events.iter().all(|e| e.envelope.is_none()));
 
+    // Session projections (guide §3.3). A fresh session has no turn, so
+    // every counter is zero and the outline is empty — the assertion that
+    // matters is that the fold answered for *this* session and covered the
+    // whole log, which is what `through_seq` says.
+    writer
+        .send(Frame::request(9, Request::SessionStats { session_id: new_id }).encode()?.into())
+        .await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 9 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionStats { session_id, stats, outline, through_seq } = resp else {
+        anyhow::bail!("expected SessionStats, got {resp:?}");
+    };
+    println!(
+        "smoke: session stats -> session={session_id} turns={} msgs={} through_seq={through_seq}",
+        stats.turns,
+        stats.user_msgs + stats.assistant_msgs
+    );
+    assert_eq!(session_id, new_id);
+    assert_eq!(stats.turns, 0, "a fresh session has taken no turn");
+    assert!(outline.is_empty());
+    assert!(through_seq >= 1, "the fold must have seen SessionCreated");
+
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;
     let _ = writer.get_mut().shutdown().await;

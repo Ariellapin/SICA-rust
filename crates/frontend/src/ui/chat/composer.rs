@@ -70,7 +70,11 @@ fn card(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
     let turn_in_flight = last_turn_in_flight(app);
     let keys = read_submit_keys(ui, input_focused && !disabled && !picker_open);
 
-    kit::elevated_frame(
+    // Resolved out here: the card's closure borrows the draft mutably for
+    // the text field, and the hint is read off the same draft.
+    let ghost = ghost_hint(app);
+
+    let card = kit::elevated_frame(
         &t,
         Elevation::Soft,
         Level::L2,
@@ -115,13 +119,19 @@ fn card(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
                             egui::Key::Enter,
                         )))
                         .frame(false);
-                    ui.add_enabled(!disabled, input)
+                    let out = ui.add_enabled_ui(!disabled, |ui| input.show(ui)).inner;
+                    if let Some(hint) = &ghost {
+                        paint_ghost(ui, &out, hint, &font_id, &t);
+                    }
+                    out.response
                 });
         });
 
         ui.add_space(8.0);
         toolbar(app, ui, disabled, turn_in_flight, input_id);
     });
+    // What the `/` and `@` menus anchor to next frame (§6.3).
+    app.chat.composer_rect = Some(card.response.rect);
 
     // Submission. `busy_enter` decides plain Enter while a turn runs;
     // Ctrl+Enter always does the other thing.
@@ -195,6 +205,9 @@ fn toolbar(
         if app.plan_active {
             plan_chip(app, ui);
         }
+        if app.session_agent.is_some() {
+            agent_chip(app, ui);
+        }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             send_button(app, ui, disabled, turn_in_flight);
@@ -248,8 +261,91 @@ fn send_button(app: &mut App, ui: &mut egui::Ui, disabled: bool, turn_in_flight:
     }
 }
 
-/// `[shield] [label] [chevron]`, h=28 r=24; the menu switches modes and
-/// gates Full access behind a risk modal (§6.7).
+/// The nudge painted after a *claimed* command (§6.3). Picking a row that
+/// takes arguments leaves `/name ` in the draft, and a non-empty draft never
+/// shows the placeholder — so the hint is painted after the token instead,
+/// in the dimmest label colour.
+///
+/// `None` unless the draft is exactly that one claimed token: once an
+/// argument is being typed the nudge has done its job. dsh also hints
+/// `/plan`, which here has nothing to hint — sica's `/plan` toggles on accept
+/// rather than claiming the token.
+fn ghost_hint(app: &App) -> Option<String> {
+    let name = claimed_command(&app.chat.draft)?;
+    match name {
+        "goal" => Some(
+            match &app.goal {
+                // A terminal goal is not one you can pause or resume, so it
+                // reads as no goal at all here.
+                Some(g) if g.phase != protocol::GoalPhase::Completed => {
+                    "goal active — edit / pause / resume / clear"
+                }
+                _ => "describe the objective for a long-running task",
+            }
+            .to_string(),
+        ),
+        "permission" => Some("read-only · workspace-write · danger-full-access".to_string()),
+        "agent" => Some(match &app.session_agent {
+            Some(n) => format!("running {n} — name another, or `off` to clear"),
+            None => "name an agents/*.md persona, or `off`".to_string(),
+        }),
+        // Everything else is a catalogue row: its declared argument names are
+        // the most useful thing to say, and a row without any says nothing.
+        _ => {
+            let entry = app.chat.slash.entries.iter().find(|e| e.name == name)?;
+            if entry.args.is_empty() {
+                return None;
+            }
+            Some(
+                entry
+                    .args
+                    .iter()
+                    .map(|a| format!("<{a}>"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
+    }
+}
+
+/// The command name of a draft that is exactly one claimed token — `/name `
+/// with the trailing space the palette leaves and nothing after it.
+fn claimed_command(draft: &str) -> Option<&str> {
+    let name = draft.strip_prefix('/')?.strip_suffix(' ')?;
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Paint `hint` where the caret sits, elided to the field's own clip rect so
+/// a long hint never spills past the card.
+fn paint_ghost(
+    ui: &egui::Ui,
+    out: &egui::text_edit::TextEditOutput,
+    hint: &str,
+    font: &egui::FontId,
+    t: &sica_core::theme::Theme,
+) {
+    let end = egui::text::CCursor::new(out.galley.text().chars().count());
+    let caret = out.galley.pos_from_cursor(&out.galley.from_ccursor(end));
+    let pos = out.galley_pos + caret.min.to_vec2();
+    let avail = out.text_clip_rect.max.x - pos.x - 4.0;
+    if avail < 48.0 {
+        return;
+    }
+    ui.painter().text(
+        pos,
+        Align2::LEFT_TOP,
+        kit::elide(ui, hint, font, avail),
+        font.clone(),
+        kit::col(t.alias.label[3]),
+    );
+}
+
+/// `[shield] [label] [chevron]`, h=28 r=24; the menu switches modes. Full
+/// access applies straight away — its consequences are spelled out in the
+/// menu item's own description rather than behind a confirmation.
 fn permission_chip(app: &mut App, ui: &mut egui::Ui) {
     let t = app.theme;
     let mode = app.permission_mode;
@@ -303,13 +399,8 @@ fn permission_chip(app: &mut App, ui: &mut egui::Ui) {
             protocol::PermissionMode::WorkspaceWrite,
             protocol::PermissionMode::DangerFullAccess,
         ][i];
-        if m == protocol::PermissionMode::DangerFullAccess {
-            app.risk_gate_open = true;
-        } else {
-            set_permission(app, m);
-        }
+        set_permission(app, m);
     }
-    risk_gate(app, ui);
 }
 
 pub fn set_permission(app: &mut App, mode: protocol::PermissionMode) {
@@ -319,70 +410,6 @@ pub fn set_permission(app: &mut App, mode: protocol::PermissionMode) {
         session_id,
         mode,
     }));
-}
-
-/// "Enable Full access?" — a mandatory checkbox, then Cancel / Enable.
-fn risk_gate(app: &mut App, ui: &mut egui::Ui) {
-    if !app.risk_gate_open {
-        return;
-    }
-    let ctx = ui.ctx().clone();
-    let mut acknowledged = app.risk_ack;
-    let out = kit::modal(
-        &ctx,
-        egui::Id::new("risk_gate"),
-        "Enable Full access?",
-        420.0,
-        true,
-        |ui| {
-            let t = kit::theme(ui);
-            ui.add(egui::Label::new(kit::txt(
-                "Full access stops asking before destructive commands and file \
-                 writes outside the workspace. The agent can then change \
-                 anything this user account can.",
-                13.0,
-                Weight::Regular,
-                kit::col(t.alias.label[1]),
-            )).wrap());
-            ui.add_space(6.0);
-            ui.checkbox(
-                &mut acknowledged,
-                "I understand the risks and want to continue",
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let mut enable = false;
-                let mut cancel = false;
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::button_enabled(
-                        ui,
-                        "Enable Full access",
-                        kit::Variant::Primary,
-                        kit::Size::Md,
-                        acknowledged,
-                    )
-                    .clicked()
-                    {
-                        enable = true;
-                    }
-                    if kit::button(ui, "Cancel", kit::Variant::Outline, kit::Size::Md).clicked() {
-                        cancel = true;
-                    }
-                });
-                (enable, cancel)
-            })
-            .inner
-        },
-    );
-    app.risk_ack = acknowledged;
-    let (enable, cancel) = out.inner;
-    if enable {
-        set_permission(app, protocol::PermissionMode::DangerFullAccess);
-    }
-    if enable || cancel || out.dismissed {
-        app.risk_gate_open = false;
-        app.risk_ack = false;
-    }
 }
 
 /// Shown only while plan mode is on; clicking it turns plan mode off.
@@ -403,6 +430,34 @@ fn plan_chip(app: &mut App, ui: &mut egui::Ui) {
         app.send(UiCommand::SendRequest(Request::SetPlanMode {
             session_id,
             active: false,
+        }));
+    }
+}
+
+/// Shown only while an agent preset is selected; clicking it clears the
+/// selection. The backend refuses a change once the session has produced a
+/// reply, and answers with a `LogLine` saying so — the chip stays put in
+/// that case, which is the honest rendering of "this is fixed now".
+fn agent_chip(app: &mut App, ui: &mut egui::Ui) {
+    let t = app.theme;
+    let Some(name) = app.session_agent.clone() else { return };
+    let resp = kit::tinted_pill(
+        ui,
+        &format!("{name} ✕"),
+        kit::col(t.alias.business_tertiary),
+        kit::col(t.alias.business),
+        13.0,
+    );
+    if resp
+        .on_hover_text(format!(
+            "Agent `{name}` — its persona leads the prompt and its `skills:` list              restricts the tools. Click to clear (/agent off)"
+        ))
+        .clicked()
+    {
+        let session_id = app.chat.session_id;
+        app.send(UiCommand::SendRequest(Request::SetSessionAgent {
+            session_id,
+            name: None,
         }));
     }
 }
@@ -624,6 +679,7 @@ fn parse_harness_command(text: &str) -> Option<(String, String)> {
         "/compact" => "compact",
         "/plan" => "plan",
         "/permission" => "permission",
+        "/agent" => "agent",
         "/goal" => "goal",
         _ => return None,
     };
@@ -991,5 +1047,19 @@ mod tests {
     fn model_names_shorten_from_the_tail() {
         assert_eq!(short_model("openai/gpt-4o-mini"), "gpt-4o-mini");
         assert!(short_model(&"x".repeat(40)).ends_with('…'));
+    }
+
+    #[test]
+    fn only_a_bare_claimed_token_carries_a_ghost_hint() {
+        // What the palette leaves behind after accepting a row.
+        assert_eq!(claimed_command("/goal "), Some("goal"));
+        // Still being typed, or already carrying an argument.
+        assert_eq!(claimed_command("/goal"), None);
+        assert_eq!(claimed_command("/goal ship it"), None);
+        // A stray second space is an argument the user has started, not a
+        // claim — the hint would sit in the middle of what they are writing.
+        assert_eq!(claimed_command("/goal  "), None);
+        assert_eq!(claimed_command("/ "), None);
+        assert_eq!(claimed_command("hello "), None);
     }
 }

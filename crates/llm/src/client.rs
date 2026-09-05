@@ -28,6 +28,11 @@ pub struct LlmClient {
     pub thinking: bool,
     api_key:      Option<String>,
     http:         reqwest::Client,
+    /// When set, `chat_stream` serves from this recording instead of
+    /// opening a socket (guide §14.1). Shared by every clone of the
+    /// client, so "served in first-call order" is a property of the
+    /// run rather than of one clone.
+    replay:       Option<std::sync::Arc<crate::replay::ReplayScript>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,12 +182,27 @@ impl LlmClient {
             // runs for many minutes on a local server. `read_timeout` guards
             // each read instead — a healthy stream resets it on every token,
             // while a hung server still errors out.
+            replay:   None,
             http:     reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .read_timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("reqwest client"),
         }
+    }
+
+    /// Attach a recorded script. Every later `chat_stream` is served
+    /// from it and no HTTP request is made.
+    pub fn with_replay(mut self, script: std::sync::Arc<crate::replay::ReplayScript>) -> Self {
+        self.replay = Some(script);
+        self
+    }
+
+    /// The attached script, if any. `Some` means every completion comes
+    /// from the recording and no HTTP request will be made — which is what
+    /// a caller has to know before it reports a connection to the user.
+    pub fn replay(&self) -> Option<&std::sync::Arc<crate::replay::ReplayScript>> {
+        self.replay.as_ref()
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -292,6 +312,9 @@ impl LlmClient {
         tx: mpsc::UnboundedSender<StreamChunk>,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
+        if let Some(script) = &self.replay {
+            return serve_replay(script, tx, cancel).await;
+        }
         let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
         let body = ChatRequest {
             model: self.model.clone(),
@@ -345,5 +368,57 @@ impl LlmClient {
             }
         }
         Ok(())
+    }
+}
+
+/// Serve one scripted call (guide §14.1). Deliberately mirrors the HTTP
+/// path's contract exactly: chunks go to `tx`, cancellation returns `Ok(())`
+/// without an error, and a failure comes back as an `anyhow::Error` the
+/// retry classifier reads the same way it reads a real one.
+async fn serve_replay(
+    script: &std::sync::Arc<crate::replay::ReplayScript>,
+    tx: mpsc::UnboundedSender<StreamChunk>,
+    cancel: Option<CancellationToken>,
+) -> Result<()> {
+    use crate::replay::ReplayCall;
+
+    let Some(call) = script.next_call() else {
+        // A run that asks for more calls than were recorded has diverged
+        // from the recording. Answering with silence would let the scenario
+        // pass while testing something else.
+        return Err(anyhow!(
+            "replay: the script is exhausted — this run made more requests \
+             than the recording holds"
+        ));
+    };
+    match call {
+        ReplayCall::Error { message } => Err(anyhow!(message)),
+        ReplayCall::Empty => Ok(()),
+        ReplayCall::Hang { hold } => {
+            match &cancel {
+                Some(tok) => tokio::select! {
+                    biased;
+                    _ = tok.cancelled() => Ok(()),
+                    _ = tokio::time::sleep(hold) => Ok(()),
+                },
+                None => {
+                    tokio::time::sleep(hold).await;
+                    Ok(())
+                }
+            }
+        }
+        call @ ReplayCall::Message { .. } => {
+            for chunk in crate::replay::chunks_for(&call) {
+                if let Some(tok) = &cancel {
+                    if tok.is_cancelled() {
+                        return Ok(());
+                    }
+                }
+                if tx.send(chunk).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
     }
 }

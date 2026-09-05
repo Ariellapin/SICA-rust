@@ -1,12 +1,17 @@
-//! The icon set. dsh ships 74 `currentColor` SVGs; egui cannot paint SVG
-//! without pulling in resvg, so the ~30 glyphs the shell actually needs are
-//! hand-painted with `Painter` — the same technique the blade mark already
-//! used. Every glyph is described in a unit square and scaled into the rect
-//! it is given, so one enum serves the 8/12/14/16/20 px sizes dsh uses.
+//! The icon set. dsh ships 74 `currentColor` SVGs; the ~30 glyphs the shell
+//! actually needs are hand-painted with `Painter` instead. Every glyph is
+//! described in a unit square and scaled into the rect it is given, so one
+//! enum serves the 8/12/14/16/20 px sizes dsh uses — and a 1.4 px stroke laid
+//! down by the painter stays crisp at 12 px where a downscaled raster would
+//! not.
 //!
 //! Strokes are single-weight (1.4 px at 16 px, scaled with the box) and every
 //! glyph is drawn in one colour, so an icon inherits the row's label tier
 //! exactly like `currentColor` does.
+//!
+//! [`mark`] is the exception: the brand mark has curves, a mask and (in the
+//! app-icon variant) a gradient, so it stays an SVG and is rasterised by
+//! resvg — see [`crate::icon`].
 
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 
@@ -313,26 +318,32 @@ pub fn show(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) -> egui::R
     resp
 }
 
-/// The blade silhouette — sica's own mark, kept (the guide ports dsh's
-/// *style*, not its brand). An angled slab with a sharpened tip and a small
-/// circular pommel at the back.
-pub fn blade_mark(painter: &Painter, rect: Rect, color: Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let w = rect.width();
-    let h = rect.height();
+/// The sica mark — the blade-and-loop logo, rasterised from
+/// `assets/mark.svg`.
+///
+/// The asset is pure white with a shaped alpha, so one texture is uploaded
+/// per process and tinted at paint time: the mark inherits a theme colour the
+/// same way a `currentColor` SVG would. The source viewBox is square, so a
+/// square is centred inside whatever `rect` the caller allocates.
+pub fn mark(ui: &egui::Ui, rect: Rect, color: Color32) {
+    let side = rect.width().min(rect.height());
+    let square = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    let tex = mark_texture(ui.ctx());
+    egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
+        .tint(color)
+        .paint_at(ui, square);
+}
 
-    let tip = Pos2::new(cx + w * 0.46, cy + h * 0.02);
-    let crown = Pos2::new(cx - w * 0.10, cy - h * 0.28);
-    let back = Pos2::new(cx - w * 0.40, cy - h * 0.08);
-    let belly = Pos2::new(cx + w * 0.05, cy + h * 0.18);
-
-    painter.add(Shape::convex_polygon(
-        vec![back, crown, tip, belly],
-        color,
-        Stroke::NONE,
-    ));
-    let pommel = Pos2::new(cx - w * 0.46, cy - h * 0.03);
-    painter.circle_filled(pommel, (h * 0.10).max(2.0), color);
-    painter.line_segment([pommel, back], Stroke::new((h * 0.05).max(1.0), color));
+/// Upload-once cache for the mark. Lives in `Context` memory rather than a
+/// `static` because a `TextureHandle` is owned by the context that made it.
+fn mark_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::new("sica_mark_texture");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return tex;
+    }
+    let px = crate::icon::MARK_PX as usize;
+    let image = egui::ColorImage::from_rgba_unmultiplied([px, px], &crate::icon::mark_rgba());
+    let tex = ctx.load_texture("sica_mark", image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
 }

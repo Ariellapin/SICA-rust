@@ -35,6 +35,8 @@ use crate::ui::kit::{self, Level, Weight};
 
 /// Tallest the list gets before it scrolls internally.
 const MAX_LIST_HEIGHT: f32 = 320.0;
+/// Gap between the bottom of the menu and the top of the composer card.
+const MENU_GAP: f32 = 4.0;
 
 /// An app action the frontend performs itself — no LLM turn involved. These
 /// mirror controls that already exist elsewhere in the UI, so the palette is a
@@ -47,6 +49,7 @@ pub enum AppCommand {
     PlanToggle,
     PermissionHint,
     GoalHint,
+    AgentHint,
     ClearDraft,
     AttachImage,
     OpenSettings,
@@ -63,6 +66,7 @@ const APP_COMMANDS: &[(&str, &str, AppCommand)] = &[
     ("plan", "Toggle plan mode (explore-only until exit-plan-mode).", AppCommand::PlanToggle),
     ("permission", "Switch permission mode: /permission <read-only|workspace-write|danger-full-access>.", AppCommand::PermissionHint),
     ("goal", "Show or change this session's objective: /goal [continue|pause|complete|block <why>|edit <text>].", AppCommand::GoalHint),
+    ("agent", "Show, pick or clear this session's agent persona: /agent [<name>|off].", AppCommand::AgentHint),
     ("clear", "Empty the composer and drop attachments.", AppCommand::ClearDraft),
     ("attach", "Pick an image to send with the next message.", AppCommand::AttachImage),
     ("settings", "Open Settings.", AppCommand::OpenSettings),
@@ -88,8 +92,9 @@ pub struct Outcome {
 }
 
 /// Draw the palette (when the draft is a slash query) and handle its keys.
-/// Called at the top of `input_bar::draw`, so the list renders above the
-/// composer and grows the bottom panel upwards.
+/// Called at the top of `composer::card` so the palette claims ↑↓/Enter/Esc
+/// before the text field sees them; the list itself floats in an [`overlay`]
+/// above the card rather than taking space in the bottom panel.
 pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
     let Some(query) = query_of(&app.chat.draft).map(str::to_owned) else {
         // Not a slash query any more — forget the picker state so the next `/`
@@ -105,10 +110,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
         app.chat.slash.selected = 0;
         // Typing after an Esc is a fresh intent — bring the list back.
         app.chat.slash.dismissed = false;
-        // A bottom panel is only as tall as the content it measured, so the
-        // frame that opens (or resizes) the list needs a follow-up frame to
-        // settle at the new height instead of clipping it.
-        ui.ctx().request_repaint();
     }
     if app.chat.slash.dismissed {
         return Outcome { open: false };
@@ -129,8 +130,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
     }
     let selected = app.chat.slash.selected;
 
-    let clicked = draw_list(app, ui, &rows, selected, matches!(nav, Nav::Moved));
-    let accepted = clicked.or(match nav {
+    let list = draw_list(app, ui, &rows, selected, matches!(nav, Nav::Moved));
+    if list.outside_press {
+        // dsh closes the menu on a pointerdown outside it. The draft
+        // survives, exactly as it does after Esc.
+        app.chat.slash.dismissed = true;
+        return Outcome { open: false };
+    }
+    let accepted = list.inner.or(match nav {
         Nav::Accept(i) => Some(i),
         _ => None,
     });
@@ -333,11 +340,11 @@ fn draw_list(
     rows: &[Row],
     selected: usize,
     scroll_to_selected: bool,
-) -> Option<usize> {
+) -> Overlay<Option<usize>> {
     let t = app.theme;
     let mut clicked = None;
 
-    frame(&t).show(ui, |ui| {
+    let out = overlay(ui, &t, app.chat.composer_rect, overlay_id(), |ui| {
         ui.set_width(ui.available_width());
         egui::ScrollArea::vertical()
             .id_source("slash_menu_scroll")
@@ -377,8 +384,7 @@ fn draw_list(
             ),
         );
     });
-    ui.add_space(6.0);
-    clicked
+    Overlay { inner: clicked, outside_press: out.outside_press }
 }
 
 /// One row: min-h 40, r=10, `[kind icon] [name] [args] [description]`, the
@@ -479,6 +485,7 @@ fn draw_row(
 /// user how to get out of the query.
 fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
     let t = app.theme;
+    let anchor = app.chat.composer_rect;
     // Esc has to be claimed here too — otherwise the only way out of a
     // no-match query is deleting it by hand. Enter/Tab are swallowed with it
     // so a typo can't leak through to the composer as a sent message.
@@ -491,7 +498,8 @@ fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
         app.chat.slash.dismissed = true;
         return;
     }
-    frame(&t).show(ui, |ui| {
+    let out = overlay(ui, &t, anchor, overlay_id(), |ui| {
+        ui.set_width(ui.available_width());
         kit::label(
             ui,
             kit::txt(
@@ -502,14 +510,14 @@ fn draw_empty(app: &mut App, ui: &mut egui::Ui, query: &str) {
             ),
         );
     });
-    ui.add_space(6.0);
+    if out.outside_press {
+        app.chat.slash.dismissed = true;
+    }
 }
 
 /// Menu chrome: r=20 card on `menu`, elevation-prominent with a `border-l1`
-/// stroke. dsh anchors this in an overlay 4 px above the composer card; here
-/// it sits directly above the card in the same bottom panel, which lands in
-/// the same place on screen without a second layout pass.
-pub(super) fn frame(t: &sica_core::theme::Theme) -> egui::Frame {
+/// stroke. [`overlay`] floats it 4 px above the composer card.
+fn frame(t: &sica_core::theme::Theme) -> egui::Frame {
     kit::elevated_frame(
         t,
         kit::Elevation::Prominent,
@@ -520,13 +528,71 @@ pub(super) fn frame(t: &sica_core::theme::Theme) -> egui::Frame {
     .inner_margin(egui::Margin::symmetric(4.0, 6.0))
 }
 
-/// Commit the highlighted row: run app commands, insert everything else.
+/// One overlay frame: whatever the contents returned, plus whether the
+/// pointer went down outside both the menu and the composer card — dsh closes
+/// the menu on an outside pointerdown (§6.3).
+pub(super) struct Overlay<R> {
+    pub inner:         R,
+    pub outside_press: bool,
+}
+
+/// Id of the menu overlay. The `/` palette and the `@` picker are mutually
+/// exclusive, so they share one `Area` and can never fight over the layer.
+pub(super) fn overlay_id() -> egui::Id {
+    egui::Id::new("composer_menu_overlay")
+}
+
+/// Float `add` in a foreground `Area` whose bottom edge sits [`MENU_GAP`]
+/// above `anchor`, edge to edge with it (§6.3).
+///
+/// `anchor` is the composer card's rect from *last* frame: the menu is drawn
+/// before the card, because it has to claim the navigation keys before the
+/// text field sees them, and the card lands in the same place every frame.
+/// The `LEFT_BOTTOM` pivot means the gap holds whatever the list measures —
+/// no height guess, and no jump while a filtered list settles.
+pub(super) fn overlay<R>(
+    ui: &mut egui::Ui,
+    t: &sica_core::theme::Theme,
+    anchor: Option<egui::Rect>,
+    id: egui::Id,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> Overlay<R> {
+    let ctx = ui.ctx().clone();
+    // Before the first card has laid out there is nothing to hang off; the
+    // panel the menu used to live in is the closest thing to its place.
+    let anchor = anchor.unwrap_or_else(|| ui.max_rect());
+    let width = anchor.width();
+    let area = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(anchor.min.x, anchor.min.y - MENU_GAP))
+        .constrain(true)
+        .show(&ctx, |ui| {
+            ui.set_width(width);
+            frame(t).show(ui, add).inner
+        });
+
+    let menu_rect = area.response.rect;
+    let outside_press = ctx.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .interact_pos()
+                .map(|p| !menu_rect.contains(p) && !anchor.contains(p))
+                .unwrap_or(false)
+    });
+    Overlay { inner: area.inner, outside_press }
+}
+
+/// Commit the highlighted row: run app commands, select agent presets,
+/// insert everything else.
 fn accept(app: &mut App, ui: &mut egui::Ui, row: &Row) {
     match row.action {
-        // `/permission` needs an argument and `/goal` takes an optional
-        // one — complete the prefix in the draft like a catalogue entry
-        // instead of firing immediately.
-        Some(AppCommand::PermissionHint) | Some(AppCommand::GoalHint) | None => {
+        // `/permission` needs an argument and `/goal` / `/agent` take an
+        // optional one — complete the prefix in the draft like a catalogue
+        // entry instead of firing immediately.
+        Some(AppCommand::PermissionHint)
+        | Some(AppCommand::GoalHint)
+        | Some(AppCommand::AgentHint) => {
             // Trailing space: it separates the name from its arguments *and*
             // closes the palette (whitespace ends a slash query).
             app.chat.draft = format!("/{} ", row.name);
@@ -535,6 +601,22 @@ fn accept(app: &mut App, ui: &mut egui::Ui, row: &Row) {
         Some(cmd) => {
             app.chat.draft.clear();
             run_app_command(app, cmd);
+        }
+        // An AGENTS row is a *selection*, not text: picking one sets the
+        // session's persona and skill view for good (guide §5.2) rather
+        // than injecting the file once. Everything else is completed into
+        // the draft so the user can type arguments.
+        None if row.kind == CatalogKind::Agent => {
+            app.chat.draft.clear();
+            let session_id = app.chat.session_id;
+            app.send(UiCommand::SendRequest(Request::SetSessionAgent {
+                session_id,
+                name: Some(row.name.clone()),
+            }));
+        }
+        None => {
+            app.chat.draft = format!("/{} ", row.name);
+            move_caret_to_end(ui, &app.chat.draft);
         }
     }
     app.chat.slash.selected = 0;
@@ -575,6 +657,9 @@ fn run_app_command(app: &mut App, cmd: AppCommand) {
         }
         AppCommand::GoalHint => {
             app.chat.draft = "/goal ".to_string();
+        }
+        AppCommand::AgentHint => {
+            app.chat.draft = "/agent ".to_string();
         }
         AppCommand::ClearDraft => {
             app.chat.draft.clear();

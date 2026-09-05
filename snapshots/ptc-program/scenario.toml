@@ -1,0 +1,3 @@
+description = "under PTC the model calls one run-code program, the program calls the tools, and only what it printed reaches the conversation"
+window = 32768
+tool_mode = "ptc"

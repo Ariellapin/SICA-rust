@@ -25,6 +25,7 @@ use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
 use sica_core::event::{ContextSource, EventKind, SurfaceEntry, SurfaceOp, TurnSource};
 use sica_core::message::{Message, Role};
 
+use crate::hooks;
 use crate::inbox::{Inbound, Inbox};
 use crate::sessions_store::{self, SessionLog};
 use crate::title_gen;
@@ -88,6 +89,10 @@ pub struct ChatHub {
     pub permissions:   Arc<Mutex<HashMap<u64, PermissionMode>>>,
     /// Plan-mode flag per session; restored from the log on load.
     pub plans:         Arc<Mutex<HashMap<u64, bool>>>,
+    /// Selected agent preset per session (guide §5.2), restored from the
+    /// log's latest `AgentPreset` event. Absent = no preset: the default
+    /// persona-less prompt against the full registry.
+    pub presets:       Arc<Mutex<HashMap<u64, String>>>,
     /// Human-in-the-loop rendezvous for pipeline approvals and questions.
     pub brokers:       Arc<BrokerSet>,
     /// Usage-anchored token meter per session (`agents::meter`). Anchored on
@@ -112,6 +117,10 @@ pub struct ChatHub {
     /// a restored active goal waits for `/goal continue`.
     pub goal_armed:    Arc<Mutex<HashSet<u64>>>,
     pub next_goal_id:  Arc<AtomicU64>,
+    /// User hooks from `.sica/hooks.json` (guide §13.1). Read once at
+    /// startup: a hooks file that could change under a running turn
+    /// would make two calls in one turn answer to different rules.
+    pub hooks:         Arc<hooks::HookConfig>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -135,6 +144,8 @@ struct ControlState {
     /// see `ControlState::armed`.
     arm_set:      Arc<Mutex<HashSet<u64>>>,
     next_goal:    Arc<AtomicU64>,
+    /// User hooks, so a dispatch can put `HooksPolicy` in the pipeline.
+    hooks:        Arc<hooks::HookConfig>,
 }
 
 impl ControlState {
@@ -166,7 +177,7 @@ impl ControlState {
             .await
             .entry(session_id)
             .or_insert_with(|| {
-                Arc::new(ReadBeforeEdit::new(sica_core::paths::workspace_root()))
+                Arc::new(ReadBeforeEdit::new(sica_core::paths::working_dir()))
             })
             .clone()
     }
@@ -185,7 +196,23 @@ impl ControlState {
         let plan = self.plan_active(session_id).await;
         let reminder = self.reminder(session_id).await;
         let reader = self.reader(session_id).await;
-        let root = sica_core::paths::workspace_root();
+        let root = sica_core::paths::working_dir();
+        // The hook policy goes in only when hooks are configured: an
+        // always-present policy that answers `Allow` still costs a lock and
+        // a payload build on every call, and the common case is no hooks.
+        let mut policies: Vec<Arc<dyn ToolPolicy>> = vec![
+            Arc::new(PermissionPolicy { mode, workspace_root: root }) as Arc<dyn ToolPolicy>,
+            Arc::new(PlanModePolicy { active: plan }) as Arc<dyn ToolPolicy>,
+            reader as Arc<dyn ToolPolicy>,
+            reminder as Arc<dyn ToolPolicy>,
+        ];
+        if !self.hooks.is_empty() {
+            policies.push(Arc::new(crate::hooks::HooksPolicy {
+                config:   self.hooks.clone(),
+                sessions: sessions.clone(),
+                events:   self.events.clone(),
+            }) as Arc<dyn ToolPolicy>);
+        }
         let mut sub = ToolSubAgent::root(self.events.clone())
             .with_summarizer(client.clone())
             .with_cancel(cancel)
@@ -193,12 +220,7 @@ impl ControlState {
             .with_brokers(self.brokers.clone())
             .with_session(session_id)
             .with_plan_active(plan)
-            .with_policies(vec![
-                Arc::new(PermissionPolicy { mode, workspace_root: root }) as Arc<dyn ToolPolicy>,
-                Arc::new(PlanModePolicy { active: plan }) as Arc<dyn ToolPolicy>,
-                reader as Arc<dyn ToolPolicy>,
-                reminder as Arc<dyn ToolPolicy>,
-            ]);
+            .with_policies(policies);
         if let Some(fs) = self.failure_sink.clone() {
             sub = sub.with_failure_sink(fs);
         }
@@ -585,6 +607,7 @@ impl ControlState {
         skills: &SkillRegistry,
         call: &agents::turn::NativeToolCall,
         over_limit: bool,
+        ptc: bool,
         client: &LlmClient,
         cancel: &CancellationToken,
     ) -> bool {
@@ -604,6 +627,16 @@ impl ControlState {
             let args = serde_json::from_str(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
             self.observe(sessions, session_id, &call.name, &args).await;
+            return false;
+        }
+        // Guide §7: under PTC the model announced one data tool, so a call
+        // naming any other is refused here — before the policy pipeline, and
+        // resolved from the mode the request was actually built with, so a
+        // preset can never announce one surface and execute another.
+        if ptc && !agents::ptc::direct_callable(&call.name) {
+            let msg = agents::ptc::direct_call_refused(&call.name);
+            append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
+                .await;
             return false;
         }
         if agents::control::is_control_skill(&call.name) {
@@ -749,6 +782,7 @@ impl ControlState {
         skills: &SkillRegistry,
         calls: &[agents::turn::NativeToolCall],
         over_limit: bool,
+        ptc: bool,
         client: &LlmClient,
         cancel: &CancellationToken,
     ) -> bool {
@@ -759,7 +793,10 @@ impl ControlState {
             }
             // Open a parallel group: consecutive parallel-eligible calls.
             let mut group: Vec<usize> = Vec::new();
-            if !over_limit {
+            // Under PTC a batch is one `run-code` call and, at most, some
+            // harness controls — nothing that overlaps — and the refusal
+            // below has to see every call, so the parallel path is off.
+            if !over_limit && !ptc {
                 let mut j = i;
                 while j < calls.len() && parallel_call(skills, &calls[j]).is_some() {
                     group.push(j);
@@ -768,7 +805,9 @@ impl ControlState {
             }
             if group.len() < 2 {
                 if self
-                    .run_native_one(sessions, session_id, skills, &calls[i], over_limit, client, cancel)
+                    .run_native_one(
+                        sessions, session_id, skills, &calls[i], over_limit, ptc, client, cancel,
+                    )
                     .await
                 {
                     // The turn ends here, but the remaining ids in this
@@ -873,7 +912,7 @@ impl ControlState {
 }
 
 /// Fallback prompt window when neither the user nor the server reports one.
-const DEFAULT_CONTEXT_WINDOW: u32 = 24_000;
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 24_000;
 
 impl ChatHub {
     pub fn new(
@@ -900,6 +939,7 @@ impl ChatHub {
             read_seen:    Arc::new(Mutex::new(HashMap::new())),
             permissions:  Arc::new(Mutex::new(HashMap::new())),
             plans:        Arc::new(Mutex::new(HashMap::new())),
+            presets:      Arc::new(Mutex::new(HashMap::new())),
             brokers:      Arc::new(BrokerSet::new()),
             meters:       Arc::new(Mutex::new(HashMap::new())),
             inbox:        Arc::new(Inbox::new()),
@@ -907,6 +947,7 @@ impl ChatHub {
             goals:        Arc::new(Mutex::new(HashMap::new())),
             goal_armed:   Arc::new(Mutex::new(HashSet::new())),
             next_goal_id: Arc::new(AtomicU64::new(1)),
+            hooks:        Arc::new(hooks::HookConfig::default()),
         }
     }
 
@@ -928,15 +969,19 @@ impl ChatHub {
             let mut g = map.try_lock().expect("fresh ChatHub, no contention");
             let mut perms = hub.permissions.try_lock().expect("fresh ChatHub");
             let mut plans = hub.plans.try_lock().expect("fresh ChatHub");
+            let mut presets = hub.presets.try_lock().expect("fresh ChatHub");
             let mut goals = hub.goals.try_lock().expect("fresh ChatHub");
             let mut max_goal = 0;
             for s in loaded {
-                let (mode, plan, goal) = control_state(&s);
+                let (mode, plan, preset, goal) = control_state(&s);
                 if mode != PermissionMode::default() {
                     perms.insert(s.id, mode);
                 }
                 if plan {
                     plans.insert(s.id, true);
+                }
+                if let Some(name) = preset {
+                    presets.insert(s.id, name);
                 }
                 // Restored *disarmed*: `goal_armed` stays empty at startup,
                 // so an active goal resumes only when a human says so.
@@ -967,6 +1012,7 @@ impl ChatHub {
             goals:        self.goals.clone(),
             arm_set:      self.goal_armed.clone(),
             next_goal:    self.next_goal_id.clone(),
+            hooks:        self.hooks.clone(),
             // Harness commands are the user acting directly; a turn task
             // overrides this with its own source.
             turn_source:  TurnSource::Human,
@@ -976,6 +1022,12 @@ impl ChatHub {
     /// Adopt the job registry the skills were built with. Without this the
     /// hub would hold an empty registry of its own and never see the jobs
     /// the shell skills actually start.
+    /// Adopt the hook configuration `main.rs` loaded and reported.
+    pub fn with_hooks(mut self, hooks: Arc<hooks::HookConfig>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     pub fn with_jobs(mut self, jobs: Arc<agents::JobRegistry>) -> Self {
         self.jobs = jobs;
         self
@@ -1021,6 +1073,50 @@ impl ChatHub {
         let g = self.sessions.lock().await;
         let log = g.get(&id)?;
         Some(crate::trajectory::page(log, from_seq, limit))
+    }
+
+    /// Fold this session's log into the projections a client reads (guide
+    /// §3.3). Pure over the log — no cache, because at our session sizes
+    /// the fold is cheaper than the staleness question a cache would raise.
+    pub async fn session_stats(
+        &self,
+        id: u64,
+    ) -> Option<(protocol::StatsDump, Vec<protocol::TurnRowDump>, u64)> {
+        use sica_core::project::{Projection, SessionStats, TurnOutline};
+
+        let g = self.sessions.lock().await;
+        let log = g.get(&id)?;
+        let events = &log.events;
+        let s = SessionStats::fold(events);
+        let outline = TurnOutline::fold(events);
+        let rows = outline
+            .turns
+            .into_iter()
+            .map(|t| protocol::TurnRowDump {
+                turn_id:         t.turn_id,
+                first_user_line: t.first_user_line,
+                source:          t.source,
+                hops:            t.hops,
+                finish_reason:   t.finish_reason,
+                start_seq:       t.start_seq,
+                ts_start:        t.ts_start,
+                ts_end:          t.ts_end,
+                tool_calls:      t.tool_calls,
+            })
+            .collect();
+        Some((
+            protocol::StatsDump {
+                user_msgs:      s.user_msgs,
+                assistant_msgs: s.assistant_msgs,
+                tool_calls:     s.tool_calls,
+                tool_failures:  s.tool_failures,
+                retries:        s.retries,
+                turns:          s.turns,
+                wall_ms:        s.wall_ms,
+            },
+            rows,
+            s.through_seq,
+        ))
     }
 
     pub async fn dump_session(&self, id: u64) -> Option<SessionDump> {
@@ -1099,6 +1195,7 @@ impl ChatHub {
         let permission_mode =
             self.permissions.lock().await.get(&id).copied().unwrap_or_default();
         let plan_active = self.plans.lock().await.get(&id).copied().unwrap_or(false);
+        let agent = self.presets.lock().await.get(&id).cloned();
         let todos = log
             .events
             .iter()
@@ -1116,6 +1213,7 @@ impl ChatHub {
             permission_mode,
             plan_active,
             todos,
+            agent,
         })
     }
 
@@ -1125,7 +1223,45 @@ impl ChatHub {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let s = SessionLog::new(id, default_title(id));
         self.sessions.lock().await.insert(id, s);
+        self.run_session_start_hooks(id).await;
         id
+    }
+
+    /// `SessionStart` hooks (guide §13.1). Only their `additionalContext`
+    /// matters here — there is no call to deny yet, so a hook that returns
+    /// a decision at session creation has nothing to decide about, and the
+    /// merged rank is deliberately ignored.
+    async fn run_session_start_hooks(&self, id: u64) {
+        if self.hooks.for_event(hooks::HookEvent::SessionStart).is_empty() {
+            return;
+        }
+        let merged = hooks::run_event(
+            &self.hooks,
+            &self.sessions,
+            &self.event_sink,
+            hooks::HookEvent::SessionStart,
+            id,
+            None,
+        )
+        .await;
+        self.inject_hook_context(id, merged.context).await;
+    }
+
+    /// A hook's `additionalContext` becomes a model-visible message. Source
+    /// `Injected`: it is the operator's own script handing the model a
+    /// fact, which is exactly what that source means.
+    async fn inject_hook_context(&self, session_id: u64, context: Vec<String>) {
+        for text in context {
+            if text.trim().is_empty() {
+                continue;
+            }
+            append_event(&self.sessions, session_id, EventKind::ContextInjected {
+                surface: SurfaceOp::Append,
+                source:  ContextSource::Injected,
+                content: text,
+            })
+            .await;
+        }
     }
 
     pub async fn delete_session(&self, id: u64) -> bool {
@@ -1307,13 +1443,13 @@ impl ChatHub {
                     level: "INFO".into(),
                     message: format!(
                         "LLM: ready ({base_url}, model={model}, ctx={window}, \
-                         temp={}, max_tokens={}, native_tools={}, thinking={})",
+                         temp={}, max_tokens={}, tools={}, thinking={})",
                         options.temperature,
                         options
                             .max_tokens
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "server-default".into()),
-                        options.native_tools,
+                        options.tool_mode.label(),
                         options.thinking,
                     ),
                 });
@@ -1342,6 +1478,39 @@ impl ChatHub {
         let this = self.clone();
         tokio::spawn(async move {
             this.connect_llm(base_url, model, api_key, options).await;
+        });
+    }
+
+    /// Install a keyless replay client (guide §14.1) and report Ready.
+    ///
+    /// Skips the health check and the context-window probe: there is no
+    /// server to ask. The window is passed in so a scenario can force a
+    /// small one and make compaction fire without a giant recording.
+    pub async fn connect_replay(
+        &self,
+        script: Arc<llm::replay::ReplayScript>,
+        window: u32,
+        options: LlmOptions,
+    ) {
+        let model = "replay".to_string();
+        let mut client = LlmClient::new("replay://recorded", &model, None);
+        client.temperature = options.temperature;
+        client.max_tokens = options.max_tokens;
+        client.thinking = options.thinking;
+        let calls = script.total();
+        let client = client.with_replay(script);
+        self.context_window.store(window, Ordering::Relaxed);
+        *self.llm_opts.lock().await = options;
+        *self.llm.lock().await = Some(client);
+        self.meters.lock().await.clear();
+        self.set_llm_state(LlmState::Ready {
+            model: model.clone(),
+            context_window: window,
+        })
+        .await;
+        self.event_sink.emit(Event::LogLine {
+            level:   "INFO".into(),
+            message: format!("LLM: replay mode — {calls} recorded call(s), ctx={window}"),
         });
     }
 
@@ -1432,6 +1601,140 @@ impl ChatHub {
         true
     }
 
+    /// Select (`Some`) or clear (`None`) the session's agent preset —
+    /// `agents/<name>.md`, guide §5.2. Durable (`AgentPreset` event) and
+    /// pushed (`SessionAgentChanged`); the persona section and the
+    /// restricted registry view take effect on the next turn.
+    ///
+    /// Refused once the session has produced a model message, per dsh: the
+    /// persona sits in the system-prompt prefix, so swapping it mid-session
+    /// both discards the provider's cache and leaves the earlier half of
+    /// the transcript answering to rules that are no longer in force.
+    /// `Ok(text)` describes what happened; `Err(text)` says why not.
+    pub async fn set_session_agent(
+        &self,
+        session_id: u64,
+        name: Option<String>,
+    ) -> Result<String, String> {
+        self.set_session_agent_in(&sica_core::paths::agents_dir(), session_id, name).await
+    }
+
+    /// [`set_session_agent`](Self::set_session_agent) against an explicit
+    /// preset directory. The directory is a parameter for the same reason
+    /// `catalog::build` takes its three: it makes the rule testable without
+    /// a process-global workspace override.
+    async fn set_session_agent_in(
+        &self,
+        dir: &std::path::Path,
+        session_id: u64,
+        name: Option<String>,
+    ) -> Result<String, String> {
+        if !self.session_exists(session_id).await {
+            return Err(format!("unknown session {session_id}"));
+        }
+        // Validate before touching any state: an unreadable preset must
+        // leave the session exactly as it was.
+        let preset = match &name {
+            Some(n) => Some(agents::preset::load(dir, n)?),
+            None => None,
+        };
+        let current = self.presets.lock().await.get(&session_id).cloned();
+        if current == name {
+            return Ok(match &name {
+                Some(n) => format!("already running agent `{n}`"),
+                None => "no agent selected".into(),
+            });
+        }
+        if self.session_has_run(session_id).await {
+            return Err(
+                "the agent is fixed once a session has produced a reply — start a new                  session to run a different one"
+                    .into(),
+            );
+        }
+        {
+            let mut g = self.presets.lock().await;
+            match &name {
+                Some(n) => g.insert(session_id, n.clone()),
+                None => g.remove(&session_id),
+            };
+        }
+        append_event(&self.sessions, session_id, EventKind::AgentPreset { name: name.clone() })
+            .await;
+        self.event_sink.emit(Event::SessionAgentChanged { session_id, name: name.clone() });
+        let message = match (&name, &preset) {
+            (Some(n), Some(p)) => {
+                // Unknown skill names are the user's typo to fix, not a
+                // reason to refuse the preset — say so once, here, rather
+                // than silently narrowing the registry on every turn.
+                let unknown = agents::preset::unknown_skills(&self.skills, p);
+                if !unknown.is_empty() {
+                    self.event_sink.emit(Event::LogLine {
+                        level:   "WARN".into(),
+                        message: format!(
+                            "agent `{n}` lists unknown skill(s): {}",
+                            unknown.join(", ")
+                        ),
+                    });
+                }
+                if p.skills.is_empty() {
+                    format!("agent → {n} — every skill stays available")
+                } else {
+                    format!("agent → {n} — skills: {}", p.skills.join(", "))
+                }
+            }
+            _ => "agent cleared".to_string(),
+        };
+        self.event_sink.emit(Event::LogLine { level: "INFO".into(), message: message.clone() });
+        Ok(message)
+    }
+
+    /// Whether the session has produced a model message yet. What fixes the
+    /// agent selection: a session that has only been *created*, or that
+    /// holds an unsent draft, is still free to choose one.
+    async fn session_has_run(&self, session_id: u64) -> bool {
+        let g = self.sessions.lock().await;
+        let Some(log) = g.get(&session_id) else { return false };
+        log.events
+            .iter()
+            .any(|ev| matches!(ev.kind, EventKind::AssistantMessage { .. }))
+    }
+
+    /// The skill registry and persona a turn on `session_id` runs with.
+    /// Resolved once per turn: both halves come from the same preset, so
+    /// the prompt can never advertise a skill the dispatcher would refuse.
+    ///
+    /// A preset that has since been deleted or broken degrades to the
+    /// unrestricted default with a loud `LogLine` — failing every turn of
+    /// an existing session because a file was renamed would be worse.
+    async fn effective_agent(&self, session_id: u64) -> (Arc<SkillRegistry>, Option<String>) {
+        self.effective_agent_in(&sica_core::paths::agents_dir(), session_id).await
+    }
+
+    /// [`effective_agent`](Self::effective_agent) against an explicit preset
+    /// directory — see [`set_session_agent_in`](Self::set_session_agent_in).
+    async fn effective_agent_in(
+        &self,
+        dir: &std::path::Path,
+        session_id: u64,
+    ) -> (Arc<SkillRegistry>, Option<String>) {
+        let Some(name) = self.presets.lock().await.get(&session_id).cloned() else {
+            return (self.skills.clone(), None);
+        };
+        match agents::preset::load(dir, &name) {
+            Ok(p) => {
+                let view = agents::preset::view(&self.skills, &p);
+                (Arc::new(view), Some(p.persona))
+            }
+            Err(e) => {
+                self.event_sink.emit(Event::LogLine {
+                    level:   "ERROR".into(),
+                    message: format!("agent `{name}` could not be loaded ({e}) — running without it"),
+                });
+                (self.skills.clone(), None)
+            }
+        }
+    }
+
     /// Deliver a pipeline approval verdict. Returns whether the id was
     /// still pending — a late answer reports `false`.
     pub async fn resolve_approval(&self, id: u64, allow: bool) -> bool {
@@ -1456,9 +1759,10 @@ impl ChatHub {
                 "permission" => self.command_permission(session_id, input).await,
                 "job-kill" => self.command_job_kill(session_id, input).await,
                 "goal" => self.command_goal(session_id, input).await,
+                "agent" => self.command_agent(session_id, input).await,
                 _ => (
                     false,
-                    "unknown command — want compact | plan | permission | job-kill | goal"
+                    "unknown command — want compact | plan | permission | job-kill | goal                      | agent"
                         .into(),
                 ),
             }
@@ -1565,9 +1869,9 @@ impl ChatHub {
         let Some(client) = self.llm.lock().await.clone() else {
             return (false, "no LLM connected — compaction needs the summariser".into());
         };
-        let (native_tools, opt_max_tokens, compact_policy) = {
+        let (tool_mode, opt_max_tokens, compact_policy) = {
             let opts = self.llm_opts.lock().await;
-            (opts.native_tools, opts.max_tokens, opts.compact)
+            (opts.tool_mode, opts.max_tokens, opts.compact)
         };
         let window = self.context_window.load(Ordering::Relaxed);
         let reserve = opt_max_tokens.unwrap_or(4096).saturating_add(512);
@@ -1578,7 +1882,11 @@ impl ChatHub {
         } else {
             None
         };
-        let wh = match build_history(&self.sessions, session_id, &self.skills, native_tools, &model, plan_policy).await {
+        let (skills, persona) = self.effective_agent(session_id).await;
+        let wh = match build_history(
+            &self.sessions, session_id, &skills, tool_mode, &model, plan_policy,
+            persona.as_deref(),
+        ).await {
             Ok(Some(wh)) => wh,
             Ok(None) => return (false, format!("session {session_id} vanished")),
             Err(e) => return (false, format!("prompt assembly failed: {e}")),
@@ -1591,7 +1899,7 @@ impl ChatHub {
             budget,
             &compact_policy,
             &wh,
-            native_tools,
+            tool_mode.native(),
             &CancellationToken::new(),
         )
         .await;
@@ -1634,6 +1942,39 @@ impl ChatHub {
                 false,
                 "unknown mode — want read-only | workspace-write | danger-full-access".into(),
             ),
+        }
+    }
+
+    /// `/agent` — report the selection and what else is on offer;
+    /// `/agent <name>` — run that `agents/<name>.md`; `/agent off` — clear
+    /// it. The palette's AGENTS rows send `SetSessionAgent` directly; this
+    /// is the typed route, and the only way to clear the selection.
+    async fn command_agent(&self, session_id: u64, input: &str) -> (bool, String) {
+        let dir = sica_core::paths::agents_dir();
+        let word = input.trim();
+        if word.is_empty() {
+            let current = self.presets.lock().await.get(&session_id).cloned();
+            let (available, _) = agents::preset::load_dir(&dir);
+            let names: Vec<&str> = available.iter().map(|p| p.name.as_str()).collect();
+            let line = match current {
+                Some(n) => format!("agent: {n}"),
+                None => "no agent selected".to_string(),
+            };
+            return (
+                true,
+                if names.is_empty() {
+                    format!("{line}
+none available — write one into {}", dir.display())
+                } else {
+                    format!("{line}
+available: {}  (`/agent off` clears)", names.join(", "))
+                },
+            );
+        }
+        let name = (!matches!(word, "off" | "none" | "clear")).then(|| word.to_string());
+        match self.set_session_agent(session_id, name).await {
+            Ok(text) => (true, text),
+            Err(text) => (false, text),
         }
     }
 
@@ -1864,19 +2205,61 @@ impl ChatHub {
             return;
         };
 
+        // `UserPromptSubmit` hooks (guide §13.1) run before anything is
+        // written: a denied prompt must leave no trace of a turn that never
+        // happened. The session's log may not exist yet — the hook's own
+        // rows and any injected context land once it does, below.
+        let prompt_hooks = if self.hooks.for_event(hooks::HookEvent::UserPromptSubmit).is_empty() {
+            hooks::Merged::default()
+        } else {
+            hooks::run_event(
+                &self.hooks,
+                &self.sessions,
+                &self.event_sink,
+                hooks::HookEvent::UserPromptSubmit,
+                session_id,
+                Some(&text),
+            )
+            .await
+        };
+        if prompt_hooks.rank == hooks::Rank::Deny {
+            // The slot a followup reserved has to come back, exactly as on
+            // the no-LLM path — otherwise the session reads as busy forever.
+            self.active_turns.lock().await.remove(&session_id);
+            self.event_sink.emit(Event::LogLine {
+                level:   "WARN".into(),
+                message: format!("a hook refused this prompt: {}", prompt_hooks.reason_text()),
+            });
+            return;
+        }
+
         // A new user message starts a fresh repeat-tool chain.
         self.repeat.lock().await.remove(&session_id);
 
-        // `/name …` loads the named command / agent / skill body as
-        // instructions *before* the message — a palette pick and a typed
-        // token arrive here identically. The message itself is kept as
-        // typed so the transcript shows what the user sent.
-        let expansion = agents::invoke::expand(&text, &agents::invoke::Roots::from_workspace());
-        if let Some(exp) = &expansion {
-            self.event_sink.emit(Event::LogLine {
-                level: "INFO".into(),
-                message: format!("loaded /{} ({:?}) as context for this turn", exp.name, exp.family),
-            });
+        // `/name …` resolves against the three markdown families — a
+        // palette pick and a typed token arrive here identically. A command
+        // or skill body is injected as instructions *before* the message; an
+        // agent name is a selection, the same one the palette's AGENTS row
+        // and `/agent <name>` make. Either way the message itself is kept as
+        // typed, so the transcript shows what the user sent.
+        let mut expansion = None;
+        let mut select_agent: Option<String> = None;
+        match agents::invoke::resolve(&text, &agents::invoke::Roots::from_workspace()) {
+            Some(agents::invoke::Invocation::Context(exp)) => {
+                self.event_sink.emit(Event::LogLine {
+                    level:   "INFO".into(),
+                    message: format!(
+                        "loaded /{} ({:?}) as context for this turn",
+                        exp.name, exp.family
+                    ),
+                });
+                expansion = Some(exp);
+            }
+            // Held rather than applied: the session's log may not exist
+            // yet, and a pending rewind has to be the first thing appended
+            // to it. Applied right after the log block below.
+            Some(agents::invoke::Invocation::Agent { name }) => select_agent = Some(name),
+            None => {}
         }
 
         // Ensure the session exists and record the user message straight
@@ -1920,6 +2303,17 @@ impl ChatHub {
                     content: exp.content,
                 });
             }
+            // A `UserPromptSubmit` hook's context sits with the turn's other
+            // snapshots, ahead of the message it is about.
+            for extra in &prompt_hooks.context {
+                if !extra.trim().is_empty() {
+                    log.append(EventKind::ContextInjected {
+                        surface: SurfaceOp::Append,
+                        source:  ContextSource::Injected,
+                        content: extra.clone(),
+                    });
+                }
+            }
             user_seq = log.append(EventKind::UserMessage {
                 surface: SurfaceOp::Append,
                 content: text.clone(),
@@ -1947,6 +2341,19 @@ impl ChatHub {
                 warn!(error = %e, session_id, "flush session (after user msg) failed");
             }
         }
+        // The agent a typed `/name` picked, now that the log exists and any
+        // rewind has been recorded ahead of it. A refusal never costs the
+        // user their message: it is logged, and the turn goes out under
+        // whatever agent the session already had.
+        if let Some(name) = select_agent {
+            if let Err(e) = self.set_session_agent(session_id, Some(name)).await {
+                self.event_sink.emit(Event::LogLine {
+                    level:   "WARN".into(),
+                    message: format!("agent not changed: {e}"),
+                });
+            }
+        }
+
         // The durable handle for this prompt, so the transcript can offer an
         // edit on it without first reloading the session from disk.
         self.event_sink.emit(Event::UserMessageStored { session_id, seq: user_seq });
@@ -1976,14 +2383,22 @@ impl ChatHub {
         let plans = self.plans.clone();
         let active_turns = self.active_turns.clone();
         let next_turn = self.next_turn.clone();
-        let skills = self.skills.clone();
+        // Guide §5.2: one resolution per turn covers both halves of the
+        // preset — the persona section of the prompt and the registry the
+        // dispatcher answers from — so the prompt can never advertise a
+        // skill the dispatch would refuse.
+        let (skills, persona) = self.effective_agent(session_id).await;
         let title_client = client.clone();
         let event_sink = self.event_sink.clone();
         let meters = self.meters.clone();
-        let (native_tools, opt_max_tokens, compact_policy) = {
+        let (tool_mode, opt_max_tokens, compact_policy) = {
             let opts = self.llm_opts.lock().await;
-            (opts.native_tools, opts.max_tokens, opts.compact)
+            (opts.tool_mode, opts.max_tokens, opts.compact)
         };
+        // Every wire-shaping site below asks the same yes/no question — PTC
+        // rides the native transport, it is not a third one — so the mode
+        // itself only reaches the two places that narrow the catalogue.
+        let native_tools = tool_mode.native();
         let model_name = client.model.clone();
         let window = self.context_window.load(Ordering::Relaxed);
         // The options half of the request envelope. Snapshotted per turn
@@ -2067,7 +2482,8 @@ impl ChatHub {
                     None
                 };
                 let mut wh = match build_history(
-                    &sessions_map, session_id, &skills, native_tools, &model_name, plan_policy,
+                    &sessions_map, session_id, &skills, tool_mode, &model_name, plan_policy,
+                    persona.as_deref(),
                 ).await {
                     Ok(Some(wh)) => wh,
                     Ok(None) => break, // session vanished mid-turn
@@ -2118,12 +2534,13 @@ impl ChatHub {
                     .await
                 {
                     wh = match build_history(
-                        &sessions_map, session_id, &skills, native_tools, &model_name,
+                        &sessions_map, session_id, &skills, tool_mode, &model_name,
                         if plans.lock().await.get(&session_id).copied().unwrap_or(false) {
                             Some(plan_policy_text())
                         } else {
                             None
                         },
+                        persona.as_deref(),
                     ).await {
                         Ok(Some(wh)) => wh,
                         Ok(None) => break,
@@ -2177,6 +2594,38 @@ impl ChatHub {
                 // anchor is dropped instead.
                 let anchor_seq = wh.entries.last().map(|e| e.seq);
 
+                // Invariant companions (§14.3), only under `--invariants`.
+                // The derivation here is deliberately *second*: the request
+                // was built from one pass over the log, this is another, and
+                // the whole point is whether two independent observations of
+                // the same log agree.
+                let seq_before_attempt = if crate::invariants::enabled() {
+                    let (events, derived) = {
+                        let g = sessions_map.lock().await;
+                        match g.get(&session_id) {
+                            Some(log) => (
+                                log.events.clone(),
+                                sica_core::event::derive_messages(&log.events),
+                            ),
+                            None => (Vec::new(), Vec::new()),
+                        }
+                    };
+                    crate::invariants::report(
+                        event_sink.as_ref(),
+                        crate::invariants::check_request_matches_log(
+                            &trimmed.messages,
+                            &wire_messages(&derived, native_tools),
+                        ),
+                    );
+                    crate::invariants::report(
+                        event_sink.as_ref(),
+                        crate::invariants::check_compaction_span_balanced(&events),
+                    );
+                    events.last().map(|e| e.seq).unwrap_or(0)
+                } else {
+                    0
+                };
+
                 let turn_id = next_turn.fetch_add(1, Ordering::Relaxed);
                 let out = agents::turn::run_turn(
                     client.clone(),
@@ -2185,11 +2634,7 @@ impl ChatHub {
                         session_id,
                         turn_id,
                         messages: trimmed.messages,
-                        tools: if native_tools {
-                            Some(skills.tools_json())
-                        } else {
-                            None
-                        },
+                        tools: tools_for(&skills, tool_mode),
                         limit: window,
                         budget,
                         cancel: Some(cancel.clone()),
@@ -2236,6 +2681,19 @@ impl ChatHub {
                             delay_ms: delay.as_millis() as u64,
                             reason:   failure.reason().to_string(),
                         });
+                        if crate::invariants::enabled() {
+                            let events = {
+                                let g = sessions_map.lock().await;
+                                g.get(&session_id).map(|l| l.events.clone()).unwrap_or_default()
+                            };
+                            crate::invariants::report(
+                                event_sink.as_ref(),
+                                crate::invariants::check_retry_appended_nothing(
+                                    &events,
+                                    seq_before_attempt,
+                                ),
+                            );
+                        }
                         append_event(&sessions_map, session_id, EventKind::LlmRetry {
                             attempt: retries,
                             max: llm::retry::RETRY_MAX,
@@ -2373,6 +2831,7 @@ impl ChatHub {
                             &skills,
                             &out.tool_calls,
                             over_limit,
+                            tool_mode.ptc(),
                             &client,
                             &cancel,
                         )
@@ -2747,7 +3206,7 @@ fn envelope_options_json(model: &str, opts: &protocol::LlmOptions, window: u32) 
         "temperature":    opts.temperature,
         "max_tokens":     opts.max_tokens,
         "context_window": window,
-        "native_tools":   opts.native_tools,
+        "tool_mode":      opts.tool_mode.label(),
         "thinking":       opts.thinking,
         "compact": {
             "threshold_pct": opts.compact.threshold_pct,
@@ -2880,7 +3339,7 @@ fn human_elapsed(secs: i64) -> String {
 /// watcher — this runs at turn start and after successful filesystem tool
 /// calls, which is when edits matter.
 fn refresh_instructions(log: &mut SessionLog) -> bool {
-    let root = sica_core::paths::workspace_root();
+    let root = sica_core::paths::working_dir();
     let baseline = agents::instructions::load(&root, &root, agents::instructions::MAX_BYTES);
 
     // Look at the surface, not the raw log: a predecessor shadowed by a
@@ -3020,14 +3479,18 @@ fn parallel_call(
 
 /// Latest durable Wave-3 control state from a session's log: the newest
 /// `PermissionMode` event wins, the newest `PlanMode` event wins.
-fn control_state(log: &SessionLog) -> (PermissionMode, bool, Option<Goal>) {
+fn control_state(log: &SessionLog) -> (PermissionMode, bool, Option<String>, Option<Goal>) {
     let mut mode = PermissionMode::default();
     let mut plan = false;
+    let mut preset = None;
     let mut goal = None;
     for ev in &log.events {
         match &ev.kind {
             EventKind::PermissionMode { mode: m } => mode = *m,
             EventKind::PlanMode { active } => plan = *active,
+            // Latest wins, and a `None` name is the cleared state — which is
+            // why this assigns rather than only overwriting on `Some`.
+            EventKind::AgentPreset { name } => preset = name.clone(),
             // Latest wins, exactly like the two above: `GoalChange` is a
             // full snapshot, so the last one is the goal.
             EventKind::GoalChange {
@@ -3046,7 +3509,7 @@ fn control_state(log: &SessionLog) -> (PermissionMode, bool, Option<Goal>) {
             _ => {}
         }
     }
-    (mode, plan, goal)
+    (mode, plan, preset, goal)
 }
 
 /// A goal on the wire. `armed` is process state, not part of the goal, so
@@ -3306,9 +3769,10 @@ async fn build_history(
     sessions: &Sessions,
     session_id: u64,
     skills: &SkillRegistry,
-    native_tools: bool,
+    mode: protocol::ToolMode,
     model: &str,
     plan_policy: Option<String>,
+    persona: Option<&str>,
 ) -> Result<Option<WireHistory>, agents::prompt::PromptError> {
     let entries = {
         let g = sessions.lock().await;
@@ -3316,7 +3780,8 @@ async fn build_history(
         log.derive_surface()
     };
     let messages: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
-    let mut wh = build_wire_history(&messages, skills, native_tools, model, plan_policy.as_deref())?;
+    let mut wh =
+        build_wire_history(&messages, skills, mode, model, plan_policy.as_deref(), persona)?;
     wh.entries = entries;
     Ok(Some(wh))
 }
@@ -3338,6 +3803,25 @@ pub struct WireHistory {
     pub breakdown:   protocol::TokenBreakdown,
 }
 
+/// The `tools` array for one mode. `Text` sends none — the catalogue is in
+/// the system prompt. `Native` sends the whole registry. `Ptc` sends only
+/// what the model may call directly (guide §7): `run-code`, plus the
+/// harness controls whose bodies run in this dispatcher and so cannot run
+/// inside a program. Shared by the request builder and the envelope
+/// fingerprint so the two can never disagree about what was offered.
+fn tools_for(skills: &SkillRegistry, mode: protocol::ToolMode) -> Option<serde_json::Value> {
+    match mode {
+        protocol::ToolMode::Text => None,
+        // `run-code` is only offered where it is the point: under `Native`
+        // the model already has every tool directly, and a second way to
+        // reach them is pure confusion on the wire.
+        protocol::ToolMode::Native => {
+            Some(skills.excluding(&[agents::ptc::RUN_CODE_NAME]).tools_json())
+        }
+        protocol::ToolMode::Ptc => Some(agents::ptc::direct_view(skills).tools_json()),
+    }
+}
+
 /// Assemble the LLM wire history: compose the system prompt through
 /// `agents::prompt` (ordered sections, strict interpolation), then map
 /// every derived message to its wire form. Tool-role messages are surfaced
@@ -3346,20 +3830,22 @@ pub struct WireHistory {
 fn build_wire_history(
     messages: &[Message],
     skills: &SkillRegistry,
-    native_tools: bool,
+    mode: protocol::ToolMode,
     model: &str,
     plan_policy: Option<&str>,
+    persona: Option<&str>,
 ) -> Result<WireHistory, agents::prompt::PromptError> {
     let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
     let vars = agents::prompt::standard_vars(model);
-    let rendered = agents::prompt::for_main_agent(&mem, skills, native_tools, &vars, plan_policy)?;
-    let tools_json = native_tools.then(|| skills.tools_json());
+    let rendered =
+        agents::prompt::for_main_agent(&mem, skills, mode, &vars, plan_policy, persona)?;
+    let tools_json = tools_for(skills, mode);
 
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len() + 1);
     if !rendered.system.is_empty() {
         out.push(ChatMessage::text("system", rendered.system.clone()));
     }
-    out.extend(wire_messages(messages, native_tools));
+    out.extend(wire_messages(messages, mode.native()));
 
     let breakdown = protocol::TokenBreakdown {
         system:  llm::tokenize::approx_tokens(&rendered.system),
@@ -3587,7 +4073,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
             },
         ];
-        let wire = build_wire_history(&msgs, &registry(), false, "test", None).unwrap().messages;
+        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None).unwrap().messages;
         // memory.md may or may not exist on this machine; look at the tail.
         let n = wire.len();
         assert_eq!(wire[n - 2].role, "user");
@@ -3606,13 +4092,14 @@ mod tests {
             Message::system(agents::compact::summary_message("folded")),
             Message::user("continue"),
         ];
-        for native in [false, true] {
-            let wire = build_wire_history(&msgs, &registry(), native, "test", None)
+        for native in [protocol::ToolMode::Text, protocol::ToolMode::Native] {
+            let wire = build_wire_history(&msgs, &registry(), native, "test", None, None)
                 .unwrap()
                 .messages;
             assert!(
                 wire.iter().skip(1).all(|m| m.role != "system"),
-                "native={native}: a non-leading system message reached the wire"
+                "{}: a non-leading system message reached the wire",
+                native.label()
             );
             let n = wire.len();
             assert_eq!(wire[n - 2].role, "user");
@@ -3643,7 +4130,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
             },
         ];
-        let wire = build_wire_history(&msgs, &registry(), true, "test", None).unwrap().messages;
+        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Native, "test", None, None).unwrap().messages;
         let n = wire.len();
         assert_eq!(wire[n - 2].role, "assistant");
         assert!(wire[n - 2].tool_calls.is_some());
@@ -3657,7 +4144,7 @@ mod tests {
             "look",
             vec![UserImage { mime: "image/png".into(), data_base64: "AAAA".into() }],
         )];
-        let wire = build_wire_history(&msgs, &registry(), false, "test", None).unwrap().messages;
+        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None).unwrap().messages;
         let last = wire.last().unwrap();
         match &last.content {
             ChatContent::Parts(parts) => {
@@ -3670,8 +4157,8 @@ mod tests {
 
     #[test]
     fn wire_history_native_keeps_memory_and_drops_catalogue() {
-        let wire_text = build_wire_history(&[Message::user("hi")], &registry(), false, "test", None).unwrap();
-        let wire_native = build_wire_history(&[Message::user("hi")], &registry(), true, "test", None).unwrap();
+        let wire_text = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Text, "test", None, None).unwrap();
+        let wire_native = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Native, "test", None, None).unwrap();
         let sys_native = &wire_native.system_body;
         assert!(sys_native.contains(agents::prompt::NATIVE_IDENTITY), "{sys_native}");
         assert!(!sys_native.contains("## Loaded skills"), "tools array carries the catalogue");
@@ -3682,7 +4169,7 @@ mod tests {
 
     #[test]
     fn wire_history_breakdown_covers_all_three_parts() {
-        let wh = build_wire_history(&[Message::user("hi")], &registry(), false, "test", None).unwrap();
+        let wh = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Text, "test", None, None).unwrap();
         assert!(wh.breakdown.history >= 5, "user message priced");
         assert_eq!(wh.breakdown.tools, 0, "text protocol sends no tools array");
         assert!(wh.envelope != 0);
@@ -3878,6 +4365,7 @@ mod tests {
             arm_set: Arc::new(Mutex::new(HashSet::new())),
             next_goal: Arc::new(AtomicU64::new(1)),
             turn_source: source,
+            hooks: Arc::new(crate::hooks::HookConfig::default()),
         };
         (cs, Arc::new(Mutex::new(HashMap::new())), cap)
     }
@@ -3894,7 +4382,8 @@ mod tests {
         log.append(EventKind::PermissionMode { mode: PermissionMode::DangerFullAccess });
         log.append(EventKind::PlanMode { active: false });
         log.append(EventKind::PlanMode { active: true });
-        let (mode, plan, goal) = control_state(&log);
+        let (mode, plan, agent, goal) = control_state(&log);
+        assert!(agent.is_none());
         assert_eq!(mode, PermissionMode::DangerFullAccess);
         assert!(plan);
         assert!(goal.is_none());
@@ -3915,7 +4404,7 @@ mod tests {
         log.append(snapshot(1, 0, protocol::GoalPhase::Active));
         log.append(snapshot(2, 1, protocol::GoalPhase::Active));
         log.append(snapshot(3, 1, protocol::GoalPhase::Paused));
-        let (_, _, goal) = control_state(&log).clone();
+        let (_, _, _, goal) = control_state(&log).clone();
         let goal = goal.expect("goal restored");
         assert_eq!((goal.id, goal.revision, goal.rounds_started), (7, 3, 1));
         assert_eq!(goal.phase, protocol::GoalPhase::Paused);
@@ -4041,6 +4530,145 @@ mod tests {
         assert!(!out.ok);
         assert!(!conclude);
         assert!(cs.plans.lock().await.get(&1).copied().unwrap_or(false));
+    }
+
+    /// A preset directory for one test, gone when it ends.
+    fn preset_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sica-chat-agents-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            "---
+name: reviewer
+description: d
+skills: [read-file, grep]
+---
+BE A REVIEWER
+",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Selecting a preset is durable, restricts the registry the turn
+    /// dispatches against, and supplies the persona section — all from the
+    /// one selection, so the prompt cannot advertise a hidden skill.
+    #[tokio::test]
+    async fn selecting_an_agent_sets_persona_and_narrows_the_registry() {
+        let dir = preset_dir("select");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(agents::RunCli(None)));
+        reg.register(Arc::new(agents::ReadFile::new(std::path::PathBuf::from("."))));
+        reg.register(Arc::new(agents::Grep::new(std::path::PathBuf::from("."))));
+        let hub = ChatHub::new(tx, Arc::new(reg), None);
+        let id = hub.create_session().await;
+
+        let msg = hub
+            .set_session_agent_in(&dir, id, Some("reviewer".into()))
+            .await
+            .expect("preset accepted");
+        assert!(msg.contains("reviewer"), "{msg}");
+        assert_eq!(hub.presets.lock().await.get(&id).cloned(), Some("reviewer".into()));
+
+        let (skills, persona) = hub.effective_agent_in(&dir, id).await;
+        assert_eq!(persona.as_deref(), Some("BE A REVIEWER"));
+        assert!(skills.by_name.contains_key("read-file"));
+        assert!(skills.by_name.contains_key("grep"));
+        assert!(!skills.by_name.contains_key("run-cli"), "unlisted skills are hidden");
+
+        // Durable, and the dump carries it to the frontend.
+        let g = hub.sessions.lock().await;
+        let log = g.get(&id).unwrap();
+        assert!(log.events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::AgentPreset { name } if name.as_deref() == Some("reviewer")
+        )));
+        assert_eq!(control_state(log).2.as_deref(), Some("reviewer"));
+        drop(g);
+        assert_eq!(hub.dump_session(id).await.unwrap().agent.as_deref(), Some("reviewer"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The selection is fixed once the session has produced a reply: the
+    /// persona lives in the system-prompt prefix, and swapping it would
+    /// leave the earlier half of the transcript answering to rules that no
+    /// longer apply.
+    #[tokio::test]
+    async fn the_agent_is_fixed_after_the_first_reply() {
+        let dir = preset_dir("fixed");
+        let (hub, _rx) = hub();
+        let id = hub.create_session().await;
+        hub.set_session_agent_in(&dir, id, Some("reviewer".into())).await.unwrap();
+        {
+            let mut g = hub.sessions.lock().await;
+            g.get_mut(&id).unwrap().append(EventKind::AssistantMessage {
+                surface:    SurfaceOp::Append,
+                content:    "answered".into(),
+                reasoning:  None,
+                tool_calls: None,
+            });
+        }
+        let err = hub.set_session_agent_in(&dir, id, None).await.unwrap_err();
+        assert!(err.contains("fixed once"), "{err}");
+        assert_eq!(hub.presets.lock().await.get(&id).cloned(), Some("reviewer".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name with nothing behind it leaves the session exactly as it was —
+    /// validation happens before any state moves.
+    #[tokio::test]
+    async fn an_unknown_or_unsafe_agent_is_refused_without_side_effects() {
+        let dir = preset_dir("refuse");
+        let (hub, _rx) = hub();
+        let id = hub.create_session().await;
+        for bad in ["ghost", "../secrets"] {
+            let err = hub
+                .set_session_agent_in(&dir, id, Some(bad.into()))
+                .await
+                .unwrap_err();
+            assert!(!err.is_empty(), "{bad}");
+        }
+        assert!(hub.presets.lock().await.get(&id).is_none());
+        let g = hub.sessions.lock().await;
+        assert!(!g
+            .get(&id)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::AgentPreset { .. })));
+        drop(g);
+        // A preset that vanishes under a live session degrades to the
+        // default rather than failing the turn.
+        hub.set_session_agent_in(&dir, id, Some("reviewer".into())).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (skills, persona) = hub.effective_agent_in(&dir, id).await;
+        assert!(persona.is_none());
+        assert_eq!(skills.by_name.len(), hub.skills.by_name.len());
+    }
+
+    /// `/agent off` clears the selection; `/agent` with no argument reports.
+    #[tokio::test]
+    async fn the_agent_command_reports_and_clears() {
+        let dir = preset_dir("command");
+        let (hub, _rx) = hub();
+        let id = hub.create_session().await;
+        hub.set_session_agent_in(&dir, id, Some("reviewer".into())).await.unwrap();
+        let (ok, text) = hub.command_agent(id, "off").await;
+        assert!(ok, "{text}");
+        assert!(hub.presets.lock().await.get(&id).is_none());
+        let (ok, text) = hub.command_agent(id, "").await;
+        assert!(ok);
+        assert!(text.contains("no agent selected"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn hub() -> (ChatHub, mpsc::UnboundedReceiver<Frame>) {

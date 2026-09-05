@@ -222,6 +222,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                          with --enable-auto-tool-choice and a --tool-call-parser \
                          matching the model. Takes effect on next Connect.",
                     );
+                    ui.add_enabled_ui(cfg.native_tools, |ui| {
+                        ui.checkbox(
+                            &mut cfg.ptc,
+                            "Programmatic tool calling (run-code)",
+                        )
+                        .on_hover_text(
+                            "Offer the model one data tool, run-code, and let                              it call every other skill from inside a sandboxed                              Rhai program. Collapses a whole read/filter/edit                              sequence into one round-trip and keeps the                              intermediate data out of the context — only what                              the program prints comes back. Needs native tool                              calling, and a model good enough to write the                              script. Takes effect on next Connect.",
+                        );
+                    });
+                    if cfg.ptc && !cfg.native_tools {
+                        // The wire has no way to say "PTC over the text
+                        // protocol", so a stale flag would silently mean
+                        // plain text mode. Clear it where the user can see.
+                        cfg.ptc = false;
+                    }
                     ui.checkbox(
                         &mut cfg.thinking,
                         "Thinking (model reasoning)",

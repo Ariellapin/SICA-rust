@@ -4,6 +4,8 @@ pub mod build_id;
 pub mod event;
 pub mod message;
 pub mod session;
+pub mod snapshot;
 pub mod paths;
+pub mod project;
 pub mod retain;
 pub mod theme;

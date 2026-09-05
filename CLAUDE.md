@@ -22,6 +22,7 @@ See [docs/architecture.md](docs/architecture.md#what-this-is).
 .\run.ps1 test  --workspace
 .\run.ps1 run   -p frontend                  # launches the GUI
 .\run.ps1 run   -p frontend --bin smoke      # headless E2E smoke test
+.\run.ps1 run   -p frontend --bin replay     # recorded-session evals
 ```
 
 Cargo filters are forwarded verbatim (`.\run.ps1 test -p agents md_skill`). To pass
@@ -31,9 +32,19 @@ equivalent; `start.bat` builds + launches the GUI; `.\run.ps1 cmd <exe> <args…
 runs any other binary with the same PATH.
 
 No clippy/rustfmt/lints config and no CI. Tests are inline `#[cfg(test)]` modules
-(~200, concentrated in `agents`). [crates/frontend/src/bin/smoke.rs](crates/frontend/src/bin/smoke.rs)
+(~530, concentrated in `agents`). [crates/frontend/src/bin/smoke.rs](crates/frontend/src/bin/smoke.rs)
 is the canonical end-to-end check — run it after any change to the protocol, IPC,
 dispatcher, or `be_core`. It reads `target/debug/backend.exe`, so build first.
+
+[crates/frontend/src/bin/replay.rs](crates/frontend/src/bin/replay.rs) is the
+second one: it replays the recordings in [snapshots/](snapshots/) against the
+real harness with the LLM served from the recording (guide §14.1), and diffs
+the session log each run produces against the recording. Run it after any
+change to the turn loop, compaction, the spill policy or the tool pipeline.
+`--bless` re-records; a scenario name limits it to one
+(`.\run.ps1 run -p frontend --bin replay -- spill-digest`). Every run also
+turns on the §14.3 invariant companions, and treats a backend ERROR line as
+a failure.
 
 ## Workspace layout
 
@@ -53,7 +64,7 @@ Seven crates, dependency direction strictly downward. Details in
 ## Reference docs
 
 - **[docs/architecture.md](docs/architecture.md)** — the crate graph, the wire
-  protocol (framing, `PROTOCOL_VERSION` history v17–v22), every on-disk surface,
+  protocol (framing, `PROTOCOL_VERSION` history v17–v25), every on-disk surface,
   how to add a new request, and the conventions to respect when editing.
 - **[docs/agent-loop.md](docs/agent-loop.md)** — one turn end to end: history
   derivation, prune/compact/trim, retry classification, the two tool-calling
@@ -77,3 +88,8 @@ Seven crates, dependency direction strictly downward. Details in
 - Nothing is ever removed from a session event log; compaction and rewind shadow spans in the derived view.
 - `Event::LogLine` is the channel for anything the operator should see in the GUI — a `warn!` alone is invisible.
 - The FE design system is `sica_core::theme` + `ui::kit`; no module below `kit` names a literal colour.
+- Optional integrations are opt-in files, absent by default and never fatal when
+  malformed: `.sica/hooks.json` in the working directory (user hooks, §13.1),
+  `sica-settings/mcp/*.toml` (one MCP server each, §13.2), `sica-settings/web.toml`
+  (the `web-search` provider key, §13.3). Each reports what it could not load as a
+  `LogLine` rather than failing startup.

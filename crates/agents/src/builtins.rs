@@ -50,7 +50,7 @@ pub const RUN_PWSH_DESCRIPTION: &str =
 pub const READ_FILE_DESCRIPTION: &str =
     "Read a UTF-8 file with line numbers. Positional args: <path>. \
      Optional named args: start, end (1-based line range). \
-     Relative paths resolve against the workspace root; up to 1 MiB.";
+     Relative paths resolve against the working directory; up to 1 MiB.";
 
 pub const WRITE_FILE_DESCRIPTION: &str =
     "Write UTF-8 content to a file. Positional args: <path> <content>. \
@@ -102,8 +102,9 @@ Behaviour:
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok), reported as the
   `exit=N` marker at the top of the result.
-- Optional named arg `cwd` (JSON-fenced / native calls only): sets the
-  working directory for the command.
+- Optional named arg `cwd` (JSON-fenced / native calls only): the directory
+  to run in, relative to the working directory unless absolute. Without it
+  the command runs in the working directory.
 
 Use this for build tools, git, package managers, or one-shot scripts.
 
@@ -163,8 +164,9 @@ Behaviour:
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok).
-- Optional named arg `cwd` (JSON-fenced / native calls only): sets the
-  working directory for the command.
+- Optional named arg `cwd` (JSON-fenced / native calls only): the directory
+  to run in, relative to the working directory unless absolute. Without it
+  the command runs in the working directory.
 - Optional named arg `background`: `true` starts the command as a
   background job and returns a job id instead of waiting. See `run-cli` for
   the full description; `job-list` / `job-output` / `job-kill` control it.
@@ -187,7 +189,7 @@ Examples:
     read-file 'src/main.rs' '1' '80' > the first 80 lines (named start/end args)
 
 Behaviour:
-- Relative paths resolve against the workspace root.
+- Relative paths resolve against the working directory.
 - Relative paths may not escape the workspace via `..`.
 - Files larger than **1 MiB** are rejected.
 - Optional named args `start` / `end` (1-based, inclusive) select a line
@@ -261,7 +263,7 @@ Examples:
 
 Behaviour:
 - `**` matches any number of directories; `*` matches within one path
-  segment. Patterns are relative to the workspace root.
+  segment. Patterns are relative to the working directory.
 - Returns at most **100** paths, most recently modified first, one per line.
 - Use `grep` to search file *contents*.
 "#;
@@ -314,7 +316,7 @@ impl Skill for RunCli {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => return err("missing or empty `command` arg"),
         };
-        let cwd = args.get("cwd").and_then(|v| v.as_str()).map(String::from);
+        let cwd = shell_cwd(&args);
 
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("cmd");
@@ -325,13 +327,29 @@ impl Skill for RunCli {
             c.args(["-c", &command]);
             c
         };
-        if let Some(cwd) = &cwd {
-            cmd.current_dir(cwd);
-        }
+        cmd.current_dir(&cwd);
         if wants_background(&args) {
             return start_background(&self.0, "cli", &command, cmd, &ctx);
         }
         run_shell(cmd, "cmd", &ctx).await
+    }
+}
+
+/// Directory a shell call runs in: the `cwd` arg when it has one (a relative
+/// path resolves against the working directory), otherwise the working
+/// directory itself. Without this the command would inherit the backend
+/// process's own cwd — wherever the frontend happened to be launched from —
+/// rather than the folder the user pointed the agent at.
+fn shell_cwd(args: &Value) -> PathBuf {
+    let root = sica_core::paths::working_dir();
+    match args
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(c) if Path::new(c).is_absolute() => PathBuf::from(c),
+        Some(c) => root.join(c),
+        None => root,
     }
 }
 
@@ -445,7 +463,7 @@ impl Skill for RunPwsh {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => return err("missing or empty `command` arg"),
         };
-        let cwd = args.get("cwd").and_then(|v| v.as_str()).map(String::from);
+        let cwd = shell_cwd(&args);
 
         // On Windows prefer the system `powershell.exe`; everywhere else
         // (including the rare case where `powershell.exe` is missing on
@@ -468,9 +486,7 @@ impl Skill for RunPwsh {
             "-Command",
             &command,
         ]);
-        if let Some(cwd) = &cwd {
-            cmd.current_dir(cwd);
-        }
+        cmd.current_dir(&cwd);
         if wants_background(&args) {
             return start_background(&self.0, "pwsh", &command, cmd, &ctx);
         }
@@ -994,6 +1010,8 @@ pub fn seed_defaults(skills_dir: &Path) -> std::io::Result<()> {
         (EDIT_FILE_NAME,  EDIT_FILE_SEED_MD),
         (GLOB_NAME,       GLOB_SEED_MD),
         (GREP_NAME,       GREP_SEED_MD),
+        (crate::web::WEB_FETCH_NAME,  crate::web::WEB_FETCH_SEED_MD),
+        (crate::web::WEB_SEARCH_NAME, crate::web::WEB_SEARCH_SEED_MD),
     ] {
         let path = skills_dir.join(format!("{name}.md"));
         if !path.exists() {
@@ -1235,6 +1253,7 @@ mod tests {
         for name in [
             RUN_CLI_NAME, RUN_PWSH_NAME, READ_FILE_NAME, WRITE_FILE_NAME,
             EDIT_FILE_NAME, GLOB_NAME, GREP_NAME,
+            crate::web::WEB_FETCH_NAME, crate::web::WEB_SEARCH_NAME,
         ] {
             let p = dir.join(format!("{name}.md"));
             assert!(p.exists(), "expected {}", p.display());

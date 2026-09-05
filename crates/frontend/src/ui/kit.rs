@@ -904,6 +904,10 @@ pub fn menu(
 // Modal
 // ---------------------------------------------------------------------------
 
+// Kept as a design-system primitive: nothing calls `modal` since the
+// Full-access risk gate was retired, and the next dialog should reach for
+// this rather than growing its own.
+#[allow(dead_code)]
 pub struct ModalOutput<R> {
     pub inner: R,
     /// The mask was clicked, Esc was pressed, or the × was hit.
@@ -912,6 +916,7 @@ pub struct ModalOutput<R> {
 
 /// Full-window mask + a centred dialog. `width`/`max_height` in points;
 /// pass `None` for the close button to make the modal non-dismissible.
+#[allow(dead_code)]
 pub fn modal<R>(
     ctx: &egui::Context,
     id: egui::Id,

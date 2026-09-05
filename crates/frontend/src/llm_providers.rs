@@ -33,6 +33,11 @@ pub struct ProviderConfig {
     /// Requires server-side tool support (e.g. vLLM `--enable-auto-tool-choice`).
     #[serde(default)]
     pub native_tools: bool,
+    /// Programmatic tool calling (guide §7): the model is offered
+    /// `run-code` and reaches every other tool from inside a script.
+    /// Rides the native wire, so it implies `native_tools`.
+    #[serde(default)]
+    pub ptc: bool,
     /// Let the model emit `<think>` reasoning. Off sends
     /// `chat_template_kwargs: {"enable_thinking": false}` with every request,
     /// which llama.cpp/vLLM template away (faster, terser answers).
@@ -68,6 +73,7 @@ impl ProviderConfig {
         self.temperature = p.temperature;
         self.thinking = p.thinking;
         self.native_tools = p.native_tools;
+        self.ptc = false;
         self.max_tokens = p.max_tokens;
         self.context_window = p.context_window;
         self.compact_threshold_pct = p.compact_threshold_pct;
@@ -91,6 +97,9 @@ impl ProviderConfig {
         if self.native_tools != p.native_tools {
             out.push("native tools");
         }
+        if self.ptc {
+            out.push("programmatic tool calling");
+        }
         if self.max_tokens != p.max_tokens
             || self.context_window != p.context_window
             || self.compact_threshold_pct != p.compact_threshold_pct
@@ -110,7 +119,14 @@ impl ProviderConfig {
             temperature: self.temperature,
             max_tokens: (self.max_tokens > 0).then_some(self.max_tokens),
             context_window: (self.context_window > 0).then_some(self.context_window),
-            native_tools: self.native_tools,
+            tool_mode: match (self.native_tools, self.ptc) {
+                // PTC is a narrowing of the native catalogue, so it needs
+                // the native wire; asking for it without native tools is a
+                // misconfiguration, not a third transport.
+                (true, true) => protocol::ToolMode::Ptc,
+                (true, false) => protocol::ToolMode::Native,
+                (false, _) => protocol::ToolMode::Text,
+            },
             thinking: self.thinking,
             compact: protocol::CompactPolicy {
                 threshold_pct: if self.compact_threshold_pct > 0 {
@@ -207,6 +223,7 @@ fn defaults() -> Vec<ProviderConfig> {
         max_tokens: 0,
         context_window: 0,
         native_tools: false,
+        ptc: false,
         thinking: true,
         compact_threshold_pct: 0,
         compact_retain_pct: 0,

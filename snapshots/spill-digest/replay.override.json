@@ -1,0 +1,6 @@
+{
+  "_comment": "Call 1 is the expectation summariser, which fires on any result over 2 KiB. Its output is not recorded in the log (it becomes the tool result's own summary), so the recording cannot supply it. An empty completion makes the sub-agent keep the raw digest — which is what this scenario is about.",
+  "calls": [
+    { "before_call": 1, "kind": "empty" }
+  ]
+}

@@ -47,6 +47,15 @@ pub struct Settings {
     /// the backend default matches when this fails to parse.
     #[serde(default = "default_permission_mode")]
     pub default_permission_mode: String,
+    /// Folder the agent reads, writes and runs commands in. `None` means the
+    /// app's own root (`paths::workspace_root`), which is what the app did
+    /// before this setting existed.
+    #[serde(default)]
+    pub working_dir:            Option<String>,
+    /// Previously chosen working directories, most recent first. The picker
+    /// offers them so switching between projects is one click.
+    #[serde(default)]
+    pub recent_working_dirs:    Vec<String>,
 }
 
 impl Default for Settings {
@@ -68,6 +77,8 @@ impl Default for Settings {
             auto_watch:             false,
             last_active_provider:   None,
             default_permission_mode: default_permission_mode(),
+            working_dir:            None,
+            recent_working_dirs:    Vec::new(),
         }
     }
 }

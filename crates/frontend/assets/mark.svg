@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The sica mark, monochrome.
+
+     A *sica* is a short curved blade; the mark draws one sweeping out of an
+     open ring. The ring is the agent loop — it is deliberately not closed,
+     because the blade breaks out through the gap: a turn that ends in an
+     answer rather than another lap.
+
+     Everything is pure white so the frontend can tint one rasterised texture
+     to any theme colour (`ui::icons::mark`). The full-colour app-icon variant
+     lives in `icon.svg` and shares this geometry exactly — edit both together.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <!-- Punches a 6-unit clearance in the shape of the blade out of anything
+         it is applied to, so the ring reads as passing *behind* the blade
+         with a hairline of background between them. The mask box is oversized
+         because the round stroke caps reach past the viewBox edges. -->
+    <mask id="blade-clearance" maskUnits="userSpaceOnUse" x="-8" y="-8" width="80" height="80">
+      <rect x="-8" y="-8" width="80" height="80" fill="#ffffff"/>
+      <path d="M 17 47 C 15 33 24 20 56 11 C 41 24 30 36 26 50 Z"
+            fill="none" stroke="#000000" stroke-width="6" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+
+  <!-- The loop. r=25, 5.5 stroke; the dash pattern leaves a ~69 degree gap
+       centred on the upper-right diagonal, which is where the blade exits.
+       Circumference is 2*pi*25 = 157.08, so 124.6 on / 30 off puts the gap
+       at 285..354 degrees measured clockwise from 3 o'clock. -->
+  <circle cx="32" cy="32" r="25"
+          fill="none" stroke="#ffffff" stroke-width="5.5"
+          stroke-dasharray="124.6 30" stroke-linecap="round"
+          mask="url(#blade-clearance)"/>
+
+  <!-- The blade. Heel inside the ring at lower left, spine curving up and
+       over, tip breaking out through the gap. -->
+  <path d="M 17 47 C 15 33 24 20 56 11 C 41 24 30 36 26 50 Z" fill="#ffffff"/>
+</svg>

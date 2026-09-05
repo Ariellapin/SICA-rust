@@ -1,0 +1,8 @@
+description = "when the prompt crosses the compaction threshold, older turns are folded into a summary that shadows them"
+window = 9000
+# Compaction spends completions the log cannot record — a summary the policy
+# judged unusable and retried, a compaction whose history moved underneath it.
+# Every reply in this recording is the same text, so which queue entry serves
+# a request cannot change the result; without the padding the recording would
+# shed one turn every time it is re-blessed.
+pad = 8

@@ -94,13 +94,13 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 let ws = crumb(ui, &app.workspace_name, false, &t);
                 if ws
                     .on_hover_text(
-                        sica_core::paths::workspace_root()
+                        sica_core::paths::working_dir()
                             .display()
                             .to_string(),
                     )
                     .clicked()
                 {
-                    let path = sica_core::paths::workspace_root().display().to_string();
+                    let path = sica_core::paths::working_dir().display().to_string();
                     ui.ctx().output_mut(|o| o.copied_text = path);
                 }
                 kit::label(
@@ -113,6 +113,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                     jobs_action(app, ui);
                 });
             });
+            stats_line(app, ui);
             tab_strip(app, ui);
         });
     let rect = ui.min_rect();
@@ -124,6 +125,62 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             kit::Level::L3.color(&t),
         ),
     );
+}
+
+/// The projection line under the session crumb (guide §3.3): turns,
+/// messages, tool calls, retries, elapsed.
+///
+/// Folded by the backend from the log, so it counts what *happened* rather
+/// than what the model can still see — a compaction shrinks the context,
+/// not the session's history. Absent until the first fold answers, and
+/// silent on a session that has nothing in it yet.
+fn stats_line(app: &mut App, ui: &mut egui::Ui) {
+    let t = app.theme;
+    let Some(s) = app.stats.stats else { return };
+    if s.turns == 0 {
+        return;
+    }
+    let mut parts = vec![
+        format!("{} turn{}", s.turns, plural(s.turns)),
+        format!("{} message{}", s.user_msgs + s.assistant_msgs, plural(s.user_msgs + s.assistant_msgs)),
+    ];
+    if s.tool_calls > 0 {
+        let mut tools = format!("{} tool call{}", s.tool_calls, plural(s.tool_calls));
+        if s.tool_failures > 0 {
+            tools.push_str(&format!(" ({} failed)", s.tool_failures));
+        }
+        parts.push(tools);
+    }
+    if s.retries > 0 {
+        parts.push(format!("{} retr{}", s.retries, if s.retries == 1 { "y" } else { "ies" }));
+    }
+    if s.wall_ms >= 1_000 {
+        parts.push(elapsed(s.wall_ms));
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        kit::label(
+            ui,
+            kit::txt(parts.join(" · "), 12.0, Weight::Regular, kit::col(t.alias.label[3])),
+        );
+    });
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Wall time as the coarsest unit that still reads: `42s`, `7m 12s`, `2h 5m`.
+fn elapsed(ms: i64) -> String {
+    let secs = ms / 1_000;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let (m, s) = (secs / 60, secs % 60);
+    if m < 60 {
+        return format!("{m}m {s}s");
+    }
+    format!("{}h {}m", m / 60, m % 60)
 }
 
 /// `Chat · Trajectory` (§2.1): gap 36, 13/16 500, `label[2]`, the active tab
@@ -333,10 +390,10 @@ fn hero_view(app: &mut App, ui: &mut egui::Ui, disabled: bool, content_w: f32) {
         ui.vertical_centered(|ui| {
             ui.horizontal(|ui| {
                 let w = ui.available_width();
-                ui.add_space((w / 2.0 - 60.0).max(0.0));
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 30.0), Sense::hover());
-                icons::blade_mark(ui.painter(), rect, kit::col(t.alias.label[0]));
-                ui.add_space(6.0);
+                ui.add_space((w / 2.0 - 86.0).max(0.0));
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                icons::mark(ui, rect, kit::col(t.alias.label[0]));
+                ui.add_space(8.0);
                 kit::label(
                     ui,
                     kit::txt("sica", 26.0, Weight::Medium, kit::col(t.alias.label[0])),
@@ -360,7 +417,7 @@ fn hero_view(app: &mut App, ui: &mut egui::Ui, disabled: bool, content_w: f32) {
                 kit::col(t.alias.label[1]),
                 12.0,
             );
-            let path = sica_core::paths::workspace_root().display().to_string();
+            let path = sica_core::paths::working_dir().display().to_string();
             if resp.on_hover_text(&path).clicked() {
                 ui.ctx().output_mut(|o| o.copied_text = path);
             }
@@ -378,9 +435,9 @@ fn draw_no_be(app: &mut App, ui: &mut egui::Ui) {
         Layout::centered_and_justified(egui::Direction::TopDown),
         |ui| {
             ui.vertical_centered(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(120.0, 60.0), Sense::hover());
-                icons::blade_mark(
-                    ui.painter(),
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
+                icons::mark(
+                    ui,
                     rect,
                     kit::col(t.alias.label[0]).linear_multiply(0.25),
                 );

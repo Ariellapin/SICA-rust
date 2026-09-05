@@ -40,6 +40,13 @@ pub struct MarkdownSkill {
     /// comma- or whitespace-separated). Empty when the skill carries no
     /// positional inputs.
     pub positionals: Vec<String>,
+    /// Skill names listed in the `skills:` frontmatter key. Only meaningful
+    /// for `agents/*.md`, where it restricts the registry view a session
+    /// running that preset sees (`crate::preset`); a `skills/*.md` file
+    /// carrying the key is parsed the same way and ignores it. Empty means
+    /// "no restriction" — an agent that wants no tools at all should say so
+    /// in its body, not by declaring an empty list.
+    pub skills:      Vec<String>,
 }
 
 #[async_trait]
@@ -210,6 +217,7 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
     let mut name        = String::new();
     let mut description = String::new();
     let mut positionals = Vec::new();
+    let mut skills      = Vec::new();
     let mut closed = false;
     for line in lines.by_ref() {
         if line.trim() == "---" {
@@ -220,7 +228,8 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
             match k.as_str() {
                 "name"        => name        = v,
                 "description" => description = v,
-                "positional"  => positionals = split_positionals(&v),
+                "positional"  => positionals = split_list(&v),
+                "skills"      => skills      = split_list(&v),
                 _ => {}
             }
         }
@@ -239,14 +248,19 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
         body: body.trim_start_matches('\n').to_string(),
         source_path: source.to_path_buf(),
         positionals,
+        skills,
     })
 }
 
-/// Parse a `positional:` frontmatter value into an ordered name list. Accepts
-/// either comma- or whitespace-separated forms (`"path, content"` and
-/// `"path content"` both work). Empty entries are dropped.
-fn split_positionals(v: &str) -> Vec<String> {
-    v.split(|c: char| c == ',' || c.is_whitespace())
+/// Parse a `positional:` / `skills:` frontmatter value into an ordered name
+/// list. Accepts comma- or whitespace-separated forms and a YAML flow
+/// sequence (`"path, content"`, `"path content"` and `"[path, content]"` all
+/// work). Empty entries are dropped.
+fn split_list(v: &str) -> Vec<String> {
+    v.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -308,6 +322,7 @@ mod tests {
             body: "instructions\n".into(),
             source_path: PathBuf::from("skills").join("n.md"),
             positionals: Vec::new(),
+            skills: Vec::new(),
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let sub = crate::ToolSubAgent::root(cap);
@@ -332,6 +347,7 @@ mod tests {
             body: "Report weather for {{city}} ({{units}}) on {{date}} in {{cwd}}.".into(),
             source_path: PathBuf::from("skills").join("weather.md"),
             positionals: vec!["city".into(), "units".into()],
+            skills: Vec::new(),
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let ctx = SkillContext { sub: crate::ToolSubAgent::root(cap) };
@@ -352,6 +368,7 @@ mod tests {
             body: "hello {{nobody}}".into(),
             source_path: PathBuf::from("skills").join("broken.md"),
             positionals: Vec::new(),
+            skills: Vec::new(),
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let ctx = SkillContext { sub: crate::ToolSubAgent::root(cap) };

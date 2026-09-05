@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +13,9 @@ use crate::supervisor::{self, UiCommand, UiEvent};
 use crate::ui;
 
 const LOG_CAPACITY: usize = 2000;
+
+/// How many previously chosen working directories the picker remembers.
+const RECENT_WORKING_DIRS: usize = 5;
 
 /// Settings sections (§7.2). Settings is a modal, not a view — the sidebar
 /// has no view switch at all since UI-1.
@@ -152,6 +156,28 @@ pub struct TrajectoryState {
     pub envelopes:  std::collections::HashMap<u64, protocol::EnvelopeDump>,
 }
 
+/// The session projections the backend folded for us (guide §3.3).
+///
+/// Asked for, never pushed: a projection is pure over the log, so there is
+/// nothing to subscribe to — the FE re-asks when the log grew (a session
+/// load, a finished turn) and shows what came back until then.
+#[derive(Default)]
+pub struct StatsState {
+    /// Session the numbers belong to. An answer for another session is
+    /// dropped, the same rule `SessionLoaded` and the ledger follow.
+    pub session_id: u64,
+    pub stats:      Option<protocol::StatsDump>,
+    /// One row per turn, oldest first — the sidebar's jump list.
+    pub outline:    Vec<protocol::TurnRowDump>,
+    /// Seq the fold covered. The answer is never wrong, only ever behind.
+    pub through_seq: u64,
+    /// A request is in flight; a second one would answer the same numbers.
+    pub loading:    bool,
+    /// The jump list is folded away by default — the sidebar's job is
+    /// sessions, and the outline is a drill-down into the open one.
+    pub expanded:   bool,
+}
+
 pub struct App {
     #[allow(dead_code)]
     pub rt: Arc<tokio::runtime::Runtime>,
@@ -267,6 +293,9 @@ pub struct App {
     pub permission_mode: protocol::PermissionMode,
     /// Plan mode of the active session (composer toggle).
     pub plan_active: bool,
+    /// Agent preset of the active session (`agents/*.md`), when it runs
+    /// one — the composer's agent chip.
+    pub session_agent: Option<String>,
     /// Session the last composer `/command` targeted — its `CommandResult`
     /// reloads that session, since compaction rewrites history.
     pub last_command_session: Option<u64>,
@@ -282,15 +311,21 @@ pub struct App {
     pub token_breakdown: Option<protocol::TokenBreakdown>,
     /// Open state of the composer's toolbar menus.
     pub menu_open: MenuOpen,
-    /// The Full-access risk gate (§6.7) and its mandatory acknowledgement.
-    pub risk_gate_open: bool,
-    pub risk_ack: bool,
+    /// Folder the agent works in, when the user pointed it somewhere other
+    /// than the app's own root. `None` = `paths::workspace_root()`.
+    pub working_dir: Option<PathBuf>,
+    /// Working directories the user has picked before, most recent first.
+    /// The Settings picker lists them so switching projects is one click.
+    pub recent_working_dirs: Vec<PathBuf>,
     /// Tool call shown in the details column, when it is open.
     pub details_call: Option<u64>,
     /// Which view the conversation column is showing (§10).
     pub view: ChatView,
     /// The Trajectory view's ledger and toolbar state.
     pub trajectory: TrajectoryState,
+    /// Folded session projections: the header's stats line and the
+    /// sidebar's turn outline (§3.3).
+    pub stats: StatsState,
     /// The OS light/dark preference eframe reported at startup; what
     /// `ThemeMode::System` resolves to.
     pub system_dark: bool,
@@ -301,6 +336,8 @@ pub struct App {
 #[derive(Default)]
 pub struct MenuOpen {
     pub permission: bool,
+    /// Settings › General working-directory picker.
+    pub working_dir: bool,
     pub model: bool,
     pub jobs: bool,
     pub goal: bool,
@@ -738,6 +775,12 @@ pub struct ChatState {
     /// wrong message.
     pub editing_turn: Option<usize>,
     pub edit_draft: String,
+    /// Screen rect the composer card occupied last frame. The `/` and `@`
+    /// menus float 4 px above it (§6.3), and they are drawn *before* it —
+    /// they have to claim the navigation keys before the text field sees
+    /// them — so last frame's rect is the anchor they get. `None` only
+    /// before the first card has ever laid out.
+    pub composer_rect: Option<egui::Rect>,
 }
 
 /// One message waiting in the backend's inbox, as the queue dock draws it.
@@ -1057,6 +1100,18 @@ impl App {
             .clone()
             .filter(|id| providers.iter().any(|p| &p.id == id));
 
+        // The working directory has to be live *before* the BE child is
+        // spawned: `child::spawn` passes it down in the environment, and the
+        // BE resolves its file skills against it at startup.
+        let working_dir = settings
+            .working_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
+        let recent_working_dirs: Vec<PathBuf> =
+            settings.recent_working_dirs.iter().map(PathBuf::from).collect();
+        sica_core::paths::set_working_dir(working_dir.as_deref());
+
         let auto_start_be = settings.auto_start_be;
         if auto_start_be {
             let _ = cmd_tx.send(UiCommand::StartBe);
@@ -1114,7 +1169,7 @@ impl App {
             had_outage: false,
             recovered_at: None,
             log_filter: LogKind2::All,
-            workspace_name: sica_core::paths::workspace_root()
+            workspace_name: sica_core::paths::working_dir()
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "—".into()),
@@ -1127,16 +1182,18 @@ impl App {
             goal_edit: None,
             permission_mode: protocol::PermissionMode::default(),
             plan_active: false,
+            session_agent: None,
             last_command_session: None,
             pending_edit_session: None,
             default_permission_mode: settings.default_permission_mode.clone(),
             token_breakdown: None,
             menu_open: MenuOpen::default(),
-            risk_gate_open: false,
-            risk_ack: false,
+            working_dir,
+            recent_working_dirs,
             details_call: None,
             view: ChatView::Chat,
             trajectory: TrajectoryState::default(),
+            stats: StatsState::default(),
             system_dark,
         }
     }
@@ -1161,6 +1218,39 @@ impl App {
     pub fn save_general(&mut self, ctx: &egui::Context) {
         self.refresh_theme(ctx);
         let _ = settings_store::save(&self.settings_snapshot());
+    }
+
+    /// Point the agent at `dir` — `None` means the app's own root. The
+    /// backend resolves the folder once, at startup (its file skills capture
+    /// it), so a change restarts the BE; sessions live on disk and are
+    /// re-listed once it is back.
+    pub fn set_working_dir(&mut self, dir: Option<PathBuf>, ctx: &egui::Context) {
+        let dir = dir.filter(|p| p != &sica_core::paths::workspace_root());
+        if dir == self.working_dir {
+            return;
+        }
+        if let Some(p) = &dir {
+            self.recent_working_dirs.retain(|r| r != p);
+            self.recent_working_dirs.insert(0, p.clone());
+            self.recent_working_dirs.truncate(RECENT_WORKING_DIRS);
+        }
+        self.working_dir = dir.clone();
+        sica_core::paths::set_working_dir(dir.as_deref());
+        self.workspace_name = sica_core::paths::working_dir()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "—".into());
+        self.save_general(ctx);
+
+        let path = sica_core::paths::working_dir().display().to_string();
+        self.push_log(LogKind::Info, format!("working directory → {path}"));
+        // Restart rather than rebuild: the binary is unchanged, only the
+        // environment it starts in.
+        if self.be_state.running {
+            self.send(UiCommand::StopBe);
+            self.send(UiCommand::StartBe);
+        }
+        self.show_toast(crate::ui::icons::Icon::Folder, format!("Working directory: {path}"), 2600);
     }
 
     /// Show a toast, replacing whatever is on screen (dsh shows one at a
@@ -1188,6 +1278,15 @@ impl App {
             auto_watch:             self.auto_watch,
             last_active_provider:   self.active_provider_id.clone(),
             default_permission_mode: self.default_permission_mode.clone(),
+            working_dir:            self
+                .working_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            recent_working_dirs:    self
+                .recent_working_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         }
     }
 
@@ -1391,9 +1490,31 @@ impl App {
         // The ledger belongs to the session that was open; drop it rather
         // than let a page for the old one land on the new one's view.
         self.trajectory = crate::app::TrajectoryState::default();
+        // Same rule for the projections: a fold for the old session
+        // must not be read as the new one's.
+        let expanded = self.stats.expanded;
+        self.stats = StatsState { expanded, ..Default::default() };
         self.details_call = None;
         self.layout.details_w = 0.0;
         self.send(UiCommand::SendRequest(Request::LoadSession { session_id: id }));
+    }
+
+    /// Ask the backend to re-fold the active session's projections (§3.3).
+    ///
+    /// Cheap enough to call on every session load and every finished turn:
+    /// the fold is a pass over the log, and asking is how the numbers stay
+    /// honest — there is no push channel because there is no state to
+    /// subscribe to, only a log that grew.
+    pub fn load_session_stats(&mut self) {
+        if self.stats.loading {
+            return;
+        }
+        let session_id = self.chat.session_id;
+        if session_id == 0 {
+            return;
+        }
+        self.stats.loading = true;
+        self.send(UiCommand::SendRequest(Request::SessionStats { session_id }));
     }
 
     /// Ask for the next page of the active session's event log. Called when
@@ -1745,6 +1866,11 @@ impl App {
                 }
                 self.chat.interrupt_requested = false;
                 self.chat.scroll_to_bottom = true;
+                // The turn appended rows; the counters and the outline
+                // are one turn behind until we re-fold.
+                if session_id == self.chat.session_id {
+                    self.load_session_stats();
+                }
             }
             UiEvent::TokenUsage { used, limit, budget, breakdown, .. } => {
                 if breakdown.is_some() {
@@ -1943,8 +2069,10 @@ impl App {
                 }
                 self.chat.turns = rebuild_turns(&session);
                 self.chat.scroll_to_bottom = true;
+                self.load_session_stats();
                 self.permission_mode = session.permission_mode;
                 self.plan_active = session.plan_active;
+                self.session_agent = session.agent;
                 self.todos = session.todos;
                 // The backend pushes this session's `JobsChanged` alongside
                 // the dump; clearing here keeps the previous session's jobs
@@ -1954,6 +2082,18 @@ impl App {
                 // An objective half-edited in the session being left must not
                 // be committed against the one being opened.
                 self.goal_edit = None;
+            }
+            UiEvent::SessionStats { session_id, stats, outline, through_seq } => {
+                self.stats.loading = false;
+                // A fold for a session the user has already left is
+                // not stale, it is about something else.
+                if session_id != self.chat.session_id {
+                    return;
+                }
+                self.stats.session_id = session_id;
+                self.stats.stats = Some(stats);
+                self.stats.outline = outline;
+                self.stats.through_seq = through_seq;
             }
             UiEvent::SessionEvents { session_id, events, envelopes, total, next_seq } => {
                 self.trajectory.loading = false;
@@ -2043,6 +2183,11 @@ impl App {
             UiEvent::PermissionModeChanged { session_id, mode } => {
                 if session_id == self.chat.session_id {
                     self.permission_mode = mode;
+                }
+            }
+            UiEvent::SessionAgentChanged { session_id, name } => {
+                if session_id == self.chat.session_id {
+                    self.session_agent = name;
                 }
             }
             UiEvent::JobsChanged { session_id, jobs } => {

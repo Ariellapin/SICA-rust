@@ -24,6 +24,15 @@ regex       = { workspace = true }
 chrono      = { workspace = true }
 # `glob` / `grep`: gitignore-aware walking + gitignore-style glob matching.
 ignore      = { workspace = true }
+# `web`: the fetch/search tools (guide §13.3). HTML is rendered to text
+# before the model sees it — a page's markup is pure token cost.
+reqwest     = { workspace = true }
+html2text   = { workspace = true }
+url         = { workspace = true }
+# `mcp`: bridge an MCP server's tools into the skill registry.
+rmcp        = { workspace = true }
+# `ptc`: the Rhai runtime behind `run-code`.
+rhai        = { workspace = true }
 
 # `proc`: Job Objects so a killed shell takes its child processes with it.
 [target.'cfg(windows)'.dependencies]

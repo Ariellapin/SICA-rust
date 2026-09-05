@@ -54,6 +54,13 @@ pub async fn spawn(
         .arg(pipe_name)
         .arg("--parent-pid")
         .arg(parent_pid.to_string())
+        // The folder the agent acts on. Always passed explicitly so the child
+        // never has to re-derive it from its own exe path — see
+        // `sica_core::paths::working_dir`.
+        .env(
+            sica_core::paths::WORKING_DIR_ENV,
+            sica_core::paths::working_dir(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

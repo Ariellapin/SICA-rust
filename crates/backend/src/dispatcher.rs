@@ -131,6 +131,18 @@ pub async fn handle(
             chat.set_permission_mode(session_id, mode).await;
             Response::Ok
         }
+        Request::SetSessionAgent { session_id, name } => {
+            // The outcome is a `LogLine` either way (`set_session_agent`
+            // emits it), so a refusal is visible without a reply shape of
+            // its own — same contract as `SetPlanMode`.
+            if let Err(e) = chat.set_session_agent(session_id, name).await {
+                chat.event_sink.emit(protocol::Event::LogLine {
+                    level:   "WARN".into(),
+                    message: format!("agent not changed: {e}"),
+                });
+            }
+            Response::Ok
+        }
         Request::SetPlanMode { session_id, active } => {
             chat.set_plan_mode(session_id, active).await;
             Response::Ok
@@ -176,6 +188,19 @@ pub async fn handle(
             match chat.steer_queued(session_id, id).await {
                 Ok(()) => Response::Ok,
                 Err(message) => Response::Error { message },
+            }
+        }
+        Request::SessionStats { session_id } => {
+            match chat.session_stats(session_id).await {
+                Some((stats, outline, through_seq)) => Response::SessionStats {
+                    session_id,
+                    stats,
+                    outline,
+                    through_seq,
+                },
+                None => Response::Error {
+                    message: format!("session {session_id} not found"),
+                },
             }
         }
         Request::ReportFrontendError { module, message, traceback } => {

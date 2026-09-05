@@ -9,12 +9,15 @@ use tracing::{info, warn};
 use protocol::{Event, Frame, Payload, Request};
 use sica_core::paths::{
     agents_dir, commands_dir, evals_dir, memory_file, skills_dir, workspace_root,
+    working_dir,
 };
 
 mod be_core;
 mod catalog;
 mod chat;
 mod dispatcher;
+mod hooks;
+mod invariants;
 mod inbox;
 mod jobs_bridge;
 mod ipc;
@@ -30,16 +33,45 @@ use chat::ChatHub;
 struct Args {
     ipc: String,
     parent_pid: Option<u32>,
+    /// `--invariants`: run the runtime invariant companions (guide
+    /// §14.3). Off by default — each check re-derives the log.
+    invariants: bool,
+    /// `--replay <session.jsonl>`: serve every completion from that
+    /// recording instead of a provider (guide §14.1). Sets up the LLM
+    /// itself, so no `ConnectLlm` is needed — and none is accepted,
+    /// because a real provider mid-replay would invalidate the run.
+    replay: Option<String>,
+    /// Prompt window for a replay run. Small values make compaction
+    /// fire on a short recording.
+    replay_window: Option<u32>,
+    /// Extra copies of the recording's last completion, for the calls
+    /// compaction spends without recording (`ReplayScript::pad`).
+    replay_pad: Option<usize>,
+    /// `--replay-tool-mode text|native|ptc`: the tool surface the recording
+    /// was made against. Anything else is a hard error — silently falling
+    /// back to text would make a PTC recording replay as a text run and
+    /// "pass" for the wrong reason.
+    replay_tool_mode: Option<String>,
 }
 
 fn parse_args() -> Args {
     let mut ipc = None;
     let mut parent_pid = None;
+    let mut invariants = false;
+    let mut replay = None;
+    let mut replay_window = None;
+    let mut replay_pad = None;
+    let mut replay_tool_mode = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ipc" => ipc = it.next(),
             "--parent-pid" => parent_pid = it.next().and_then(|s| s.parse().ok()),
+            "--invariants" => invariants = true,
+            "--replay" => replay = it.next(),
+            "--replay-window" => replay_window = it.next().and_then(|s| s.parse().ok()),
+            "--replay-pad" => replay_pad = it.next().and_then(|s| s.parse().ok()),
+            "--replay-tool-mode" => replay_tool_mode = it.next(),
             "--log-level" => {
                 if let Some(lvl) = it.next() {
                     std::env::set_var("RUST_LOG", lvl);
@@ -51,11 +83,40 @@ fn parse_args() -> Args {
     Args {
         ipc: ipc.expect("--ipc <pipe-name> is required"),
         parent_pid,
+        invariants,
+        replay,
+        replay_window,
+        replay_pad,
+        replay_tool_mode,
     }
+}
+
+/// Load `<dir>/session.jsonl` (or the file itself) plus an optional
+/// sibling `replay.override.json`.
+fn load_replay(path: &str, pad: usize) -> Result<llm::replay::ReplayScript> {
+    let p = std::path::Path::new(path);
+    let (log_path, dir) = if p.is_dir() {
+        (p.join("session.jsonl"), p.to_path_buf())
+    } else {
+        (p.to_path_buf(), p.parent().unwrap_or(std::path::Path::new(".")).to_path_buf())
+    };
+    let jsonl = std::fs::read_to_string(&log_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", log_path.display()))?;
+    let mut script = llm::replay::ReplayScript::from_log(&jsonl);
+    let overrides = dir.join("replay.override.json");
+    if overrides.exists() {
+        let body = std::fs::read_to_string(&overrides)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", overrides.display()))?;
+        script = script.with_overrides(&body).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(script.pad(pad))
 }
 
 fn main() -> Result<()> {
     let args = parse_args();
+    if args.invariants {
+        invariants::enable();
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -132,6 +193,10 @@ async fn run(args: Args) -> Result<()> {
     // authored `*.md` is loaded alongside them.
     let skills_path = skills_dir();
     let root = workspace_root();
+    // Where the agent itself acts. Defaults to `root`; the frontend points it
+    // at another project through `SICA_WORKING_DIR`.
+    let cwd = working_dir();
+    info!(working_dir = %cwd.display(), "agent working directory");
     if let Err(e) = agents::skill_creator::seed_default(&skills_path) {
         warn!(error = %e, dir = %skills_path.display(), "seed skill-creator.md failed");
     }
@@ -153,12 +218,19 @@ async fn run(args: Args) -> Result<()> {
         warn!(error = %e, dir = %skills_path.display(), "seed plan-mode.md failed");
     }
     // `agents/` and `commands/` back the other two families of the FE's "/"
-    // palette. Created empty so the folders are discoverable; the palette
-    // simply lists nothing for a family with no files in it.
+    // palette. Created so the folders are discoverable; `commands/` stays
+    // empty until a user writes into it, and the palette simply lists
+    // nothing for a family with no files.
     for dir in [agents_dir(), commands_dir()] {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             warn!(error = %e, dir = %dir.display(), "create palette dir failed");
         }
+    }
+    // One worked example of the agent-preset frontmatter (guide §5.2), so
+    // the family is not empty on a fresh checkout. Seed-once, like the
+    // skill docs and the plan-mode policy: a user edit survives restarts.
+    if let Err(e) = agents::preset::seed_defaults(&agents_dir()) {
+        warn!(error = %e, dir = %agents_dir().display(), "seed agent preset failed");
     }
     // Background jobs (Wave 4, guide §12.4). Built before the registry
     // because the shell skills hold it: `run-cli 'cargo build'
@@ -173,11 +245,18 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(Arc::new(agents::JobOutput(jobs.clone())));
     skill_registry.register(Arc::new(agents::JobList(jobs.clone())));
     skill_registry.register(Arc::new(agents::JobKill(jobs.clone())));
-    skill_registry.register(Arc::new(agents::ReadFile::new(root.clone())));
-    skill_registry.register(Arc::new(agents::WriteFile::new(root.clone())));
-    skill_registry.register(Arc::new(agents::EditFile::new(root.clone())));
-    skill_registry.register(Arc::new(agents::Glob::new(root.clone())));
-    skill_registry.register(Arc::new(agents::Grep::new(root.clone())));
+    skill_registry.register(Arc::new(agents::ReadFile::new(cwd.clone())));
+    skill_registry.register(Arc::new(agents::WriteFile::new(cwd.clone())));
+    skill_registry.register(Arc::new(agents::EditFile::new(cwd.clone())));
+    skill_registry.register(Arc::new(agents::Glob::new(cwd.clone())));
+    skill_registry.register(Arc::new(agents::Grep::new(cwd.clone())));
+    // The web tools (guide §13.3). `web-search` registers whether or
+    // not a key is configured: a tool that disappears when unconfigured
+    // teaches the model the capability does not exist, when what is
+    // true is that the *user* has a file to write — which is what the
+    // failure text says.
+    skill_registry.register(Arc::new(agents::WebFetch));
+    skill_registry.register(Arc::new(agents::WebSearch));
     // `ask-user` needs the broker the hub installs on every sub-agent.
     // `todo-write` / `exit-plan-mode` are catalogue entries whose bodies
     // run in the hub (session-log mutation + turn control) — the
@@ -204,6 +283,12 @@ async fn run(args: Args) -> Result<()> {
     // session's completed turns, and `ralph` runs fresh rounds against a
     // fixed objective. All three drive full LLM conversations, so like
     // `agent-team` they need the finished registry — attached below.
+    // `run-code` (guide §7) is registered in every mode: it needs the
+    // finished registry to know what a program may call, and it is a
+    // perfectly good tool to have under native mode too — but only
+    // `ToolMode::Ptc` narrows the catalogue down to it.
+    let run_code = Arc::new(agents::RunCode::new());
+    skill_registry.register(run_code.clone());
     let subagent = Arc::new(agents::Subagent::fresh());
     let subagent_fork = Arc::new(agents::Subagent::forking());
     let ralph = Arc::new(agents::Ralph::new());
@@ -225,6 +310,32 @@ async fn run(args: Args) -> Result<()> {
         skill_registry.register(team.clone());
         team
     });
+    // MCP servers (guide §13.2). Started before the markdown scan so a
+    // remote tool cannot be shadowed by a `skills/*.md` of the same name —
+    // though the `mcp__server__tool` prefix makes that collision unlikely,
+    // the ordering is what guarantees it. Every failure here is a warning:
+    // an MCP server is somebody else's process, and the agent has to come
+    // up without it.
+    let mcp = agents::mcp::load_all(&agents::mcp::config_dir()).await;
+    let mcp_tool_count = mcp.tools.len();
+    for tool in mcp.tools {
+        skill_registry.register(tool);
+    }
+    for w in &mcp.warnings {
+        warn!(warning = %w, "mcp");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level:   "WARN".into(),
+            message: w.clone(),
+        }));
+    }
+    for (server, count) in &mcp.servers {
+        info!(server, tools = count, "mcp server connected");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level:   "INFO".into(),
+            message: format!("mcp: {server} connected, {count} tool(s)"),
+        }));
+    }
+
     let parse_errors = agents::md_skill::register_all(&mut skill_registry, &skills_path);
     let skill_count = skill_registry.by_name.len();
     let skill_registry = Arc::new(skill_registry);
@@ -237,8 +348,10 @@ async fn run(args: Args) -> Result<()> {
     subagent.attach_registry(&skill_registry);
     subagent_fork.attach_registry(&skill_registry);
     ralph.attach_registry(&skill_registry);
+    run_code.attach_registry(&skill_registry);
     info!(
         count = skill_count,
+        mcp = mcp_tool_count,
         dir = %skills_path.display(),
         agent_team = agent_team.is_some(),
         "skills loaded"
@@ -288,12 +401,77 @@ async fn run(args: Args) -> Result<()> {
     let tool_failure_sink: Arc<dyn agents::ToolFailureSink> =
         Arc::new(ToolFailureBridge { bus: idealist_bus.clone() });
 
+    // User hooks (guide §13.1). Loaded once: a hooks file that could change
+    // under a running turn would make two calls in one turn answer to
+    // different rules. Every complaint from the load is reported — a hook
+    // that silently never runs is worse than one that says why.
+    let hook_config = std::sync::Arc::new(hooks::load());
+
+    for w in &hook_config.warnings {
+        warn!(warning = %w, "hooks");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level:   "WARN".into(),
+            message: w.clone(),
+        }));
+    }
+    if !hook_config.is_empty() {
+        // A hook can deny a tool call, so its presence is something the
+        // operator must be able to see at a glance rather than infer from a
+        // call that mysteriously failed.
+        let msg = format!(
+            "{} user hook(s) loaded from {}",
+            hook_config.count(),
+            hooks::config_path().display()
+        );
+        info!(count = hook_config.count(), "user hooks loaded");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level:   "INFO".into(),
+            message: msg,
+        }));
+    }
+
     let chat = ChatHub::new_loaded(
         out_tx.clone(),
         skill_registry.clone(),
         Some(tool_failure_sink.clone()),
     )
-    .with_jobs(jobs.clone());
+    .with_jobs(jobs.clone())
+    .with_hooks(hook_config.clone());
+
+    // Replay mode (guide §14.1): the recording is the provider. Installed
+    // here rather than through `ConnectLlm` because there is nothing to
+    // connect to — and because a driver that had to negotiate a connection
+    // first would be racing the run it is trying to measure.
+    if let Some(path) = &args.replay {
+        match load_replay(path, args.replay_pad.unwrap_or(0)) {
+            Ok(script) => {
+                let window = args.replay_window.unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
+                let tool_mode = match args.replay_tool_mode.as_deref() {
+                    None | Some("") | Some("text") => protocol::ToolMode::Text,
+                    Some("native") => protocol::ToolMode::Native,
+                    Some("ptc") => protocol::ToolMode::Ptc,
+                    Some(other) => {
+                        anyhow::bail!("replay: unknown --replay-tool-mode {other:?}")
+                    }
+                };
+                chat.connect_replay(
+                    std::sync::Arc::new(script),
+                    window,
+                    protocol::LlmOptions { tool_mode, ..Default::default() },
+                )
+                .await;
+            }
+            Err(e) => {
+                // Fatal: a replay run that silently became a no-LLM run
+                // would report "no divergence" for the wrong reason.
+                let _ = out_tx.send(Frame::event(Event::LogLine {
+                    level:   "ERROR".into(),
+                    message: format!("replay: {e}"),
+                }));
+                anyhow::bail!("replay: {e}");
+            }
+        }
+    }
 
     // Bridge: a finished job appends its audit line, drops a notice into the
     // owning session's inbox (the model reads it at its next step) and

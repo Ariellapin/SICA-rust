@@ -1,0 +1,2 @@
+description = "a completion that carries nothing is retried, and the retry's reply is the turn"
+window = 32768

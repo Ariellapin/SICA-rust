@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -141,6 +141,45 @@ impl TodoStatus {
     }
 }
 
+/// How the model is offered its tools (guide §2.3, §7).
+///
+/// - `Text` — the text protocol: the catalogue lives in the system prompt
+///   and a call is a fenced block the backend parses out of the reply.
+/// - `Native` — the OpenAI `tools` / `tool_calls` API. Requires a server +
+///   template with tool support (vLLM `--enable-auto-tool-choice`, etc.).
+/// - `Ptc` — programmatic tool calling: the model is offered `run-code`
+///   (plus the harness controls, whose bodies live in the dispatcher and so
+///   cannot run inside a program) and calls every other tool from inside a
+///   script. Rides the native wire, so it implies [`ToolMode::native`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ToolMode {
+    #[default]
+    Text,
+    Native,
+    Ptc,
+}
+
+impl ToolMode {
+    /// Whether requests use the OpenAI-native `tools` array. `Ptc` does —
+    /// it is a narrower catalogue on the same wire, not a third transport.
+    pub fn native(self) -> bool {
+        matches!(self, ToolMode::Native | ToolMode::Ptc)
+    }
+
+    /// Whether the model reaches its tools through `run-code`.
+    pub fn ptc(self) -> bool {
+        matches!(self, ToolMode::Ptc)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolMode::Text => "text",
+            ToolMode::Native => "native",
+            ToolMode::Ptc => "ptc",
+        }
+    }
+}
+
 /// Tunables the frontend passes along with `ConnectLlm`. Kept as a struct so
 /// adding a knob later is one field, not a new request variant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,10 +193,10 @@ pub struct LlmOptions {
     /// i.e. the launched `--ctx-size`, then vLLM `max_model_len` /
     /// llama.cpp `n_ctx_train`), falling back to 24k.
     pub context_window: Option<u32>,
-    /// Use the OpenAI-native `tools` / `tool_calls` API instead of the
-    /// text-protocol tool calling. Requires a server + template with tool
-    /// support (e.g. vLLM with `--enable-auto-tool-choice`).
-    pub native_tools: bool,
+    /// How the model is offered its tools: the text protocol, the
+    /// OpenAI-native `tools` array, or programmatic tool calling.
+    #[serde(default)]
+    pub tool_mode: ToolMode,
     /// Let the model emit reasoning (`<think>` blocks). When off, requests
     /// carry `chat_template_kwargs: {"enable_thinking": false}` so servers
     /// that template the toggle (llama.cpp, vLLM/Qwen) skip reasoning
@@ -175,7 +214,7 @@ impl Default for LlmOptions {
             temperature: 0.2,
             max_tokens: None,
             context_window: None,
-            native_tools: false,
+            tool_mode: ToolMode::Text,
             thinking: true,
             compact: CompactPolicy::default(),
         }
@@ -287,6 +326,14 @@ pub enum Request {
     /// Enter (`active: true`) or leave plan mode. Leaving is normally done
     /// through the `exit-plan-mode` tool so the plan gets reviewed first.
     SetPlanMode { session_id: u64, active: bool },
+    /// Select the session's agent preset (`agents/<name>.md`, guide §5.2):
+    /// its body becomes the persona section of the system prompt and its
+    /// `skills:` list restricts the registry the session dispatches
+    /// against. `None` clears the selection. Refused once the session has
+    /// produced a model message — a prompt prefix that changes mid-session
+    /// discards the provider's cache and leaves half the transcript
+    /// answering to rules no longer in force.
+    SetSessionAgent { session_id: u64, name: Option<String> },
     /// Answer a pipeline approval request (`ApprovalRequested`).
     ResolveApproval { id: u64, allow: bool },
     /// Answer an `ask-user` / plan-review question (`QuestionAsked`).
@@ -314,6 +361,13 @@ pub enum Request {
     /// own. Meaningless with nothing running, and answered with an error
     /// then — the FE disables the action rather than sending it.
     SteerQueued { session_id: u64, id: u64 },
+
+    /// Fold a session's log into the finished projections a client reads
+    /// (guide §3.3): the counters under the title and the turn outline the
+    /// sidebar jumps with. Pure over the log, so it is safe to ask for at
+    /// any time — including while a turn is running, when it answers with
+    /// what is durable so far.
+    SessionStats { session_id: u64 },
 
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
@@ -350,6 +404,16 @@ pub enum Response {
         /// Seq to ask for next, or `None` when this page reached the end.
         next_seq:   Option<u64>,
     },
+    /// Session projections (`SessionStats`). `through_seq` says how much of
+    /// the log the numbers cover, so a client can tell a stale answer from
+    /// a current one instead of guessing.
+    SessionStats {
+        session_id:  u64,
+        stats:       StatsDump,
+        /// One row per turn, oldest first.
+        outline:     Vec<TurnRowDump>,
+        through_seq: u64,
+    },
 }
 
 /// Which family an [`EventDump`] belongs to — the ledger's tinted kind tag
@@ -381,6 +445,8 @@ pub enum EventTag {
     /// A harness command that never made a model message.
     Command,
     Approval,
+    /// A user hook ran (guide §13.1).
+    Hook,
     Goal,
     Job,
     Other,
@@ -403,6 +469,7 @@ impl EventTag {
             EventTag::Prompt => "PROMPT",
             EventTag::Command => "COMMAND",
             EventTag::Approval => "APPROVAL",
+            EventTag::Hook => "HOOK",
             EventTag::Goal => "GOAL",
             EventTag::Job => "JOB",
             EventTag::Other => "OTHER",
@@ -479,6 +546,47 @@ pub struct EnvelopeDump {
     pub options:     String,
 }
 
+/// Counters folded from a session's log (`sica_core::project::SessionStats`).
+///
+/// Counts *events*, not the derived surface: a turn compaction later shadowed
+/// still happened, and a stats line that shrank when the context was
+/// compacted would be lying about the session's history.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatsDump {
+    pub user_msgs:      u32,
+    pub assistant_msgs: u32,
+    pub tool_calls:     u32,
+    /// Tool results that came back `ok: false`. Policy denials count — a
+    /// refused call is a call that did not do its work.
+    pub tool_failures:  u32,
+    /// Failed LLM attempts that were re-run.
+    pub retries:        u32,
+    pub turns:          u32,
+    /// First event to last, in milliseconds.
+    pub wall_ms:        i64,
+}
+
+/// One turn of the outline (`sica_core::project::TurnOutline`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnRowDump {
+    pub turn_id:         u64,
+    /// First non-empty line of the opening user message, capped for a row.
+    /// Empty for a turn no user message opened (a goal round).
+    pub first_user_line: String,
+    /// `human` / `goal round` / `followup`.
+    pub source:          String,
+    /// Hops the turn took. `0` while it is still running.
+    pub hops:            u8,
+    /// Empty while the turn is still running.
+    pub finish_reason:   String,
+    /// Seq of the `TurnStart` — what a "jump to turn" click carries into the
+    /// Trajectory view.
+    pub start_seq:       u64,
+    pub ts_start:        i64,
+    pub ts_end:          i64,
+    pub tool_calls:      u32,
+}
+
 /// Which family a [`CatalogEntry`] belongs to. Drives the group headings in
 /// the frontend's "/" palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +656,10 @@ pub struct SessionDump {
     /// Latest durable todo list — drives the FE checklist on reload.
     #[serde(default)]
     pub todos: Vec<TodoItem>,
+    /// Selected agent preset (`agents/<name>.md`), when the session runs
+    /// one — drives the FE composer chip without a second round-trip.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,6 +958,13 @@ pub enum Event {
         session_id: u64,
         mode: PermissionMode,
     },
+    /// The session's agent preset changed (via `/agent` or
+    /// `SetSessionAgent`), or was pushed on load. `None` is no preset —
+    /// the default persona-less prompt.
+    SessionAgentChanged {
+        session_id: u64,
+        name: Option<String>,
+    },
     /// The session's inbox changed: `queued` user messages are waiting to
     /// run as their own turns once the current one ends. `accepted` says
     /// what the arriving item became — `"queued"`, `"steered"` or
@@ -1127,6 +1246,8 @@ mod tests {
             },
             Event::PlanModeChanged { session_id: 2, active: true },
             Event::PermissionModeChanged { session_id: 2, mode: PermissionMode::ReadOnly },
+            Event::SessionAgentChanged { session_id: 2, name: Some("reviewer".into()) },
+            Event::SessionAgentChanged { session_id: 2, name: None },
         ];
         for ev in events {
             let back = Frame::decode(&Frame::event(ev).encode().unwrap()).unwrap();

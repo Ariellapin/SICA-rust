@@ -1,0 +1,1 @@
+The session log is append-only.

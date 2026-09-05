@@ -282,14 +282,14 @@ primitive, named the same so the doc and the code line up:
 | `elevated_frame(Elevation, stroke_level)` | menu/popover/card chrome | paints the shadow stack described above |
 
 Icons: dsh ships 74 `currentColor` SVGs at 8/12/14/16/20 px. egui cannot
-paint SVG without `egui_extras`' `svg` feature (resvg, ~2 MB); the workspace
-already depends on `egui_commonmark` with default features off, and its
-`svg` feature forwards to `egui_extras/svg`, so it is one line in the root
-`Cargo.toml`. Two options: (a) enable that feature and load the set as
-`include_bytes!`; (b)
-hand-paint the ~24 glyphs the transcript needs with `Painter` like the
-current `blade_mark`. Recommend (a) — it also unlocks image previews in
-tool rows — behind an `Icon` enum so the choice is local to `kit::icon`.
+paint SVG on its own. The ~30 glyphs the transcript needs are hand-painted
+with `Painter` behind the `Icon` enum, so the choice stays local to
+`ui::icons`. The *brand* marks are the exception: `resvg` is a direct
+workspace dependency and `ui::icons::mark` rasterises `assets/mark.svg`
+once into a white texture that is tinted per theme, which is also how
+`icon::generate` builds the window icon from `assets/icon.svg`. Glyphs stay
+hand-painted because a 16 px stroke drawn by `Painter` beats a downscaled
+raster; the mark does not, because it has curves, a mask and a gradient.
 
 ---
 
@@ -391,7 +391,7 @@ Persist a user override in `sica-settings.json` as `chat_content_width`.
 
 Hero phase: when the active session has no `UserMessage`, hide the header,
 vertically centre `[headline] [composer]` with 32 px bottom bias; the
-headline is the blade mark at 34 px + "sica" in 26/32 500 + the "Preview"
+headline is the blade mark at 38 px + "sica" in 26/32 500 + the "Preview"
 superscript style badge reading the build profile (`debug`/`release`).
 
 ---
@@ -883,9 +883,21 @@ generate plan`, `hint.goal = describe the objective for a long-running task`,
 **popupSelect** (search field, ↑↓, Enter, Esc; rows `label + detail +
 check`) serves `/permission` and `/model`.
 
-**sica-rust:** `slash_menu.rs` already ranks prefix > substring >
-description, groups Commands → Skills → Agents, has ↑↓/Enter/Tab/Esc, and
-rewrites the draft to `/name `. It renders *inside* the bottom panel.
+**sica-rust:** `slash_menu.rs` ranks with the dsh fuzzy scorer, groups
+Commands → Skills → Agents, has ↑↓/Enter/Tab/Esc, and rewrites the draft to
+`/name `. Both menus float in one shared `Area` (`slash_menu::overlay`)
+pinned by its `LEFT_BOTTOM` pivot 4 px above the composer card — the card's
+rect from last frame, since the menus are drawn first to claim the keys — so
+the transcript no longer moves when the list opens or resizes, and a
+pointerdown outside the menu closes it. The ghost hint is painted at the
+caret from the galley's own cursor rect: `/goal `, `/permission ` and
+`/agent ` carry the strings above, and any other claimed row shows its
+declared `<args>`. `/plan` has no hint because it toggles on accept rather
+than claiming the token. An **AGENTS** row is the one exception to "rewrite
+the draft": picking one is a *selection*, so it sends
+`Request::SetSessionAgent` and clears the draft (guide §5.2), and the choice
+shows as a business-tinted composer chip next to the plan chip that clears
+it on click.
 
 **Port (S–M):** move the list into an `Area` anchored 4 px above the card,
 r=20, max-height 320; rows to 40 px / r=10; kind icons; swap the ranking
@@ -959,10 +971,16 @@ for new sessions". No colour per preset.
 **sica-rust:** `PERM WORKSPACE-WRITE` caps in the status bar, right-click
 context menu; `default_permission_mode` has no UI.
 
-**Port (S):** `permission_chip` → `kit::menu` → `Request::SetPermissionMode`;
-`danger-full-access` gated by `kit::modal` with the checkbox. Settings ›
-General gets the default-mode row (writes `default_permission_mode`, which
-`SessionCreated` already applies).
+**Port (S):** `permission_chip` → `kit::menu` → `Request::SetPermissionMode`.
+Settings › General gets the default-mode row (writes
+`default_permission_mode`, which `SessionCreated` already applies).
+**Deviation:** the `RiskConfirmation` modal is *not* ported. dsh guards a
+hosted, shared server; the desktop app's Full access reaches exactly what
+the user's own account already reaches, and a modal that always answers
+"Enable" trains the reflex that makes the next one useless. The consequence
+is spelled out where the choice is made — the menu item and the Settings row
+carry it — and switching back is one click. `kit::modal` stays in the design
+system for the next dialog that earns one.
 
 ### 6.8 Model selection
 
@@ -1081,7 +1099,7 @@ a 188 px nav and a content column. Sections:
 
 | Section | Rows / cards | Source of truth |
 | --- | --- | --- |
-| **General** | Default permission (risk-gated) · Appearance Light/Dark/System cubes · Font size stepper 12–17 · Conversation display Normal/Compact · Enter while busy Queue/Steer · Startup (auto-start BE, auto-connect LLM) · Logging (raw LLM) · Idealist auto-apply | `settings_store::Settings` — **live apply** on change (`apply_and_save_settings` per change; drop the Apply bar) |
+| **General** | Default permission · **Working directory** (the folder the agent reads, writes and runs commands in — `paths::working_dir`, distinct from the app root that holds settings, sessions and skills; a picker menu over the app folder, the last five choices and a native chooser; changing it restarts the BE, which resolves its file skills once at startup) · Appearance Light/Dark/System cubes · Font size stepper 12–17 · Conversation display Normal/Compact · Enter while busy Queue/Steer · Startup (auto-start BE, auto-connect LLM) · Logging (raw LLM) · Idealist auto-apply | `settings_store::Settings` — **live apply** on change (`apply_and_save_settings` per change; drop the Apply bar) |
 | **Models** | one card per `sica-settings/llm-providers/*.toml`: title + id, API key (password), "Customized settings" fold with Base URL · Model · Temperature · Max tokens · Context window · Native tools · Thinking · Compact policy (threshold / retain / summary tokens) · preset drift + Apply preset; footer Cancel / Apply; **Connect** stays on the card *and* on the composer chip; dashed "+ Add provider" creates a TOML from `llm::preset`; "Fetch available models" = `GET {base}/v1/models` via a new `Request::ListModels { provider }` (the BE holds the HTTP client) → picker | `frontend::llm_providers` |
 | **Skills** (replaces dsh Plugins) | tab **Catalogue**: the `ListCatalog` entries grouped Commands / Skills / Agents with descriptions and source paths, search, "Open folder" per kind, skill-creator template button; tab **Harness**: shell timeout (`Skill::timeout`), output caps, `MAX_TOOL_HOPS`, parallel pool cap, compaction thresholds — **read-only until those are settings** (today they are constants); tab **Delegation**: `agent-team.md` on/off switch (rename to `.md.off`), child-excluded list | `agents` constants → later a `harness.toml` |
 | **Diagnostics** (new home for Communication) | connection card (BE pid / IPC / protocol version / build id, Start / Stop / Rebuild & Restart, auto-watch, release profile), the log panel with a level filter, the demo request row | `controls.rs`, `log_panel.rs` |
@@ -1256,11 +1274,13 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | --- | --- | --- | --- |
 | **UI-1 Foundation** ✅ | `Theme` v2 with the static scale + two alias maps, `apply_visuals`, `ui::kit` (button, icon_button, pill, state_dot, disclosure_row, menu, modal, toast, elevated_frame, hairline, code/IO blocks), three-column layout with the collapsible 280/56 sidebar, status bar removed → connection indicator + Rebuild chip in the foot, content width axis 680–920. **Deviations:** the UI face is the *platform* sans loaded at runtime (dsh's own rule) rather than bundled Inter, and the code face stays IBM Plex Mono; icons are painted by `ui::icons` instead of pulling resvg; elevation is one blur layer plus the 0.5 px hairline, since egui's `Frame` carries a single shadow. | **M** | none |
 | **UI-2 Transcript** ✅ | user bubble with `/name`+`@path` runs, flat assistant, `TurnStatus` shimmer + 15 s clock, reasoning disclosure with the sweep glare, tool rows with variants/states/nesting and diff / terminal / read / search / IN-OUT bodies + the `+A -R` diff stat, the retry chain with its live countdown, per-turn usage and time pills on the tail, error / max-tokens / stopped / compaction / injection rows, compact-mode turn fold, hero, back-to-bottom. **Open:** nothing. Produced-file chips and the tail's branch action landed with UI-6; the Inspect pill landed with UI-5. | **L** | v17 batch 1 ✅ |
-| **UI-3 Composer + control plane** ✅ | r=22 card, toolbar (`+`, permission chip + risk gate, plan chip, model select, context ring with the `TokenBreakdown` panel, send/stop), keymap with the busy-Enter preference, dock (to-dos, goal, queue with per-row Edit · Remove · Steer over the backend's real inbox), stats line, approval and question/plan-review takeovers, `/` menu with dsh's fuzzy ranking, drop overlay, toasts for WARN/ERROR. **Open:** the ghost hint after a claimed command is not in, and the `/` menu renders in the composer's panel rather than a floating overlay. `@file` completion landed with UI-6. | **L** | v17 batch 2 ✅ (queue dock landed on v19) |
+| **UI-3 Composer + control plane** ✅ | r=22 card, toolbar (`+`, permission chip + risk gate, plan chip, model select, context ring with the `TokenBreakdown` panel, send/stop), keymap with the busy-Enter preference, dock (to-dos, goal, queue with per-row Edit · Remove · Steer over the backend's real inbox), stats line, approval and question/plan-review takeovers, `/` menu with dsh's fuzzy ranking, drop overlay, toasts for WARN/ERROR. **Open:** nothing. `@file` completion landed with UI-6; the floating menu overlay and the claimed-command ghost hint landed with UI-7. | **L** | v17 batch 2 ✅ (queue dock landed on v19) |
 | **UI-4 Settings + sessions** ✅ | Settings modal with General (live) / Models / Skills / Diagnostics; session rows with the status dot, relative time and a ⋯ menu (Open · Rename · Fork · Archive · Copy title · Delete); inline rename, Last-updated order, the header search field with dsh's 250 ms debounce over the backend content scan, and "Fetch available models" as pickable chips per provider. **Open:** nothing — un-archive stays deliberately absent (§13). | **M** | v17 batch 3 ✅ |
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
+
+| **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the

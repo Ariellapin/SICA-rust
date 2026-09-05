@@ -17,8 +17,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let mut dirty = false;
 
-    // Permission — the default mode for new sessions, risk-gated like the
-    // composer chip.
+    // Permission — the default mode for new sessions. Full access applies
+    // like any other mode; the segment's description carries the warning.
     let modes = ["Read Only", "Workspace Write", "Full access"];
     let ids = ["read-only", "workspace-write", "danger-full-access"];
     let current = ids
@@ -28,66 +28,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     row(
         ui,
         "Permission",
-        "Choose the default permission mode for new sessions",
+        "Default permission mode for new sessions. Full access stops asking \
+         before destructive commands and writes outside the working directory.",
         |ui| {
             if let Some(i) = segmented(ui, &modes, current) {
-                if i == 2 {
-                    app.risk_gate_open = true;
-                } else {
-                    app.default_permission_mode = ids[i].to_string();
-                    dirty = true;
-                }
+                app.default_permission_mode = ids[i].to_string();
+                dirty = true;
             }
         },
     );
-    if app.risk_gate_open && app.settings_open {
-        // The gate is shared with the composer chip; here it sets the
-        // *default* rather than the live session.
-        let mut ack = app.risk_ack;
-        let out = kit::modal(
-            &ctx,
-            egui::Id::new("risk_gate_settings"),
-            "Enable Full access?",
-            420.0,
-            true,
-            |ui| {
-                let t = kit::theme(ui);
-                ui.add(
-                    egui::Label::new(kit::txt(
-                        "New sessions will stop asking before destructive commands \
-                         and writes outside the workspace.",
-                        13.0,
-                        Weight::Regular,
-                        kit::col(t.alias.label[1]),
-                    ))
-                    .wrap(),
-                );
-                ui.add_space(6.0);
-                ui.checkbox(&mut ack, "I understand the risks and want to continue");
-                ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    kit::button_enabled(
-                        ui,
-                        "Enable Full access",
-                        kit::Variant::Primary,
-                        kit::Size::Md,
-                        ack,
-                    )
-                    .clicked()
-                })
-                .inner
-            },
-        );
-        app.risk_ack = ack;
-        if out.inner {
-            app.default_permission_mode = "danger-full-access".into();
-            app.risk_gate_open = false;
-            app.risk_ack = false;
-            dirty = true;
-        } else if out.dismissed {
-            app.risk_gate_open = false;
-            app.risk_ack = false;
-        }
+
+    // Working directory — the folder the agent reads, writes and runs
+    // commands in. Separate from the app's own root, which keeps holding
+    // settings, sessions and skills.
+    if working_dir_row(app, ui, &ctx) {
+        dirty = false; // `set_working_dir` already persisted everything.
     }
 
     // Appearance — three cubes.
@@ -203,6 +158,93 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         app.save_general(&ctx);
     }
     ui.add_space(24.0);
+}
+
+/// The Working directory row: the live path as the description, a picker
+/// button on the right. The menu lists the app's own folder, the directories
+/// the user picked before, and a native folder chooser.
+///
+/// Returns `true` when the directory changed — the caller then skips its own
+/// save, because switching folders persists and restarts the BE itself.
+fn working_dir_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
+    let root = sica_core::paths::workspace_root();
+    let current = sica_core::paths::working_dir();
+    let label = current
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| current.display().to_string());
+
+    // Menu targets, in the order the items are drawn. `None` = the app root.
+    let mut targets: Vec<Option<std::path::PathBuf>> = vec![None];
+    let mut items = vec![kit::MenuItem::new("App folder")
+        .detail(root.display().to_string())
+        .checked(app.working_dir.is_none())];
+    for dir in app.recent_working_dirs.clone() {
+        if dir == root {
+            continue;
+        }
+        items.push(
+            kit::MenuItem::new(
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.display().to_string()),
+            )
+            .detail(dir.display().to_string())
+            .checked(app.working_dir.as_deref() == Some(dir.as_path()))
+            .sep_above(targets.len() == 1),
+        );
+        targets.push(Some(dir));
+    }
+    items.push(kit::MenuItem::new("Choose folder…").sep_above(true));
+
+    let mut chosen: Option<Option<std::path::PathBuf>> = None;
+    row(
+        ui,
+        "Working directory",
+        &current.display().to_string(),
+        |ui| {
+            let resp = kit::button(ui, &label, kit::Variant::Outline, kit::Size::Sm);
+            let anchor = resp.rect;
+            let tip = "Where the agent reads, writes and runs commands. \
+                       Changing it restarts the backend.";
+            if resp.on_hover_text(tip).clicked() {
+                app.menu_open.working_dir = !app.menu_open.working_dir;
+            }
+            let mut open = app.menu_open.working_dir;
+            let picked = kit::menu(
+                ui.ctx(),
+                egui::Id::new("working_dir_menu"),
+                anchor,
+                kit::MenuSide::Below,
+                300.0,
+                &items,
+                &mut open,
+            );
+            app.menu_open.working_dir = open;
+            match picked.map(|i| targets.get(i)) {
+                Some(Some(t)) => chosen = Some(t.clone()),
+                // The last item is the native chooser; a cancelled dialog
+                // decides nothing, which is not the same as "app folder".
+                Some(None) => {
+                    if let Some(dir) =
+                        rfd::FileDialog::new().set_directory(&current).pick_folder()
+                    {
+                        chosen = Some(Some(dir));
+                    }
+                }
+                None => {}
+            }
+        },
+    );
+
+    match chosen {
+        Some(dir) => {
+            let before = app.working_dir.clone();
+            app.set_working_dir(dir, ctx);
+            app.working_dir != before
+        }
+        None => false,
+    }
 }
 
 /// Three "cubes" — icon over label, `flex 1 1 180px`, r=20, selected gets a

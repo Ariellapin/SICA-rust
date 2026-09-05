@@ -1,19 +1,24 @@
-//! `/name` — user-typed skill invocation.
+//! `/name` — user-typed invocation of the three markdown families.
 //!
 //! The chat palette (`slash_menu.rs`) rewrites a pick into `/name args…`,
 //! and a user can type the token by hand. Either way the sent text starts
-//! with a whitespace-bounded `/name`. [`expand`] resolves that name to a
-//! markdown file and returns the framed content the backend injects as
-//! `ContextInjected { source: SkillInvocation }` *before* the user's
-//! message, so the model reads the instructions and then the request.
+//! with a whitespace-bounded `/name`. [`resolve`] maps that name to a file
+//! and says what the backend should *do* with it.
 //!
 //! Resolution order, first hit wins:
 //!
-//! 1. `commands/<name>.md` — a canned prompt; `{{args}}` in the body is
-//!    replaced with the rest of the line.
-//! 2. `agents/<name>.md` — a persona.
+//! 1. `commands/<name>.md` — a canned prompt. Injected as
+//!    `ContextInjected { source: SkillInvocation }` before the user's
+//!    message, with `{{args}}` replaced by the rest of the line.
+//! 2. `agents/<name>.md` — a **persona**, and a persona is session state,
+//!    not one-shot context: this resolves to [`Invocation::Agent`], which
+//!    the backend answers by *selecting* the preset (guide §5.2), exactly
+//!    as the palette's AGENTS row and `/agent <name>` do. One file family,
+//!    one meaning — otherwise the same file would mean two things
+//!    depending on which route reached it.
 //! 3. `skills/<name>.md` — a skill contract (user-authored or the seeded
-//!    doc of a Rust built-in, so `/run-cli …` loads the `run-cli` contract).
+//!    doc of a Rust built-in, so `/run-cli …` loads the `run-cli`
+//!    contract). Injected like a command, minus the `{{args}}` rewrite.
 //!
 //! Nothing here executes a skill — that stays the model's decision after it
 //! has read the contract. Names are restricted to `[A-Za-z0-9_-]` so a
@@ -42,15 +47,25 @@ impl Roots {
     }
 }
 
-/// Which family answered.
+/// Which *injecting* family answered. Agents are not here: they select
+/// rather than inject (see [`Invocation::Agent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     Command,
-    Agent,
     Skill,
 }
 
-/// The result of resolving a `/name` token.
+/// What the backend should do about a typed `/name`.
+#[derive(Debug, Clone)]
+pub enum Invocation {
+    /// Inject this body as context ahead of the user's message.
+    Context(Expansion),
+    /// Select this agent preset for the session. The user's message still
+    /// goes out as typed; only the persona and the registry view change.
+    Agent { name: String },
+}
+
+/// The result of resolving a `/name` token to an injecting family.
 #[derive(Debug, Clone)]
 pub struct Expansion {
     pub name: String,
@@ -79,23 +94,32 @@ pub fn parse_token(text: &str) -> Option<(&str, &str)> {
 /// is no token or nothing on disk answers to it — the text is then sent as
 /// typed, which is also what happens for the frontend's own app commands
 /// (`/new`, `/stop`…) should one ever reach the backend.
-pub fn expand(text: &str, roots: &Roots) -> Option<Expansion> {
+pub fn resolve(text: &str, roots: &Roots) -> Option<Invocation> {
     let (name, args) = parse_token(text)?;
-    let candidates = [
-        (Family::Command, roots.commands.join(format!("{name}.md"))),
-        (Family::Agent, roots.agents.join(format!("{name}.md"))),
-        (Family::Skill, roots.skills.join(format!("{name}.md"))),
-    ];
-    for (family, path) in candidates {
-        let Ok(skill) = load(&path) else { continue };
-        let content = match family {
-            Family::Command => {
-                let body = skill.body.replace("{{args}}", args);
-                MarkdownSkill { body, ..skill }.render_skill_content()
-            }
-            _ => skill.render_skill_content(),
-        };
-        return Some(Expansion { name: name.to_string(), family, content, args: args.to_string() });
+    // Commands still shadow an `agents/<name>.md` of the same name: the
+    // precedence has not changed, only what an agent hit *means*.
+    if let Ok(skill) = load(&roots.commands.join(format!("{name}.md"))) {
+        let body = skill.body.replace("{{args}}", args);
+        return Some(Invocation::Context(Expansion {
+            name:    name.to_string(),
+            family:  Family::Command,
+            content: MarkdownSkill { body, ..skill }.render_skill_content(),
+            args:    args.to_string(),
+        }));
+    }
+    // A *readable* agent file is a selection. A malformed one falls through
+    // to `skills/` exactly as a malformed command does, rather than becoming
+    // a selection the backend would only fail to load a moment later.
+    if load(&roots.agents.join(format!("{name}.md"))).is_ok() {
+        return Some(Invocation::Agent { name: name.to_string() });
+    }
+    if let Ok(skill) = load(&roots.skills.join(format!("{name}.md"))) {
+        return Some(Invocation::Context(Expansion {
+            name:    name.to_string(),
+            family:  Family::Skill,
+            content: skill.render_skill_content(),
+            args:    args.to_string(),
+        }));
     }
     None
 }
@@ -145,7 +169,9 @@ mod tests {
         let (tmp, r) = roots();
         std::fs::write(r.commands.join("standup.md"), "---\nname: standup\n---\nWrite a standup since {{args}}.\n").unwrap();
         std::fs::write(r.skills.join("standup.md"), "---\nname: standup\n---\nSKILL\n").unwrap();
-        let e = expand("/standup monday", &r).unwrap();
+        let Some(Invocation::Context(e)) = resolve("/standup monday", &r) else {
+            panic!("a command injects")
+        };
         assert_eq!(e.family, Family::Command);
         assert_eq!(e.args, "monday");
         assert!(e.content.contains("Write a standup since monday."), "{}", e.content);
@@ -154,21 +180,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// An agent token *selects*; it never injects. Same file, same effect
+    /// as the palette's AGENTS row and as `/agent <name>` (guide §5.2).
     #[test]
-    fn falls_through_agents_to_skills_and_unknown_is_none() {
+    fn an_agent_token_selects_rather_than_injecting() {
         let (tmp, r) = roots();
         std::fs::write(r.agents.join("reviewer.md"), "---\nname: reviewer\n---\nYou review.\n").unwrap();
+        match resolve("/reviewer look at chat.rs", &r) {
+            Some(Invocation::Agent { name }) => assert_eq!(name, "reviewer"),
+            other => panic!("expected a selection, got {other:?}"),
+        }
+        // A command of the same name still wins, and still injects.
+        std::fs::write(r.commands.join("reviewer.md"), "---\nname: reviewer\n---\nCMD\n").unwrap();
+        let Some(Invocation::Context(e)) = resolve("/reviewer", &r) else {
+            panic!("a command shadows the agent")
+        };
+        assert_eq!(e.family, Family::Command);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn falls_through_to_skills_and_unknown_is_none() {
+        let (tmp, r) = roots();
         std::fs::write(r.skills.join("run-cli.md"), "---\nname: run-cli\n---\nContract.\n").unwrap();
-        assert_eq!(expand("/reviewer", &r).unwrap().family, Family::Agent);
-        let s = expand("/run-cli cargo build", &r).unwrap();
+        let Some(Invocation::Context(s)) = resolve("/run-cli cargo build", &r) else {
+            panic!("a skill injects")
+        };
         assert_eq!(s.family, Family::Skill);
         assert_eq!(s.args, "cargo build");
         assert!(s.content.contains("Contract."));
-        assert!(expand("/nope", &r).is_none());
-        assert!(expand("plain text", &r).is_none());
-        // A malformed file is skipped like a missing one.
+        assert!(resolve("/nope", &r).is_none());
+        assert!(resolve("plain text", &r).is_none());
+        // A malformed file is skipped like a missing one — including a
+        // malformed *agent*, which must not become a selection.
         std::fs::write(r.skills.join("bad.md"), "no frontmatter").unwrap();
-        assert!(expand("/bad", &r).is_none());
+        std::fs::write(r.agents.join("broken.md"), "no frontmatter").unwrap();
+        assert!(resolve("/bad", &r).is_none());
+        assert!(resolve("/broken", &r).is_none());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -743,7 +743,7 @@ fn produced_row(app: &mut App, ui: &mut egui::Ui, files: &[String], t: &Theme) {
         );
         for path in files.iter().take(MAX_CHIPS) {
             if file_chip(ui, path, t).on_hover_text(path).clicked() {
-                let full = sica_core::paths::workspace_root().join(path);
+                let full = sica_core::paths::working_dir().join(path);
                 if let Err(e) = crate::ui::settings::reveal_path(&full) {
                     app.push_log(LogKind::Warn, format!("could not open {path}: {e}"));
                 }

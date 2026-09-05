@@ -70,6 +70,19 @@ pub trait Skill: Send + Sync {
         Vec::new()
     }
 
+    /// The JSON Schema for this skill's arguments, when the default
+    /// shape will not do.
+    ///
+    /// The registry otherwise synthesises `{ "type": "string" }` for
+    /// every declared arg, which is right for the built-ins — they take
+    /// paths and command lines. A skill whose arguments are genuinely
+    /// typed (an MCP tool, §13.2) returns its own schema here and it
+    /// goes into the `tools` array verbatim; flattening it to strings
+    /// would make a tool taking a number or an array uncallable.
+    fn parameters_schema(&self) -> Option<Value> {
+        None
+    }
+
     /// Wall-clock budget `ToolSubAgent` enforces around `run`. When it
     /// elapses the skill future is dropped (a child process survives only
     /// if the skill spawned it without `kill_on_drop`) and the call is

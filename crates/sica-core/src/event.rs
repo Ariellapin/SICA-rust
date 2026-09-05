@@ -190,6 +190,11 @@ pub enum EventKind {
     /// Plan-mode switch. Latest wins; drives the plan policy and the
     /// `PLAN_POLICY` prompt section. Never surfaced.
     PlanMode { active: bool },
+    /// Agent-preset selection (guide §5.2). Latest wins; drives the
+    /// `PERSONA` prompt section and the session's registry view. `None`
+    /// is the cleared state. Never surfaced — the persona reaches the model
+    /// through the system prompt, not the transcript.
+    AgentPreset { name: Option<String> },
     /// Full-replacement todo list. Latest wins; never surfaced (the FE
     /// renders the checklist from the pushed event).
     TodoWrite { items: Vec<protocol::TodoItem> },
@@ -242,6 +247,24 @@ pub enum EventKind {
     JobFinished {
         id: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
+    /// One user hook ran (guide §13.1). Durable audit only: what the model
+    /// reads is the tool outcome the hook allowed or denied, plus any
+    /// `ContextInjected` the hook's `additionalContext` produced, so the
+    /// hook itself is bookkeeping and never surfaces.
+    ///
+    /// `decision` is the merged rank the codec read (`allow` / `ask` /
+    /// `deny` / `block` / `error`); `exit_code` is `None` when the command
+    /// could not be spawned or timed out.
+    Hook {
+        /// `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`.
+        event:     String,
+        /// The command line as configured — what an operator has to grep
+        /// their own hooks file for.
+        command:   String,
+        decision:  String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
     },

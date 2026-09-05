@@ -125,19 +125,23 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     let panel_rect = ctx
         .memory(|m| m.area_rect(egui::Id::new("settings_panel")))
         .unwrap_or(screen);
-    if ctx.input(|i| {
-        i.pointer.any_pressed()
-            && i.pointer
-                .interact_pos()
-                .map(|p| !panel_rect.contains(p))
-                .unwrap_or(false)
-    }) {
+    // An open menu owns its own clicks — its card can extend past the panel,
+    // and a pick there must not take the whole dialog down with it.
+    if !app.menu_open.working_dir
+        && ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .map(|p| !panel_rect.contains(p))
+                    .unwrap_or(false)
+        })
+    {
         close = true;
     }
 
     if close {
         app.settings_open = false;
-        app.risk_gate_open = false;
+        app.menu_open.working_dir = false;
     }
 }
 

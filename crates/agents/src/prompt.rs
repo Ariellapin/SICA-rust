@@ -19,6 +19,8 @@
 
 use std::collections::BTreeMap;
 
+use protocol::ToolMode;
+
 use crate::registry::SkillRegistry;
 
 /// Centrally allocated sparse order slots. Never renumber a published slot —
@@ -26,6 +28,11 @@ use crate::registry::SkillRegistry;
 pub mod order {
     /// Who/what the harness is (native-mode identity, deployment persona).
     pub const IDENTITY: i32 = -1000;
+    /// The selected agent preset's body (`agents/*.md`, guide §5.2). Ahead
+    /// of `memory.md`: "who is answering" frames the workspace's standing
+    /// instructions rather than trailing them. dsh puts its deployment
+    /// persona at 0, which sica already spends on `MEMORY`.
+    pub const PERSONA: i32 = -500;
     /// `memory.md` — the workspace's durable instruction file.
     pub const MEMORY: i32 = 0;
     /// Plan-mode policy (Wave 3).
@@ -34,6 +41,10 @@ pub mod order {
     pub const SKILL_GUIDANCE: i32 = 1000;
     /// The live skill catalogue (text-protocol mode only).
     pub const CATALOGUE: i32 = 2000;
+    /// The generated `run-code` SDK (`ToolMode::Ptc` only, guide §7): the
+    /// rules of the script runtime plus one signature per callable tool.
+    /// dsh renders its TypeScript SDK at the same slot.
+    pub const PTC_SDK: i32 = 5000;
     /// Structured-output mandate for subagent rounds (Wave 4).
     pub const STRUCTURED_OUTPUT: i32 = 9900;
 }
@@ -200,7 +211,7 @@ pub fn interpolate(
 /// that print it should tolerate an empty value.
 pub fn standard_vars(model: &str) -> BTreeMap<String, String> {
     let mut vars = BTreeMap::new();
-    vars.insert("cwd".into(), sica_core::paths::workspace_root().display().to_string());
+    vars.insert("cwd".into(), sica_core::paths::working_dir().display().to_string());
     vars.insert("os".into(), std::env::consts::OS.to_string());
     vars.insert(
         "date".into(),
@@ -227,6 +238,8 @@ pub const RUNTIME_CONTEXT_HEADER: &str =
 ///
 /// - **Text protocol**: `memory.md` (MEMORY) + one SKILL_GUIDANCE section
 ///   per skill that provides guidance + the live catalogue (CATALOGUE).
+/// - **Persona**: when a session runs an agent preset (§5.2) its body is a
+///   PERSONA section, between the native identity and `memory.md`.
 /// - **Native**: an IDENTITY section + `memory.md` + skill guidance. The
 ///   catalogue is deliberately absent — the `tools` array carries it, and
 ///   the text-protocol invocation brief in `memory.md` is overridden by the
@@ -239,15 +252,19 @@ pub const RUNTIME_CONTEXT_HEADER: &str =
 pub fn for_main_agent(
     memory: &str,
     registry: &SkillRegistry,
-    native_tools: bool,
+    mode: ToolMode,
     vars: &BTreeMap<String, String>,
     plan_policy: Option<&str>,
+    persona: Option<&str>,
 ) -> Result<Rendered, PromptError> {
     let mut a = Assembly::new();
     a.vars = vars.clone();
 
-    if native_tools {
+    if mode.native() {
         a.section(Section::new("identity", order::IDENTITY, NATIVE_IDENTITY));
+    }
+    if let Some(persona) = persona.filter(|p| !p.trim().is_empty()) {
+        a.section(Section::new("persona", order::PERSONA, persona));
     }
     a.section(Section::new("memory", order::MEMORY, memory));
     if let Some(policy) = plan_policy.filter(|p| !p.trim().is_empty()) {
@@ -263,8 +280,12 @@ pub fn for_main_agent(
             a.section(Section::new(format!("guidance:{name}"), order::SKILL_GUIDANCE, guidance));
         }
     }
-    if !native_tools {
-        let catalogue = registry.catalogue_markdown();
+    if !mode.native() {
+        // `run-code` stays out of the text-protocol catalogue: a program is
+        // no use to a model that cannot reliably emit one call, and the
+        // guide gates PTC on native-tools providers (§7). It is still
+        // registered, so `/run-code` reaches it when a human asks for it.
+        let catalogue = registry.catalogue_markdown_excluding(&[crate::ptc::RUN_CODE_NAME]);
         if !catalogue.is_empty() {
             a.section(Section::new(
                 "catalogue",
@@ -272,6 +293,13 @@ pub fn for_main_agent(
                 format!("## Loaded skills\n\n{catalogue}"),
             ));
         }
+    }
+    // Under PTC the `tools` array carries only `run-code` and the harness
+    // controls, so the SDK *is* the catalogue for everything else — without
+    // it a program has no way to learn what it can call.
+    if mode.ptc() {
+        let sdk = crate::ptc::sdk_markdown(&crate::ptc::program_view(registry));
+        a.section(Section::new("ptc-sdk", order::PTC_SDK, sdk));
     }
     a.context(Section::new("runtime", 0, runtime_context_text(vars)));
     a.render()
@@ -399,7 +427,7 @@ mod tests {
         reg.register(Arc::new(Guided));
         reg.register(Arc::new(Plain));
         let vars = standard_vars("m");
-        let r = for_main_agent("MEMORY BODY", &reg, false, &vars, None).unwrap();
+        let r = for_main_agent("MEMORY BODY", &reg, ToolMode::Text, &vars, None, None).unwrap();
         // memory → guidance → catalogue, blank-line joined.
         let sys = &r.system;
         assert!(sys.starts_with("MEMORY BODY"), "{sys}");
@@ -419,7 +447,7 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.register(Arc::new(Guided));
         let vars = standard_vars("m");
-        let r = for_main_agent("MEMORY BODY", &reg, true, &vars, None).unwrap();
+        let r = for_main_agent("MEMORY BODY", &reg, ToolMode::Native, &vars, None, None).unwrap();
         let sys = &r.system;
         assert!(sys.starts_with(NATIVE_IDENTITY), "{sys}");
         assert!(sys.contains("MEMORY BODY"), "native mode keeps memory.md");
@@ -428,18 +456,85 @@ mod tests {
     }
 
     #[test]
+    fn ptc_mode_renders_the_sdk_after_the_guidance_and_hides_the_controls() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Guided));
+        reg.register(Arc::new(crate::ptc::RunCode::new()));
+        let vars = standard_vars("m");
+        let r = for_main_agent("MEMORY BODY", &reg, ToolMode::Ptc, &vars, None, None).unwrap();
+        let sys = &r.system;
+        // PTC rides the native wire, so it keeps the native identity and
+        // still drops the text-protocol catalogue.
+        assert!(sys.starts_with(NATIVE_IDENTITY), "{sys}");
+        assert!(!sys.contains("## Loaded skills"), "{sys}");
+        assert!(sys.contains("## Programmatic tool calling"), "{sys}");
+        assert!(sys.contains("- `run_cli()`"), "{sys}");
+        // `run-code` is the tool being *called*, never one a program calls.
+        assert!(!sys.contains("- `run_code("), "{sys}");
+        // PTC_SDK (5000) is after SKILL_GUIDANCE (1000).
+        assert!(sys.find("GUIDED").unwrap() < sys.find("## Programmatic").unwrap());
+    }
+
+    #[test]
+    fn text_mode_keeps_run_code_out_of_the_catalogue() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Plain));
+        reg.register(Arc::new(crate::ptc::RunCode::new()));
+        let vars = standard_vars("m");
+        let r = for_main_agent("MEM", &reg, ToolMode::Text, &vars, None, None).unwrap();
+        assert!(r.system.contains("## Loaded skills"), "{}", r.system);
+        assert!(!r.system.contains("run-code"), "{}", r.system);
+    }
+
+    #[test]
+    fn native_mode_renders_no_sdk() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(crate::ptc::RunCode::new()));
+        let vars = standard_vars("m");
+        let r = for_main_agent("MEM", &reg, ToolMode::Native, &vars, None, None).unwrap();
+        assert!(!r.system.contains("## Programmatic tool calling"), "{}", r.system);
+    }
+
+    #[test]
     fn plan_policy_section_appears_only_when_active() {
         let reg = SkillRegistry::new();
         let vars = standard_vars("m");
-        let off = for_main_agent("MEM", &reg, false, &vars, None).unwrap();
+        let off = for_main_agent("MEM", &reg, ToolMode::Text, &vars, None, None).unwrap();
         assert!(!off.system.contains("plan mode"));
         let on =
-            for_main_agent("MEM", &reg, false, &vars, Some("PLAN RULES")).unwrap();
+            for_main_agent("MEM", &reg, ToolMode::Text, &vars, Some("PLAN RULES"), None).unwrap();
         assert!(on.system.contains("PLAN RULES"));
         // PLAN_POLICY (500) sits between memory (0) and guidance (1000).
         let mem = on.system.find("MEM").unwrap();
         let plan = on.system.find("PLAN RULES").unwrap();
         assert!(mem < plan);
+    }
+
+    #[test]
+    fn persona_precedes_memory_and_follows_the_native_identity() {
+        let reg = SkillRegistry::new();
+        let vars = standard_vars("m");
+        let r = for_main_agent("MEM", &reg, ToolMode::Native, &vars, None, Some("I AM REVIEWER")).unwrap();
+        let sys = &r.system;
+        let ident = sys.find(NATIVE_IDENTITY).unwrap();
+        let persona = sys.find("I AM REVIEWER").unwrap();
+        let mem = sys.find("MEM").unwrap();
+        assert!(ident < persona && persona < mem, "{sys}");
+        // Absent / blank personas leave no slot behind.
+        let none = for_main_agent("MEM", &reg, ToolMode::Native, &vars, None, None).unwrap();
+        assert!(!none.system.contains("I AM REVIEWER"));
+        let blank = for_main_agent("MEM", &reg, ToolMode::Native, &vars, None, Some("  
+ ")).unwrap();
+        assert_eq!(blank.system, none.system);
+    }
+
+    #[test]
+    fn a_persona_interpolates_like_any_other_section() {
+        let reg = SkillRegistry::new();
+        let mut vars = standard_vars("m");
+        vars.insert("cwd".into(), "/work".into());
+        let r = for_main_agent("MEM", &reg, ToolMode::Text, &vars, None, Some("dir {{cwd}}")).unwrap();
+        assert!(r.system.starts_with("dir /work"), "{}", r.system);
     }
 
     #[test]

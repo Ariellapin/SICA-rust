@@ -30,6 +30,8 @@ tracing-subscriber = { workspace = true }
 futures            = { workspace = true }
 async-trait        = { workspace = true }
 chrono             = { workspace = true }
+# `hooks`: matcher patterns in `.sica/hooks.json`.
+regex              = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

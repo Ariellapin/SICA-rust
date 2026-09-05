@@ -53,6 +53,20 @@ impl SkillRegistry {
         out
     }
 
+    /// The complement of [`excluding`](Self::excluding): this registry
+    /// narrowed to `names`. Used by agent presets (`crate::preset`), whose
+    /// frontmatter `skills:` list is an allow-list rather than a deny-list.
+    /// Names that match nothing are ignored — the caller reports them.
+    pub fn restricted_to(&self, names: &[&str]) -> Self {
+        let mut out = Self::new();
+        for name in names {
+            if let Some(skill) = self.by_name.get(*name) {
+                out.by_name.insert((*name).to_string(), skill.clone());
+            }
+        }
+        out
+    }
+
     /// Render the live registry as a deterministic Markdown bullet list, sorted
     /// by skill name. Each line is `- **name** ('arg1' 'arg2') — description`,
     /// where the args section is omitted for skills that take none. Used by the
@@ -119,24 +133,33 @@ impl SkillRegistry {
             .iter()
             .filter_map(|name| {
                 let skill = self.by_name.get(*name)?;
-                let mut props = Map::new();
-                let args = skill.positional_args();
-                for a in args.iter().chain(&skill.optional_args()) {
-                    props.insert(
-                        a.clone(),
-                        serde_json::json!({ "type": "string" }),
-                    );
-                }
+                // A skill that carries its own schema wins: the synthesised
+                // all-strings shape below is a convenience for the built-ins,
+                // not a contract the provider has to be told.
+                let parameters = match skill.parameters_schema() {
+                    Some(schema) => schema,
+                    None => {
+                        let mut props = Map::new();
+                        let args = skill.positional_args();
+                        for a in args.iter().chain(&skill.optional_args()) {
+                            props.insert(
+                                a.clone(),
+                                serde_json::json!({ "type": "string" }),
+                            );
+                        }
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": Value::Object(props),
+                            "required": args,
+                        })
+                    }
+                };
                 Some(serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": skill.name(),
                         "description": skill.description(),
-                        "parameters": {
-                            "type": "object",
-                            "properties": Value::Object(props),
-                            "required": args,
-                        },
+                        "parameters": parameters,
                     },
                 }))
             })
@@ -283,6 +306,42 @@ mod tests {
         async fn run(&self, _a: Value, _c: SkillContext) -> SkillOutcome {
             SkillOutcome { ok: true, summary: String::new() }
         }
+    }
+
+    struct OwnSchema;
+    #[async_trait]
+    impl Skill for OwnSchema {
+        fn name(&self) -> &str { "mcp__fs__search" }
+        fn positional_args(&self) -> Vec<String> { vec!["query".into()] }
+        fn optional_args(&self) -> Vec<String> { vec!["limit".into()] }
+        fn parameters_schema(&self) -> Option<Value> {
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1 },
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+            }))
+        }
+        async fn run(&self, _a: Value, _c: SkillContext) -> SkillOutcome {
+            SkillOutcome { ok: true, summary: String::new() }
+        }
+    }
+
+    #[test]
+    fn a_skill_with_its_own_schema_sends_it_verbatim() {
+        // An MCP tool's arguments are typed. Flattening `limit` to a string
+        // the way the built-ins are flattened would make the tool uncallable
+        // for any server that validates its own schema.
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(OwnSchema));
+        let params = &reg.tools_json()[0]["function"]["parameters"];
+        assert_eq!(params["properties"]["limit"]["type"], "integer");
+        assert_eq!(params["properties"]["limit"]["minimum"], 1);
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["required"], serde_json::json!(["query"]));
     }
 
     #[test]

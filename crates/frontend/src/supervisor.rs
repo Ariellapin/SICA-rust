@@ -127,6 +127,14 @@ pub enum UiEvent {
     SessionList { sessions: Vec<SessionMeta> },
     /// Content-search hits for the sidebar's search field.
     SessionSearch { hits: Vec<protocol::SessionHit> },
+    /// Folded session projections (§3.3) — the header's stats line and
+    /// the sidebar's turn outline.
+    SessionStats {
+        session_id:  u64,
+        stats:       protocol::StatsDump,
+        outline:     Vec<protocol::TurnRowDump>,
+        through_seq: u64,
+    },
     /// One page of a session's raw event log — the Trajectory ledger (§10).
     SessionEvents {
         session_id: u64,
@@ -158,6 +166,9 @@ pub enum UiEvent {
     TodosChanged { session_id: u64, items: Vec<protocol::TodoItem> },
     PlanModeChanged { session_id: u64, active: bool },
     PermissionModeChanged { session_id: u64, mode: protocol::PermissionMode },
+    /// The session's agent preset (`agents/*.md`) changed, or was pushed
+    /// when the session loaded. `None` is no preset.
+    SessionAgentChanged { session_id: u64, name: Option<String> },
 
     // Wave 4 inbox: a message sent while a turn was running was queued
     // rather than cancelling it (`accepted` is "queued" | "steered" |
@@ -376,6 +387,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::PermissionModeChanged { session_id, mode } => {
             UiEvent::PermissionModeChanged { session_id, mode }
+        }
+        Event::SessionAgentChanged { session_id, name } => {
+            UiEvent::SessionAgentChanged { session_id, name }
         }
         Event::InboxChanged { session_id, queued, accepted } => {
             UiEvent::InboxChanged { session_id, queued, accepted }

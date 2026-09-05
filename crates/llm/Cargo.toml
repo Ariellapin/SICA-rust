@@ -22,6 +22,10 @@ url                = { workspace = true }
 regex              = { workspace = true }
 once_cell          = { workspace = true }
 
+[features]
+# Exposes `llm::mock`, the scripted fault server, to other crates' tests.
+mock = []
+
 [dev-dependencies]
 # Already in the tree via reqwest; used to fabricate status-code errors in
 # `retry` tests.

@@ -308,6 +308,10 @@ fn describe(kind: &EventKind) -> Described {
             EventTag::Command,
             format!("plan mode · {}", if *active { "on" } else { "off" }),
         ),
+        EventKind::AgentPreset { name } => row(
+            EventTag::Command,
+            format!("agent · {}", name.as_deref().unwrap_or("cleared")),
+        ),
         EventKind::TodoWrite { items } => {
             row(EventTag::Command, format!("todos · {} item(s)", items.len())).payload(
                 items
@@ -348,6 +352,15 @@ fn describe(kind: &EventKind) -> Described {
                 None => format!("job {id} · {status}"),
             };
             row(EventTag::Job, text).ok(exit_code.map(|c| c == 0).unwrap_or(false))
+        }
+        EventKind::Hook { event, command, decision, exit_code } => {
+            let text = match exit_code {
+                Some(c) => format!("{event} hook · {decision} · exit {c} · {command}"),
+                None => format!("{event} hook · {decision} · {command}"),
+            };
+            // "ok" here is about the hook itself running, not about what it
+            // decided: a hook that denies a call worked exactly as intended.
+            row(EventTag::Hook, text).ok(decision != "error")
         }
         EventKind::Unknown => row(
             EventTag::Other,

@@ -70,10 +70,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
         app.chat.at.last_query = token.query.clone();
         app.chat.at.selected = 0;
         app.chat.at.dismissed = false;
-        // The list lives in a bottom panel, which is only as tall as the
-        // content it measured last frame; ask for the follow-up frame that
-        // settles the new height.
-        ui.ctx().request_repaint();
     }
     if app.chat.at.dismissed {
         return Outcome { open: false };
@@ -103,8 +99,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, input_focused: bool) -> Outcome {
         return Outcome { open: false };
     }
     let selected = app.chat.at.selected;
-    let clicked = draw_list(app, ui, &rows, selected, matches!(nav, Nav::Moved));
-    let accepted = clicked.or(match nav {
+    let list = draw_list(app, ui, &rows, selected, matches!(nav, Nav::Moved));
+    if list.outside_press {
+        // Same rule as the `/` palette: a pointerdown anywhere else closes
+        // the picker and leaves the half-typed token alone.
+        app.chat.at.dismissed = true;
+        return Outcome { open: false };
+    }
+    let accepted = list.inner.or(match nav {
         Nav::Accept(i) => Some(i),
         _ => None,
     });
@@ -239,7 +241,7 @@ fn poll_index(app: &mut App) {
 fn spawn_scan() -> Receiver<Vec<FileEntry>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(scan(&sica_core::paths::workspace_root()));
+        let _ = tx.send(scan(&sica_core::paths::working_dir()));
     });
     rx
 }
@@ -413,10 +415,11 @@ fn draw_list(
     rows: &[Row],
     selected: usize,
     scroll_to_selected: bool,
-) -> Option<usize> {
+) -> super::slash_menu::Overlay<Option<usize>> {
     let t = app.theme;
     let mut clicked = None;
-    super::slash_menu::frame(&t).show(ui, |ui| {
+    let id = super::slash_menu::overlay_id();
+    let out = super::slash_menu::overlay(ui, &t, app.chat.composer_rect, id, |ui| {
         ui.set_width(ui.available_width());
         kit::label(
             ui,
@@ -449,8 +452,7 @@ fn draw_list(
             ),
         );
     });
-    ui.add_space(6.0);
-    clicked
+    super::slash_menu::Overlay { inner: clicked, outside_press: out.outside_press }
 }
 
 /// One row: min-h 40, r=10, `[kind icon] [name] [parent directory]`.
@@ -541,14 +543,18 @@ fn draw_placeholder(app: &mut App, ui: &mut egui::Ui, indexing: bool, query: &st
     } else {
         format!("no file matching @{query}")
     };
-    super::slash_menu::frame(&t).show(ui, |ui| {
+    let id = super::slash_menu::overlay_id();
+    let out = super::slash_menu::overlay(ui, &t, app.chat.composer_rect, id, |ui| {
         ui.set_width(ui.available_width());
         kit::label(
             ui,
             kit::txt(text, 13.0, Weight::Regular, kit::col(t.alias.label[2])),
         );
     });
-    ui.add_space(6.0);
+    if out.outside_press {
+        app.chat.at.dismissed = true;
+        return Outcome { open: false };
+    }
     if indexing {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }

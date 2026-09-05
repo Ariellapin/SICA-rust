@@ -1432,7 +1432,7 @@ fn live_system_prompt(registry: Option<&SkillRegistry>) -> String {
     let empty = SkillRegistry::new();
     let reg = registry.unwrap_or(&empty);
     let vars = crate::prompt::standard_vars("");
-    match crate::prompt::for_main_agent(&mem, reg, false, &vars, None) {
+    match crate::prompt::for_main_agent(&mem, reg, protocol::ToolMode::Text, &vars, None, None) {
         Ok(r) => r.system,
         Err(e) => format!("[prompt assembly failed: {e}]"),
     }

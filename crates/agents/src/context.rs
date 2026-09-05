@@ -19,6 +19,11 @@ pub struct TrimReport {
     pub dropped:  usize,
 }
 
+/// Prefix of the trimmer's wire-only marker. Exported so a reader of a
+/// request can tell that message apart from anything the log holds — it is
+/// inserted here and never appended to a session.
+pub const CONTEXT_NOTICE_PREFIX: &str = "[context notice:";
+
 /// Trim `messages` to fit `budget_tokens` (approximate). The leading system
 /// message (if any) and the final message are never dropped. Oldest
 /// non-system messages go first; when anything was dropped, a short user-role
@@ -51,7 +56,7 @@ pub fn trim_to_budget(messages: Vec<ChatMessage>, budget_tokens: u32) -> TrimRep
             ChatMessage {
                 role: "user".into(),
                 content: ChatContent::Text(format!(
-                    "[context notice: the {dropped} oldest message(s) of this \
+                    "{CONTEXT_NOTICE_PREFIX} the {dropped} oldest message(s) of this \
                      conversation were removed to fit the model's context \
                      window. Do not assume their contents.]"
                 )),

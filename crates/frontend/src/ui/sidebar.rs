@@ -18,6 +18,10 @@ use egui::{Align, Align2, Layout, Rect, Sense, Vec2};
 use protocol::Request;
 use sica_core::theme::tokens::{RADIUS_CARD, RADIUS_INPUT, RADIUS_PILL};
 
+/// Turn rows the outline shows before it starts saying "N older".
+/// A long session must not push the session list off the column.
+const OUTLINE_ROWS: usize = 12;
+
 use crate::app::App;
 use crate::supervisor::UiCommand;
 use crate::ui::icons::{self, Icon};
@@ -56,8 +60,8 @@ fn brand_row(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
     let h = if collapsed { 36.0 } else { 60.0 };
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
     let mark_rect = Rect::from_center_size(
-        egui::pos2(rect.min.x + 16.0, rect.center().y),
-        Vec2::new(24.0, 18.0),
+        egui::pos2(rect.min.x + 18.0, rect.center().y),
+        Vec2::splat(22.0),
     );
 
     if collapsed {
@@ -75,9 +79,9 @@ fn brand_row(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
                 kit::col(t.alias.label[1]),
             );
         } else {
-            icons::blade_mark(
-                ui.painter(),
-                Rect::from_center_size(hit.center(), Vec2::new(22.0, 16.0)),
+            icons::mark(
+                ui,
+                Rect::from_center_size(hit.center(), Vec2::splat(20.0)),
                 kit::col(t.alias.label[0]),
             );
         }
@@ -94,7 +98,7 @@ fn brand_row(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         egui::pos2(rect.max.x - 36.0, rect.max.y),
     );
     let brand = ui.interact(brand_hit, ui.id().with("brand"), Sense::click());
-    icons::blade_mark(ui.painter(), mark_rect, kit::col(t.alias.label[0]));
+    icons::mark(ui, mark_rect, kit::col(t.alias.label[0]));
     ui.painter().text(
         egui::pos2(mark_rect.max.x + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -402,6 +406,9 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
                     pending == Some(*id),
                     &mut |a| action = Some(a),
                 );
+                if *id == active_id {
+                    turn_outline(app, ui);
+                }
                 if !snippet.is_empty() {
                     ui.horizontal(|ui| {
                         ui.add_space(26.0);
@@ -524,6 +531,122 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
             }
         }
         None => {}
+    }
+}
+
+/// The turn outline under the active session's row (guide §3.3): one line
+/// per turn, click jumps the Trajectory ledger to that turn's `TurnStart`.
+///
+/// Folded from the log, not from `chat.turns` — the transcript holds only
+/// the derived surface, so a turn compaction shadowed has no row there and
+/// would silently vanish from a list built off it. Collapsed by default:
+/// the sidebar's subject is sessions, and this is a drill-down into the one
+/// that is open.
+fn turn_outline(app: &mut App, ui: &mut egui::Ui) {
+    let t = app.theme;
+    if app.stats.outline.is_empty() {
+        return;
+    }
+    let n = app.stats.outline.len();
+    let expanded = app.stats.expanded;
+
+    // Disclosure row: "▸ 7 turns".
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(RADIUS_INPUT), kit::cola(t.alias.hover));
+    }
+    ui.painter().text(
+        egui::pos2(rect.min.x + 26.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        format!("{} {} turn{}", if expanded { "▾" } else { "▸" }, n, if n == 1 { "" } else { "s" }),
+        kit::font(12.0, Weight::Medium),
+        kit::col(t.alias.label[2]),
+    );
+    if resp.clicked() {
+        app.stats.expanded = !expanded;
+    }
+    if !expanded {
+        return;
+    }
+
+    // Newest first: the turn a user wants to jump back to is almost always
+    // a recent one, and the list is capped so a long session cannot push
+    // the session rows off the column.
+    let rows: Vec<(u64, String, String, bool)> = app
+        .stats
+        .outline
+        .iter()
+        .rev()
+        .take(OUTLINE_ROWS)
+        .map(|r| {
+            let label = if r.first_user_line.is_empty() {
+                format!("({})", r.source)
+            } else {
+                r.first_user_line.clone()
+            };
+            (r.start_seq, label, r.finish_reason.clone(), r.finish_reason.is_empty())
+        })
+        .collect();
+    let hidden = n.saturating_sub(rows.len());
+    let mut jump = None;
+    for (start_seq, label, finish, running) in rows {
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            continue;
+        }
+        if resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                egui::Rounding::same(RADIUS_INPUT),
+                kit::col(t.alias.sidebar_hover),
+            );
+        }
+        // A turn still running gets the ongoing dot; a finished one a plain
+        // tick mark, so the list says which end of it you are looking at.
+        let dot = egui::pos2(rect.min.x + 32.0, rect.center().y);
+        ui.painter().circle_filled(
+            dot,
+            3.0,
+            if running { kit::col(t.alias.business) } else { kit::col(t.alias.label[3]) },
+        );
+        let font = kit::font(12.0, Weight::Regular);
+        let avail = rect.width() - 48.0;
+        let shown = kit::elide(ui, &label, &font, avail.max(40.0));
+        ui.painter().text(
+            egui::pos2(rect.min.x + 42.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            shown,
+            font,
+            kit::col(t.alias.label[if running { 1 } else { 2 }]),
+        );
+        let tip = if finish.is_empty() {
+            format!("{label}\nrunning · jump to the ledger")
+        } else {
+            format!("{label}\nfinished: {finish} · jump to the ledger")
+        };
+        if resp.on_hover_text(tip).clicked() {
+            jump = Some(start_seq);
+        }
+    }
+    if hidden > 0 {
+        ui.horizontal(|ui| {
+            ui.add_space(42.0);
+            kit::label(
+                ui,
+                kit::txt(
+                    format!("{hidden} older"),
+                    11.0,
+                    Weight::Regular,
+                    kit::col(t.alias.label[3]),
+                ),
+            );
+        });
+    }
+    if let Some(seq) = jump {
+        app.inspect_event(seq);
     }
 }
 
