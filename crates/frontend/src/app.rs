@@ -24,6 +24,7 @@ pub enum SettingsTab {
     General,
     Models,
     Skills,
+    Integrations,
     Diagnostics,
 }
 

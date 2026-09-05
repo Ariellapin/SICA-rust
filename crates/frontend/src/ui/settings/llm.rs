@@ -125,7 +125,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     field_row(ui, &t, "Base URL", &mut cfg.base_url, false);
                     field_row(ui, &t, "Model",    &mut cfg.model,    false);
-                    field_row(ui, &t, "API key",  &mut cfg.api_key,  true);
+                    key_row(ui, &t, &mut cfg.api_key);
                     if models_row(ui, &t, cfg, &models, &pending, ipc_connected) {
                         clicked_fetch = Some(cfg.base_url.clone());
                     }
@@ -448,6 +448,46 @@ fn models_row(
     }
     ui.add_space(2.0);
     fetch
+}
+
+/// The API-key row (§14.6). The value is **write-only**: what is on screen
+/// is a state — configured, and from where — never the key. A key that is
+/// already stored stays stored unless something is typed over it, and a
+/// `${VAR}` reference is shown as itself, because a variable name is not a
+/// secret and hiding it would only make it unfixable.
+fn key_row(ui: &mut egui::Ui, t: &Theme, value: &mut String) {
+    let reference = sica_core::creds::is_reference(value);
+    let status = match sica_core::creds::describe(value) {
+        sica_core::creds::Status::Absent => "not set".to_string(),
+        sica_core::creds::Status::Configured(sica_core::creds::Source::Literal) => {
+            "configured · in file".to_string()
+        }
+        sica_core::creds::Status::Configured(sica_core::creds::Source::Env(name)) => {
+            format!("configured · environment ({name})")
+        }
+        sica_core::creds::Status::Configured(sica_core::creds::Source::File(name)) => {
+            format!("configured · sica-settings/.env ({name})")
+        }
+        sica_core::creds::Status::Unresolved(name) => format!("{name} is not set"),
+    };
+    ui.horizontal(|ui| {
+        label_cell(ui, t, "API key");
+        let w = (ui.available_width() - 4.0).max(80.0);
+        // A reference is readable; a literal key never is.
+        let edit = egui::TextEdit::singleline(value)
+            .password(!reference)
+            .hint_text("key or ${VAR}")
+            .desired_width(w);
+        ui.add(edit);
+    });
+    ui.horizontal(|ui| {
+        label_cell(ui, t, "");
+        kit::label(
+            ui,
+            kit::txt(status, 11.0, Weight::Regular, kit::col(t.alias.label[3])),
+        );
+    });
+    ui.add_space(4.0);
 }
 
 fn field_row(

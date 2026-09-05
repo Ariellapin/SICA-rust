@@ -11,6 +11,7 @@
 mod diagnostics;
 mod general;
 mod llm;
+mod integrations;
 mod skills;
 
 use egui::{Align, Align2, Layout, Rect, Rounding, Sense, Vec2};
@@ -24,10 +25,11 @@ use crate::ui::kit::{self, Elevation, Level, Weight};
 const NAV_W: f32 = 188.0;
 const PANEL_W: f32 = 800.0;
 
-const SECTIONS: [(SettingsTab, &str, Icon); 4] = [
+const SECTIONS: [(SettingsTab, &str, Icon); 5] = [
     (SettingsTab::General, "General", Icon::Gear),
     (SettingsTab::Models, "Models", Icon::Model),
     (SettingsTab::Skills, "Skills", Icon::Sparkle),
+    (SettingsTab::Integrations, "Integrations", Icon::Shield),
     (SettingsTab::Diagnostics, "Diagnostics", Icon::Job),
 ];
 
@@ -112,6 +114,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                                             SettingsTab::General => general::draw(app, ui),
                                             SettingsTab::Models => llm::draw(app, ui),
                                             SettingsTab::Skills => skills::draw(app, ui),
+                                            SettingsTab::Integrations => integrations::draw(app, ui),
                                             SettingsTab::Diagnostics => diagnostics::draw(app, ui),
                                         });
                                 });
