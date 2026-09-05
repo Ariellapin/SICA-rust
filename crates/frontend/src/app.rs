@@ -24,6 +24,7 @@ pub enum SettingsTab {
     General,
     Models,
     Skills,
+    Agents,
     Integrations,
     Diagnostics,
 }
@@ -194,6 +195,10 @@ pub struct App {
 
     /// Sidebar workspaces (§4.3).
     pub workspaces: WorkspacesUi,
+    /// Preset a *new* session starts with (§7.2). Applied through
+    /// `SetSessionAgent` right after `SessionCreated`; `None` means the
+    /// persona-less default prompt.
+    pub default_agent: Option<String>,
 
     pub request_draft: RequestDraft,
     pub release_profile: bool,
@@ -1204,6 +1209,8 @@ impl App {
                 ..Default::default()
             },
 
+            default_agent: settings.default_agent.clone(),
+
             request_draft: RequestDraft::default(),
             release_profile: settings.release_profile,
             autoscroll: settings.autoscroll,
@@ -1362,6 +1369,7 @@ impl App {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            default_agent:          self.default_agent.clone(),
             sidebar_group:          if self.workspaces.grouped {
                 "workspace".into()
             } else {
@@ -2170,6 +2178,15 @@ impl App {
                     session_id: id,
                     mode,
                 }));
+                // …and in the configured default preset (§7.2). Sent right
+                // after creation, which is the only moment it can be set:
+                // a session's preset is fixed once it has produced anything.
+                if let Some(name) = self.default_agent.clone() {
+                    self.send(UiCommand::SendRequest(Request::SetSessionAgent {
+                        session_id: id,
+                        name: Some(name),
+                    }));
+                }
                 // Re-list so the title/timestamp come from the BE rather than
                 // the placeholder we just inserted.
                 self.send(UiCommand::SendRequest(Request::ListSessions));

@@ -62,6 +62,11 @@ pub struct Settings {
     /// inside a workspace is the backend's, because it is durable there.
     #[serde(default = "default_sidebar_group")]
     pub sidebar_group:          String,
+    /// Agent preset applied to every freshly minted session (§7.2). `None`
+    /// is the persona-less prompt, which is what the app did before presets
+    /// existed.
+    #[serde(default)]
+    pub default_agent:          Option<String>,
 }
 
 fn default_sidebar_group() -> String {
@@ -90,6 +95,7 @@ impl Default for Settings {
             working_dir:            None,
             recent_working_dirs:    Vec::new(),
             sidebar_group:          default_sidebar_group(),
+            default_agent:          None,
         }
     }
 }
