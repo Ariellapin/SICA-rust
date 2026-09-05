@@ -276,6 +276,9 @@ pub async fn connect(name: &str, cfg: &ServerConfig) -> Result<Vec<Arc<McpTool>>
     use rmcp::ServiceExt;
     use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 
+    // MCP servers are process-wide (one connection per config file, made at
+    // startup), so they get the process default rather than a session's own
+    // directory — there is no session in scope when they are spawned.
     let root = sica_core::paths::working_dir();
     let cwd = match &cfg.cwd {
         Some(c) if Path::new(c).is_absolute() => PathBuf::from(c),

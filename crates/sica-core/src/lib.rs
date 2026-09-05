@@ -1,6 +1,8 @@
 //! Shared types and helpers used by `backend`, `llm`, `agents`, and `idealist`.
 
+pub mod atomic;
 pub mod build_id;
+pub mod creds;
 pub mod event;
 pub mod message;
 pub mod session;

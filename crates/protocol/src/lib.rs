@@ -3,10 +3,12 @@
 //! A single duplex stream carries every message. Each `Frame` carries a
 //! correlation `id` (0 for unsolicited events) and a tagged `Payload`.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -275,7 +277,14 @@ pub enum Request {
     /// appends. Answers `Ok`, or `Error` with the reason.
     EditUserMessage { session_id: u64, seq: u64, text: String },
     InterruptTurn   { session_id: u64 },
-    NewSession,
+    /// Mint a session. `workspace_id` names the workspace whose directory
+    /// the session works in (§3.9); `None` puts it in the process default
+    /// folder and leaves it **Ungrouped**. The backend resolves the
+    /// directory, stamps it into the session header, *then* attaches the
+    /// session to the workspace — so the header is the proof of membership
+    /// and an interrupted attach can only lose the account entry, never
+    /// misfile a session.
+    NewSession { workspace_id: Option<u64> },
     ListSessions,
     LoadSession   { session_id: u64 },
     DeleteSession { session_id: u64 },
@@ -290,8 +299,31 @@ pub enum Request {
     /// `DeleteSession` nothing is lost.
     ArchiveSession { session_id: u64 },
     /// Substring search over every session's stored messages. Answers
-    /// `SessionSearch`.
+    /// `SearchSessions`.
     SearchSessions { query: String },
+
+    // Workspaces (§3.9). A workspace is the durable record of a directory
+    // the user works in. The subsystem is invisible to models: no tool, no
+    // prompt text, no session event — only these requests and the
+    // `WorkspacesChanged` event.
+    /// Answers `Workspaces`.
+    ListWorkspaces,
+    /// Register a directory. Idempotent per canonical path: registering one
+    /// that is already known answers with the existing row rather than a
+    /// duplicate. Answers `Workspaces`, or `Error` with the OS reason when
+    /// the path is relative, missing or not a directory.
+    CreateWorkspace { path: String, title: Option<String> },
+    RenameWorkspace { id: u64, title: String },
+    /// Drop the **registration only**. The directory, its files, the
+    /// sessions and their logs are untouched; those sessions become
+    /// Ungrouped.
+    DeleteWorkspace { id: u64 },
+    /// Reorder: place `id` before `before`, or last when it is `None`.
+    MoveWorkspace { id: u64, before: Option<u64> },
+    /// Reorder a session within its workspace's manual order. Membership
+    /// itself follows the session's directory, so this never moves a session
+    /// between workspaces.
+    MoveSession { workspace_id: u64, session_id: u64, before: Option<u64> },
     /// Page through a session's **raw event log** — the ledger the Trajectory
     /// view draws (UI guide §10). Unlike `LoadSession`, which answers with the
     /// *derived* surface the model sees, this returns every line the log
@@ -385,6 +417,10 @@ pub enum Response {
     SessionSearch  { hits: Vec<SessionHit> },
     SessionCreated { id: u64 },
     SessionLoaded  { session: SessionDump },
+    /// The whole workspace projection. It is small — one row per registered
+    /// directory — so every mutation answers with all of it rather than a
+    /// delta the frontend would have to reconcile.
+    Workspaces     { rows: Vec<WorkspaceDump>, ungrouped: Vec<u64> },
     Catalog        { entries: Vec<CatalogEntry> },
     /// Outcome text of a `RunCommand` (shown in the log panel; never model
     /// history).
@@ -625,6 +661,30 @@ pub struct SessionMeta {
     /// renders it as a relative bucket (§4.2).
     #[serde(default)]
     pub updated_at: i64,
+    /// The directory this session works in (§3.9). `None` for a session
+    /// created before sessions had their own — it runs in the process
+    /// default and groups as Ungrouped.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+}
+
+/// One registered workspace (§3.9).
+///
+/// `sessions` is a **manual** order — a new session is prepended, activity
+/// never reorders it — and holds only sessions whose own header agrees with
+/// this workspace's path, so a stale account entry is filtered out here
+/// rather than shown as a session that is not there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceDump {
+    pub id: u64,
+    pub path: PathBuf,
+    pub title: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub sessions: Vec<u64>,
+    /// The directory is not there *right now*. Answered live and never
+    /// stored: an unmounted drive is a status, not a deletion.
+    pub missing: bool,
 }
 
 /// One content-search hit: the session that matched plus the line it matched
@@ -775,6 +835,10 @@ pub enum Event {
     /// Emitted after the auto-title agent renames a session. Lets the FE
     /// sidebar update without polling `ListSessions`.
     SessionTitleChanged { session_id: u64, title: String },
+
+    /// Pushed after every workspace mutation, carrying the whole projection
+    /// (§3.9). Same shape as `Response::Workspaces`.
+    WorkspacesChanged { rows: Vec<WorkspaceDump>, ungrouped: Vec<u64> },
 
     // Live token meter (fixes the stale-meter bug from Python).
     //

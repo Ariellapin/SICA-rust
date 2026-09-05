@@ -316,7 +316,7 @@ impl Skill for RunCli {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => return err("missing or empty `command` arg"),
         };
-        let cwd = shell_cwd(&args);
+        let cwd = shell_cwd(&args, &ctx);
 
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("cmd");
@@ -340,8 +340,8 @@ impl Skill for RunCli {
 /// directory itself. Without this the command would inherit the backend
 /// process's own cwd — wherever the frontend happened to be launched from —
 /// rather than the folder the user pointed the agent at.
-fn shell_cwd(args: &Value) -> PathBuf {
-    let root = sica_core::paths::working_dir();
+fn shell_cwd(args: &Value, ctx: &SkillContext) -> PathBuf {
+    let root = call_root(None, ctx);
     match args
         .get("cwd")
         .and_then(|v| v.as_str())
@@ -463,7 +463,7 @@ impl Skill for RunPwsh {
             Some(c) if !c.is_empty() => c.to_string(),
             _ => return err("missing or empty `command` arg"),
         };
-        let cwd = shell_cwd(&args);
+        let cwd = shell_cwd(&args, &ctx);
 
         // On Windows prefer the system `powershell.exe`; everywhere else
         // (including the rare case where `powershell.exe` is missing on
@@ -526,12 +526,13 @@ impl Skill for ReadFile {
         Concurrency::Parallel
     }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
+        let root = call_root(Some(&self.root), &ctx);
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `path` arg"),
         };
-        let resolved = match resolve(&self.root, path) {
+        let resolved = match resolve(&root, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
         };
@@ -612,7 +613,8 @@ impl Skill for WriteFile {
     fn description(&self) -> &str { WRITE_FILE_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["path".into(), "content".into()] }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
+        let root = call_root(Some(&self.root), &ctx);
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `path` arg"),
@@ -622,7 +624,7 @@ impl Skill for WriteFile {
             None    => return err("missing `content` arg"),
         };
         let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(false);
-        let resolved = match resolve(&self.root, path) {
+        let resolved = match resolve(&root, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
         };
@@ -667,7 +669,8 @@ impl Skill for EditFile {
         vec!["path".into(), "old".into(), "new".into()]
     }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
+        let root = call_root(Some(&self.root), &ctx);
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `path` arg"),
@@ -680,7 +683,7 @@ impl Skill for EditFile {
             Some(s) => s.to_string(),
             None    => return err("missing `new` arg"),
         };
-        let resolved = match resolve(&self.root, path) {
+        let resolved = match resolve(&root, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
         };
@@ -755,14 +758,15 @@ impl Skill for Glob {
     fn description(&self) -> &str { GLOB_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["pattern".into()] }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
+        let root = call_root(Some(&self.root), &ctx);
         let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `pattern` arg"),
         };
         // gitignore-style overrides give us `**` semantics without a second
         // glob dialect — and the walker already honours .gitignore.
-        let overrides = match ignore::overrides::OverrideBuilder::new(&self.root)
+        let overrides = match ignore::overrides::OverrideBuilder::new(&root)
             .add(pattern)
             .and_then(|b| b.build())
         {
@@ -771,7 +775,7 @@ impl Skill for Glob {
         };
 
         let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        for entry in ignore::WalkBuilder::new(&self.root).build().flatten() {
+        for entry in ignore::WalkBuilder::new(&root).build().flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -808,7 +812,7 @@ impl Skill for Glob {
             ));
         }
         for (_, p) in &hits {
-            out.push_str(&display_relative(&self.root, p));
+            out.push_str(&display_relative(&root, p));
             out.push('\n');
         }
         out.pop();
@@ -830,7 +834,8 @@ impl Skill for Grep {
     fn description(&self) -> &str { GREP_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["pattern".into(), "path".into()] }
 
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
+        let root = call_root(Some(&self.root), &ctx);
         let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `pattern` arg"),
@@ -844,7 +849,7 @@ impl Skill for Grep {
             Ok(r)  => r,
             Err(e) => return err(&format!("bad regex {pattern:?}: {e}")),
         };
-        let start = match resolve(&self.root, path) {
+        let start = match resolve(&root, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
         };
@@ -864,7 +869,7 @@ impl Skill for Grep {
                 }
                 total += 1;
                 if rows.len() < MAX_GREP_MATCHES {
-                    rows.push(format!("{}:{}: {}", display_relative(&self.root, file), i + 1, line));
+                    rows.push(format!("{}:{}: {}", display_relative(&root, file), i + 1, line));
                 } else {
                     capped = true;
                 }
@@ -884,7 +889,7 @@ impl Skill for Grep {
         if rows.is_empty() {
             return SkillOutcome {
                 ok: true,
-                summary: format!("no matches for {pattern:?} under {}", display_relative(&self.root, &start)),
+                summary: format!("no matches for {pattern:?} under {}", display_relative(&root, &start)),
             };
         }
         let mut out = rows.join("\n");
@@ -1019,6 +1024,19 @@ pub fn seed_defaults(skills_dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Directory a call resolves relative paths against.
+///
+/// The session's own working directory wins (guide §3.9); `fallback` — the
+/// root the skill was registered with — is what a call outside any session
+/// gets, and `None` falls back to the process default. The registry is built
+/// once at startup and shared by every session, so a skill that trusted only
+/// its construction-time root would send every session to the same folder.
+pub(crate) fn call_root(fallback: Option<&Path>, ctx: &SkillContext) -> PathBuf {
+    ctx.cwd().unwrap_or_else(|| {
+        fallback.map(Path::to_path_buf).unwrap_or_else(sica_core::paths::working_dir)
+    })
 }
 
 pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {

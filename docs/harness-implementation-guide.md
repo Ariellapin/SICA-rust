@@ -233,6 +233,206 @@ Per-message 👍/👎 (S): `EventKind::MessageFeedback { seq_ref, rating, note }
 — log-only, never surfaced; FE buttons on the assistant action strip. Useful
 as labels for `model-eval` later.
 
+### 3.8 `dsh-session-format*` — the header, format versions and migrations — **done** (Wave 9, protocol v26)
+
+**Mechanism.** Per-session metadata travels *beside* the log, never in it: a
+`SessionHeader { version, id, createdAt, cwd, parentSession, isSeeded, origin,
+delegationDepth, agentPreset }` stamped from `SESSION_FORMAT_VERSION`.
+`stat`/`list` read headers only — listing never opens a cold body, so a
+format upgrade can never turn startup into a scan. `open` runs the
+build-static migration chain (`session-format-v0-to-v1`, `-v1-to-v2`, indexed
+by `session-format-catalog`) under per-id serialisation, leaves every source
+byte untouched, and publishes only the final generation. A *future* version
+is refused with `SessionFormatUnsupportedError` — distinct from the
+corruption error, because nothing is damaged — and a future highest
+generation refuses even when an older readable one remains. Current-format
+restoration keeps unknown events marked `ignorable: true`; the historical
+migrations refuse an unknown type outright.
+
+**sica-rust today.** No version anywhere. `SessionCreated { id, title,
+created_at }` is line 1 and doubles as the header; `EventKind::Unknown`
+(`#[serde(other)]`, Wave 1) makes an older build *silently* accept a newer
+log, which is the opposite of dsh's fail-closed refusal; `sessions_store`
+lists by reading every log in full; and nothing records the directory a
+session was working in, so a session made under one folder reopens under
+whatever `working_dir()` is current (§3.9 needs exactly this fact).
+
+#### What shipped
+
+`SessionCreated += format: u16, cwd: Option<PathBuf>`, both
+`#[serde(default)]` (`0` = pre-format, `None` = the process default), with
+`pub const SESSION_FORMAT: u16 = 1` in `sica_core::event`. The header stays
+line 1 — a sidecar file is one more thing to lose.
+
+`sica_core::event::migrate` is the chain: pure
+`fn(&mut Vec<serde_json::Value>)` steps indexed by the generation they
+upgrade *from*, so `CHAIN[0]` is v0→v1 and `CHAIN.len() == SESSION_FORMAT`
+(a test pins that). `migrate::plan` answers `Current | Migrate { from } |
+Future { format }`, and the loader acts on each: a future log is **skipped
+with a WARN naming the file** and never rewritten (nothing is damaged — this
+build simply cannot know what the rows mean), an older one is migrated in
+memory and the file republished *whole and atomically* only on its next
+append. That delay is the point: opening an old session read-only leaves the
+disk exactly as it was, and a test asserts the bytes are unchanged after a
+load. Steps run on `Value`, not on `EventKind`, because a migration exists
+precisely when the typed form of the old rows is gone from the build that
+has to read them — and a step reshapes rows, never removes one.
+
+`read_log` also counts rows that land as `EventKind::Unknown` and emits one
+WARN per log with the count, so what Wave 1 made *silent* acceptance is now
+*visible* acceptance.
+
+`sessions_store::list_headers` answers a listing from the header alone —
+`SessionHeader { id, format, title, created_at, cwd, updated_at, archived }`.
+It reads line 1, then scans the rest as text, `serde_json`-parsing only the
+rows that can change what a listing shows (`session_title`,
+`session_archived`) and reading `ts` off the raw line. A bounded *tail*, the
+shape this section originally called for, would have lost the auto-title of
+any long session — the titler writes early and the body grows after it — so
+the cheap read covers the whole file and a test asserts it agrees with a
+full load, title, archive flag, cwd and `updated_at` alike. Its first
+production caller is the §3.9 bootstrap.
+
+A fork inherits its source's directory (`SessionLog::fork`), which is the
+same rule as the header being the truth: a fork that reopened in the process
+default would be a silent move.
+
+#### Left for later
+
+- **Lazy bodies.** `LoadSession` is still not the only place a body is read:
+  `ChatHub::new_loaded` keeps every log resident, as it always has, and
+  `list_headers` is used by the registry rather than by `ListSessions`.
+  Making the map lazy is a separate refactor of the hub's resident-map
+  assumption (search, projections and the invariants all read it), and it
+  buys startup time rather than correctness.
+
+### 3.9 `dsh-workspace`, `dsh-api-workspace-controller`, `dsh-host-directory-picker*` — the workspace registry — **done** (Wave 9, protocol v26)
+
+**Mechanism.** A workspace is the durable record of a directory the user works
+in: `{ id: uuid, path, title, createdAt, updatedAt, sessionIds }`, where
+`path` is the `fs.realpath` canon (trailing slashes, `..` and symlinks
+resolved — a symlink to an owned directory *collides*) and is never rewritten,
+even when the directory disappears; `title` defaults to the final path
+segment; `sessionIds` is a manually ordered account (a new session is
+prepended, `insertSessionBefore` reorders, activity never reorders).
+Membership needs **both** an id on the account and a session header whose
+canonical `cwd` equals the path, so a session belongs to at most one workspace
+and a stale account entry is filtered on read and pruned on the next write.
+`ctx.workspaceRegistry`: `create(path, title?)` is idempotent per canonical
+path and rejects a relative, missing or non-directory path; `get`/`list` are
+synchronous cache reads; `resolveByPath` never creates; `delete(id)` removes
+the *registration only* — directory, files, live sessions and logs are
+untouched and its sessions become **Ungrouped**; `insertBefore` orders the
+registry; `archiveSession` hides a session from every grouping surface;
+`status()` answers `ok | missing-dir` live and never mutates (the folder may
+only be temporarily unmounted). Create and delete write a pending-mutation
+marker before their two writes; startup rolls an interrupted create *back*
+(it is re-creatable) and an interrupted delete *forward*. On first start the
+registry **bootstraps from session headers alone** (id, cwd, createdAt —
+never bodies): sessions with a valid cwd are grouped per directory newest
+first, cwd-less legacy sessions stay Ungrouped, and the initialised marker is
+written last so an interrupted bootstrap resumes. Sessions get their cwd from
+whoever creates them: the session controller resolves a new session's cwd
+from the chosen workspace's path, creates the session so the cwd lands in its
+immutable header, *then* attaches — which re-validates. The subsystem is
+**invisible to models**: no tools, no prompt text, no session events.
+
+Picking a directory is its own seam, `ctx.directoryPicker`, with two backends
+behind one `capability()`: **native** (`kind: 'native', pick(signal)` — one
+OS chooser per pick: `osascript`, Zenity then KDialog, or a child-process
+`IFileOpenDialog` on Windows; `null` on cancel; abort kills the chooser) and
+**browse** (`kind: 'browse', list(path?), createDirectory(path, name)` — one
+level at a time, directories only, name-sorted, a host-owned `hidden` flag,
+`crumbs` from the filesystem root, a `home` anchor, `maxEntries 1000` with
+`truncated: true`; creation is non-recursive and takes one path segment; the
+errors are the closed set `directory-unreadable | directory-exists |
+directory-create-failed`). Both refuse a path that is not fully qualified — on
+Windows the rooted-but-driveless `\foo` and an incomplete UNC prefix pass
+`isAbsolute` yet resolve against the process drive, so they are refused
+rather than rebased. `-auto` samples the host once per boot (loopback bind, no
+`SSH_*`, a display → native; anything ambiguous → browse).
+
+**sica-rust today.** One folder for the whole app: `paths::working_dir()` —
+`SICA_WORKING_DIR` on the BE child, set from Settings › General (the app
+folder, the last five choices, or an `rfd` native chooser; UI guide UI-7).
+Changing it **restarts the BE**, every session shares it, and because no
+session records its cwd (§3.8), the one made under `~/proj-a` silently
+reopens under `~/proj-b`. `agents::instructions::load(root, cwd, …)`,
+`builtins::shell_cwd`, the `workspace-write` confinement and `{{cwd}}` all
+read the process global.
+
+**Shipped (M, protocol v26).** Three parts, in this order.
+
+1. **`cwd` per session.** `ToolSubAgent` carries `cwd: Option<PathBuf>`,
+   inherited by `child()`, and `SkillContext::cwd()` is what a skill reads;
+   `builtins::call_root` is the one rule — *the call's directory wins over
+   the root the skill was registered with* — because the registry is built
+   once at startup and shared by every session. `read-file`, `write-file`,
+   `edit-file`, `glob`, `grep` and both shells go through it, and so do
+   prompt assembly (`prompt::standard_vars_in`, which renders `{{cwd}}`),
+   the AGENTS.md chain (`refresh_instructions` reads `log.cwd()`), the
+   runtime-context snapshot, `ReadBeforeEdit`, `PermissionPolicy`'s
+   confinement root and the hooks (payload `cwd` and the child's working
+   directory; the hooks *file* is still discovered once at BE start from the
+   process default, since a config that changed under a running turn would
+   make two calls in one turn answer to different rules).
+   `chat::session_cwd` resolves it from the header, falling back to
+   `working_dir()` for a legacy log. Every new session records a directory
+   even without a workspace — that is what stops one made under `~/proj-a`
+   from reopening under `~/proj-b` — so `SICA_WORKING_DIR` survives as the
+   default for Ungrouped sessions, exactly as this section asked.
+2. **The registry — `backend::workspaces`** over one JSON file,
+   `sica-settings/workspaces.json` (`{ version, order: [id], rows: { id: {
+   path, title, created_at, updated_at, sessions: [id] } } }`), written
+   through `atomic_write` (§14.6). `u64` ids from the same counter as
+   sessions (`ChatHub::next_id`); `path` canonicalised with
+   `std::fs::canonicalize` and the `\\?\` prefix stripped, relative paths
+   refused. `create` idempotent by canonical path; `delete` = registration
+   only; membership = id on the account **and** `SessionCreated.cwd == path`,
+   filtered on read and pruned on the next write; `missing` =
+   `!Path::is_dir()` at answer time, never stored. `project` also picks up a
+   session whose header names a workspace the account has never heard of —
+   the header is the truth, so an ordering entry that is merely absent must
+   not hide a session. `bootstrap_if_empty` runs on a missing document, from
+   `sessions_store::list_headers` (id, cwd, created_at — never a body),
+   newest first, the file written last. No pending-mutation marker: one file
+   and one atomic rename, so the two-write hazard does not exist. A
+   `version` from the future is refused *and* write-locked for the run; a
+   corrupt document is derived data, so it is moved aside and rebuilt.
+3. **Protocol (v26).** `Request::ListWorkspaces` → `Response::Workspaces {
+   rows: Vec<WorkspaceDump>, ungrouped: Vec<u64> }` with `WorkspaceDump {
+   id, path, title, created_at, updated_at, sessions: Vec<u64>, missing:
+   bool }`; `CreateWorkspace { path, title: Option<String> }` (answers
+   `Workspaces`, or `Error` with the OS reason for a missing or
+   non-directory path); `RenameWorkspace { id, title }` · `DeleteWorkspace {
+   id }` · `MoveWorkspace { id, before: Option<u64> }` · `MoveSession {
+   workspace_id, session_id, before: Option<u64> }`; `NewSession` gains `{
+   workspace_id: Option<u64> }` — the BE resolves the cwd, stamps the header,
+   then attaches, the same create-then-attach order, so the header is the
+   proof. Every mutation pushes `Event::WorkspacesChanged` carrying the full
+   projection (it is small), and `SessionMeta += cwd: Option<PathBuf>`.
+   `ArchiveSession` already exists and already hides the row everywhere —
+   `project` filters archived sessions out of both the groups and Ungrouped.
+
+The directory picker is the FE's existing `rfd::FileDialog::pick_folder` —
+frontend and backend always share a machine, so the browse backend and the
+boot-time chooser have nothing to decide here; the fence is kept
+(canonicalise on the BE, refuse relative) and so is the rule that a missing
+folder is a *status*, not a deletion. Eleven tests in `backend::workspaces`
+cover canonical-path idempotence across three spellings of one directory,
+refusing a relative / missing / non-directory path, membership filtering a
+session whose header disagrees, the orphan a bare header still groups,
+delete leaving the directory and the log on disk, `missing` surviving its
+folder, bootstrap grouping newest-first with a cwd-less log landing in
+Ungrouped and surviving a restart, manual ordering of both kinds, a future
+document, a corrupt one, and archived sessions vanishing from every surface.
+`smoke` walks the wire path end to end: create → new session in it →
+`ListWorkspaces` shows it → delete → it is Ungrouped and still loads.
+
+**The UI is UI guide §4.3 and has not landed.** Until it does the FE sends
+`workspace_id: None` and drops `Event::WorkspacesChanged`, so the registry is
+reachable over the wire and exercised by `smoke`, but invisible in the app.
+
 ---
 
 ## 4. LLM seam
@@ -711,9 +911,9 @@ model is offered `run-code` **plus those controls** as direct native tools
 (`ptc::direct_view`), and everything else only from inside a program
 (`ptc::program_view`). Without that split, turning PTC on would silently
 remove plan mode, todos, goals and the ability to ask a question.
-Delegation (`subagent`, `ralph`, `agent-team`) stays program-callable: it is
-driven by the main agent, not a runtime-owned child, so `CHILD_EXCLUDED`
-does not apply.
+Delegation (`subagent`, `ralph`, `agent-team`, `workflow`) stays
+program-callable: it is driven by the main agent, not a runtime-owned
+child, so `CHILD_EXCLUDED` does not apply.
 
 A model-direct call to anything else is refused in `run_native_one` before
 the policy pipeline, with `ptc::direct_call_refused`, from the `tool_mode`
@@ -956,12 +1156,36 @@ query }` (walk with `ignore`, cap 200). On send, the BE expands `@path` into
 `ContextInjected { source: FileReference, content: <file body, framed
 untrusted, 32 KiB cap> }`.
 
-### 9.6 `dsh-attachment(-local)` — **present (variant)**
+### 9.6 `dsh-attachment(-local)`, `dsh-client-file-upload` — **present (variant)**
 
-Images ride on `UserImage` inline base64. dsh content-addresses them and keeps
-base64 out of the log. S: store `sessions/<id>/attachments/<sha>.png` and
-put only the hash in `UserMessage.images` — the log files are currently
-bloated by every pasted screenshot.
+**Mechanism.** Bytes go to `ctx.attachments` first, and the log gets an
+immutable content-addressed reference (`sha256:<digest>` plus verified
+`mediaType`, `bytes`, `width`, `height`, an optional path-stripped `name` and
+the pre-normalisation dimensions) only after the object is durable under
+`<DSH_HOME>/attachments/v1`; no base64, object URL or temp path ever reaches
+an event or a model block. Admission limits: **20 images and 200 MiB of
+source per message; one source ≤ 20 MiB, ≤ 64 Mpixel, ≤ 8192 px a side**;
+normalisation then caps the long edge at **2048 px** and the encoding at
+**4 MiB**. Every authoritative read re-verifies digest, signature and
+dimensions. Generic files are a second path: the browser streams them to a
+session-addressed upload route and receives an opaque **receipt** that a
+later prompt cites; the host promotes receipts to durable references during
+prompt admission, so a wire caller can never cite an attachment it did not
+upload.
+
+**sica-rust today.** Images ride on `UserImage` inline base64 in
+`UserMessage.images` (paste, drop, the `+` picker) — every pasted screenshot
+bloats the JSONL and re-crosses the pipe on each reload. No generic files.
+
+**Implement (S).** Store `sessions/<id>/attachments/<sha256>.<ext>` and keep
+only `{ sha, media_type, bytes, width, height, name }` in the event; resolve
+on history derivation. Adopt dsh's admission numbers as constants and
+downscale on intake (the FE already depends on `image` for paste) — the 4 MiB
+cap is also what keeps a request under the provider's body limit. Generic
+files need no store: a dropped `.txt` / `.md` / `.csv` becomes
+`ContextInjected { source: FileReference }` with the file's text through
+`retain` (§6.10), which is what `@path` already produces. The UI is UI guide
+§5.3.
 
 ---
 
@@ -1204,7 +1428,7 @@ Per-owner concurrency limit 10; jobs die with the process.
   model learns of it at the next step, or a follow-up turn if idle.
 - `Event::JobsChanged` (bump) for a jobs list in the FE session header.
 
-### 12.5 `dsh-workflow`, `dsh-workflow-worker-thread`, `dsh-tool-workflow`
+### 12.5 `dsh-workflow`, `dsh-workflow-worker-thread`, `dsh-tool-workflow` — **done** (Wave 8)
 
 **Mechanism.** The model writes a plain JavaScript orchestration script run in
 a fresh worker with `agent(prompt, {label, phase, schema, provider, model})`,
@@ -1213,10 +1437,94 @@ a fresh worker with `agent(prompt, {label, phase, schema, provider, model})`,
 coordinates them." Identity travels as a `meta` parameter, not code. Misused
 hooks kill the script; a child failure is a per-item `null`.
 
-**Implement (L, after §7's runtime).** The same Rhai/boa sandbox with
-`agent(prompt, #{schema: …})` bound to `run_conversation` (§12.1), `parallel`
-as `join_all`, and the `WorkflowRun` rendered as nested chips. Skip until
-subagents and structured output exist — it composes them.
+**Why it matters.** *"Summarise each of these six modules, then reconcile the
+six summaries"* is one thought, but without a workflow it costs one main-agent
+turn — and one main-agent context — per step.
+
+#### What shipped
+
+`agents::workflow`, the `workflow` skill: `workflow '<script>'` with an
+optional `input`. It runs in **the same sandbox as `run-code`**, which was
+the point of doing §7 first — that sandbox is now `agents::script`
+([`Sandbox`], [`Limits`], the abort wording, the Rhai↔JSON conversions),
+shared by both skills so the two runtimes cannot drift and a later swap to
+a JavaScript engine is one seam instead of two. What differs is only the
+host functions bound onto the engine.
+
+The script gets **no tools at all** — not a narrowed set, none. It cannot
+read a file, run a command or reach the network, and the unit test that
+pins this asserts `read_file`, `tool` and `run_cli` all fail with "Function
+not found". That is dsh's rule taken literally, and it is what keeps a
+workflow readable: every line is either control flow or a delegation.
+
+The bound verbs:
+
+| Verb | Behaviour |
+| --- | --- |
+| `agent(prompt)` | One child through [`runner::run_conversation`] — the same driver behind `subagent` and `ralph`, so the child's tool calls re-enter the guarded pipeline and its chips nest under the `workflow` chip. Returns the report string, prefixed **UNVERIFIED** when the child made no successful tool call. A failure throws, so `try`/`catch` decides whether it is fatal. |
+| `agent(prompt, #{ label, max_hops, schema })` | `schema` (a JSON Schema object) makes the child report through `structured-output` (§12.2) and turns the return value into an **indexable Rhai map**, so a script can branch on `r.status` rather than grep a string. `max_hops` is clamped to 1–24. |
+| `parallel([spec, …])` | Up to 8 children **concurrently**. A failed child contributes `()` — dsh's per-item null — because a fan-out whose branches are independent should not lose the other seven. |
+| `pipeline(items, …stages)` | Each item through each stage, sequentially. A stage returning `()` drops that item from the later stages, so a per-item failure stops costing agents. |
+| `phase(t)` / `log(m)` | `LogLine`s for the operator. Deliberately *not* program output: the result is what the script prints. |
+| `args` | The `input` argument, as a scope constant. |
+
+**`parallel` is the one deliberate departure from dsh's API, and it is the
+one that makes the primitive real.** dsh passes thunks; Rhai is
+single-threaded, so a thunk that calls `agent()` blocks the only thread
+there is and `parallel(thunks)` would be a loop wearing a costume. The
+*futures*, though, belong to the host — so `parallel` takes a list of agent
+specifications and drives them with `join_all`. Genuinely concurrent, and
+the only concurrency either script runtime has.
+
+Caps, in the order they bite: 8 per fan-out, 32 children per script
+(reserved **before** a fan-out spawns, so an over-budget `parallel` fails
+having spent nothing), 200 000 operations — two orders of magnitude below
+`run-code`'s, because a workflow that needs two million operations of its
+own has stopped coordinating and started computing — and a 45-minute
+wall-clock deadline polled from `on_progress` alongside the interrupt token.
+
+**It is opt-in, on `agent-team`'s terms** (§12.7): the skill registers only
+when `skills/workflow.md` exists on disk. Two reasons, and the second is the
+one that decided it. One call can spend 32 full LLM conversations. And the
+scripting reference has to be in the system prompt — a model cannot write a
+second language from a one-line description — which measured at **~575
+tokens on every request of every session**, whether or not that session ever
+writes a script. Gating the skill gates the section with it
+(`prompt::order::WORKFLOW_SDK`, 5100, next to the PTC SDK's 5000), and the
+five replay recordings stayed byte-identical, which is how the gate was
+verified rather than asserted.
+
+Children run on `registry.excluding(CHILD_EXCLUDED)`, and `workflow` was
+added to that list: a workflow child starting a workflow is the recursion
+`CHILD_EXCLUDED` exists to stop.
+
+Coverage: 8 tests in `agents::script` (output, the three abort reasons, the
+scope constant, the JSON round trip, the output window), 22 in
+`agents::workflow`, and one in `agents::prompt` for the gate. The workflow
+tests replace exactly one function — `drive`, the part that needs a
+provider — and drive the *real* `spec_from`, `plan`, `claim`, `label_for`
+and `pipeline` through the real engine; one more runs `Workflow::run` end to
+end through `spawn_blocking` with a script that calls no agent.
+
+#### Left for later
+
+- **No replay scenario, and none is possible today.** §14.1's design is that
+  a recorded `session.jsonl` *is* the LLM script — but a delegated child's
+  replies are never written to the session log, so a scenario whose run
+  consumes child completions cannot survive its own `--bless`. This is why
+  `subagent`, `ralph` and `agent-team` have no scenario either; it is a
+  property of the replay design, not of this feature. Fixing it means
+  recording child conversations in a sidecar the way `replay.override.json`
+  already carries what the log cannot express.
+- **A `WorkflowRun` structure and durable nesting.** Progress is `LogLine`s
+  and the children's live chips, the same shape `ralph` uses. Reconstructing
+  a finished workflow after a reload needs `ToolResult.parent_seq`
+  (Appendix A) — still unused, still the same one change for §7, §12.6 and
+  this.
+- **`provider` / `model` per agent.** dsh lets a script pick a cheaper model
+  per step. Here every child runs on the session's connection.
+- **Thunk-style `parallel`** if the runtime ever gains concurrency (a JS
+  engine with a real event loop would).
 
 ### 12.6 `dsh-tool-ralph` — fresh-agent rounds
 
@@ -1381,7 +1689,7 @@ tool surface, declared as `tool_mode` in its `scenario.toml`.
 (`SICA_WORKSPACE_ROOT`) so it never sees the checkout's state or the
 previous run's.
 
-Four things the design had to learn from contact with the code. A
+Five things the design had to learn from contact with the code. A
 `CompactionSummary` is a completion too, so it is a script entry — a
 script built only from assistant rows runs one call short and every later
 reply answers the wrong request. `TurnFinished` is emitted per **hop**, so
@@ -1395,7 +1703,14 @@ the prompt — a spill notice names the file it spilled to — so the driver
 zero-pads its pid into the directory name: without that, a 4-digit pid and
 a 5-digit one price the same history one token apart and `token_usage`
 diverges on roughly every other run, which reads as a flaky harness rather
-than as what it is.
+than as what it is. And **a delegated conversation cannot be recorded at
+all**: the script *is* the session log, and a child's completions never
+reach it, so a scenario that spends child calls would lose them the moment
+it was re-blessed. That is why `subagent`, `ralph`, `agent-team` and
+`workflow` (§12.5) have no scenario — a limit of the recording format, not
+of those features. Lifting it means a sidecar for child conversations, next
+to the `replay.override.json` that already carries what the log cannot
+express.
 
 ### 14.2 `dsh-llm-mock-server` — scripted fault server — **done** (Wave 5)
 
@@ -1466,19 +1781,29 @@ types, and `main.rs` is the one composition point — which is already how
 wanted, the markdown files (`skills/`, `agents/`, `commands/`) plus §13.1
 hooks and §13.2 MCP are the safe versions of it.
 
-### 14.6 Infrastructure packages with no sica-rust counterpart
+### 14.6 Infrastructure packages — what each is, and the sica-rust stance
 
-`dsh-api-*`, `dsh-typert-*` (generated remote RPC), `dsh-host-*` (web
-server, directory pickers), `dsh-client-*` (~45 React UI packages — the ideas
-in §3.3, §11, §12.4 are the transferable ones), `dsh-storage-*` (typed KV
-domains; `sica-settings.json` + TOML suffice), `dsh-settings-file`
-(comment-preserving YAML; n/a), `dsh-credentials-*` (S if wanted: resolve
-`${ENV_VAR}` references in provider TOML so keys leave the repo),
-`dsh-http-proxy` (S: honour `HTTPS_PROXY` in `LlmClient::new` via reqwest's
-`Proxy::from_env`), `dsh-util-*`, `dsh-experimental-webworker-*`,
-`dsh-sdk-*` and `dsh-acp` (an SDK/stdio-RPC surface for driving sica-rust
-headlessly would be `backend --ipc` plus a JSON codec — M, if a use appears),
-`vendor/*`.
+Where a package has no counterpart the reason is given rather than a bare
+"n/a"; where a small port earns its keep it is sized. The ~45 `dsh-client-*`
+React packages are the UI guide's subject and are not repeated here.
+
+| dsh | Mechanism | sica-rust |
+| --- | --- | --- |
+| `dsh-settings`, `dsh-settings-file`, `dsh-api-settings-controller` | One user-owned document of per-namespace sections; each owner registers a schema and reads `defaults → composition base → user layer`; `applies: live \| restart` is a UI hint the settings surface badges; `validate` refuses a cross-field-invalid *write* rather than storing a value that would disable its owner; writes are revision-fenced; external edits are pushed to owners; the file provider preserves comments | `frontend::settings_store::Settings` (flat, serde defaults) plus one TOML per provider or MCP server. Worth porting: the **`applies` badge** on rows that need a BE restart, and **watching `sica-settings.json` and `sica-settings/**` for external edits** so "Open configuration file" round-trips without a restart (S — the FE already runs a `notify` watcher over the source tree; still to do, and it is a frontend surface, so it belongs with UI guide §7.2). Revision fencing is moot with one writer |
+| `dsh-credentials`, `dsh-credentials-local`, `dsh-authorization` | Config carries *references* (env-var names), never values; layers `env → file → project-env → user-env`; consumers re-resolve **per operation**, so a rotated key reaches the next request without a restart; `describe(ref)` answers configured / source / writable without the value, so the read half can cross the wire; an empty value is absent everywhere; a project `.env` may not set proxy variables ("it arrives with `git clone`"). `authorization` is the browser-session token for the HTTP API | Keys sit in `sica-settings/llm-providers/*.toml` and `web.toml` (gitignored). **Done (Wave 9)** — `sica_core::creds`: `api_key = "${DEEPSEEK_API_KEY}"` resolves at request time from the process env, then `<workspace_root>/sica-settings/.env` (never the working directory's `.env` — dsh's rule), with an empty value absent everywhere and `describe` answering configured / source / unresolved *without* the value, which is the half that can safely cross a wire. Wired into `agents::web` (per search) and the FE's `ConnectLlm` (per connect), so a rotated key needs no restart and the stored settings keep the reference rather than the secret. **Left:** the write-only Models card showing "configured · env" — UI guide §7.2's row. Authorization is n/a: the pipe is per-user |
+| `dsh-storage`, `-domain`, `-json`, `-sqlite` | A hub of named backends (`json`: one whole human-readable file per unit, republished atomically; `sqlite`: one document per row) under one typed **domain** form: a spec with `name`, `version`, `layout: single \| per-record`, `compatibleVersions`, `invalidRecords: 'backup-and-skip'` for disposable derived data, zod record schemas; a `version-mismatch` read rejects, a per-record document outside the accepted set reads as absent | One JSON file per domain written through `atomic_write`; `workspaces.json` (§3.9) is the first, the projection cache (§3.3) would be the second if session sizes ever warrant it. Keep dsh's two rules: **stamp a version and refuse a newer one**, and **a malformed derived file is moved aside, never fatal** |
+| `dsh-atomic-write`, `dsh-home-paths`, `dsh-launch-environment`, `dsh-app-boot`, `dsh-cmdline`, `dsh-util-workspace-path` | temp + fsync + rename; `$DSH_HOME` (`~/.dsh`) resolution; `.env` loading at launch with the project-`.env` fence; the CLI's profile and patch flags | `sica_core::paths` + `SICA_WORKSPACE_ROOT` / `SICA_WORKING_DIR`. **Done (Wave 9)** — `sica_core::atomic::atomic_write(path, bytes)` (sibling temp file, `sync_all`, `rename`) plus `atomic_write_json`; used by the workspace registry (§3.9) and the §3.8 log rewrite. **Left:** `sica-settings.json` is still written in place by the FE |
+| `dsh-http-proxy` | Honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` read at launch; loopback always direct; credentials in the URL never echoed | **S:** reqwest's builder reads the env proxy by default — verify `LlmClient::new` never calls `no_proxy()`, and name `NO_PROXY` in the connection card's tooltip |
+| `dsh-api-gateway`, `-remotes`, `-session-controller`, `-workspace-controller`, `dsh-typert-*` | Generated remote RPC (`@Remote` verbs, a stream mode), the HTTP/WS gateway, one controller per surface | `backend::dispatcher` over bincode; a new request is added by hand (architecture.md). The controllers' *shapes* are what §3.9 copies |
+| `dsh-host-webserver`, `-frontend-static`, `dsh-client-connection`, `-hmr`, `-locale`, `-modules`, `-store`, `dsh-client-web`, `dsh-web-app`, `dsh-brand` | Serving the browser client; reconnect; the module roster; the locale registry | n/a — egui in-process. The locale registry is deliberately a `strings` module (UI guide §13) |
+| `dsh-host-plugin-inventory`, `dsh-client-ui-settings-plugin-inventory` | A read-only roster of loaded plugins with Enabled / Disabled / Failed and provenance, per preset | The Skills › Catalogue tab (UI guide §7.2) is the equivalent for skills, agents and commands; MCP servers and hooks get theirs in the Integrations tab (UI guide §7.2) |
+| `dsh-sdk-*` (`client`, `protocol`, `server`, `minimal`, `app`), `dsh-acp-app`, `dsh-headless`, the Python SDK | JSON-RPC over stdio for driving the harness headlessly; the ACP editor protocol; a Python wheel bundling the runtime | **M if a use appears:** `backend --ipc stdio` with a JSON codec in place of bincode is the whole surface — the dispatcher is already transport-agnostic. `replay` and `smoke` are the headless drivers that exist today |
+| `dsh-subagent-acp`, `-claude-code`, `-codex`, `-dsh-sdk` | External CLIs as subagent providers behind the §12.1 contract | **S–M each, only when such a CLI is installed:** a `subagent-<cli>` skill that runs `claude -p` / `codex exec` under `run-cli`'s `JobGuard`, feeds the task on stdin, and frames stdout as an untrusted child report (§9.4) |
+| `dsh-code-runtime`, `-worker-thread`, `dsh-experimental-code-runtime-python` | The PTC program runtime and its worker-thread isolation; an experimental Python runtime | §7 on `rhai`; Python n/a |
+| `dsh-experimental-inspector` | Chrome DevTools over CDP for the host *and* connected clients: console evaluation, sources, captured fetches, the Cordis tree as an Elements panel | n/a. The Trajectory view's inspector, `--invariants` (§14.3) and the raw LLM log are the sica-rust windows into a run |
+| `dsh-webhook`, `-github`, the `github-ready-review` overlay | A signed `POST /github` on a second listener creates a titled root session under the repository's workspace when a PR goes ready-for-review, with a read-only review prompt | n/a: server-side session creation. The desktop equivalent is a `/review <pr>` command over `gh pr diff`, which is a `commands/*.md` file, not a feature |
+| `dsh-identity` (`anonymous-user-id`), `dsh-session-telemetry-otel`, `dsh-feedback` | An anonymous id, OTel export, feedback upload | n/a (§3.7) |
+| `dsh-experimental-webworker-*`, `dsh-util-*`, `dsh-deque`, `dsh-timeout`, `dsh-native-command`, `dsh-base`, `dsh-loader-smoke`, `dsh-agent-loop-testkit`, `dsh-test-support`, `vendor/*` | Browser-worker packaging, utilities, a no-shell subprocess runner, the loader smoke test, test kits | n/a; `agents::proc` and the inline `#[cfg(test)]` modules cover the same ground |
 
 ---
 
@@ -1495,7 +1820,9 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | **5 — ecosystem & evals** — **done** (protocol v23) | hooks (§13.1, `backend::hooks` + `HooksPolicy`) · MCP (§13.2, `agents::mcp` on `rmcp`, `Skill::parameters_schema`) · `web-fetch`/`web-search` (§13.3, `agents::web`) · session projections (§3.3, `sica_core::project` + `Request::SessionStats`) · mock LLM server (§14.2, `llm::mock`) · replay evals (§14.1, `llm::replay` + `sica_core::snapshot` + `--bin replay`, four scenarios) · invariants (§14.3, `backend::invariants` behind `--invariants`) | M×7 | yes (v23) |
 | **6 — presets** — **done** (protocol v24) | agent presets from `agents/*.md` (§5.2, `agents::preset` + `prompt::order::PERSONA` + `SkillRegistry::restricted_to` + `Request::SetSessionAgent`) | M×1 | yes (v24) |
 | **7 — PTC** — **done** (protocol v25) | programmatic tool calling (§7, `agents::ptc` on `rhai` + `prompt::order::PTC_SDK` + `ToolMode` + the `ptc-program` replay scenario) | XL×1 | yes (v25) |
-| **later** | workflow scripts (§12.5) · Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) | L/XL | — |
+| **8 — workflows** — **done** | model-written orchestration scripts (§12.5, `agents::workflow` on the shared `agents::script` sandbox + `prompt::order::WORKFLOW_SDK`, opt-in on `skills/workflow.md`) | L×1 | no |
+| **9 — workspaces & durability** — **done** (protocol v26) | per-session `cwd` + the format header and its migration chain (§3.8, `event::migrate` + `sessions_store::list_headers`) · workspace registry `backend::workspaces` + `NewSession { workspace_id }` (§3.9) · `sica_core::atomic::atomic_write` · credential references + `sica-settings/.env` (§14.6, `sica_core::creds`) | M×3 + S×2 | yes (v26) — `ListWorkspaces` … `MoveSession`, `Event::WorkspacesChanged`, `SessionMeta.cwd`; log-only `SessionCreated.format` / `.cwd` |
+| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · durable `WorkflowRun` events (§12.5, needed by UI guide §6.11) · lazy session bodies (§3.8) · settings-file watch and the write-only Models card (§14.6, both frontend surfaces — they belong with a UI wave) · content-addressed images (§9.6, its own shape change to `UserImage` and so its own bump) | L/XL | — |
 
 ---
 
@@ -1515,6 +1842,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | `JobFinished { id, status, exit_code }` — **done** (Wave 4) | no | §12.4 |
 | `Hook { event, command, decision, exit_code }` — **done** (Wave 5) | no | §13.1 |
 | `AgentPreset { name: Option<String> }` — **done** (Wave 6) | no | §5.2 |
+| `SessionCreated += format: u16, cwd: Option<PathBuf>` — **done** (Wave 9) | (existing; line 1 stays the header) | §3.8, §3.9 |
 | `MessageFeedback { seq_ref, rating, note }` | no | §3.7 |
 | `Schedule { id, fire_at, prompt }` | no | §12.8 |
 
@@ -1532,6 +1860,8 @@ by a newer backend still loads on an older one.
 | 5 — shipped as v23 | `SessionStats` | `Response::SessionStats` (`StatsDump`, `TurnRowDump`). Log-only: `EventKind::Hook`; wire-only: `EventTag::Hook`. `ListWorkspaceFiles` was dropped — the `@` picker walks the tree in the frontend, so no request is needed |
 | 6 — shipped as v24 | `SetSessionAgent` | `Event::SessionAgentChanged`; `SessionDump.agent`. Log-only: `EventKind::AgentPreset` |
 | 7 — shipped as v25 | — | `LlmOptions.native_tools: bool` → `LlmOptions.tool_mode: ToolMode { Text, Native, Ptc }`. No new variant: PTC rides the native `tools` array with a narrowed catalogue, and a program's sub-calls are live events only |
+| 8 — no bump | — | —. `workflow` (§12.5) is one more skill: its children reuse the delegation events Wave 4 already added, and its progress is `LogLine`s. `ToolResult.parent_seq` stays reserved and unused |
+| 9 — shipped as v26 | `ListWorkspaces`, `CreateWorkspace`, `RenameWorkspace`, `DeleteWorkspace`, `MoveWorkspace`, `MoveSession`; `NewSession { workspace_id }` | `Response::Workspaces` (`WorkspaceDump`); `Event::WorkspacesChanged`; `SessionMeta.cwd`. Log-only: `SessionCreated.format`, `SessionCreated.cwd`. Nothing for the registry itself — dsh logs no workspace event either |
 
 Every bump: `.\run.ps1 build --workspace`, restart the GUI, run
 `.\run.ps1 run -p frontend --bin smoke`, and update CLAUDE.md's version note.
@@ -1545,4 +1875,9 @@ session/src/{types,surface}.ts` · `packages/compaction/compaction-basic/src/
 summarizer.ts` · `packages/guard/repeat-tool-reminder` · `packages/spill/
 spill-policy` · `packages/context/agent-instructions/src/render.ts` ·
 `packages/workflow/tool-ralph/src/index.ts` · `packages/sandbox/
-sandbox-windows-acl` · `docs/tool-catalog.md` · `docs/config-catalog.md`.
+sandbox-windows-acl` · `docs/tool-catalog.md` · `docs/config-catalog.md` · `packages/workspace/
+workspace/src/{types,index}.ts` + `docs/subsystems/workspace.md` (the
+registry) · `packages/host/directory-picker-browse/src` (the listing fence) ·
+`packages/session/session-format*` + `docs/subsystems/persistence.md`
+("Format refusal") · `docs/subsystems/{settings,credentials,storage,
+attachment}.md`.

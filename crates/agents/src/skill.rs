@@ -35,6 +35,16 @@ pub struct SkillContext {
     pub sub: ToolSubAgent,
 }
 
+impl SkillContext {
+    /// Directory this call's session works in (guide §3.9), or `None` when
+    /// the call belongs to no session. A skill that resolves relative paths
+    /// prefers this over whatever root it was registered with: the registry
+    /// is process-wide and built once, the working directory is per session.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        self.sub.cwd.clone()
+    }
+}
+
 #[async_trait]
 pub trait Skill: Send + Sync {
     fn name(&self) -> &str;

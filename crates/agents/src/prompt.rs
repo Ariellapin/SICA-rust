@@ -45,6 +45,10 @@ pub mod order {
     /// rules of the script runtime plus one signature per callable tool.
     /// dsh renders its TypeScript SDK at the same slot.
     pub const PTC_SDK: i32 = 5000;
+    /// The `workflow` scripting reference (guide §12.5), present only when
+    /// the skill is registered. Constant, unlike the PTC SDK: a workflow
+    /// script has no tools, so there is no catalogue to generate.
+    pub const WORKFLOW_SDK: i32 = 5100;
     /// Structured-output mandate for subagent rounds (Wave 4).
     pub const STRUCTURED_OUTPUT: i32 = 9900;
 }
@@ -210,8 +214,15 @@ pub fn interpolate(
 /// variable is registered either way so references never fail; templates
 /// that print it should tolerate an empty value.
 pub fn standard_vars(model: &str) -> BTreeMap<String, String> {
+    standard_vars_in(model, &sica_core::paths::working_dir())
+}
+
+/// [`standard_vars`] for a session with its own working directory
+/// (guide §3.9). `{{cwd}}` is what the model reads to know where it is, so
+/// it has to be the session's folder and not the process default.
+pub fn standard_vars_in(model: &str, cwd: &std::path::Path) -> BTreeMap<String, String> {
     let mut vars = BTreeMap::new();
-    vars.insert("cwd".into(), sica_core::paths::working_dir().display().to_string());
+    vars.insert("cwd".into(), cwd.display().to_string());
     vars.insert("os".into(), std::env::consts::OS.to_string());
     vars.insert(
         "date".into(),
@@ -300,6 +311,11 @@ pub fn for_main_agent(
     if mode.ptc() {
         let sdk = crate::ptc::sdk_markdown(&crate::ptc::program_view(registry));
         a.section(Section::new("ptc-sdk", order::PTC_SDK, sdk));
+    }
+    // A workflow script is a second language the model has to write, so its
+    // reference is worth its tokens only where the skill actually exists.
+    if registry.by_name.contains_key(crate::workflow::WORKFLOW_NAME) {
+        a.section(Section::new("workflow-sdk", order::WORKFLOW_SDK, crate::workflow::SDK));
     }
     a.context(Section::new("runtime", 0, runtime_context_text(vars)));
     a.render()
@@ -493,6 +509,27 @@ mod tests {
         let vars = standard_vars("m");
         let r = for_main_agent("MEM", &reg, ToolMode::Native, &vars, None, None).unwrap();
         assert!(!r.system.contains("## Programmatic tool calling"), "{}", r.system);
+    }
+
+    #[test]
+    fn the_workflow_reference_costs_nothing_until_the_skill_is_registered() {
+        let vars = standard_vars("m");
+        let mut bare = SkillRegistry::new();
+        bare.register(Arc::new(Plain));
+        let without = for_main_agent("MEM", &bare, ToolMode::Native, &vars, None, None).unwrap();
+        assert!(!without.system.contains("## Workflow scripts"), "{}", without.system);
+
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Plain));
+        reg.register(Arc::new(crate::workflow::Workflow::new()));
+        let with = for_main_agent("MEM", &reg, ToolMode::Native, &vars, None, None).unwrap();
+        let sys = &with.system;
+        assert!(sys.contains("## Workflow scripts"), "{sys}");
+        assert!(sys.contains("`agent(prompt)`"), "{sys}");
+        // WORKFLOW_SDK (5100) sits after SKILL_GUIDANCE (1000), so the
+        // reference follows the one-liner that says when to reach for it.
+        let guidance = sys.find("Reach for `workflow`").expect("the guidance renders");
+        assert!(guidance < sys.find("## Workflow scripts").unwrap(), "{sys}");
     }
 
     #[test]

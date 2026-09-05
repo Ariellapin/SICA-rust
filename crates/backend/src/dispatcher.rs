@@ -35,8 +35,8 @@ pub async fn handle(
             let _ = shutdown_tx.send(()).await;
             Response::Ok
         }
-        Request::NewSession => {
-            let id = chat.create_session().await;
+        Request::NewSession { workspace_id } => {
+            let id = chat.create_session(workspace_id).await;
             Response::SessionCreated { id }
         }
         Request::ListSessions => {
@@ -94,6 +94,38 @@ pub async fn handle(
         Request::SearchSessions { query } => Response::SessionSearch {
             hits: chat.search_sessions(&query).await,
         },
+
+        // Workspaces (guide §3.9). Every mutation answers with the whole
+        // projection *and* pushes it, so a second frontend surface — the
+        // sidebar and an open picker, say — never disagree.
+        Request::ListWorkspaces => {
+            let (rows, ungrouped) = chat.workspace_projection().await;
+            Response::Workspaces { rows, ungrouped }
+        }
+        Request::CreateWorkspace { path, title } => {
+            let id = chat.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match chat.workspaces.create(id, std::path::Path::new(&path), title) {
+                Ok(_) => {
+                    chat.publish_workspaces().await;
+                    let (rows, ungrouped) = chat.workspace_projection().await;
+                    Response::Workspaces { rows, ungrouped }
+                }
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::RenameWorkspace { id, title } => {
+            workspace_result(chat, chat.workspaces.rename(id, &title), id).await
+        }
+        Request::DeleteWorkspace { id } => {
+            workspace_result(chat, chat.workspaces.delete(id), id).await
+        }
+        Request::MoveWorkspace { id, before } => {
+            workspace_result(chat, chat.workspaces.move_workspace(id, before), id).await
+        }
+        Request::MoveSession { workspace_id, session_id, before } => {
+            let ok = chat.workspaces.move_session(workspace_id, session_id, before);
+            workspace_result(chat, ok, workspace_id).await
+        }
         Request::ConnectLlm { base_url, model, api_key, options } => {
             // Spawn so the dispatcher can keep handling other requests while
             // the HTTP round-trip completes. State changes flow back via
@@ -215,3 +247,19 @@ pub async fn handle(
     }
 }
 
+
+/// Answer a workspace mutation: the whole projection on success, a
+/// reason on a workspace that is not there. Success also pushes the
+/// projection so every open surface updates without asking.
+async fn workspace_result(
+    chat: &crate::chat::ChatHub,
+    ok: bool,
+    id: u64,
+) -> Response {
+    if !ok {
+        return Response::Error { message: format!("workspace {id} not found") };
+    }
+    chat.publish_workspaces().await;
+    let (rows, ungrouped) = chat.workspace_projection().await;
+    Response::Workspaces { rows, ungrouped }
+}

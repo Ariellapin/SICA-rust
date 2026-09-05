@@ -372,11 +372,12 @@ pub fn payload(
     tool_input: Option<&Value>,
     tool_response: Option<&Value>,
     prompt: Option<&str>,
+    cwd: &Path,
 ) -> Value {
     let mut v = json!({
         "hook_event_name": event.name(),
         "session_id": session_id.to_string(),
-        "cwd": sica_core::paths::working_dir().display().to_string(),
+        "cwd": cwd.display().to_string(),
     });
     let map = v.as_object_mut().expect("payload is an object");
     if let Some(t) = tool {
@@ -395,16 +396,18 @@ pub fn payload(
 }
 
 /// Run every hook in `hooks` with `payload` on stdin and merge the answers.
-pub async fn run_all(hooks: &[&Hook], payload: &Value) -> Merged {
+/// Each runs in `cwd` — the calling session's directory (guide §3.9), so a
+/// hook's relative paths mean what the payload's `cwd` says they mean.
+pub async fn run_all(hooks: &[&Hook], payload: &Value, cwd: &Path) -> Merged {
     let body = payload.to_string();
     let mut answers = Vec::new();
     for h in hooks {
-        answers.push((h.command.clone(), run_one(h, &body).await));
+        answers.push((h.command.clone(), run_one(h, &body, cwd).await));
     }
     merge(answers)
 }
 
-async fn run_one(hook: &Hook, stdin_body: &str) -> HookAnswer {
+async fn run_one(hook: &Hook, stdin_body: &str, cwd: &Path) -> HookAnswer {
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.args(["/C", &hook.command]);
@@ -414,7 +417,7 @@ async fn run_one(hook: &Hook, stdin_body: &str) -> HookAnswer {
         c.args(["-c", &hook.command]);
         c
     };
-    cmd.current_dir(sica_core::paths::working_dir())
+    cmd.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -679,6 +682,10 @@ impl agents::pipeline::ToolPolicy for HooksPolicy {
         if hooks.is_empty() {
             return PreDecision::Allow;
         }
+        let cwd = match call.session_id {
+            Some(id) => crate::chat::session_cwd(&self.sessions, id).await,
+            None => sica_core::paths::working_dir(),
+        };
         let payload = payload(
             HookEvent::PreToolUse,
             call.session_id.unwrap_or(0),
@@ -686,8 +693,9 @@ impl agents::pipeline::ToolPolicy for HooksPolicy {
             Some(call.args),
             None,
             None,
+            &cwd,
         );
-        let merged = run_all(&hooks, &payload).await;
+        let merged = run_all(&hooks, &payload, &cwd).await;
         self.record(HookEvent::PreToolUse, call.session_id, &merged).await;
         match merged.rank {
             Rank::Allow => PreDecision::Allow,
@@ -719,6 +727,10 @@ impl agents::pipeline::ToolPolicy for HooksPolicy {
             "ok":      outcome.ok,
             "summary": sica_core::retain::utf8_head(&outcome.summary, 8 * 1024),
         });
+        let cwd = match call.session_id {
+            Some(id) => crate::chat::session_cwd(&self.sessions, id).await,
+            None => sica_core::paths::working_dir(),
+        };
         let payload = payload(
             HookEvent::PostToolUse,
             call.session_id.unwrap_or(0),
@@ -726,8 +738,9 @@ impl agents::pipeline::ToolPolicy for HooksPolicy {
             Some(call.args),
             Some(&response),
             None,
+            &cwd,
         );
-        let merged = run_all(&hooks, &payload).await;
+        let merged = run_all(&hooks, &payload, &cwd).await;
         self.record(HookEvent::PostToolUse, call.session_id, &merged).await;
         // A post hook cannot un-run the call, so `ask` has nothing to ask
         // about: only a deny is actionable, and it becomes feedback the
@@ -768,8 +781,9 @@ pub async fn run_event(
     if hooks.is_empty() {
         return Merged::default();
     }
-    let payload = payload(event, session_id, None, None, None, prompt);
-    let merged = run_all(&hooks, &payload).await;
+    let cwd = crate::chat::session_cwd(sessions, session_id).await;
+    let payload = payload(event, session_id, None, None, None, prompt, &cwd);
+    let merged = run_all(&hooks, &payload, &cwd).await;
     for (command, decision, exit_code) in &merged.ran {
         if decision == "error" {
             events.emit(protocol::Event::LogLine {
@@ -1007,6 +1021,7 @@ mod tests {
 
     #[test]
     fn the_payload_carries_only_the_fields_its_event_has() {
+        let cwd = sica_core::paths::working_dir();
         let pre = payload(
             HookEvent::PreToolUse,
             7,
@@ -1014,6 +1029,7 @@ mod tests {
             Some(&json!({ "path": "a.txt" })),
             None,
             None,
+            &cwd,
         );
         assert_eq!(pre["hook_event_name"], "PreToolUse");
         assert_eq!(pre["session_id"], "7");
@@ -1021,7 +1037,7 @@ mod tests {
         assert!(pre.get("tool_response").is_none());
         assert!(pre.get("prompt").is_none());
 
-        let prompt = payload(HookEvent::UserPromptSubmit, 7, None, None, None, Some("hi"));
+        let prompt = payload(HookEvent::UserPromptSubmit, 7, None, None, None, Some("hi"), &cwd);
         assert_eq!(prompt["prompt"], "hi");
         assert!(prompt.get("tool_name").is_none());
     }
@@ -1057,7 +1073,7 @@ mod tests {
             timeout: Duration::from_secs(20),
             matcher: None,
         };
-        let merged = run_all(&[&hook], &json!({ "hook_event_name": "PreToolUse" })).await;
+        let merged = run_all(&[&hook], &json!({ "hook_event_name": "PreToolUse" }), &sica_core::paths::working_dir()).await;
         assert_eq!(merged.rank, Rank::Deny);
         assert_eq!(merged.reason_text(), "denied by test");
         assert_eq!(merged.ran.len(), 1);
@@ -1072,7 +1088,7 @@ mod tests {
             timeout: Duration::from_secs(20),
             matcher: None,
         };
-        let merged = run_all(&[&hook], &json!({})).await;
+        let merged = run_all(&[&hook], &json!({}), &sica_core::paths::working_dir()).await;
         assert_eq!(merged.rank, Rank::Allow);
         assert_eq!(merged.ran[0].1, "error");
     }

@@ -107,7 +107,7 @@ fn brand_row(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         kit::col(t.alias.label[0]),
     );
     if brand.on_hover_text("New session").clicked() {
-        app.send(UiCommand::SendRequest(Request::NewSession));
+        app.send(UiCommand::SendRequest(Request::NewSession { workspace_id: None }));
     }
 
     // Panel toggle.
@@ -150,7 +150,7 @@ fn new_session(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
             kit::col(t.alias.label[0]),
         );
         if resp.on_hover_text("New session").clicked() {
-            app.send(UiCommand::SendRequest(Request::NewSession));
+            app.send(UiCommand::SendRequest(Request::NewSession { workspace_id: None }));
         }
         return;
     }
@@ -184,7 +184,7 @@ fn new_session(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         kit::col(t.alias.label[0]),
     );
     if resp.clicked() {
-        app.send(UiCommand::SendRequest(Request::NewSession));
+        app.send(UiCommand::SendRequest(Request::NewSession { workspace_id: None }));
     }
 }
 

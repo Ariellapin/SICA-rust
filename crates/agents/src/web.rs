@@ -279,7 +279,7 @@ fn no_config_message(detail: &str) -> String {
         "web-search is not configured: {detail}\n\
          Create {} with:\n\n\
          provider = \"brave\"   # brave | exa | tavily\n\
-         api_key  = \"<your key>\"\n\n\
+         api_key  = \"<your key>\"   # or \"${{BRAVE_API_KEY}}\" for an env reference\n\n\
          Report this to the user — it is a setup step only they can do; \
          retrying will not change it.",
         config_path().display()
@@ -295,8 +295,19 @@ pub fn load_config() -> Result<WebConfig, String> {
         }
         Err(e) => return Err(no_config_message(&format!("{} unreadable: {e}", path.display()))),
     };
-    let cfg: WebConfig = toml::from_str(&text)
+    let mut cfg: WebConfig = toml::from_str(&text)
         .map_err(|e| no_config_message(&format!("{} is malformed: {e}", path.display())))?;
+    // The key may be a reference — `api_key = "${BRAVE_API_KEY}"` — rather
+    // than the secret itself (guide §14.6). This runs on every search, not
+    // once at startup, so a rotated key reaches the next request.
+    if sica_core::creds::is_reference(&cfg.api_key) {
+        match sica_core::creds::describe(&cfg.api_key) {
+            sica_core::creds::Status::Unresolved(name) => {
+                return Err(no_config_message(&format!("{name} is not set")));
+            }
+            _ => cfg.api_key = sica_core::creds::resolve(&cfg.api_key),
+        }
+    }
     if cfg.api_key.trim().is_empty() {
         return Err(no_config_message("api_key is empty"));
     }
@@ -525,6 +536,11 @@ Behaviour:
 
       provider = "brave"   # brave | exa | tavily
       api_key  = "<your key>"
+
+  The key may also name an environment variable instead of holding the
+  secret: `api_key = "${BRAVE_API_KEY}"`, read from the process
+  environment or `sica-settings/.env` on every search, so rotating it
+  needs no restart.
 
   Without it the call fails with that message. That is a setup step only the
   user can do — report it, do not retry.

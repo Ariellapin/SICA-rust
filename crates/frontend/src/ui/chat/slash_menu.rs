@@ -625,7 +625,7 @@ fn accept(app: &mut App, ui: &mut egui::Ui, row: &Row) {
 
 fn run_app_command(app: &mut App, cmd: AppCommand) {
     match cmd {
-        AppCommand::NewSession => app.send(UiCommand::SendRequest(Request::NewSession)),
+        AppCommand::NewSession => app.send(UiCommand::SendRequest(Request::NewSession { workspace_id: None })),
         AppCommand::StopTurn => {
             let streaming = app.chat.turns.last().map(|t| !t.finished).unwrap_or(false);
             if streaming && !app.chat.interrupt_requested {

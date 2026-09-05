@@ -13,9 +13,10 @@
 //! - **The model can loop and branch over tools** instead of unrolling the
 //!   iteration into the conversation one hop at a time.
 //!
-//! The runtime is [Rhai](https://rhai.rs): pure Rust, no I/O of its own, and
-//! hard-limited on operations, recursion, string/array/map size and wall
-//! clock. Every capability a program has arrives as a host function that
+//! The runtime is the shared [Rhai](https://rhai.rs) sandbox
+//! ([`crate::script`], also behind `workflow`): pure Rust, no I/O of its
+//! own, and hard-limited on operations, recursion, string/array/map size
+//! and wall clock. Every capability a program has arrives as a host function that
 //! re-enters the ordinary guarded pipeline — `ToolSubAgent::run`, so the
 //! permission policies, the approval broker, the repeat guard, spilling and
 //! the summariser all still apply, and every sub-call surfaces as a live
@@ -27,19 +28,20 @@
 //! `on_progress` polls the interrupt token and the wall-clock deadline
 //! between operations, which is what stops a runaway loop.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Position};
+use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use crate::registry::SkillRegistry;
+use crate::script::{self, throw, to_json};
 use crate::skill::{Skill, SkillContext, SkillOutcome};
 use crate::subagent::{ToolInvocation, ToolSubAgent};
 
@@ -347,15 +349,8 @@ impl Skill for RunCode {
 /// printed nothing and returned nothing is *not* a failure — but saying so
 /// beats handing back an empty block the model has to guess about.
 fn finish(result: ProgramResult) -> SkillOutcome {
-    let ProgramResult { mut output, error, calls } = result;
-    if output.len() > MAX_PROGRAM_OUTPUT {
-        let window = sica_core::retain::head_tail(
-            &output,
-            MAX_PROGRAM_OUTPUT * 3 / 4,
-            MAX_PROGRAM_OUTPUT / 4,
-        );
-        output = window.render("program output");
-    }
+    let ProgramResult { output, error, calls } = result;
+    let output = script::window(output, MAX_PROGRAM_OUTPUT, "program output");
     match error {
         Some(err) => SkillOutcome {
             ok:      false,
@@ -425,11 +420,7 @@ impl Dispatcher<'_> {
     }
 }
 
-fn throw(message: String) -> Box<EvalAltResult> {
-    Box::new(EvalAltResult::ErrorRuntime(Dynamic::from(message), Position::NONE))
-}
-
-/// Build the engine, register one host function per skill, and run the
+/// Build the sandbox, register one host function per skill, and run the
 /// program. Called on a blocking thread.
 fn run_program(
     code: &str,
@@ -439,90 +430,16 @@ fn run_program(
     cancel: Option<CancellationToken>,
     deadline: Instant,
 ) -> ProgramResult {
-    let mut engine = Engine::new();
-    // No filesystem, no module imports, no `eval` — a program's only
-    // capabilities are the host functions registered below.
-    engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver::new());
-    engine.disable_symbol("eval");
-    engine.set_max_operations(MAX_OPERATIONS);
-    engine.set_max_call_levels(24);
-    engine.set_max_expr_depths(64, 32);
-    engine.set_max_string_size(4 * 1024 * 1024);
-    engine.set_max_array_size(100_000);
-    engine.set_max_map_size(100_000);
-
-    let printed = Rc::new(RefCell::new(String::new()));
-    {
-        let sink = printed.clone();
-        engine.on_print(move |s| {
-            let mut buf = sink.borrow_mut();
-            if buf.len() < MAX_PROGRAM_OUTPUT * 2 {
-                buf.push_str(s);
-                buf.push('\n');
-            }
-        });
-    }
-    {
-        let sink = printed.clone();
-        engine.on_debug(move |s, _src, pos| {
-            let mut buf = sink.borrow_mut();
-            if buf.len() < MAX_PROGRAM_OUTPUT * 2 {
-                buf.push_str(&format!("[debug {pos}] {s}\n"));
-            }
-        });
-    }
-    // Polled between operations. Checking the clock on every one of two
-    // million operations would dominate the runtime, so the deadline is
-    // sampled; the interrupt token is a cheap atomic load and is not.
-    engine.on_progress(move |ops| {
-        if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
-            return Some(Dynamic::from("interrupted"));
-        }
-        if ops % 4096 == 0 && Instant::now() >= deadline {
-            return Some(Dynamic::from("deadline"));
-        }
-        None
-    });
-
-    let calls = Rc::new(Cell::new(0u32));
-    register_tools(&mut engine, registry, sub, handle, &calls);
-
-    let outcome = engine.eval::<Dynamic>(code);
-    let mut output = printed.borrow().clone();
-    let error = match outcome {
-        Ok(value) => {
-            if !value.is_unit() {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str(&format!("Result: {value}"));
-            }
-            None
-        }
-        Err(e) => Some(describe(&e)),
+    let limits = script::Limits {
+        operations: MAX_OPERATIONS,
+        budget:     PROGRAM_BUDGET,
+        output_max: MAX_PROGRAM_OUTPUT,
     };
-    ProgramResult { output, error, calls: calls.get() }
-}
-
-/// A script error as the model should read it: the abort reasons the
-/// progress hook raises are harness facts, not Rhai syntax, so they get
-/// their own wording.
-fn describe(err: &EvalAltResult) -> String {
-    match err {
-        EvalAltResult::ErrorTerminated(token, _) => match token.to_string().as_str() {
-            "interrupted" => "the turn was interrupted — the program was stopped".into(),
-            "deadline" => format!(
-                "the program exceeded its {}s wall-clock budget and was stopped",
-                PROGRAM_BUDGET.as_secs()
-            ),
-            other => format!("the program was stopped ({other})"),
-        },
-        EvalAltResult::ErrorTooManyOperations(_) => format!(
-            "the program exceeded its operation cap ({MAX_OPERATIONS}) and was stopped — \
-             it is probably looping"
-        ),
-        other => other.to_string(),
-    }
+    let mut sandbox = script::Sandbox::new(limits, cancel, deadline);
+    let calls = Rc::new(Cell::new(0u32));
+    register_tools(&mut sandbox.engine, registry, sub, handle, &calls);
+    let out = sandbox.run(code);
+    ProgramResult { output: out.output, error: out.error, calls: calls.get() }
 }
 
 /// Register `tool(name, args)` plus one function per skill, named after it.
@@ -656,38 +573,6 @@ fn coerce(skill: &Arc<dyn Skill>, value: Value) -> Value {
         Value::Number(n) => Value::String(n.to_string()),
         other => Value::String(other.to_string()),
     }
-}
-
-/// Rhai value → JSON. Arrays and maps convert structurally so a typed MCP
-/// tool can be handed `#{ paths: ["a", "b"] }`; anything exotic degrades to
-/// its display form rather than failing the call.
-fn to_json(d: &Dynamic) -> Value {
-    if d.is_unit() {
-        return Value::Null;
-    }
-    if let Ok(b) = d.as_bool() {
-        return Value::Bool(b);
-    }
-    if let Ok(i) = d.as_int() {
-        return Value::Number(i.into());
-    }
-    if let Ok(f) = d.as_float() {
-        return serde_json::Number::from_f64(f as f64).map(Value::Number).unwrap_or(Value::Null);
-    }
-    if d.is_string() {
-        return Value::String(d.clone().into_string().unwrap_or_default());
-    }
-    if let Some(arr) = d.clone().try_cast::<rhai::Array>() {
-        return Value::Array(arr.iter().map(to_json).collect());
-    }
-    if let Some(map) = d.clone().try_cast::<rhai::Map>() {
-        let mut obj = Map::new();
-        for (k, v) in map.iter() {
-            obj.insert(k.to_string(), to_json(v));
-        }
-        return Value::Object(obj);
-    }
-    Value::String(d.to_string())
 }
 
 #[cfg(test)]

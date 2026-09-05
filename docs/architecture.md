@@ -22,7 +22,7 @@ Seven crates, dependency direction strictly downward:
 | `protocol` | Wire types only (`Frame`, `Request`, `Response`, `Event`) + `PROTOCOL_VERSION`. No I/O, no dep on `sica-core`. Shared by both binaries — changes here force rebuilding both. |
 | `sica-core` | Shared utilities: `paths` (every on-disk surface), `event` (the append-only session log + `derive_surface` fold), `project` (pure folds over that log — session stats, the turn outline, the last token reading), `snapshot` (tokenising a log so two runs of it can be diffed), `retain` (UTF-8-safe head/tail windows + the one omission sentence every cut uses), `message`/`session` (chat message types; `Session` survives only for legacy TOML migration), `build_id`, `theme`. |
 | `llm` | HTTP client for OpenAI-compatible `/v1/chat/completions` (llama.cpp, vLLM, OpenAI, Anthropic-compat), SSE streaming + `<think>` splitting, connection state machine, token counting, `replay` (serve completions from a recorded log instead of a socket) and `mock` (a scripted fault server, test-only). |
-| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds), `web` (`web-fetch`/`web-search`), `mcp` (MCP servers bridged as skills), `ptc` (the `run-code` Rhai runtime behind programmatic tool calling). |
+| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds), `web` (`web-fetch`/`web-search`), `mcp` (MCP servers bridged as skills), `script` (the shared Rhai sandbox: limits, output capture, abort wording, Rhai↔JSON), `ptc` (the `run-code` runtime behind programmatic tool calling), `workflow` (model-written orchestration scripts, opt-in on `skills/workflow.md`). |
 | `idealist` | Classifies failures (`FeBug` vs `BeFix`), writes improvement tickets to `idealist_workspace/`, optional BE auto-patching (off by default). |
 | `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `hooks.rs` runs the user's own shell hooks around it; `invariants.rs` holds the runtime invariant companions (`--invariants`); `be_core/` holds the legacy demo state. |
 | `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the surfaces — `kit` (the design-system primitives), `icons`, `sidebar`, `chat/` (transcript, tool rows, composer, dock, control takeovers, `trajectory` (the event-log ledger), `details` (the tool / event inspector)), `settings/` (a modal). Styling is the dsh port described in [docs/harness-ui-guide.md](harness-ui-guide.md); waves UI-1…UI-5 are in. |
@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 25) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 26) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -162,6 +162,39 @@ to jump to. `ToolSubAgent::with_log_seq` carries it from the dispatch site;
 it is `0` for a nested `SkillContext::sub` call, which is a live event only
 and never reaches the log.
 
+v26 adds **per-session working directories and the workspace registry**
+(harness guide §3.8–§3.9). Two shape changes on the wire, one on disk.
+
+`SessionCreated` — line 1 of every log, and now explicitly its *header* —
+gains `format: u16` (`sica_core::event::SESSION_FORMAT`, currently 1) and
+`cwd: Option<PathBuf>`, both `#[serde(default)]`, so an older log still
+loads. A log from a *newer* format is skipped with a warning rather than
+read through the wrong lens; one from an older format is migrated in
+memory by `event::migrate` and rewritten — atomically — only on its next
+append, so opening an old session never touches the disk.
+
+The directory in that header is what every path-resolving surface now
+reads: `ToolSubAgent.cwd` carries it into the skills, and prompt assembly
+(`{{cwd}}`), the AGENTS.md chain, the write-confinement policy,
+read-before-edit, the hooks and the shells all resolve against it instead
+of the process-wide `paths::working_dir()`. That is what stops a session
+made under one folder from silently reopening under another.
+
+On top of it sits `backend::workspaces` — the registry of directories the
+user has registered, one JSON document at `sica-settings/workspaces.json`
+written through `sica_core::atomic::atomic_write`. Membership needs both an
+entry on the workspace's account **and** a session header naming the same
+canonical path, so the account is an ordering and the header is the truth;
+deleting a workspace removes the registration only, and its sessions become
+Ungrouped. The wire gains `ListWorkspaces` / `CreateWorkspace` /
+`RenameWorkspace` / `DeleteWorkspace` / `MoveWorkspace` / `MoveSession`,
+`Response::Workspaces` (`WorkspaceDump`), `Event::WorkspacesChanged`,
+`SessionMeta.cwd`, and `NewSession` becomes
+`NewSession { workspace_id: Option<u64> }`. The subsystem is invisible to
+models: no skill reads it and nothing about it reaches a session log. Its
+frontend surface is UI guide §4.3; until that lands the FE sends
+`workspace_id: None` and drops the event.
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
@@ -173,7 +206,7 @@ and never reaches the log.
 | `commands/*.md` | `agents::invoke`, `backend::catalog` | Listed in the `/` palette and resolved by a typed `/name` (`{{args}}` substitutes the rest of the line). Read per message — no restart needed. |
 | `agents/*.md` | `agents::preset`, `agents::invoke`, `backend::catalog` | Session personas (v24): body → `PERSONA` prompt section, frontmatter `skills:` → registry view. A typed `/name` *selects* one rather than injecting it. Seeded once with `reviewer.md`. Read at selection and once per turn — no restart needed. |
 | `skills/*.md` | `agents::md_skill` | Scanned at BE startup only — adding a skill needs a BE restart. `plan-mode.md` is the plan-policy config, excluded from the scan by name. |
-| `sessions/<id>.jsonl` | `backend::sessions_store` | One append-only event log per chat session (`sica_core::event::SessionEvent`, one JSON object per line). A torn final line or a bad line mid-file is skipped, never fatal. Loaded eagerly at startup by `ChatHub::new_loaded`; a fresh session is not written until its first user message. Legacy `<id>.toml` files are migrated once into `LegacyMessage` events and renamed `<id>.toml.bak` (never deleted). |
+| `sessions/<id>.jsonl` | `backend::sessions_store` | One append-only event log per chat session (`sica_core::event::SessionEvent`, one JSON object per line). Line 1 is the `SessionCreated` **header**: id, title, created_at, `format` and the session's `cwd` (v26). A torn final line or a bad line mid-file is skipped, never fatal; a future `format` is skipped whole. Loaded eagerly at startup by `ChatHub::new_loaded`; `list_headers` answers from line 1 plus a scan for the rows that can change a listing, without deriving anything. A fresh session is not written until its first user message. Legacy `<id>.toml` files are migrated once into `LegacyMessage` events and renamed `<id>.toml.bak` (never deleted). |
 | `spill/<session>/*.txt` | `agents::spill` | Full text of tool outputs too large to feed back into context; the model holds only a digest + this path. `.gitignore`d churn. |
 | `sica-settings.json` | `frontend::settings_store` | FE settings, read at startup. Settings › General applies live (theme mode, content font size 12–17, Normal/Compact transcript, busy-Enter, reduce-motion) and writes through on every change; the other sections still have their own Apply / Connect buttons. |
 | `sica-settings/llm-providers/*.toml` | `frontend::llm_providers` | One panel per provider; filename stem is the id. `.gitignore`d — may hold API keys. In the UI, `0` means "auto" for `max_tokens`/`context_window`. Each card shows a per-model recommendation (`llm::preset`, matched from the model string: temperature / thinking / tool mode per family) with a one-click Apply that persists to the TOML. |
@@ -182,7 +215,9 @@ and never reaches the log.
 | `evals/reports/<suite>-<ts>.{md,json}` | `agents::model_eval` | Report + machine-readable baseline the next run of that suite diffs against. `.gitignore`d. |
 | `.sica/hooks.json` (under the **working** directory) | `backend::hooks` | User hooks (guide §13.1), in Claude Code's own schema so an existing file can be copied across. Read once at BE start — a hooks file that could change under a running turn would make two calls in one turn answer to different rules. Absent by default; malformed is a `LogLine`, never fatal. `PreToolUse`/`PostToolUse` ride the tool pipeline as `HooksPolicy`; `UserPromptSubmit`/`SessionStart` are dispatched from `chat.rs`. A hook that fails to spawn, times out, or writes non-JSON **abstains** — the operator's script being broken must not become a permission decision. |
 | `sica-settings/mcp/*.toml` | `agents::mcp` | One MCP server per file (`command`, `args`, `env`, `cwd`, `enabled`); the stem is the server name. Started at BE start over stdio, tools only, each bridged as a skill named `mcp__<server>__<tool>` whose JSON Schema goes into the `tools` array verbatim. A server that will not start is a `LogLine` and the agent comes up without it. |
-| `sica-settings/web.toml` | `agents::web` | `provider` (`brave` \| `exa` \| `tavily`) + `api_key` for `web-search`. Absent by default; the tool still registers and its failure text says exactly which file to write, because a tool that disappears when unconfigured teaches the model the capability does not exist. `.gitignore` it — it holds a key. |
+| `sica-settings/workspaces.json` | `backend::workspaces` | The workspace registry (v26): `{ version, order, rows }`, one row per registered directory with its title and the manual order of its sessions. Written whole through `atomic_write` on every mutation. Missing on a fresh install and bootstrapped from session headers; a corrupt one is moved aside and rebuilt, a newer `version` is refused and left alone. |
+| `sica-settings/.env` | `sica_core::creds` | Optional `KEY=value` file backing `${VAR}` references in the provider TOMLs and `web.toml`. Read on every resolution, so a rotated key needs no restart. Deliberately *not* the working directory's `.env` — that file arrives with `git clone`. `.gitignore` it. |
+| `sica-settings/web.toml` | `agents::web` | `provider` (`brave` \| `exa` \| `tavily`) + `api_key` for `web-search` (a literal, or `"${BRAVE_API_KEY}"` to name an environment variable). Absent by default; the tool still registers and its failure text says exactly which file to write, because a tool that disappears when unconfigured teaches the model the capability does not exist. `.gitignore` it — it holds a key. |
 | `snapshots/<scenario>/` | `frontend::bin::replay` | Recorded-session evals (guide §14.1): `session.jsonl` (the recording, which is *also* the replay script), optional `scenario.toml`, `replay.override.json`, `workspace/` and `workspace.expected/`. Source, not churn. |
 
 ## Adding a new request (the common task)

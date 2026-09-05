@@ -241,7 +241,7 @@ async fn run_scenario(exe: &Path, dir: &Path, bless: bool) -> Result<()> {
 
     // New session.
     writer
-        .send(Frame::request(next_id, Request::NewSession).encode()?.into())
+        .send(Frame::request(next_id, Request::NewSession { workspace_id: None }).encode()?.into())
         .await?;
     let id = next_id;
     next_id += 1;

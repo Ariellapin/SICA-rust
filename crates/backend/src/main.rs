@@ -25,6 +25,7 @@ mod parent_watch;
 mod sessions_store;
 mod title_gen;
 mod trajectory;
+mod workspaces;
 
 use be_core::BeState;
 use chat::ChatHub;
@@ -295,6 +296,17 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(subagent.clone());
     skill_registry.register(subagent_fork.clone());
     skill_registry.register(ralph.clone());
+    // `workflow` is opt-in on the same terms as `agent-team` below, and for
+    // the same reason: one call can spend dozens of full LLM conversations,
+    // and the scripting reference it needs in the system prompt is ~600
+    // tokens every session would otherwise pay for whether or not it ever
+    // writes a script. `skills/workflow.md` on disk turns it on.
+    let workflow_doc = skills_path.join(format!("{}.md", agents::workflow::WORKFLOW_NAME));
+    let workflow = workflow_doc.exists().then(|| {
+        let workflow = Arc::new(agents::Workflow::new());
+        skill_registry.register(workflow.clone());
+        workflow
+    });
     // `agent-team` is opt-in: it registers only when the user has put
     // `skills/agent-team.md` on disk. A team is N full LLM conversations per
     // call and its teammates are the least reliable output in the app on a
@@ -348,12 +360,16 @@ async fn run(args: Args) -> Result<()> {
     subagent.attach_registry(&skill_registry);
     subagent_fork.attach_registry(&skill_registry);
     ralph.attach_registry(&skill_registry);
+    if let Some(workflow) = &workflow {
+        workflow.attach_registry(&skill_registry);
+    }
     run_code.attach_registry(&skill_registry);
     info!(
         count = skill_count,
         mcp = mcp_tool_count,
         dir = %skills_path.display(),
         agent_team = agent_team.is_some(),
+        workflow = workflow.is_some(),
         "skills loaded"
     );
     let _ = out_tx.send(Frame::event(Event::LogLine {

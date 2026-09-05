@@ -328,6 +328,10 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
     let ui_ev = match ev {
         Event::Heartbeat { .. } => UiEvent::Heartbeat,
         Event::Progress { .. } => return,
+        // The workspace projection (harness guide §3.9) has no surface
+        // yet — the sidebar grouping that consumes it is UI guide §4.3.
+        // Dropped rather than queued so it cannot pile up unread.
+        Event::WorkspacesChanged { .. } => return,
         Event::LogLine { level, message } => UiEvent::LogLine { level, message },
         Event::LlmStateChanged { state } => UiEvent::LlmStateChanged(state),
         Event::TurnStarted { session_id, turn_id } => {

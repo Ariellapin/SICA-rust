@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
     // Session round-trip through the event-log store. A fresh session lives
     // in memory only (nothing is written until its first user message), so
     // this leaves no file behind in `sessions/`.
-    writer.send(Frame::request(5, Request::NewSession).encode()?.into()).await?;
+    writer.send(Frame::request(5, Request::NewSession { workspace_id: None }).encode()?.into()).await?;
     let resp = loop {
         let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
         let frame = Frame::decode(&bytes)?;
@@ -226,6 +226,111 @@ async fn main() -> Result<()> {
     assert_eq!(stats.turns, 0, "a fresh session has taken no turn");
     assert!(outline.is_empty());
     assert!(through_seq >= 1, "the fold must have seen SessionCreated");
+
+
+    // Workspaces (guide §3.9): register a directory, open a session in it,
+    // see the session grouped under it, then delete the *registration* and
+    // watch the session survive as Ungrouped. Every mutation answers with
+    // the whole projection.
+    let ws_dir = std::env::temp_dir().join(format!("sica-smoke-ws-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws_dir);
+    std::fs::create_dir_all(&ws_dir)?;
+    let ws_path = ws_dir.display().to_string();
+
+    writer
+        .send(Frame::request(10, Request::CreateWorkspace { path: ws_path.clone(), title: None })
+            .encode()?.into())
+        .await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 10 => break r,
+            _ => {}
+        }
+    };
+    let Response::Workspaces { rows, .. } = resp else {
+        anyhow::bail!("expected Workspaces, got {resp:?}");
+    };
+    let ws = rows
+        .iter()
+        .find(|w| w.path.file_name() == ws_dir.file_name())
+        .unwrap_or_else(|| panic!("created workspace missing from {rows:?}"))
+        .clone();
+    println!("smoke: workspace -> id={} title={:?} missing={}", ws.id, ws.title, ws.missing);
+    assert!(!ws.missing, "the directory was just created");
+    assert!(ws.sessions.is_empty(), "a fresh workspace holds no sessions");
+
+    // A session created in it takes its directory — that stamped header is
+    // what makes the grouping true rather than bookkeeping.
+    writer
+        .send(Frame::request(11, Request::NewSession { workspace_id: Some(ws.id) })
+            .encode()?.into())
+        .await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 11 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionCreated { id: ws_session } = resp else {
+        anyhow::bail!("expected SessionCreated, got {resp:?}");
+    };
+
+    writer.send(Frame::request(12, Request::ListWorkspaces).encode()?.into()).await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 12 => break r,
+            _ => {}
+        }
+    };
+    let Response::Workspaces { rows, ungrouped } = resp else {
+        anyhow::bail!("expected Workspaces, got {resp:?}");
+    };
+    let ws_row = rows.iter().find(|w| w.id == ws.id).expect("workspace still listed");
+    println!("smoke: workspace sessions -> {:?} (ungrouped {})", ws_row.sessions, ungrouped.len());
+    assert_eq!(ws_row.sessions, vec![ws_session], "the new session groups under it");
+    assert!(!ungrouped.contains(&ws_session));
+
+    // Deleting the registration keeps the session and its log.
+    writer
+        .send(Frame::request(13, Request::DeleteWorkspace { id: ws.id }).encode()?.into())
+        .await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 13 => break r,
+            _ => {}
+        }
+    };
+    let Response::Workspaces { rows, ungrouped } = resp else {
+        anyhow::bail!("expected Workspaces, got {resp:?}");
+    };
+    assert!(!rows.iter().any(|w| w.id == ws.id), "the registration is gone");
+    assert!(ungrouped.contains(&ws_session), "its session is Ungrouped, not lost");
+
+    writer
+        .send(Frame::request(14, Request::LoadSession { session_id: ws_session }).encode()?.into())
+        .await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 14 => break r,
+            _ => {}
+        }
+    };
+    let Response::SessionLoaded { session } = resp else {
+        anyhow::bail!("expected SessionLoaded, got {resp:?}");
+    };
+    assert_eq!(session.id, ws_session, "the session still loads after its workspace is gone");
+    println!("smoke: workspace delete -> session {ws_session} still loads");
+    let _ = std::fs::remove_dir_all(&ws_dir);
 
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;

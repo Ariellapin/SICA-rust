@@ -1327,7 +1327,12 @@ impl App {
         // waiting for the Apply bar) is what makes "auto-connect on start"
         // survive across restarts.
         self.persist_settings();
-        let api_key = if cfg.api_key.is_empty() { None } else { Some(cfg.api_key.clone()) };
+        // A provider file may name an environment variable instead of
+        // holding the key (guide §14.6): `api_key = "${DEEPSEEK_API_KEY}"`.
+        // Resolved here, on the way to the wire, so the stored settings
+        // keep the reference and never the secret.
+        let api_key = sica_core::creds::resolve(&cfg.api_key);
+        let api_key = if api_key.is_empty() { None } else { Some(api_key) };
         let options = cfg.llm_options();
         self.send(UiCommand::SendRequest(Request::ConnectLlm {
             base_url: cfg.base_url,
@@ -2008,7 +2013,7 @@ impl App {
                 if sessions.is_empty() {
                     // First-run case: ask the BE to mint a session so the user
                     // has something to type into.
-                    self.send(UiCommand::SendRequest(Request::NewSession));
+                    self.send(UiCommand::SendRequest(Request::NewSession { workspace_id: None }));
                     self.chat.sessions.clear();
                 } else {
                     let has_active = sessions.iter().any(|s| s.id == self.chat.session_id);
@@ -2046,6 +2051,7 @@ impl App {
                         title: format!("Session {id}"),
                         created_at: 0,
                         updated_at: 0,
+                        cwd: None,
                     });
                 }
                 self.switch_session(id);

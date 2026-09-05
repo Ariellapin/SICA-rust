@@ -37,6 +37,7 @@ pub const CHILD_EXCLUDED: &[&str] = &[
     crate::delegate::SUBAGENT_NAME,
     crate::delegate::SUBAGENT_FORK_NAME,
     crate::ralph::RALPH_NAME,
+    crate::workflow::WORKFLOW_NAME,
     ASK_USER_NAME,
     TODO_WRITE_NAME,
     EXIT_PLAN_MODE_NAME,

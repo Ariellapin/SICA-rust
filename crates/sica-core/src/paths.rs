@@ -22,6 +22,13 @@ pub fn settings_file() -> PathBuf {
     workspace_root().join("sica-settings.json")
 }
 
+/// The workspace registry document (guide §3.9): every directory the user
+/// has registered, its title, and the manual order of both the workspaces
+/// and the sessions inside them. Written atomically on every mutation.
+pub fn workspaces_file() -> PathBuf {
+    workspace_root().join("sica-settings").join("workspaces.json")
+}
+
 /// Directory holding one TOML file per LLM provider panel. Folder is
 /// `.gitignore`d because individual files may contain API keys.
 pub fn llm_providers_dir() -> PathBuf {

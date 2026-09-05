@@ -630,6 +630,45 @@ sessions". The composer is *not* remounted between hero and active phases.
 **Port (S):** `draw_empty` → the hero described in §2.2; the placeholder
 swaps per phase (§5).
 
+### 3.8 Markdown extras — math, images, wide tables, file links
+
+**dsh** (`ui-renderer` and the markdown pipeline behind §3.2): **math** —
+inline `$…$` and `\(…\)`, display `$$…$$` and `\[…\]` typeset with KaTeX,
+numbered display equations (`(1)`), math inside table cells; **images** — a
+markdown image renders inline in the body (durable attachments through the
+§5.3 gallery, remote URLs as they are); **wide tables** scroll horizontally
+inside their own container, never the column; **inline-code file paths**
+become links — a runtime-context line tells the model that when it creates or
+modifies files it should name the primary outputs in its final answer as
+inline code carrying the exact tool path (or a basename unique among that
+turn's changed files), and the renderer resolves those to clickable
+references; **CJK** strong text is rendered where CommonMark's word-boundary
+rule would drop it; every link is clickable and opens externally.
+
+**sica-rust:** `egui_commonmark` — no math, images only if a loader is
+installed, tables at natural width (a wide one pushes the column), inline
+code is plain.
+
+**Port:**
+- **Math (S, honest fallback):** there is no KaTeX for egui. Detect `$…$`,
+  `$$…$$`, `\(…\)` and `\[…\]` before the viewer and render the TeX source
+  through `kit::code_block` tagged `math` (display) or as inline code
+  (inline), so the source stays legible and copyable instead of being
+  mangled by the parser's `_` and `*` rules. Typesetting is **later**.
+- **Images (S):** add `egui_extras` with its image loaders and install them
+  once at startup; allow relative and `file://` paths only under the
+  session's `cwd` (§4.3) plus `http(s)://`; a failed load shows the alt text
+  with a retry glyph, as dsh does.
+- **Wide tables (S):** wrap each table in a horizontal `ScrollArea` capped at
+  the content width — a pre-split on the table block, like the code-fence
+  split in §3.2.
+- **File links (S, FE + one prompt line):** add dsh's runtime-context line to
+  `agents::prompt` (harness §5.1), and in the viewer treat inline code that
+  resolves to an existing file under `cwd` as a link: hover shows the full
+  path, click opens it in the OS (`open_in_explorer`), Ctrl-click inserts
+  `@path` into the composer. The produced-file chips (UI-6) already do this
+  for `write-file` rows; this extends it to prose.
+
 ---
 
 ## 4. Sessions and the sidebar
@@ -658,8 +697,8 @@ keyboard switching.
 
 ### 4.2 Port (**M**)
 
-sica-rust has one workspace root, so grouping is moot: ship the **flat
-list, Last updated**, sorted by the newest event. Row chrome per above.
+UI-4 shipped the **flat list, Last updated**, sorted by the newest event;
+grouping by workspace is §4.3, on the harness registry (guide §3.9). Row chrome per above.
 `SessionMeta` needs `updated_at`, `running`, `pending: Option<PendingKind>`
 and `completed_unseen: bool` — the last three the FE derives itself from
 `TurnStarted/Finished`, `ApprovalRequested/QuestionAsked`, and "finished
@@ -679,6 +718,100 @@ the logs).
 
 The sidebar header row ("Sessions", search icon, `+`) uses h=36, `label[2]`;
 the 24 px bottom fade is a gradient rect painted over the scroll area.
+
+### 4.3 Workspaces — grouping, the picker, and "Add workspace" (**M**, on harness §3.9)
+
+**dsh** (`ui-workspace`, `ui-directory-picker-{native,browse}`):
+
+- **Section header** h=36, r=12: the label **"Workspaces"** (grouped) or
+  **"Sessions"** (flat) in `label[2]`, then a search icon that expands to
+  fill the header (§4.1), a **View options** menu (**Group by:** WorkSpace ·
+  In one list; **Order by:** Manual · Last updated) and **Add workspace**.
+  Entering Last updated re-sorts fully and later prompts promote their
+  session once; entering Manual freezes positions and drags edit the order.
+  Workspace order is host-durable in either mode; session order inside a real
+  workspace is host-durable only in Manual; Ungrouped and flat orders stay
+  browser-local.
+- **Workspace row** h=34, r=8, pad 0 8, gap 6: `[folder 16] [title 14/20] …
+  [⋯ "Workspace actions for {name}"] [+ "New session in {name}"]`, the two
+  trailing actions 28 px circles; click toggles the group. Expanded: the
+  first **5 non-blank sessions** plus the selected blank **"New Session"** as
+  one provisional row until its first prompt, then **"Show {n} more
+  sessions" / "Show less"**; closing and reopening restores the fold.
+  Sessions without a workspace sit under **"Ungrouped"**; `origin: subagent`
+  sessions are hidden everywhere; a row inherits the blue activity dot while
+  any subagent descendant runs ("{n} subagents running").
+- **Workspace menu:** **Rename workspace** (dialog, field "Workspace name"; a
+  duplicate answers "A workspace named “{name}” already exists."), **Delete
+  workspace** (dialog: "This removes “{name}” from the workspace list. The
+  folder and session logs will be kept. Its sessions will appear under
+  Ungrouped." · Cancel / Delete · "Deleting workspace…"), **Add workspace…**.
+  The session menu adds **Fork session** / **Archive session** (§4.1). Empty
+  states: "No sessions yet", "No matches".
+- **Hover card** on a workspace row: the path with the home directory
+  shortened to `~` (`~/Documents/project`) and "Created {time}"; click copies
+  the *full* path and flashes "Copied".
+- **Hero picker** (§3.7's chip, r=16 `[folder] [name] [chevron]`): a menu of
+  workspaces ("Loading workspaces…" while the baseline loads) with **Add
+  workspace…** last; the pick is staged for the session about to start and
+  adopted only after the list projection has refreshed with the committed
+  workspace. A folder that cannot be adopted opens **"Couldn’t open folder"**
+  with the host's reason and a **Choose again** button.
+- **Add workspace** goes through the composed picker: **native** = the OS
+  folder chooser, one per open, cancel decides nothing; **browse** = the
+  in-app **"Select Workspace Directory"** dialog, **680 × 500** (clamped to
+  the viewport − 32), Miller columns: a header with the crumb trail and an
+  editable path zone ("Edit path"), one full-width level until a row is
+  selected, then level + children columns; a prefix filter on the last pane;
+  footer **"Show hidden files"** toggle (hidden = the host's dot-prefix
+  flag), **New folder** (nested dialog "New folder in “{name}”", field
+  "Folder name", default "Untitled folder", Create / Cancel; the created
+  folder is selected), **Open** adopts the selection, falling back to the
+  listed level, / **Cancel**; a level cut at 1000 entries says "Too many
+  folders to list; only the beginning is shown."
+
+**sica-rust:** one folder for the whole app (Settings › General "Working
+directory": the app folder · five recents · "Choose folder…" through `rfd`;
+changing it restarts the BE), a flat session list, and the hero chip that
+names the folder and copies its path.
+
+**Port (M):**
+
+- **State.** `App.workspaces: Vec<WorkspaceDump>` + `ungrouped: Vec<u64>`
+  from `Response::Workspaces` / `Event::WorkspacesChanged`; per-workspace
+  `expanded` and `show_all` flags, and the Group-by / Order-by choice in
+  `sica-settings.json` (`sidebar_group: workspace | flat`, `sidebar_order:
+  manual | updated`). Legacy sessions with no `cwd` are Ungrouped.
+- **Sidebar.** `sidebar::session_region` gains the workspace row (34 px,
+  folder icon, ⋯ and + circles), the 5-row fold with "Show {n} more
+  sessions", the Ungrouped group, and the View-options `kit::menu`. Row
+  status dots and the subagent bubble-up already exist (`row_dot`); a
+  workspace whose `missing` flag is set paints its title in `warn` with the
+  tooltip "Folder not found — sessions still open" and disables its `+`. The
+  workspace ⋯ menu: Rename (inline, as for sessions), Delete (the armed
+  Delete/Keep row with dsh's retention sentence as its tooltip — the same
+  pattern as session delete), **Move up / Move down** in place of drag (egui
+  has no list drag-and-drop; `MoveWorkspace { before }` is what both send).
+  The hover card is the session hover card with the `~`-shortened path (a
+  `home_dir()` prefix swap) and "Created {time}"; click copies the full
+  path.
+- **Add workspace** = `rfd::FileDialog::pick_folder` (the Settings row uses
+  it already) → `Request::CreateWorkspace { path, title: None }` → on
+  `WorkspacesChanged` select the new group and send `NewSession {
+  workspace_id }`. A refused path (not a directory, no permission) is the
+  `Error` text in a `kit::modal` with **Choose again**, per dsh. The browse
+  dialog is **not ported**: FE and BE always share the machine.
+- **Hero picker.** The chip becomes a `kit::menu` (title + path detail, the
+  current one checked, "Add workspace…" last with `sep_above`). The pick is
+  stored as `App.pending_workspace` and spent by the next `NewSession`; the
+  header crumb (§8) shows the *session's* workspace, not the app-wide folder.
+- **Settings › General.** The "Working directory" row becomes **"Default
+  folder for ungrouped sessions"** (which is what `SICA_WORKING_DIR` still
+  means after harness §3.9) and stops restarting the BE. The sidebar's `New
+  session` button creates in the *selected* workspace, or in Ungrouped when
+  none is selected — dsh's provisional "New Session" row under the group.
+- Not ported: drag reorder (Move up / down covers it) and browser-local
+  session orders (one order, host-durable).
 
 ---
 
@@ -804,6 +937,37 @@ queue, stats, context_ring}.rs`.
   progress: reuse the ring with a rotating arc and the tooltip "Compacting
   context…"; the `⟳ COMPRESSING` status text goes.
 
+### 5.3 Attachments — the rail, files, the lightbox (**S–M**, on harness §9.6)
+
+**dsh** (`ui-attachment`, `client/file-upload`): one ordered **draft rail**
+under the text, non-wrapping, horizontal; edge arrows page the overflow, the
+scrollbar is hidden, a new item scrolls into view. Every item is **64 px
+high**: an image is a 64 px square thumbnail; a generic file is a **240 ×
+64** card, r=16, blue-gradient document glyph, filename, then `EXT · size`.
+Uploading swaps the glyph for a spinner with byte progress (an indeterminate
+bar before the first report); failure shows **Retry**; the remove control
+appears on hover or focus (always on touch). Clicking an image opens the
+original. The limits (harness §9.6) are the drop overlay's second line. In
+**history** a message renders files and images right-aligned in source
+order: a lone image at 240 px on its long edge (aspect clamped to [0.25, 4],
+never upscaled); with more than one attachment every image is a 64 px square
+beside 240 × 64 cards, wrapping. A loaded image opens the document-level
+**lightbox** (Esc, mask press or × close; focus returns to the opener); a
+failed load shows a retry control. The same gallery serves the Trajectory
+view and tool results that carry images.
+
+**sica-rust:** images by paste, drop and the `+` picker into
+`pending_images`, drawn as thumbnails; the drop overlay (UI-3); no generic
+files, no lightbox, history images at a fixed size.
+
+**Port:** the rail as a horizontal `ScrollArea` of 64 px items with the two
+card shapes; `attach_from_path` accepts text files (`txt md csv json log
+toml yaml rs …`, size-capped) as file cards that send as `@path`-style
+`ContextInjected` text (harness §9.6) rather than bytes; history sizing per
+the rule above; the lightbox is a `kit::modal` showing the image at
+`min(viewport − 64, natural)` with Esc / mask / × and a Copy action; no
+upload progress — the bytes are local.
+
 ---
 
 ## 6. Control plane surfaces
@@ -906,7 +1070,7 @@ adjacency, penalties for skips — 30 lines). Add the ghost hint after a
 claimed command (paint `label[3]` text at the caret's row end). `@` files:
 FE-side walk of `workspace_root()` honouring `.gitignore` via the `ignore`
 crate (the BE `glob` skill uses it already — or add `Request::ListFiles {
-query }`), inserting the relative path. `@session` → later (§13).
+query }`), inserting the relative path. `@session` → §6.12.
 
 ### 6.4 Goal
 
@@ -1043,6 +1207,63 @@ put `UNVERIFIED` (which dsh does not have) as an amber `StateDot` +
 files need `write-file` path collection at `TurnEnd` — **S**, worth doing:
 the tail row `Produced [chip] [chip] + 2 files`, click opens in Explorer).
 
+### 6.11 Workflow runs and the agent-team panel
+
+**dsh** (`ui-workflow-run`, the experimental `client-ui-agent-team`): a
+top-level workflow run is its **own conversation node**, rebuilt from four
+durable events (`tool-workflow/run-start`, member start, member end, run end)
+and independent of the workflow tool card. The run is a 32 px disclosure row
+`[chevron] [state dot] [title] [status]`; **phases** are disclosure rows with
+title + member count and a fixed aggregate-status tail; **members** are rows
+with a 16 px dot slot, a truncating name and a fixed status column. A mount
+opens running / failed / cancelled / interrupted levels and closes completed
+ones; the first abnormal edge opens once, normal completion closes once
+(delayed while focus is inside), and a new running member under a completed
+phase reopens it. A **running** member whose child session is in the
+ordinary list, is `origin: subagent` and is parented by this session is
+clickable and opens the child; everything else is inert. A turn that closed
+with missing terminal events shows the run as **interrupted** without
+touching the tool result. The agent-team panel is the same shape for a team:
+one row per teammate with its report state.
+
+**sica-rust:** `workflow` (harness §12.5) and `agent-team` render as a
+**Delegate** tool row (§3.4) whose nested children are the live
+`ToolCallStarted` rows; `phase()` / `log()` are `LogLine`s, so history shows
+the row and the printed result only.
+
+**Port (M, gated on harness §12.5 "left for later"):** the durable
+`WorkflowRun` events are the prerequisite — `EventKind::WorkflowRun {
+run_id, phase: Option<String>, member: Option<String>, state }` written on
+run start, member start / end and run end, so a reload rebuilds the tree the
+live events built. With them the Delegate row's body becomes the run → phase
+→ member tree with dsh's open/close rules (`disclosure_row` + `StateDot`),
+and the `[id: call-N]` citations of a team report (harness §12.2) link to the
+member rows. Until then, promote the `phase()` `LogLine`s into the row body
+as a phase list — one line of FE work that already makes a long run legible.
+
+### 6.12 `@session` references
+
+**dsh** (`ui-reference`, `dsh-session-reference`): the `@` menu is one list
+— **Files & folders** first (a directory row carries **Browse folder** on
+Tab or its chevron and keeps the menu open at the trailing slash), then
+**Sessions** (`title · cwd · age`, the workspace named only when it is not
+the current one). A session pick inserts an atomic chip (chat-bubble glyph +
+title) whose serialized form is `@[label](dsh-session:<id>)`; on send the
+host validates the mention and captures the referenced session's context at
+the pre-step boundary inside the untrusted frame, and a failed capture ends
+that turn. `@"…` searches files only.
+
+**sica-rust:** the `@` picker (UI-6) lists files and drills folders; no
+sessions.
+
+**Port (S FE + S BE):** a **Sessions** group under the files, fed by
+`App.sessions` (title, the `~`-shortened `cwd` from `SessionMeta.cwd`,
+relative age), inserting `@session:<id>`; the BE's `send_user_message`
+resolves the token to `ContextInjected { source: SessionReference(id),
+content }` — the referenced log's derived transcript through `retain` (head +
+tail, 8 KiB) wrapped in `UNTRUSTED_NOTICE` (harness §9.4) — and refuses an
+unknown id with `Response::Error` before the turn opens.
+
 ---
 
 ## 7. Settings
@@ -1102,20 +1323,47 @@ a 188 px nav and a content column. Sections:
 | **General** | Default permission · **Working directory** (the folder the agent reads, writes and runs commands in — `paths::working_dir`, distinct from the app root that holds settings, sessions and skills; a picker menu over the app folder, the last five choices and a native chooser; changing it restarts the BE, which resolves its file skills once at startup) · Appearance Light/Dark/System cubes · Font size stepper 12–17 · Conversation display Normal/Compact · Enter while busy Queue/Steer · Startup (auto-start BE, auto-connect LLM) · Logging (raw LLM) · Idealist auto-apply | `settings_store::Settings` — **live apply** on change (`apply_and_save_settings` per change; drop the Apply bar) |
 | **Models** | one card per `sica-settings/llm-providers/*.toml`: title + id, API key (password), "Customized settings" fold with Base URL · Model · Temperature · Max tokens · Context window · Native tools · Thinking · Compact policy (threshold / retain / summary tokens) · preset drift + Apply preset; footer Cancel / Apply; **Connect** stays on the card *and* on the composer chip; dashed "+ Add provider" creates a TOML from `llm::preset`; "Fetch available models" = `GET {base}/v1/models` via a new `Request::ListModels { provider }` (the BE holds the HTTP client) → picker | `frontend::llm_providers` |
 | **Skills** (replaces dsh Plugins) | tab **Catalogue**: the `ListCatalog` entries grouped Commands / Skills / Agents with descriptions and source paths, search, "Open folder" per kind, skill-creator template button; tab **Harness**: shell timeout (`Skill::timeout`), output caps, `MAX_TOOL_HOPS`, parallel pool cap, compaction thresholds — **read-only until those are settings** (today they are constants); tab **Delegation**: `agent-team.md` on/off switch (rename to `.md.off`), child-excluded list | `agents` constants → later a `harness.toml` |
+| **Agents** (dsh Agent presets) | roster cards from `agents/*.md` (harness §5.2): name · description · `skills:` count · **In use** when the current session runs it · **Set as default** (a `default_agent` setting the FE applies through `SetSessionAgent` right after `SessionCreated`) · **Show location** (`open_in_explorer`) · **Duplicate** (dialog "Copy preset · copied from {name}": *Identifier* → the new filename, placeholder `my-agent`, "Identifier is required / invalid / taken"; *Name*; Create) · **Delete** with a confirmation naming the preset; a file that fails to parse renders as a marked card with the reason as tooltip and only Show location / Delete live. Plus the **new-session chip** on the hero ("Agent preset for the session you are about to start", opens on the default, spent by the next session) and a read-only **header label** ("fixed when it started"). dsh's read-only shipped presets and its Creator-mode add-card have no counterpart: every sica preset is a file the user owns | `agents/*.md` + `settings_store.default_agent` — **S–M** |
+| **Integrations** (dsh Plugins › Plugin configuration) | one card per optional integration, each read from its file and reporting what the BE said at startup: **MCP servers** (`sica-settings/mcp/*.toml`: name, command, an `enabled` toggle that rewrites the TOML, status Started / Failed with the `LogLine` reason, tool count from the catalogue) · **Hooks** (`.sica/hooks.json` under the session's cwd: the matched events, read-only, "Open file") · **Web search** (`web.toml`: provider select, key field **write-only** — shows "configured" after save, harness §14.6) · **Workflow / Agent team** switches (rename `skills/{workflow,agent-team}.md` ⇄ `.md.off`). dsh's "Overridden / Reset to default" pair has no meaning here: a card *is* its file | the files named — **S–M**; an MCP change needs the BE restarted, which the row's `applies: restart` badge says |
 | **Diagnostics** (new home for Communication) | connection card (BE pid / IPC / protocol version / build id, Start / Stop / Rebuild & Restart, auto-watch, release profile), the log panel with a level filter, the demo request row | `controls.rs`, `log_panel.rs` |
 
 The "Open configuration file" header action opens `sica-settings.json` in
 the OS editor (`open_in_explorer` exists).
+
+### 7.3 Onboarding (**S**)
+
+**dsh:** on a first run with no usable provider the app root is made inert
+behind a body-level stage: a **welcome** dialog (the preview notice,
+**Continue**), then **"Add an API key to get started"** — "Configure the
+official DeepSeek provider to start building.", one **API key** field,
+**Configure later** / **Save and continue** (disabled until non-empty,
+"Saving…"). Saving writes the credential and returns to a working composer;
+"later" leaves the composer blocked with **Select model** (§6.8). The Models
+list marks a provider with an **"API key missing"** badge; **Open
+configuration file** sits in the settings header.
+
+**sica-rust:** a fresh checkout starts disconnected with the §6.8 blocked
+composer and no hint that Settings › Models is where to go.
+
+**Port:** at startup, when `llm_providers::load_all()` has no provider with a
+key, open a `kit::modal` over the shell: "Add an API key to get started" ·
+provider select (the TOML stems, "custom" last) · API key field · **Configure
+later** / **Save and continue** → writes the key into that provider's TOML,
+sets `last_active_provider`, connects. The Models cards get the **key
+missing** badge (`warn` `StateDot` + tooltip). No welcome dialog — the
+preview badge on the hero already says what the build is.
 
 ---
 
 ## 8. Sessions header, title, workspace
 
 Covered by §2.2 (header) and §4 (rows). Title generation already matches dsh
-(fallback → LLM → user-pinned once `RenameSession` exists). Workspace: one
-root; show it as the header's first crumb (`workspace_name`, tooltip = full
-path, click copies it — dsh's hover-card copy behaviour). No workspace
-picker.
+(fallback → LLM → user-pinned once `RenameSession` exists). Workspace: the
+header's first crumb is the **session's own** workspace (`SessionMeta.cwd` →
+its `WorkspaceDump.title`, or the folder name for an Ungrouped session),
+tooltip = full path, click copies it — dsh's hover-card copy behaviour; the
+picker and the grouping are §4.3. Until harness §3.9 lands the crumb shows
+the app-wide `working_dir()`, as it does today.
 
 ---
 
@@ -1255,6 +1503,9 @@ Additive only; `#[serde(default)]` on every new field so old logs load.
 | `Event::ToolCallStarted += call_seq: u64` | the Inspect pill §3.4 | ✅ (v20 — **addition**: the live event carried only the process-local tool id, while a reloaded row carries the durable `ToolCall` seq, so the same call had two identities and the pill had nothing stable to jump to. `0` for a nested `SkillContext::sub` call, which is a live event only and never reaches the log) |
 | `EventKind::RequestEnvelope { fingerprint, system, tools, options }` · `EventDump += envelope` · `Response::SessionEvents += envelopes: Vec<EnvelopeDump>` | the inspector's Schema / System Prompt / Tools / Options tabs §10 | ✅ (v22 — **deviation:** the bodies live in a durable log event written on *change*, not a hash on `TurnStart`; see §10. `EventTag::Prompt` is its ledger tag) |
 | `TurnFinished.finish_reason` gains `"max_tokens"` and `"interrupted"` as stable strings | §3.2, §3.5 | ✅ (`run_turn` normalises the provider's `"length"`; `chat.rs` ends the turn on it rather than hunting for a tool call in a truncated reply) |
+| `Request::ListWorkspaces` · `CreateWorkspace` · `RenameWorkspace` · `DeleteWorkspace` · `MoveWorkspace` · `MoveSession` → `Response::Workspaces { rows, ungrouped }` · `Event::WorkspacesChanged` · `NewSession { workspace_id }` · `SessionMeta += cwd` | workspace grouping, picker, add / rename / delete §4.3, header crumb §8 | ⏳ v26 — harness Wave 9 (§3.9) |
+| `ContextInjected` source `SessionReference(id)`; `@session:<id>` resolved in `send_user_message` | `@session` references §6.12 | ⏳ log-only, no bump |
+| `EventKind::WorkflowRun { run_id, phase, member, state }` | the workflow run body §6.11 | ⏳ log-only; harness §12.5 "left for later" |
 
 `forward_event` keeps `LogLine.level` (no wire change). `PROTOCOL_VERSION`
 is **22** (v17 batch → v18 prompt editing → v19 queue verbs → v20 trajectory
@@ -1277,10 +1528,9 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-3 Composer + control plane** ✅ | r=22 card, toolbar (`+`, permission chip + risk gate, plan chip, model select, context ring with the `TokenBreakdown` panel, send/stop), keymap with the busy-Enter preference, dock (to-dos, goal, queue with per-row Edit · Remove · Steer over the backend's real inbox), stats line, approval and question/plan-review takeovers, `/` menu with dsh's fuzzy ranking, drop overlay, toasts for WARN/ERROR. **Open:** nothing. `@file` completion landed with UI-6; the floating menu overlay and the claimed-command ghost hint landed with UI-7. | **L** | v17 batch 2 ✅ (queue dock landed on v19) |
 | **UI-4 Settings + sessions** ✅ | Settings modal with General (live) / Models / Skills / Diagnostics; session rows with the status dot, relative time and a ⋯ menu (Open · Rename · Fork · Archive · Copy title · Delete); inline rename, Last-updated order, the header search field with dsh's 250 ms debounce over the backend content scan, and "Fetch available models" as pickable chips per provider. **Open:** nothing — un-archive stays deliberately absent (§13). | **M** | v17 batch 3 ✅ |
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
-
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
-
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
+| **UI-8 Workspaces, onboarding, integrations** ⏳ | Workspace grouping in the sidebar, the hero picker and Add workspace over `rfd` (§4.3) · the session's workspace as the header crumb (§8) · the first-run onboarding modal and "key missing" badges (§7.3) · Settings › Agents and Settings › Integrations (§7.2) · the attachment rail with file cards and the lightbox (§5.3) · markdown extras — math fallback, images, scrolling tables, file links (§3.8) · `@session` (§6.12) · the workflow run body (§6.11, once the harness event exists) | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
 UI-2/3 are where the interaction model changes; UI-4/5 are polish and the
@@ -1295,17 +1545,26 @@ power-user view.
 - **Lexical contenteditable with inline chips** — `TextEdit` cannot embed
   widgets; `@path` and `/name` are decorated as coloured runs (galley
   colouring), which is what dsh does *after* send anyway.
-- **Workspaces** (multiple roots, drag order, groups) — sica-rust resolves
-  one `workspace_root()`; the header crumb shows it.
+- **Workspace drag order and browser-local session orders** — §4.3 ports
+  the registry, the grouping and the picker; reorder is Move up / Move down
+  and the order is host-durable, one per workspace. The in-app **browse**
+  directory dialog is also skipped: FE and BE share a machine, so the OS
+  chooser is always available.
 - **Brand assets** — whale mark, wordmark, "Into the Unknown", "Preview".
   sica-rust keeps the blade and its name.
 - **Locale registry** — worth a `frontend::strings` module of `pub const`s
   (every string above is one), not a runtime registry; one language.
 - **No-delete sessions, no unarchive** — product decisions for a hosted
   server; the desktop app keeps Delete behind the armed confirmation.
-- **Message feedback, schedule popover, agent presets section, MCP /
-  plugin inventory** — the features do not exist in the harness yet
-  (harness guide §12.8, §13.1–13.2); add their surfaces with the features.
+- **Message feedback, schedule popover** — the features do not exist in the
+  harness yet (harness guide §3.7, §12.8); add their surfaces with the
+  features. Agent presets and the MCP / hooks / web integrations *do* exist
+  since Waves 5–6 — their settings surfaces are §7.2's Agents and
+  Integrations rows.
+- **Math typesetting** — §3.8 renders TeX source legibly; KaTeX-quality
+  layout in egui is its own project.
+- **The Cordis inspector** (Chrome DevTools over the host) — the Trajectory
+  inspector and `--invariants` are the sica-rust windows into a run.
 - **Sidebar collapse choreography** (freeze-fade-slide) and the **turn
   rail** scrubber — nice, later.
 

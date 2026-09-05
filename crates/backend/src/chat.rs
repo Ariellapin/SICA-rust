@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -121,6 +122,10 @@ pub struct ChatHub {
     /// startup: a hooks file that could change under a running turn
     /// would make two calls in one turn answer to different rules.
     pub hooks:         Arc<hooks::HookConfig>,
+    /// The workspace registry (guide §3.9): which directories the user
+    /// has registered, and the manual order of the sessions in each.
+    /// Invisible to models — no skill reads it.
+    pub workspaces:    Arc<crate::workspaces::Registry>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -171,14 +176,12 @@ impl ControlState {
             .clone()
     }
 
-    async fn reader(&self, session_id: u64) -> Arc<ReadBeforeEdit> {
+    async fn reader(&self, session_id: u64, cwd: &Path) -> Arc<ReadBeforeEdit> {
         self.read_seen
             .lock()
             .await
             .entry(session_id)
-            .or_insert_with(|| {
-                Arc::new(ReadBeforeEdit::new(sica_core::paths::working_dir()))
-            })
+            .or_insert_with(|| Arc::new(ReadBeforeEdit::new(cwd.to_path_buf())))
             .clone()
     }
 
@@ -195,13 +198,16 @@ impl ControlState {
         let mode = self.mode(session_id).await;
         let plan = self.plan_active(session_id).await;
         let reminder = self.reminder(session_id).await;
-        let reader = self.reader(session_id).await;
-        let root = sica_core::paths::working_dir();
+        // The session's own working directory (guide §3.9): every policy
+        // that fences a path, and every skill that resolves one, has to
+        // agree on it, so it is resolved once here and handed down.
+        let root = session_cwd(sessions, session_id).await;
+        let reader = self.reader(session_id, &root).await;
         // The hook policy goes in only when hooks are configured: an
         // always-present policy that answers `Allow` still costs a lock and
         // a payload build on every call, and the common case is no hooks.
         let mut policies: Vec<Arc<dyn ToolPolicy>> = vec![
-            Arc::new(PermissionPolicy { mode, workspace_root: root }) as Arc<dyn ToolPolicy>,
+            Arc::new(PermissionPolicy { mode, workspace_root: root.clone() }) as Arc<dyn ToolPolicy>,
             Arc::new(PlanModePolicy { active: plan }) as Arc<dyn ToolPolicy>,
             reader as Arc<dyn ToolPolicy>,
             reminder as Arc<dyn ToolPolicy>,
@@ -220,6 +226,7 @@ impl ControlState {
             .with_brokers(self.brokers.clone())
             .with_session(session_id)
             .with_plan_active(plan)
+            .with_cwd(Some(root))
             .with_policies(policies);
         if let Some(fs) = self.failure_sink.clone() {
             sub = sub.with_failure_sink(fs);
@@ -948,7 +955,44 @@ impl ChatHub {
             goal_armed:   Arc::new(Mutex::new(HashSet::new())),
             next_goal_id: Arc::new(AtomicU64::new(1)),
             hooks:        Arc::new(hooks::HookConfig::default()),
+            workspaces:   Arc::new(crate::workspaces::Registry::load(
+                sica_core::paths::workspaces_file(),
+            )),
         }
+    }
+
+    /// Sessions as the workspace registry sees them (guide §3.9): id,
+    /// directory, archived. Read from the live map rather than from disk so
+    /// a session that has not been flushed yet still groups correctly.
+    pub async fn session_facts(&self) -> Vec<crate::workspaces::SessionFacts> {
+        let g = self.sessions.lock().await;
+        let mut out: Vec<crate::workspaces::SessionFacts> = g
+            .values()
+            .map(|s| crate::workspaces::SessionFacts {
+                id:       s.id,
+                cwd:      s.cwd(),
+                archived: s.archived(),
+            })
+            .collect();
+        out.sort_by_key(|s| s.id);
+        out
+    }
+
+    /// The projection both `ListWorkspaces` and `Event::WorkspacesChanged`
+    /// carry.
+    pub async fn workspace_projection(&self) -> (Vec<protocol::WorkspaceDump>, Vec<u64>) {
+        let facts = self.session_facts().await;
+        self.workspaces.project(&facts)
+    }
+
+    /// Push the whole projection to the frontend. Called after every
+    /// mutation — the document is one row per registered directory, so
+    /// sending all of it costs less than a delta the FE would reconcile.
+    pub async fn publish_workspaces(&self) {
+        let facts = self.session_facts().await;
+        self.workspaces.prune(&facts);
+        let (rows, ungrouped) = self.workspaces.project(&facts);
+        self.event_sink.emit(Event::WorkspacesChanged { rows, ungrouped });
     }
 
     /// Build a hub pre-populated with every session it can find on disk
@@ -994,6 +1038,23 @@ impl ChatHub {
             hub.next_goal_id.store(max_goal + 1, Ordering::Relaxed);
         }
         hub.next_id.store(max_id + 1, Ordering::Relaxed);
+        // Bootstrap the workspace registry (§3.9) from the headers of the
+        // sessions just restored — never from their bodies. It is a no-op
+        // once the document exists.
+        {
+            let headers: Vec<crate::workspaces::BootstrapSession> = sessions_store::list_headers()
+                .into_iter()
+                .map(|h| crate::workspaces::BootstrapSession {
+                    id:         h.id,
+                    cwd:        h.cwd,
+                    created_at: h.created_at,
+                })
+                .collect();
+            let next = hub.next_id.clone();
+            hub.workspaces.bootstrap_if_empty(&headers, &move || {
+                next.fetch_add(1, Ordering::Relaxed)
+            });
+        }
         hub
     }
 
@@ -1043,6 +1104,7 @@ impl ChatHub {
                 title: s.title(),
                 created_at: s.created_at(),
                 updated_at: s.updated_at(),
+                cwd: s.cwd(),
             })
             .collect();
         out.sort_by_key(|s| s.created_at);
@@ -1219,10 +1281,29 @@ impl ChatHub {
 
     /// Mint a session in memory only. It reaches disk with its first user
     /// message, so an unused "new session" leaves no file behind.
-    pub async fn create_session(&self) -> u64 {
+    ///
+    /// `workspace_id` decides the directory it works in (guide §3.9): the
+    /// workspace's path, else the process default. The order is dsh's —
+    /// resolve the directory, stamp it into the header, *then* attach — so
+    /// the header is the proof of membership and a failed attach can only
+    /// lose an ordering entry, never misfile a session.
+    pub async fn create_session(&self, workspace_id: Option<u64>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let s = SessionLog::new(id, default_title(id));
+        // A session always records where it works, workspace or not:
+        // that is what stops it from reopening somewhere else after the
+        // user points the app at another folder. Without a workspace the
+        // directory is the process default, and the session groups as
+        // Ungrouped until that folder is registered.
+        let cwd = workspace_id
+            .and_then(|w| self.workspaces.path_of(w))
+            .unwrap_or_else(sica_core::paths::working_dir);
+        let s = SessionLog::new_in(id, default_title(id), Some(cwd));
         self.sessions.lock().await.insert(id, s);
+        if let Some(w) = workspace_id {
+            if self.workspaces.attach(w, id) {
+                self.publish_workspaces().await;
+            }
+        }
         self.run_session_start_hooks(id).await;
         id
     }
@@ -3267,6 +3348,19 @@ pub(crate) async fn append_event(
     Some(seq)
 }
 
+/// The directory a session works in: the one stamped into its header when
+/// it was created (guide §3.9), falling back to the process default for a
+/// session written before sessions had their own — and for one that is not
+/// in the map at all.
+pub(crate) async fn session_cwd(sessions: &Sessions, session_id: u64) -> PathBuf {
+    sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .and_then(|log| log.cwd())
+        .unwrap_or_else(sica_core::paths::working_dir)
+}
+
 /// Snapshot the volatile runtime facts (time, cwd, os, model, permission
 /// mode, plan mode) as a user-role message. The new snapshot shadows its
 /// predecessor at the position the first one took, so one copy is ever
@@ -3289,7 +3383,8 @@ fn append_runtime_context(
             .find(|ev| ev.seq == e.seq)
             .map(|ev| ev.ts)
     });
-    let mut vars = agents::prompt::standard_vars(model);
+    let cwd = log.cwd().unwrap_or_else(sica_core::paths::working_dir);
+    let mut vars = agents::prompt::standard_vars_in(model, &cwd);
     vars.insert("permission".into(), perm_mode.context_line().into());
     vars.insert(
         "plan".into(),
@@ -3339,7 +3434,10 @@ fn human_elapsed(secs: i64) -> String {
 /// watcher — this runs at turn start and after successful filesystem tool
 /// calls, which is when edits matter.
 fn refresh_instructions(log: &mut SessionLog) -> bool {
-    let root = sica_core::paths::working_dir();
+    // The session's folder is both the ceiling of the chain walk and the
+    // directory it walks up from: two sessions in two projects each read
+    // their own AGENTS.md.
+    let root = log.cwd().unwrap_or_else(sica_core::paths::working_dir);
     let baseline = agents::instructions::load(&root, &root, agents::instructions::MAX_BYTES);
 
     // Look at the surface, not the raw log: a predecessor shadowed by a
@@ -3774,14 +3872,22 @@ async fn build_history(
     plan_policy: Option<String>,
     persona: Option<&str>,
 ) -> Result<Option<WireHistory>, agents::prompt::PromptError> {
-    let entries = {
+    let (entries, cwd) = {
         let g = sessions.lock().await;
         let Some(log) = g.get(&session_id) else { return Ok(None) };
-        log.derive_surface()
+        (log.derive_surface(), log.cwd())
     };
+    let cwd = cwd.unwrap_or_else(sica_core::paths::working_dir);
     let messages: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
-    let mut wh =
-        build_wire_history(&messages, skills, mode, model, plan_policy.as_deref(), persona)?;
+    let mut wh = build_wire_history(
+        &messages,
+        skills,
+        mode,
+        model,
+        plan_policy.as_deref(),
+        persona,
+        &cwd,
+    )?;
     wh.entries = entries;
     Ok(Some(wh))
 }
@@ -3834,9 +3940,10 @@ fn build_wire_history(
     model: &str,
     plan_policy: Option<&str>,
     persona: Option<&str>,
+    cwd: &Path,
 ) -> Result<WireHistory, agents::prompt::PromptError> {
     let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
-    let vars = agents::prompt::standard_vars(model);
+    let vars = agents::prompt::standard_vars_in(model, cwd);
     let rendered =
         agents::prompt::for_main_agent(&mem, skills, mode, &vars, plan_policy, persona)?;
     let tools_json = tools_for(skills, mode);
@@ -4073,7 +4180,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
             },
         ];
-        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None).unwrap().messages;
+        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None, &sica_core::paths::working_dir()).unwrap().messages;
         // memory.md may or may not exist on this machine; look at the tail.
         let n = wire.len();
         assert_eq!(wire[n - 2].role, "user");
@@ -4093,7 +4200,7 @@ mod tests {
             Message::user("continue"),
         ];
         for native in [protocol::ToolMode::Text, protocol::ToolMode::Native] {
-            let wire = build_wire_history(&msgs, &registry(), native, "test", None, None)
+            let wire = build_wire_history(&msgs, &registry(), native, "test", None, None, &sica_core::paths::working_dir())
                 .unwrap()
                 .messages;
             assert!(
@@ -4130,7 +4237,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
             },
         ];
-        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Native, "test", None, None).unwrap().messages;
+        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Native, "test", None, None, &sica_core::paths::working_dir()).unwrap().messages;
         let n = wire.len();
         assert_eq!(wire[n - 2].role, "assistant");
         assert!(wire[n - 2].tool_calls.is_some());
@@ -4144,7 +4251,7 @@ mod tests {
             "look",
             vec![UserImage { mime: "image/png".into(), data_base64: "AAAA".into() }],
         )];
-        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None).unwrap().messages;
+        let wire = build_wire_history(&msgs, &registry(), protocol::ToolMode::Text, "test", None, None, &sica_core::paths::working_dir()).unwrap().messages;
         let last = wire.last().unwrap();
         match &last.content {
             ChatContent::Parts(parts) => {
@@ -4157,8 +4264,8 @@ mod tests {
 
     #[test]
     fn wire_history_native_keeps_memory_and_drops_catalogue() {
-        let wire_text = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Text, "test", None, None).unwrap();
-        let wire_native = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Native, "test", None, None).unwrap();
+        let wire_text = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Text, "test", None, None, &sica_core::paths::working_dir()).unwrap();
+        let wire_native = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Native, "test", None, None, &sica_core::paths::working_dir()).unwrap();
         let sys_native = &wire_native.system_body;
         assert!(sys_native.contains(agents::prompt::NATIVE_IDENTITY), "{sys_native}");
         assert!(!sys_native.contains("## Loaded skills"), "tools array carries the catalogue");
@@ -4169,7 +4276,7 @@ mod tests {
 
     #[test]
     fn wire_history_breakdown_covers_all_three_parts() {
-        let wh = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Text, "test", None, None).unwrap();
+        let wh = build_wire_history(&[Message::user("hi")], &registry(), protocol::ToolMode::Text, "test", None, None, &sica_core::paths::working_dir()).unwrap();
         assert!(wh.breakdown.history >= 5, "user message priced");
         assert_eq!(wh.breakdown.tools, 0, "text protocol sends no tools array");
         assert!(wh.envelope != 0);
@@ -4569,7 +4676,7 @@ BE A REVIEWER
         reg.register(Arc::new(agents::ReadFile::new(std::path::PathBuf::from("."))));
         reg.register(Arc::new(agents::Grep::new(std::path::PathBuf::from("."))));
         let hub = ChatHub::new(tx, Arc::new(reg), None);
-        let id = hub.create_session().await;
+        let id = hub.create_session(None).await;
 
         let msg = hub
             .set_session_agent_in(&dir, id, Some("reviewer".into()))
@@ -4606,7 +4713,7 @@ BE A REVIEWER
     async fn the_agent_is_fixed_after_the_first_reply() {
         let dir = preset_dir("fixed");
         let (hub, _rx) = hub();
-        let id = hub.create_session().await;
+        let id = hub.create_session(None).await;
         hub.set_session_agent_in(&dir, id, Some("reviewer".into())).await.unwrap();
         {
             let mut g = hub.sessions.lock().await;
@@ -4629,7 +4736,7 @@ BE A REVIEWER
     async fn an_unknown_or_unsafe_agent_is_refused_without_side_effects() {
         let dir = preset_dir("refuse");
         let (hub, _rx) = hub();
-        let id = hub.create_session().await;
+        let id = hub.create_session(None).await;
         for bad in ["ghost", "../secrets"] {
             let err = hub
                 .set_session_agent_in(&dir, id, Some(bad.into()))
@@ -4660,7 +4767,7 @@ BE A REVIEWER
     async fn the_agent_command_reports_and_clears() {
         let dir = preset_dir("command");
         let (hub, _rx) = hub();
-        let id = hub.create_session().await;
+        let id = hub.create_session(None).await;
         hub.set_session_agent_in(&dir, id, Some("reviewer".into())).await.unwrap();
         let (ok, text) = hub.command_agent(id, "off").await;
         assert!(ok, "{text}");
@@ -4730,7 +4837,7 @@ BE A REVIEWER
     async fn permission_mode_sets_once_and_reports() {
         let (hub, _) = hub();
         assert!(!hub.set_permission_mode(99, PermissionMode::ReadOnly).await, "unknown session");
-        let id = hub.create_session().await;
+        let id = hub.create_session(None).await;
         assert!(hub.set_permission_mode(id, PermissionMode::ReadOnly).await);
         assert!(!hub.set_permission_mode(id, PermissionMode::ReadOnly).await, "unchanged: no-op");
         assert!(hub.set_permission_mode(id, PermissionMode::DangerFullAccess).await);
@@ -4749,7 +4856,7 @@ BE A REVIEWER
     #[tokio::test]
     async fn run_command_plan_and_permission() {
         let (hub, _) = hub();
-        let id = hub.create_session().await;
+        let id = hub.create_session(None).await;
         let text = hub.run_command(id, "plan", "on").await;
         assert!(text.contains("plan mode on"), "{text}");
         assert!(hub.plans.lock().await.get(&id).copied().unwrap_or(false));

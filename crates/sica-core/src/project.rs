@@ -264,6 +264,7 @@ mod tests {
         vec![
             ev(1, 1_000, EventKind::SessionCreated {
                 id: 1, title: "Session 1".into(), created_at: 1_000,
+                format: crate::event::SESSION_FORMAT, cwd: None,
             }),
             ev(2, 1_100, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
             user(3, 1_100, "  \nlist the crates\nand say why"),

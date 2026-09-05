@@ -18,6 +18,7 @@
 //! Windows when `cmd /C` cannot resolve a command).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
@@ -125,6 +126,12 @@ pub struct ToolSubAgent {
     /// turn is excluded by construction, so a fork never inherits a
     /// half-written exchange.
     pub fork_seed:     Option<Arc<Vec<ChatMessage>>>,
+    /// Directory the owning session works in (guide §3.9). `None` means
+    /// "whatever the process defaults to" — a session created before
+    /// sessions had their own directory, or a sub-agent running outside one
+    /// (tests, evals, teammates). Inherited by `child()`, so a nested call
+    /// can never drift into another project's folder.
+    pub cwd:           Option<PathBuf>,
     /// Seq of the durable `ToolCall` the caller logged for *this* dispatch,
     /// carried onto `Event::ToolCallStarted` so a live tool row and the
     /// ledger row for the same call share one identity. `None` for a nested
@@ -149,8 +156,17 @@ impl ToolSubAgent {
             session_id:   None,
             plan_active:  false,
             fork_seed:    None,
+            cwd:          None,
             log_seq:      None,
         }
+    }
+
+    /// Bind this call (and its children) to the session's working
+    /// directory. Without it every file skill falls back to the process
+    /// default, which is the pre-§3.9 behaviour.
+    pub fn with_cwd(mut self, cwd: Option<PathBuf>) -> Self {
+        self.cwd = cwd;
+        self
     }
 
     /// Name the durable `ToolCall` seq this dispatch was logged under.
@@ -238,6 +254,7 @@ impl ToolSubAgent {
             session_id:   self.session_id,
             plan_active:  self.plan_active,
             fork_seed:    self.fork_seed.clone(),
+            cwd:          self.cwd.clone(),
             // A nested call is a live event only — it never reaches the
             // session log, so it inherits no seq.
             log_seq:      None,
