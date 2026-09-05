@@ -21,6 +21,8 @@ mod tool_row;
 pub mod trajectory;
 mod user_text;
 
+pub use messages::lightbox;
+
 use egui::{Align, Align2, Layout, Rect, Sense, Vec2};
 
 use crate::app::{App, ChatView};

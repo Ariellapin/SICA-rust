@@ -365,7 +365,8 @@ fn draw_user_editor(app: &mut App, ui: &mut egui::Ui, i: usize, t: &Theme) {
 }
 
 fn draw_user_images(app: &mut App, ui: &mut egui::Ui, turn_idx: usize) {
-    const THUMB: f32 = 96.0;
+    let lone = app.chat.turns[turn_idx].images.len() == 1;
+    let mut open_lightbox: Option<(usize, usize)> = None;
     let ctx = ui.ctx().clone();
     let avail = ui.available_width();
     ui.allocate_ui_with_layout(
@@ -383,19 +384,80 @@ fn draw_user_images(app: &mut App, ui: &mut egui::Ui, turn_idx: usize) {
                     turn_idx * 1000 + j,
                 );
                 if let Some(handle) = tex {
-                    let natural = handle.size_vec2();
-                    let size = if natural.x <= 0.0 || natural.y <= 0.0 {
-                        Vec2::splat(THUMB)
-                    } else {
-                        let scale = (THUMB / natural.x).min(THUMB / natural.y);
-                        natural * scale
-                    };
-                    ui.image((handle.id(), size));
+                    let size = history_image_size(handle.size_vec2(), lone);
+                    let resp = ui
+                        .add(egui::Image::new((handle.id(), size)).sense(Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::ZoomIn);
+                    if resp.clicked() {
+                        // The thumbnail is a way in, not the picture. dsh
+                        // opens the original; this opens it in place.
+                        open_lightbox = Some((turn_idx, j));
+                    }
                 }
             }
         },
     );
+    if let Some(which) = open_lightbox {
+        app.lightbox = Some(which);
+    }
     ui.add_space(6.0);
+}
+
+/// The full-size view (§5.3): the image at `min(viewport − 64, natural)`,
+/// closed by Esc, the mask or ×.
+///
+/// It is a *document-level* surface, not part of the row that opened it —
+/// the transcript scrolls, and a viewer that scrolled with it would be a
+/// picture that runs away from the reader.
+pub fn lightbox(app: &mut App, ctx: &egui::Context) {
+    let Some((turn, idx)) = app.lightbox else { return };
+    let Some(att) = app.chat.turns.get_mut(turn).and_then(|t| t.images.get_mut(idx)) else {
+        app.lightbox = None;
+        return;
+    };
+    // `Attachment` carries no filename — the transcript stores what the
+    // model was sent, not what the file was called on disk.
+    let name = format!("Attachment {}", idx + 1);
+    let mime = att.mime.clone();
+    let data = att.data_base64.clone();
+    let tex = super::composer::ensure_texture(ctx, &mut att.texture, &mime, &data, turn * 1000 + idx);
+    let mut copy = false;
+    let out = kit::modal(ctx, egui::Id::new("image_lightbox"), &name, 960.0, true, |ui| {
+        match &tex {
+            Some(handle) => {
+                let natural = handle.size_vec2();
+                let room = ui.ctx().screen_rect().size() - Vec2::splat(64.0);
+                let scale = (room.x / natural.x).min(room.y / natural.y).min(1.0);
+                ui.add(egui::Image::new((handle.id(), natural * scale)));
+            }
+            None => {
+                let t = kit::theme(ui);
+                kit::label(
+                    ui,
+                    kit::txt(
+                        "This image could not be decoded.",
+                        13.0,
+                        Weight::Regular,
+                        kit::col(t.alias.label[2]),
+                    ),
+                );
+            }
+        }
+        ui.add_space(10.0);
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+            if kit::button(ui, "Copy", kit::Variant::Outline, kit::Size::Sm).clicked() {
+                copy = true;
+            }
+        });
+    });
+    if copy {
+        // The bytes are base64 in the log; the useful thing to put on the
+        // clipboard is the data URI, which pastes into a browser.
+        ctx.output_mut(|o| o.copied_text = format!("data:{mime};base64,{data}"));
+    }
+    if out.dismissed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.lightbox = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +509,32 @@ fn draw_assistant(
             }
         }
     });
+}
+
+/// How large an image is drawn in the transcript (§5.3).
+///
+/// A lone image is the message's subject, so it gets **240 px on its long
+/// edge** — but it is never *upscaled*: a 32 px icon blown up to 240 is a
+/// blurry lie about what was attached. Several images are a set rather than
+/// a subject, so each becomes a 64 px square. An aspect beyond dsh's
+/// `[0.25, 4]` is clamped, which is what keeps a 20 000 × 40 panorama from
+/// becoming a hairline that cannot be clicked.
+fn history_image_size(natural: Vec2, lone: bool) -> Vec2 {
+    if natural.x <= 0.0 || natural.y <= 0.0 {
+        return Vec2::splat(if lone { 240.0 } else { 64.0 });
+    }
+    if !lone {
+        return Vec2::splat(64.0);
+    }
+    let aspect = (natural.x / natural.y).clamp(0.25, 4.0);
+    let (w, h) = if aspect >= 1.0 {
+        (240.0, 240.0 / aspect)
+    } else {
+        (240.0 * aspect, 240.0)
+    };
+    // Never bigger than it really is.
+    let scale = (natural.x / w).min(natural.y / h).min(1.0);
+    Vec2::new(w * scale, h * scale)
 }
 
 /// Is `i` the last non-marker row — the one the loop is working on?
@@ -1139,4 +1227,45 @@ fn draw_pan_anchor(ctx: &egui::Context, origin: Pos2, t: &Theme) {
         ));
     }
     painter.circle_filled(origin, 1.5, ink);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lone image is the message's subject and gets 240 px on its long
+    /// edge — but is never upscaled, because a 32 px icon blown up to 240 is
+    /// a blurry lie about what was attached.
+    #[test]
+    fn a_lone_image_fills_240_on_its_long_edge_but_is_never_upscaled() {
+        let wide = history_image_size(Vec2::new(1200.0, 600.0), true);
+        assert_eq!(wide, Vec2::new(240.0, 120.0));
+        let tall = history_image_size(Vec2::new(600.0, 1200.0), true);
+        assert_eq!(tall, Vec2::new(120.0, 240.0));
+
+        let tiny = history_image_size(Vec2::new(32.0, 32.0), true);
+        assert_eq!(tiny, Vec2::new(32.0, 32.0), "a small image stays small");
+    }
+
+    /// An extreme aspect is clamped, which is what stops a panorama from
+    /// becoming a hairline nobody can click.
+    #[test]
+    fn an_extreme_aspect_is_clamped() {
+        let panorama = history_image_size(Vec2::new(20_000.0, 40.0), true);
+        assert_eq!(panorama.x / panorama.y, 4.0);
+        let column = history_image_size(Vec2::new(40.0, 20_000.0), true);
+        assert!((column.y / column.x - 4.0).abs() < 0.001);
+    }
+
+    /// Several images are a set rather than a subject.
+    #[test]
+    fn images_in_a_group_are_uniform_squares() {
+        for natural in [Vec2::new(1200.0, 600.0), Vec2::new(20.0, 900.0)] {
+            assert_eq!(history_image_size(natural, false), Vec2::splat(64.0));
+        }
+        // A texture that decoded to nothing still takes room, so the row
+        // does not silently collapse.
+        assert_eq!(history_image_size(Vec2::ZERO, true), Vec2::splat(240.0));
+        assert_eq!(history_image_size(Vec2::ZERO, false), Vec2::splat(64.0));
+    }
 }

@@ -197,6 +197,8 @@ pub struct App {
     pub workspaces: WorkspacesUi,
     /// The hero's agent-preset picker (§7.2): anchored to its chip.
     pub preset_menu: Option<egui::Rect>,
+    /// Image open in the lightbox (§5.3): `(turn, index)`.
+    pub lightbox: Option<(usize, usize)>,
     /// First-run key dialog (§7.3): open now, and answered once ever.
     pub onboarding_open: bool,
     pub onboarded: bool,
@@ -1219,6 +1221,7 @@ impl App {
             },
 
             preset_menu: None,
+            lightbox: None,
             onboarding_open: crate::ui::onboarding_wanted(
                 &providers,
                 settings.last_active_provider.as_deref(),

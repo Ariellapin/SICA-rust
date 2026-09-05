@@ -91,6 +91,8 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     }
 
     settings::draw(app, ctx);
+    // Over the transcript, under the first-run dialog.
+    chat::lightbox(app, ctx);
     // Last, so it sits over everything the first run has no use for yet.
     onboarding::draw(app, ctx);
     draw_toast(app, ctx, central);

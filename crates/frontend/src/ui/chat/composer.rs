@@ -911,6 +911,7 @@ pub fn ensure_texture(
 pub fn pick_file_and_attach(app: &mut App) {
     let picked = rfd::FileDialog::new()
         .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+        .add_filter("Text", &TEXT_EXTS)
         .pick_file();
     let Some(path) = picked else { return };
     if let Err(e) = attach_from_path(app, &path) {
@@ -918,7 +919,43 @@ pub fn pick_file_and_attach(app: &mut App) {
     }
 }
 
+/// Text files the composer accepts (§5.3). They do **not** become bytes on
+/// the wire: a text file is already something the agent can read, so it
+/// enters the message as an `@path` reference and the backend expands it.
+/// That is one mechanism instead of two, and it keeps a megabyte of CSV out
+/// of the session log.
+const TEXT_EXTS: [&str; 12] = [
+    "txt", "md", "csv", "json", "log", "toml", "yaml", "yml", "rs", "py", "ts", "sql",
+];
+
+/// `true` when this path is a text file the composer should reference
+/// rather than embed.
+pub fn is_text_attachment(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| TEXT_EXTS.contains(&e.as_str()))
+}
+
+/// Put `@path` in the draft, relative to the session's folder when it is
+/// under it — the shorter form is the one the user recognises, and the
+/// backend resolves both.
+fn reference_in_draft(app: &mut App, path: &Path) {
+    let cwd = app.session_workspace().1;
+    let shown = path.strip_prefix(&cwd).unwrap_or(path);
+    let at = format!("@{}", shown.display().to_string().replace('\\', "/"));
+    if !app.chat.draft.is_empty() && !app.chat.draft.ends_with(' ') {
+        app.chat.draft.push(' ');
+    }
+    app.chat.draft.push_str(&at);
+    app.chat.draft.push(' ');
+}
+
 fn attach_from_path(app: &mut App, path: &Path) -> std::io::Result<()> {
+    if is_text_attachment(path) {
+        reference_in_draft(app, path);
+        return Ok(());
+    }
     let bytes = std::fs::read(path)?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(std::io::Error::new(
