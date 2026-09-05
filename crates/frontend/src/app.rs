@@ -1144,6 +1144,14 @@ pub struct ToolChip {
     pub args_json:    String,
     /// Wall-clock time of the dispatch, pipeline included.
     pub duration_ms:  u64,
+    /// Progress lines an orchestrating skill printed while it ran — the
+    /// `phase()` and `log()` calls of a `workflow` script, and `agent-team`'s
+    /// equivalents (UI guide §6.11). They are the operator's view of a run
+    /// that otherwise shows only its final output, and they live on the chip
+    /// rather than in the log panel so a long run stays legible where it
+    /// happened. Live only: a reload rebuilds the row without them, which is
+    /// what the durable `WorkflowRun` events are for.
+    pub notes:        Vec<String>,
     /// Body open/closed (§3.4). Rows start collapsed.
     pub expanded:     bool,
 }
@@ -1359,6 +1367,42 @@ impl App {
     pub fn show_toast(&mut self, icon: crate::ui::icons::Icon, text: impl Into<String>, hold_ms: u64) {
         self.toast_seq += 1;
         self.toast = Some(crate::ui::kit::Toast::new(self.toast_seq, icon, text, hold_ms));
+    }
+
+    /// Route an orchestrator's progress line onto the chip of the call that
+    /// is producing it (§6.11).
+    ///
+    /// The prefix is the association: `workflow` and `agent-team` print
+    /// `"<skill>: …"`, and only one such call runs at a time in a session —
+    /// both cap their children and drive them from a single dispatch — so
+    /// the newest unfinished chip of that name is the right one. A line that
+    /// arrives with no such chip running stays in the log panel alone, which
+    /// is where it went before.
+    fn note_on_running_chip(&mut self, message: &str) {
+        const ORCHESTRATORS: [&str; 2] = ["workflow", "agent-team"];
+        let Some(skill) = ORCHESTRATORS
+            .iter()
+            .find(|s| message.starts_with(&format!("{s}: ")))
+        else {
+            return;
+        };
+        let body = message[skill.len() + 2..].to_string();
+        for turn in self.chat.turns.iter_mut().rev() {
+            if let Some(chip) = turn
+                .tool_chips
+                .iter_mut()
+                .rev()
+                .find(|c| !c.finished && c.name == **skill)
+            {
+                // Bounded: a script that logs in a loop must not be able to
+                // grow the transcript without limit.
+                const MAX_NOTES: usize = 200;
+                if chip.notes.len() < MAX_NOTES {
+                    chip.notes.push(body);
+                }
+                return;
+            }
+        }
     }
 
     /// A `file://` link the transcript emitted (§3.8) — an inline-code path
@@ -1810,6 +1854,7 @@ impl App {
             // tool-call parser has to be visible without opening Settings,
             // so it also raises a toast.
             UiEvent::LogLine { level, message } => {
+                self.note_on_running_chip(&message);
                 let kind = LogKind::from_level(&level);
                 match kind {
                     LogKind::Error => {
@@ -2141,6 +2186,7 @@ impl App {
                         finished: false, ok: true, summary: String::new(),
                         output: String::new(), duration_ms: 0,
                         expanded: false,
+                        notes: Vec::new(),
                     });
                 }
             }
@@ -2571,6 +2617,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     args_json: m.tool_args_json.clone().unwrap_or_default(),
                     duration_ms: 0,
                     expanded: false,
+                    notes: Vec::new(),
                 });
             }
             "system" if m.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX) => {

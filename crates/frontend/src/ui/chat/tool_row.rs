@@ -139,6 +139,33 @@ fn draw_one(
     }
 }
 
+/// The phase list of an orchestrating run (§6.11): what `workflow`'s
+/// `phase()` and `log()` printed, and `agent-team`'s equivalents.
+///
+/// This is the interim the UI guide asks for while the durable
+/// `WorkflowRun` events do not exist. It makes a long run legible *as it
+/// runs* — which is when a run that spends thirty child conversations most
+/// needs explaining — and it is live only: a reload rebuilds the row with
+/// its result and no phases, because nothing about the run reached the log.
+///
+/// Returns `true` when it drew anything.
+fn progress(ui: &mut egui::Ui, chip: &ToolChip) -> bool {
+    if chip.notes.is_empty() {
+        return false;
+    }
+    // Newest last, capped: the tail is where a running job is.
+    const SHOWN: usize = 12;
+    let skipped = chip.notes.len().saturating_sub(SHOWN);
+    if skipped > 0 {
+        kit::footnote(ui, &format!("… {skipped} earlier line(s)"));
+    }
+    for line in chip.notes.iter().skip(skipped) {
+        kit::footnote(ui, &kit::one_line(line, 160));
+    }
+    ui.add_space(4.0);
+    true
+}
+
 /// What the hover-revealed pills under an expanded body asked for.
 enum RowAction {
     /// Open the Trajectory view focused on this call's durable event.
@@ -293,10 +320,18 @@ fn hover_of(chip: &ToolChip) -> String {
 fn body(ui: &mut egui::Ui, chip: &ToolChip, state: ToolState) {
     ui.add_space(4.0);
     if state == ToolState::Running {
+        // A running orchestrator has something to say: its own progress.
+        // Everything else has only "running…", which is what the chip's dot
+        // already says.
+        if progress(ui, chip) {
+            ui.add_space(4.0);
+            return;
+        }
         kit::footnote(ui, "running…");
         ui.add_space(4.0);
         return;
     }
+    progress(ui, chip);
     // What the tool itself produced. Older sessions (and harness controls)
     // carry only the outcome, which is then the same text.
     let out = if chip.output.is_empty() { &chip.summary } else { &chip.output };
