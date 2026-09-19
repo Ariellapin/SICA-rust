@@ -594,6 +594,22 @@ pub fn stats_line(app: &App, ui: &mut egui::Ui) {
     if app.gen_speed.tps > 0.0 {
         groups.push(format!("{:.0} tok/s", app.gen_speed.tps));
     }
+    // Folded from every turn's own `TurnUsage` (§5.2): what went in and
+    // out over the session, and how long the model took to start
+    // answering on average. Absent until a turn has reported.
+    let usages: Vec<_> = app.chat.turns.iter().filter_map(|t| t.usage).collect();
+    if !usages.is_empty() {
+        let input: u64 = usages.iter().map(|u| u64::from(u.prompt)).sum();
+        let output: u64 = usages.iter().map(|u| u64::from(u.completion)).sum();
+        if input + output > 0 {
+            groups.push(format!("Input {} · Output {}", short_k(input), short_k(output)));
+        }
+        let with_ttft: Vec<u64> = usages.iter().map(|u| u.ttft_ms).filter(|&t| t > 0).collect();
+        if !with_ttft.is_empty() {
+            let avg = with_ttft.iter().sum::<u64>() / with_ttft.len() as u64;
+            groups.push(format!("TTFT avg {}", short_ms(avg)));
+        }
+    }
     let used = app.tokens.used.load(Ordering::Relaxed);
     let budget = app.tokens.budget.load(Ordering::Relaxed);
     if budget > 0 {
@@ -602,9 +618,31 @@ pub fn stats_line(app: &App, ui: &mut egui::Ui) {
     let line = groups.join("  |  ");
     ui.add_space(4.0);
     ui.vertical_centered(|ui| {
+        // Ellipsised to the column; the full line is the tooltip.
+        let font = kit::font(12.0, Weight::Regular);
+        let shown = kit::elide(ui, &line, &font, ui.available_width() - 16.0);
         kit::label(
             ui,
-            kit::txt(line, 12.0, Weight::Regular, kit::col(t.alias.label[2])),
-        );
+            kit::txt(&shown, 12.0, Weight::Regular, kit::col(t.alias.label[2])),
+        )
+        .on_hover_text(&line);
     });
+}
+
+/// `12.3K` / `840`.
+fn short_k(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// `840ms` / `1.2s`.
+fn short_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
 }

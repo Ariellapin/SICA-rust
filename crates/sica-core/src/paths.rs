@@ -32,6 +32,13 @@ pub fn settings_file() -> PathBuf {
     workspace_root().join("sica-settings.json")
 }
 
+/// The folder of per-file settings beside the document: provider TOMLs,
+/// MCP servers, `web.toml`, the workspace registry, `.env`. Watched by the
+/// frontend for external edits (guide §14.6).
+pub fn settings_dir() -> PathBuf {
+    workspace_root().join("sica-settings")
+}
+
 /// The workspace registry document (guide §3.9): every directory the user
 /// has registered, its title, and the manual order of both the workspaces
 /// and the sessions inside them. Written atomically on every mutation.

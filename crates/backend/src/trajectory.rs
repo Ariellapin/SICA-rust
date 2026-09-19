@@ -387,6 +387,25 @@ fn describe(kind: &EventKind) -> Described {
             // decided: a hook that denies a call worked exactly as intended.
             row(EventTag::Hook, text).ok(decision != "error")
         }
+        EventKind::Schedule { id, op, prompt, rule, fire_at, .. } => {
+            let text = match (op.as_str(), rule.as_deref(), fire_at) {
+                ("create", Some(rule), Some(at)) => format!(
+                    "reminder {id} created · {rule} · {}",
+                    agents::schedule::rfc3339(*at)
+                ),
+                _ => format!("reminder {id} · {op}"),
+            };
+            row(EventTag::Command, text).payload(prompt.clone().unwrap_or_default())
+        }
+        EventKind::MessageFeedback { seq_ref, rating, note } => {
+            let word = match rating {
+                1 => "thumbs up",
+                -1 => "thumbs down",
+                _ => "rating cleared",
+            };
+            row(EventTag::Other, format!("message {seq_ref} · {word}"))
+                .payload(note.clone().unwrap_or_default())
+        }
         EventKind::Unknown => row(
             EventTag::Other,
             "unknown event (written by a newer backend)".into(),

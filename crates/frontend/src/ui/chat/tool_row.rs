@@ -35,7 +35,7 @@ pub fn title_of(skill: &str) -> &'static str {
         "write-file" => "Write",
         "edit-file" => "Edit",
         "skill-creator" | "model-eval" => "Code",
-        "subagent" | "subagent-fork" | "ralph" | "agent-team" => "Delegate",
+        "subagent" | "subagent-fork" | "ralph" | "agent-team" | "workflow" => "Delegate",
         "todo-write" => "To-dos",
         "ask-user" => "Ask",
         "exit-plan-mode" => "Plan review",
@@ -71,12 +71,24 @@ fn draw_one(
     let chip = &chips[idx];
     let t = app.theme;
     let state = state_of(chip, app.chat.interrupt_requested);
+    // A delegate's report that no successful tool call backed (UI §6.10):
+    // the harness marks it `UNVERIFIED`, which dsh has no equivalent of, so
+    // the row carries an amber dot and says so instead of reading as a
+    // plain success.
+    let unverified = state == ToolState::Ok
+        && matches!(chip.name.as_str(), "subagent" | "subagent-fork" | "ralph" | "agent-team")
+        && (chip.output.contains("UNVERIFIED") || chip.summary.contains("UNVERIFIED"));
     let leading = match state {
         ToolState::Error => Leading::Dot(DotState::Error),
         ToolState::Stopped => Leading::Dot(DotState::Warning),
+        _ if unverified => Leading::Dot(DotState::Warning),
         _ => Leading::Icon(Icon::for_skill(&chip.name)),
     };
-    let summary = summary_of(chip, state);
+    let summary = if unverified {
+        "unverified — no successful tool call backed this report".to_string()
+    } else {
+        summary_of(chip, state)
+    };
     let title = title_of(&chip.name);
     let expanded = chip.expanded;
     // Collapsed edit/write rows carry `+A -R` in mono, like dsh's `.diffStat`.
@@ -156,6 +168,11 @@ fn draw_one(
 /// Returns `true` when it drew anything.
 fn run_tree(ui: &mut egui::Ui, run: Option<&protocol::WorkflowRunDump>) -> bool {
     let Some(run) = run else { return false };
+    // A run that has started but has no member yet has nothing to draw as
+    // a tree; the live phase list (`progress`) is what explains it then.
+    if run.phases.is_empty() {
+        return false;
+    }
     let t = kit::theme(ui);
     // A run that started and never ended is *interrupted* once nothing is
     // running any more — that is the whole reason its start is a row of its

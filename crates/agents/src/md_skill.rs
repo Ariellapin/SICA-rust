@@ -47,6 +47,14 @@ pub struct MarkdownSkill {
     /// "no restriction" — an agent that wants no tools at all should say so
     /// in its body, not by declaring an empty list.
     pub skills:      Vec<String>,
+    /// `disable-model-invocation: true` (guide §8.1): the file is for the
+    /// person's `/name`, never for the model — it stays out of the
+    /// catalogue and the `tools` array.
+    pub disable_model_invocation: bool,
+    /// `user-invocable: false`: the `/` palette does not list it.
+    pub user_invocable: bool,
+    /// `tool_mode:` — only meaningful for `agents/*.md` (guide §2.3).
+    pub tool_mode:   Option<String>,
 }
 
 #[async_trait]
@@ -63,6 +71,14 @@ impl Skill for MarkdownSkill {
         self.positionals.clone()
     }
 
+    fn model_invocable(&self) -> bool {
+        !self.disable_model_invocation
+    }
+
+    fn user_invocable(&self) -> bool {
+        self.user_invocable
+    }
+
     /// A markdown skill's body *is* the instruction — framing it as
     /// untrusted data would tell the model to ignore it.
     fn trusted(&self) -> bool {
@@ -75,7 +91,7 @@ impl Skill for MarkdownSkill {
     /// `{{date}}`, `{{model}}`). Strict, per the prompt module — a body
     /// referencing a valueless variable fails the call loudly instead of
     /// feeding the model a malformed template.
-    async fn run(&self, args: Value, _ctx: SkillContext) -> SkillOutcome {
+    async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let mut vars = crate::prompt::standard_vars("");
         for name in self.positional_args() {
             if let Some(v) = args.get(&name) {
@@ -86,10 +102,16 @@ impl Skill for MarkdownSkill {
                 vars.insert(name, s);
             }
         }
-        let source = format!("skills/{}.md", self.name);
+        let source = self.source_path.display().to_string();
         let body = match crate::prompt::interpolate(&self.body, &vars, &source) {
             Ok(b)  => b,
             Err(e) => {
+                // The operator's file is broken, not the model's call: say
+                // so where the operator looks (guide §5.1), naming the file.
+                ctx.sub.events.emit(protocol::Event::LogLine {
+                    level:   "ERROR".into(),
+                    message: format!("{source}: {e}"),
+                });
                 return SkillOutcome {
                     ok:      false,
                     summary: format!("skill `{}` failed to render: {e}", self.name),
@@ -218,6 +240,9 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
     let mut description = String::new();
     let mut positionals = Vec::new();
     let mut skills      = Vec::new();
+    let mut disable_model_invocation = false;
+    let mut user_invocable = true;
+    let mut tool_mode = None;
     let mut closed = false;
     for line in lines.by_ref() {
         if line.trim() == "---" {
@@ -230,6 +255,13 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
                 "description" => description = v,
                 "positional"  => positionals = split_list(&v),
                 "skills"      => skills      = split_list(&v),
+                "disable-model-invocation" | "disable_model_invocation" => {
+                    disable_model_invocation = yaml_bool(&v).unwrap_or(false)
+                }
+                "user-invocable" | "user_invocable" => {
+                    user_invocable = yaml_bool(&v).unwrap_or(true)
+                }
+                "tool_mode" | "tool-mode" => tool_mode = Some(v),
                 _ => {}
             }
         }
@@ -249,7 +281,20 @@ fn parse(text: &str, source: &Path) -> Result<MarkdownSkill, String> {
         source_path: source.to_path_buf(),
         positionals,
         skills,
+        disable_model_invocation,
+        user_invocable,
+        tool_mode,
     })
+}
+
+/// YAML's boolean spellings, the way a hand-edited frontmatter writes
+/// them. Anything else is `None` so the caller keeps its default.
+fn yaml_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parse a `positional:` / `skills:` frontmatter value into an ordered name
@@ -323,6 +368,9 @@ mod tests {
             source_path: PathBuf::from("skills").join("n.md"),
             positionals: Vec::new(),
             skills: Vec::new(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            tool_mode: None,
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let sub = crate::ToolSubAgent::root(cap);
@@ -348,6 +396,9 @@ mod tests {
             source_path: PathBuf::from("skills").join("weather.md"),
             positionals: vec!["city".into(), "units".into()],
             skills: Vec::new(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            tool_mode: None,
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let ctx = SkillContext { sub: crate::ToolSubAgent::root(cap) };
@@ -369,6 +420,9 @@ mod tests {
             source_path: PathBuf::from("skills").join("broken.md"),
             positionals: Vec::new(),
             skills: Vec::new(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            tool_mode: None,
         };
         let cap: Arc<dyn crate::agent::EventSink> = Arc::new(Sink);
         let ctx = SkillContext { sub: crate::ToolSubAgent::root(cap) };

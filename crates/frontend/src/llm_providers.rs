@@ -54,6 +54,13 @@ pub struct ProviderConfig {
     /// Completion cap for the compaction summary. 0 = default (8192).
     #[serde(default)]
     pub compact_max_tokens: u32,
+    /// Summariser attempts when compaction fails. 0 = default (1).
+    #[serde(default)]
+    pub compact_retries: u32,
+    /// Retry every request failure, fatal ones included (dsh's
+    /// `retry: { mode: always }`, harness §4.2) — for unattended runs.
+    #[serde(default)]
+    pub retry_always: bool,
 }
 
 fn default_temperature() -> f32 {
@@ -144,8 +151,13 @@ impl ProviderConfig {
                 } else {
                     d.max_tokens
                 },
-                retries: d.retries,
+                retries: if self.compact_retries > 0 {
+                    self.compact_retries.min(5)
+                } else {
+                    d.retries
+                },
             },
+            retry_always: self.retry_always,
         }
     }
 }
@@ -220,6 +232,8 @@ pub(crate) fn defaults() -> Vec<ProviderConfig> {
         model: String::new(),
         api_key: String::new(),
         temperature: default_temperature(),
+        compact_retries: 0,
+        retry_always: false,
         max_tokens: 0,
         context_window: 0,
         native_tools: false,

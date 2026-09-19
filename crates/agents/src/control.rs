@@ -44,6 +44,9 @@ pub const CHILD_EXCLUDED: &[&str] = &[
     crate::goal::CREATE_GOAL_NAME,
     crate::goal::GET_GOAL_NAME,
     crate::goal::UPDATE_GOAL_NAME,
+    crate::schedule::SCHEDULE_CREATE_NAME,
+    crate::schedule::SCHEDULE_LIST_NAME,
+    crate::schedule::SCHEDULE_DELETE_NAME,
 ];
 
 /// User-editable plan-mode policy, seeded once into `skills/` (never
@@ -91,7 +94,18 @@ pub fn is_policy_doc(path: &Path) -> bool {
 /// they mutate the session log and (for `exit-plan-mode`) conclude the
 /// turn. The dispatcher intercepts them before any sub-agent spins up.
 pub fn is_control_skill(name: &str) -> bool {
-    name == TODO_WRITE_NAME || name == EXIT_PLAN_MODE_NAME || crate::goal::is_goal_skill(name)
+    name == TODO_WRITE_NAME
+        || name == EXIT_PLAN_MODE_NAME
+        || crate::goal::is_goal_skill(name)
+        || is_schedule_skill(name)
+}
+
+/// The reminder tools (guide §12.8) are harness controls too: they mutate
+/// the session log and their bodies run in the hub.
+pub fn is_schedule_skill(name: &str) -> bool {
+    name == crate::schedule::SCHEDULE_CREATE_NAME
+        || name == crate::schedule::SCHEDULE_LIST_NAME
+        || name == crate::schedule::SCHEDULE_DELETE_NAME
 }
 
 /// Coerce an argument that should be a JSON array into one. The tool

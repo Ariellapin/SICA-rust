@@ -27,6 +27,9 @@ pub enum Block {
     Math(String),
     /// A GFM table, rendered inside its own horizontal scroll.
     Table(String),
+    /// A closed fenced code block: the info-string language and the body
+    /// without its fences, drawn by `kit::code_block` (§3.2).
+    Code { lang: String, body: String },
 }
 
 /// Split an assistant message into renderable blocks.
@@ -53,17 +56,30 @@ pub fn split(text: &str) -> Vec<Block> {
         let trimmed = line.trim_start();
 
         // A fence runs to its closing marker, or to the end of the message
-        // (a stream cut mid-block is normal while a turn is live).
+        // (a stream cut mid-block is normal while a turn is live). A closed
+        // fence becomes its own block so it can be drawn by `kit::code_block`
+        // — the language banner and the Copy button (§3.2); an unclosed one
+        // stays prose, rendered as it always was until the closer streams.
         if let Some(fence) = fence_marker(trimmed) {
-            prose.push(line);
+            let lang = trimmed[fence.len()..].trim().to_string();
+            let start = i;
+            let mut body: Vec<&str> = Vec::new();
+            let mut closed = false;
             i += 1;
             while i < lines.len() {
                 let l = lines[i];
-                prose.push(l);
                 i += 1;
                 if l.trim_start().starts_with(fence) {
+                    closed = true;
                     break;
                 }
+                body.push(l);
+            }
+            if closed {
+                flush(&mut prose, &mut out);
+                out.push(Block::Code { lang, body: body.join("\n") });
+            } else {
+                prose.extend(lines[start..i].iter().copied());
             }
             continue;
         }
@@ -452,14 +468,29 @@ mod tests {
         assert_eq!(bracket, vec![Block::Math("x = 1".into())]);
     }
 
-    /// A fence is opaque: what is inside it is what the model is showing.
+    /// A fence is opaque: what is inside it is what the model is showing —
+    /// a closed one becomes a code block, never math or a table.
     #[test]
     fn nothing_inside_a_fence_is_split() {
         let text = "```tex\n$$ x $$\n| a | b |\n|---|---|\n```";
-        assert_eq!(split(text), vec![prose(text)]);
-        // A fence left open by a stream cut still keeps its contents.
+        assert_eq!(
+            split(text),
+            vec![Block::Code { lang: "tex".into(), body: "$$ x $$\n| a | b |\n|---|---|".into() }]
+        );
+        // A fence left open by a stream cut still keeps its contents, as
+        // prose, until the closer arrives.
         let cut = "```\n$$ x $$";
         assert_eq!(split(cut), vec![prose(cut)]);
+        // Prose around a fence stays prose; `~~~` fences count too.
+        let mixed = "before\n~~~\nx\n~~~\nafter";
+        assert_eq!(
+            split(mixed),
+            vec![
+                prose("before"),
+                Block::Code { lang: String::new(), body: "x".into() },
+                prose("after"),
+            ]
+        );
     }
 
     #[test]
@@ -493,6 +524,7 @@ mod tests {
                 .map(|b| match b {
                     Block::Prose(s) | Block::Table(s) => s.clone(),
                     Block::Math(s) => s.clone(),
+                    Block::Code { body, .. } => body.clone(),
                 })
                 .collect::<Vec<_>>()
                 .join("");

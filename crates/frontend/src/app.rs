@@ -305,6 +305,13 @@ pub struct App {
     pub jobs: Vec<protocol::JobDump>,
     /// Durable objective of the active session, when it has one.
     pub goal: Option<protocol::GoalDump>,
+    /// Active reminders of the active session (harness §12.8) — the
+    /// header's schedule popover. Replaced wholesale on every change.
+    pub schedules: Vec<protocol::ScheduleDump>,
+    /// Backend warnings about MCP servers, in arrival order (§7.2): the
+    /// Integrations tab shows the newest one that names a server as that
+    /// server's Failed reason.
+    pub mcp_notes: Vec<String>,
     /// The goal bar's inline objective editor, and its draft. `Some` only
     /// while the field is open; committing sends `/goal edit <text>`, which
     /// is a compare-and-set on the backend like every other goal mutation.
@@ -360,6 +367,8 @@ pub struct MenuOpen {
     pub working_dir: bool,
     pub model: bool,
     pub jobs: bool,
+    /// The header's reminder popover (harness §12.8).
+    pub schedule: bool,
     pub goal: bool,
     pub context: bool,
 }
@@ -761,6 +770,22 @@ impl App {
         {
             return (w.title.clone(), w.path.clone());
         }
+        // Ungrouped: the session's *own* folder from its header (§8), not
+        // the app-wide default — the two differ as soon as the default has
+        // moved since the session was created.
+        if let Some(cwd) = self
+            .chat
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.cwd.clone())
+        {
+            let name = cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cwd.display().to_string());
+            return (name, cwd);
+        }
         (self.workspace_name.clone(), sica_core::paths::working_dir())
     }
 }
@@ -777,8 +802,20 @@ impl WorkspacesUi {
     }
 }
 
+/// Turns a session shows on open and per "Load earlier" (§3.6). dsh pages
+/// 50 nodes; a turn here is a user/assistant pair, so 50 turns is a longer
+/// page than dsh's, and the eager load makes the page a *render* window.
+pub const PAGE_TURNS: usize = 50;
+
 #[derive(Default)]
 pub struct ChatState {
+    /// Turns hidden above the rendered window (§3.6). `0` shows everything;
+    /// "Load earlier" subtracts a page. New turns append below the window,
+    /// so this never has to move for them.
+    pub hidden_before: usize,
+    /// A turn the rail asked to scroll to (§3.6); honoured and cleared by
+    /// the next transcript pass, which is the one that knows the rect.
+    pub scroll_to_turn: Option<usize>,
     pub session_id:    u64,
     #[allow(dead_code)]
     pub next_session:  AtomicU64,
@@ -1027,6 +1064,14 @@ pub struct Turn {
     /// backend has not acknowledged yet, which is exactly when editing must
     /// not be offered.
     pub user_seq:           Option<u64>,
+    /// Seq of the turn's final assistant message — what the tail's thumbs
+    /// rate (harness §3.7). From the dump on reload, from `TurnUsage` live.
+    pub assistant_seq:      Option<u64>,
+    /// The rating the user gave it: `1`, `-1`, or none.
+    pub feedback:           Option<i8>,
+    /// The ERROR line the backend logged while this turn ran, when it ended
+    /// in `error` — what the turn error row shows (§3.5).
+    pub error:              Option<String>,
 }
 
 /// One step-level retry inside a turn: the backend classified an LLM failure
@@ -1073,6 +1118,9 @@ impl Turn {
             retries: Vec::new(),
             usage: None,
             user_seq: None,
+            assistant_seq: None,
+            feedback: None,
+            error: None,
         }
     }
 
@@ -1319,6 +1367,8 @@ impl App {
             todos: Vec::new(),
             jobs: Vec::new(),
             goal: None,
+            schedules: Vec::new(),
+            mcp_notes: Vec::new(),
             goal_edit: None,
             permission_mode: protocol::PermissionMode::default(),
             plan_active: false,
@@ -1360,6 +1410,59 @@ impl App {
         let _ = settings_store::save(&self.settings_snapshot());
     }
 
+    /// Apply an external edit of `sica-settings.json` or the files under
+    /// `sica-settings/` (harness §14.6): the document is read again and the
+    /// live preferences follow, without a restart. The app's own writes
+    /// reach here too through the watcher; a document that says exactly
+    /// what the app already holds is left alone, so nothing churns.
+    pub fn reload_settings_from_disk(&mut self, ctx: &egui::Context) {
+        // Provider and MCP files: re-read the roster so Settings › Models
+        // shows the edit. The active connection is untouched — it was made
+        // from the values in force when Connect was pressed.
+        self.providers = crate::llm_providers::load_all();
+        let Some(on_disk) = settings_store::on_disk_text() else { return };
+        let mine = serde_json::to_string_pretty(&self.settings_snapshot()).unwrap_or_default();
+        if on_disk.trim() == mine.trim() {
+            return;
+        }
+        let Ok(s) = serde_json::from_str::<Settings>(&on_disk) else {
+            self.push_log(LogKind::Warn, "settings file changed on disk but does not parse — keeping the live values".into());
+            return;
+        };
+        self.theme_mode = ThemeMode::parse(&s.theme_mode);
+        self.content_px = s.content_px.clamp(tokens::CONTENT_MIN_PX, tokens::CONTENT_MAX_PX);
+        self.transcript_compact = s.transcript_compact;
+        self.busy_enter = BusyEnter::parse(&s.busy_enter);
+        self.reduce_motion = s.reduce_motion;
+        self.layout.content_w = s.chat_content_width;
+        self.log_raw_llm = s.log_raw_llm;
+        self.idealist_auto_apply_be = s.idealist_auto_apply_be;
+        self.auto_start_be = s.auto_start_be;
+        self.auto_connect_llm = s.auto_connect_llm;
+        self.autoscroll = s.autoscroll;
+        self.release_profile = s.release_profile;
+        if self.auto_watch != s.auto_watch {
+            self.auto_watch = s.auto_watch;
+            self.send(UiCommand::SetAutoWatch(s.auto_watch));
+        }
+        self.default_permission_mode = s.default_permission_mode;
+        self.default_agent = s.default_agent;
+        self.onboarded = s.onboarded;
+        self.workspaces.grouped = s.sidebar_group != "flat";
+        self.workspaces.by_updated = s.sidebar_order != "manual";
+        self.recent_working_dirs = s.recent_working_dirs.iter().map(PathBuf::from).collect();
+        let dir = s
+            .working_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
+        if dir != self.working_dir {
+            self.set_working_dir(dir, ctx);
+        }
+        self.refresh_theme(ctx);
+        self.push_log(LogKind::Info, "settings reloaded from disk".into());
+    }
+
     /// Point the agent at `dir` — `None` means the app's own root. The
     /// backend resolves the folder once, at startup (its file skills capture
     /// it), so a change restarts the BE; sessions live on disk and are
@@ -1383,14 +1486,16 @@ impl App {
         self.save_general(ctx);
 
         let path = sica_core::paths::working_dir().display().to_string();
-        self.push_log(LogKind::Info, format!("working directory → {path}"));
-        // Restart rather than rebuild: the binary is unchanged, only the
-        // environment it starts in.
-        if self.be_state.running {
-            self.send(UiCommand::StopBe);
-            self.send(UiCommand::StartBe);
-        }
-        self.show_toast(crate::ui::icons::Icon::Folder, format!("Working directory: {path}"), 2600);
+        self.push_log(LogKind::Info, format!("default folder for new sessions → {path}"));
+        // Live (harness §3.9, UI §7.2): the backend changes its default on
+        // the wire, and the next session created outside a workspace is
+        // stamped with it. Sessions that already exist keep the folder in
+        // their header, so nothing running is disturbed. The child also
+        // gets the folder in its environment on its next spawn.
+        self.send(UiCommand::SendRequest(protocol::Request::SetWorkingDir {
+            path: dir.map(|p| p.display().to_string()),
+        }));
+        self.show_toast(crate::ui::icons::Icon::Folder, format!("New sessions start in {path}"), 2600);
     }
 
     /// Show a toast, replacing whatever is on screen (dsh shows one at a
@@ -1410,7 +1515,7 @@ impl App {
     /// arrives with no such chip running stays in the log panel alone, which
     /// is where it went before.
     fn note_on_running_chip(&mut self, message: &str) {
-        const ORCHESTRATORS: [&str; 2] = ["workflow", "agent-team"];
+        const ORCHESTRATORS: [&str; 3] = ["workflow", "agent-team", "ralph"];
         let Some(skill) = ORCHESTRATORS
             .iter()
             .find(|s| message.starts_with(&format!("{s}: ")))
@@ -1614,6 +1719,18 @@ impl App {
         style.spacing.menu_margin = egui::Margin::same(4.0);
         style.spacing.scroll.bar_width = 8.0;
         style.spacing.scroll.floating = true;
+        // Scrollbar thumbs (§1.1): 8 px, r=4 (half the width), invisible
+        // until the pointer is over the column, solid while dragged.
+        style.spacing.scroll.handle_min_length = 24.0;
+        style.spacing.scroll.dormant_handle_opacity = 0.0;
+        style.spacing.scroll.active_handle_opacity = 0.55;
+        style.spacing.scroll.interact_handle_opacity = 1.0;
+        style.spacing.scroll.dormant_background_opacity = 0.0;
+        style.spacing.scroll.active_background_opacity = 0.0;
+        style.spacing.scroll.interact_background_opacity = 0.0;
+        // Tooltips (§1.3): a 500 ms delay, so a pointer crossing the sidebar
+        // does not light up every row it passes.
+        style.interaction.tooltip_delay = 0.5;
 
         // Surfaces.
         style.visuals.panel_fill = col(a.bg_base);
@@ -1873,13 +1990,13 @@ impl App {
         self.chat.turns.iter_mut().rev().find(|t| t.notice.is_none())
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.ui_rx.try_recv() {
-            self.handle_event(ev);
+            self.handle_event(ev, ctx);
         }
     }
 
-    fn handle_event(&mut self, ev: UiEvent) {
+    fn handle_event(&mut self, ev: UiEvent, ctx: &egui::Context) {
         match ev {
             UiEvent::Log(s) => self.push_log(LogKind::Info, s),
             // The BE's own level survives the hop now (§9): a WARN from the
@@ -1890,9 +2007,20 @@ impl App {
                 let kind = LogKind::from_level(&level);
                 match kind {
                     LogKind::Error => {
+                        // The turn error row (§3.5) shows the failure it
+                        // ended on; an ERROR logged while a turn runs is it.
+                        if let Some(t) = self.active_turn_mut() {
+                            if !t.finished {
+                                t.error = Some(message.clone());
+                            }
+                        }
                         self.show_toast(crate::ui::icons::Icon::Warning, message.clone(), 6000)
                     }
                     LogKind::Warn => {
+                        if message.starts_with("mcp") {
+                            self.mcp_notes.push(message.clone());
+                            self.mcp_notes.truncate(64);
+                        }
                         self.show_toast(crate::ui::icons::Icon::Warning, message.clone(), 3000)
                     }
                     _ => {}
@@ -2001,8 +2129,21 @@ impl App {
                 // Intentionally not logged — IPC dot color is the only surface.
             }
             UiEvent::FsEvent(paths) => {
-                let count = paths.len();
-                let sample = paths
+                // Settings edits (harness §14.6) are applied here, not
+                // rebuilt: the document and the provider files are read
+                // again and the live preferences follow. Source changes
+                // only refresh the restart-pending check.
+                let (settings, source): (Vec<_>, Vec<_>) = paths
+                    .iter()
+                    .partition(|p| crate::watcher::is_settings_path(p));
+                if !settings.is_empty() {
+                    self.reload_settings_from_disk(ctx);
+                }
+                if source.is_empty() {
+                    return;
+                }
+                let count = source.len();
+                let sample = source
                     .iter()
                     .take(3)
                     .map(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
@@ -2253,7 +2394,7 @@ impl App {
                 }
             }
             UiEvent::TurnUsage {
-                session_id, prompt, completion, reasoning, duration_ms, ttft_ms, ..
+                session_id, prompt, completion, reasoning, duration_ms, ttft_ms, last_seq, ..
             } => {
                 // One `TurnUsage` per *request* — so this, not the last hop's
                 // `TurnFinished`, is where the session stops being busy. Stop
@@ -2277,6 +2418,9 @@ impl App {
                     t.usage = Some(TurnUsage {
                         prompt, completion, reasoning, duration_ms, ttft_ms,
                     });
+                    if last_seq > 0 {
+                        t.assistant_seq = Some(last_seq);
+                    }
                 }
             }
             UiEvent::IdealistStatus { activity, severity, last_ticket } => {
@@ -2340,6 +2484,7 @@ impl App {
                         created_at: 0,
                         updated_at: 0,
                         cwd: None,
+                        scheduled: false,
                     });
                 }
                 self.switch_session(id);
@@ -2371,6 +2516,9 @@ impl App {
                     return;
                 }
                 self.chat.turns = rebuild_turns(&session);
+                // Pagination (§3.6): a long session opens on its newest
+                // page; "Load earlier" walks back a page at a time.
+                self.chat.hidden_before = self.chat.turns.len().saturating_sub(PAGE_TURNS);
                 // The runs a reload has to draw again (§6.11). Replaced
                 // wholesale: they belong to the session being opened.
                 self.runs = session
@@ -2389,6 +2537,7 @@ impl App {
                 // off screen in the frame before it lands.
                 self.jobs.clear();
                 self.goal = None;
+                self.schedules = session.schedules;
                 // An objective half-edited in the session being left must not
                 // be committed against the one being opened.
                 self.goal_edit = None;
@@ -2514,6 +2663,16 @@ impl App {
                     self.goal = goal;
                 }
             }
+            UiEvent::SchedulesChanged { session_id, rows } => {
+                // The sidebar's alarm glyph follows the same fact, so keep
+                // the row in step without waiting for the next list.
+                if let Some(meta) = self.chat.sessions.iter_mut().find(|s| s.id == session_id) {
+                    meta.scheduled = !rows.is_empty();
+                }
+                if session_id == self.chat.session_id {
+                    self.schedules = rows;
+                }
+            }
             UiEvent::InboxChanged { session_id, queued, accepted } => {
                 if session_id == self.chat.session_id {
                     match accepted.as_str() {
@@ -2628,6 +2787,8 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
                     ..Turn::new(session.id, turns.len() as u64 + 1)
                 });
                 slot.assistant = m.content.clone();
+                slot.assistant_seq = (m.seq > 0).then_some(m.seq);
+                slot.feedback = m.feedback;
                 if let Some(r) = &m.reasoning {
                     slot.reasoning = r.clone();
                 }
@@ -2714,7 +2875,7 @@ fn rebuild_turns(session: &SessionDump) -> Vec<Turn> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        self.drain_events(ctx);
         self.tick_heartbeat_watchdog();
         ui::draw(self, ctx);
         self.take_file_link(ctx);

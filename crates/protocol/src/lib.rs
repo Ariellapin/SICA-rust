@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -208,6 +208,12 @@ pub struct LlmOptions {
     /// to dsh's 80/16 policy; the frontend can override per provider.
     #[serde(default)]
     pub compact: CompactPolicy,
+    /// dsh's `retry: { mode: always }` (harness §4.2): retry *every*
+    /// request failure up to the budget, fatal ones included. Off by
+    /// default — a 4xx normally reproduces — and worth turning on for an
+    /// unattended run against a flaky local server.
+    #[serde(default)]
+    pub retry_always: bool,
 }
 
 impl Default for LlmOptions {
@@ -219,6 +225,7 @@ impl Default for LlmOptions {
             tool_mode: ToolMode::Text,
             thinking: true,
             compact: CompactPolicy::default(),
+            retry_always: false,
         }
     }
 }
@@ -435,6 +442,18 @@ pub enum Request {
     /// any time — including while a turn is running, when it answers with
     /// what is durable so far.
     SessionStats { session_id: u64 },
+
+    /// Point the backend's *default* working directory — the folder an
+    /// Ungrouped session is created in — at `path` without a restart
+    /// (harness §3.9, UI §7.2). `None` resets it to the app's own root.
+    /// Existing sessions keep the directory stamped in their header; only
+    /// sessions created after this call read the new default.
+    SetWorkingDir { path: Option<String> },
+
+    /// Rate one assistant message (harness §3.7): `rating` is `1`, `-1` or
+    /// `0` to clear. Log-only — the model never sees it — and useful as a
+    /// label for `model-eval` later.
+    RateMessage { session_id: u64, seq: u64, rating: i8, note: Option<String> },
 
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
@@ -701,6 +720,11 @@ pub struct SessionMeta {
     /// default and groups as Ungrouped.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// The session holds at least one active reminder (harness §12.8) —
+    /// the sidebar's non-interactive alarm glyph. Best-effort: it says the
+    /// list is non-empty, not that a live runtime will deliver it.
+    #[serde(default)]
+    pub scheduled: bool,
 }
 
 /// One orchestrated run as the transcript draws it (UI guide §6.11):
@@ -791,6 +815,25 @@ pub struct SessionDump {
     /// so a reload draws the same tree the live events drew.
     #[serde(default)]
     pub runs: Vec<WorkflowRunDump>,
+    /// Active reminders (harness §12.8), the header popover's rows.
+    #[serde(default)]
+    pub schedules: Vec<ScheduleDump>,
+}
+
+/// One active reminder as the frontend draws it (UI guide §6.10). Only
+/// durable facts cross the wire: whether it is overdue is derived from the
+/// viewer's clock, as dsh does, so the row never disagrees with the time
+/// the user is looking at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleDump {
+    pub id: String,
+    pub prompt: String,
+    /// `after` | `at` | `every`.
+    pub rule: String,
+    /// Next target, unix seconds UTC.
+    pub fire_at: i64,
+    /// Interval for an `every` record; `None` for a one-shot.
+    pub every_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,6 +881,11 @@ pub struct MessageDump {
     /// prose.
     #[serde(default)]
     pub context_source: Option<String>,
+    /// The user's rating of an assistant message (`1` / `-1`), when they
+    /// gave one (harness §3.7). Log-only bookkeeping the transcript shows
+    /// as a lit thumb.
+    #[serde(default)]
+    pub feedback: Option<i8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -972,6 +1020,11 @@ pub enum Event {
         duration_ms: u64,
         /// Time to the first streamed token of the turn's first hop.
         ttft_ms:     u64,
+        /// Seq of the turn's final `AssistantMessage` — the handle the
+        /// tail's thumbs rate (`Request::RateMessage`, harness §3.7). `0`
+        /// when the turn produced no assistant message.
+        #[serde(default)]
+        last_seq:    u64,
     },
 
     /// Auto-compaction started: the assembled prompt crossed
@@ -1138,6 +1191,13 @@ pub enum Event {
         session_id: u64,
         goal: Option<GoalDump>,
     },
+    /// A session's active reminders changed (harness §12.8): one was
+    /// created, deleted or delivered. The whole list, like every other
+    /// pushed projection, so the FE never reconciles deltas.
+    SchedulesChanged {
+        session_id: u64,
+        rows: Vec<ScheduleDump>,
+    },
 }
 
 /// Where a session's durable objective stands (guide §12.3).
@@ -1223,6 +1283,10 @@ pub struct JobDump {
     pub status:  String,
     pub running: bool,
     pub unread:  u64,
+    /// When the job started, unix milliseconds — the popover's duration
+    /// column (UI guide §6.9) is derived from it and the viewer's clock.
+    #[serde(default)]
+    pub started_at: i64,
 }
 
 #[derive(Debug, Error)]

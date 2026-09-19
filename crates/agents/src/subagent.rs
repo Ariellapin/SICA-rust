@@ -173,6 +173,10 @@ pub struct ToolSubAgent {
     /// call and for any sub-agent running outside a session — neither is
     /// written to a session log, so neither has a seq to give.
     pub log_seq:       Option<u64>,
+    /// The session's approval policy is `never` (guide §10.2): an `Ask`
+    /// from any policy is refused outright instead of reaching the broker.
+    /// Deterministic denial for unattended runs; inherited by children.
+    pub ask_denied:    bool,
 }
 
 impl ToolSubAgent {
@@ -194,7 +198,14 @@ impl ToolSubAgent {
             runs:         None,
             cwd:          None,
             log_seq:      None,
+            ask_denied:   false,
         }
+    }
+
+    /// Approval policy `never` (guide §10.2): every `Ask` becomes a denial.
+    pub fn with_ask_denied(mut self, denied: bool) -> Self {
+        self.ask_denied = denied;
+        self
     }
 
     /// Report one edge of an orchestrated run (§6.11): the run starting, a
@@ -328,6 +339,7 @@ impl ToolSubAgent {
             // A nested call is a live event only — it never reaches the
             // session log, so it inherits no seq.
             log_seq:      None,
+            ask_denied:   self.ask_denied,
         }
     }
 
@@ -458,8 +470,9 @@ impl ToolSubAgent {
             depth:        self.depth,
             session_id:   self.session_id,
         };
-        let (denial, record) = self.pre_decision(&view).await;
+        let (denial, record, pre_context) = self.pre_decision(&view).await;
         approval = record;
+        notices.extend(pre_context);
         if let Some(denied) = denial {
             let outcome = SkillOutcome { ok: false, summary: denied };
             let (summary, extra, blocked) = self.post_chain(&view, &outcome).await;
@@ -579,11 +592,20 @@ impl ToolSubAgent {
     /// after and can only deny. Returns the denial text (if any) plus the
     /// approval audit whenever the verdict went through the broker —
     /// approved or denied, every request is audited.
-    async fn pre_decision(&self, view: &CallView<'_>) -> (Option<String>, Option<ApprovalRecord>) {
+    async fn pre_decision(
+        &self,
+        view: &CallView<'_>,
+    ) -> (Option<String>, Option<ApprovalRecord>, Vec<String>) {
         let mut verdict: Option<PreDecision> = None;
+        // Context an allowing policy attached (a `PreToolUse` hook's
+        // `additionalContext`) reaches the model whatever the final
+        // verdict — a hook that explained why it let a call through has
+        // said something worth hearing even if a later guard denied it.
+        let mut context: Vec<String> = Vec::new();
         for policy in self.policies.iter() {
             match policy.pre_execute(view).await {
                 PreDecision::Allow => {}
+                PreDecision::AllowWith { extra_context } => context.extend(extra_context),
                 other => {
                     verdict = Some(other);
                     break;
@@ -602,8 +624,31 @@ impl ToolSubAgent {
             }
         }
         match verdict {
-            PreDecision::Allow => (None, None),
-            PreDecision::Deny { reason } => (Some(reason), None),
+            PreDecision::Allow | PreDecision::AllowWith { .. } => (None, None, context),
+            PreDecision::Deny { reason } => (Some(reason), None, context),
+            // Approval policy `never`: the question is not asked, and the
+            // model is told which policy refused it so it can change course.
+            PreDecision::Ask { reason } if self.ask_denied => {
+                self.events.emit(Event::LogLine {
+                    level: "WARN".into(),
+                    message: format!(
+                        "approval: `{}` denied — this session's approval policy is `never` ({reason})",
+                        view.skill
+                    ),
+                });
+                (
+                    Some(format!(
+                        "approval refused ({reason}): this session's approval policy is `never`, \
+                         so nothing is asked — use a read-only alternative or report the need"
+                    )),
+                    Some(ApprovalRecord {
+                        skill: view.skill.to_string(),
+                        args_preview: view.args_preview.to_string(),
+                        decision: "denied",
+                    }),
+                    context,
+                )
+            }
             PreDecision::Ask { reason } => {
                 let allowed = match (&self.brokers, self.session_id) {
                     (Some(brokers), Some(session_id)) => {
@@ -630,7 +675,7 @@ impl ToolSubAgent {
                         level: "INFO".into(),
                         message: format!("approval: `{}` allowed once", view.skill),
                     });
-                    (None, Some(record))
+                    (None, Some(record), context)
                 } else {
                     self.events.emit(Event::LogLine {
                         level: "WARN".into(),
@@ -647,7 +692,7 @@ impl ToolSubAgent {
                     (Some(format!(
                         "approval denied ({reason}) — change approach, use a \
                          read-only alternative, or ask the user"
-                    )), Some(record))
+                    )), Some(record), context)
                 }
             }
         }

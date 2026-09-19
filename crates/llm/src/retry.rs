@@ -61,6 +61,20 @@ pub fn classify(err: &anyhow::Error) -> Failure {
     Failure::Fatal(text)
 }
 
+/// The delay a `429` / `503` answer asked for (dsh honours `Retry-After`).
+/// The client folds the header into the error's context as
+/// `retry-after=<seconds>`; this reads it back so the loop can wait what
+/// the server said instead of what the backoff table guesses. Capped at
+/// two minutes: a server asking for an hour is a server to give up on.
+pub fn retry_after(err: &anyhow::Error) -> Option<Duration> {
+    let text = format!("{err:#}");
+    let idx = text.find("retry-after=")?;
+    let rest = &text[idx + "retry-after=".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let secs: u64 = digits.parse().ok()?;
+    Some(Duration::from_secs(secs.min(120)))
+}
+
 /// The failure recorded when a request completes cleanly but delivers no
 /// content, no reasoning and no tool call. Local servers do this under
 /// memory pressure; treating it as a real (empty) reply would persist a

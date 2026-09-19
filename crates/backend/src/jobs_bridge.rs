@@ -51,6 +51,7 @@ impl JobsBridge {
                 status:  j.status.label(),
                 running: j.status.is_running(),
                 unread:  j.unread,
+                started_at: j.started_at,
             })
             .collect()
     }

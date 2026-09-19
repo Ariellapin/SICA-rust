@@ -36,6 +36,9 @@ use crate::skill::SkillOutcome;
 /// Decision of one `pre_execute` listener.
 pub enum PreDecision {
     Allow,
+    /// Allow, and put `extra_context` in front of the model after the
+    /// result — a `PreToolUse` hook's `additionalContext` (guide §13.1).
+    AllowWith { extra_context: Vec<String> },
     Deny { reason: String },
     /// Ask the human once. Needs a broker + session on the sub-agent;
     /// without either it degrades to `Deny`.

@@ -65,6 +65,9 @@ struct McpRow {
     tools:   usize,
     /// The file could not be parsed; the reason is the card's whole story.
     error:   Option<String>,
+    /// What the backend said about this server at startup — the `Failed`
+    /// reason (§7.2), kept from the WARN log line that named it.
+    note:    Option<String>,
 }
 
 fn mcp_rows(app: &App) -> Vec<McpRow> {
@@ -90,6 +93,14 @@ fn mcp_rows(app: &App) -> Vec<McpRow> {
             .filter(|e| e.name.starts_with(&prefix))
             .count();
         let text = std::fs::read_to_string(&path).unwrap_or_default();
+        // The newest backend warning that names this server — the reason
+        // a Failed card can give instead of "see the log".
+        let note = app
+            .mcp_notes
+            .iter()
+            .rev()
+            .find(|m| m.contains(&format!("{name}:")) || m.contains(&format!("`{name}`")) || m.contains(&format!(" {name} ")))
+            .cloned();
         match toml::from_str::<agents::mcp::ServerConfig>(&text) {
             Ok(cfg) => out.push(McpRow {
                 name,
@@ -98,6 +109,7 @@ fn mcp_rows(app: &App) -> Vec<McpRow> {
                 enabled: cfg.enabled,
                 tools,
                 error: None,
+                note,
             }),
             Err(e) => out.push(McpRow {
                 name,
@@ -106,6 +118,7 @@ fn mcp_rows(app: &App) -> Vec<McpRow> {
                 enabled: false,
                 tools,
                 error: Some(e.to_string()),
+                note,
             }),
         }
     }
@@ -147,7 +160,10 @@ fn mcp_servers(app: &mut App, ui: &mut egui::Ui) {
                 r.tools,
                 if r.tools == 1 { "" } else { "s" }
             ),
-            None => format!("{} · no tools registered — see the log for why", r.command),
+            None => match &r.note {
+                Some(note) => format!("{} · failed: {}", r.command, kit::one_line(note, 120)),
+                None => format!("{} · no tools registered — see the log for why", r.command),
+            },
         };
         let mut enabled = r.enabled;
         let path = r.path.clone();
@@ -351,7 +367,7 @@ fn web_search(app: &mut App, ui: &mut egui::Ui) {
 /// LLM conversations per call, and `workflow` also adds its scripting
 /// reference to every system prompt while it is on — so the switch is the
 /// presence of the file, and turning it off renames rather than deletes.
-const OPTIONAL: [(&str, &str); 2] = [
+const OPTIONAL: [(&str, &str); 3] = [
     (
         "workflow",
         "Model-written orchestration scripts (harness §12.5). One call can \
@@ -362,6 +378,13 @@ const OPTIONAL: [(&str, &str); 2] = [
         "agent-team",
         "A named team of children answering one brief (harness §12.7). Each \
          call is several full conversations.",
+    ),
+    (
+        "schedule",
+        "Reminders that return as follow-up messages (harness §12.8): \
+         schedule-create / -list / -delete. Three catalogue entries cost \
+         every request ~250 tokens while on; reminders already in a log \
+         are delivered either way.",
     ),
 ];
 

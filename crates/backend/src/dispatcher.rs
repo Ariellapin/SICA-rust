@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use protocol::{Request, Response};
+use protocol::{Event, Frame, Request, Response};
 
 use crate::be_core::{fib, BeState};
 use crate::chat::ChatHub;
@@ -200,6 +200,32 @@ pub async fn handle(
         Request::InjectContext { session_id, text } => {
             chat.inject_context(session_id, text).await;
             Response::Ok
+        }
+        // The default folder for sessions created from now on (guide §3.9,
+        // UI §7.2). Live: no restart, and no effect on any session that
+        // already has its directory in its header.
+        Request::SetWorkingDir { path } => {
+            let dir = path.map(std::path::PathBuf::from);
+            if let Some(d) = &dir {
+                if !d.is_dir() {
+                    return Response::Error { message: format!("{} is not a directory", d.display()) };
+                }
+            }
+            sica_core::paths::set_working_dir(dir.as_deref());
+            let _ = chat.out_tx.send(Frame::event(Event::LogLine {
+                level:   "INFO".into(),
+                message: format!(
+                    "default folder for new sessions → {}",
+                    sica_core::paths::working_dir().display()
+                ),
+            }));
+            Response::Ok
+        }
+        Request::RateMessage { session_id, seq, rating, note } => {
+            match chat.rate_message(session_id, seq, rating, note).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
         }
         // The queue verbs report a row that is already gone as an error
         // rather than as success: the loop claims rows on its own schedule,

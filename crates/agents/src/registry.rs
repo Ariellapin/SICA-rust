@@ -92,6 +92,9 @@ impl SkillRegistry {
         let mut out = String::new();
         for name in names {
             let Some(skill) = self.by_name.get(name) else { continue };
+            if !skill.model_invocable() {
+                continue;
+            }
             out.push_str("- **");
             out.push_str(skill.name());
             out.push_str("**");
@@ -110,10 +113,10 @@ impl SkillRegistry {
                 }
                 out.push(')');
             }
-            let desc = skill.description();
+            let desc = description_of(skill.as_ref());
             if !desc.is_empty() {
                 out.push_str(" — ");
-                out.push_str(desc);
+                out.push_str(&desc);
             }
             out.push('\n');
         }
@@ -133,6 +136,9 @@ impl SkillRegistry {
             .iter()
             .filter_map(|name| {
                 let skill = self.by_name.get(*name)?;
+                if !skill.model_invocable() {
+                    return None;
+                }
                 // A skill that carries its own schema wins: the synthesised
                 // all-strings shape below is a convenience for the built-ins,
                 // not a contract the provider has to be told.
@@ -158,7 +164,7 @@ impl SkillRegistry {
                     "type": "function",
                     "function": {
                         "name": skill.name(),
-                        "description": skill.description(),
+                        "description": description_of(skill.as_ref()),
                         "parameters": parameters,
                     },
                 }))
@@ -183,6 +189,11 @@ impl SkillRegistry {
     ///   become absent JSON keys.
     pub fn resolve(&self, call: &ToolCall) -> Option<(Arc<dyn Skill>, Value)> {
         let skill = self.get(&call.skill)?;
+        // A skill the model was never offered cannot be called by it,
+        // whatever name it guessed (`disable-model-invocation`).
+        if !skill.model_invocable() {
+            return None;
+        }
         if let Some(json) = &call.args_json {
             return Some((skill, json.clone()));
         }
@@ -209,6 +220,24 @@ impl SkillRegistry {
         }
         Some((skill, Value::Object(obj)))
     }
+}
+
+/// Longest description the model is shown, in characters (guide §8.1,
+/// dsh's cap). A skill doc can say as much as it likes; the catalogue line
+/// and the `tools` entry carry the first 500 characters and an ellipsis,
+/// so one verbose file cannot crowd the prompt.
+pub const DESCRIPTION_CAP: usize = 500;
+
+/// A skill's description as the model sees it: capped at
+/// [`DESCRIPTION_CAP`] characters.
+pub fn description_of(skill: &dyn Skill) -> String {
+    let desc = skill.description();
+    if desc.chars().count() <= DESCRIPTION_CAP {
+        return desc.to_string();
+    }
+    let mut out: String = desc.chars().take(DESCRIPTION_CAP).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]

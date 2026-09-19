@@ -105,6 +105,7 @@ pub enum UiEvent {
         reasoning:   u32,
         duration_ms: u64,
         ttft_ms:     u64,
+        last_seq:    u64,
     },
 
     // Tool chips.
@@ -194,6 +195,8 @@ pub enum UiEvent {
     JobsChanged { session_id: u64, jobs: Vec<protocol::JobDump> },
     /// The session's durable objective changed (`None` = no goal).
     GoalChanged { session_id: u64, goal: Option<protocol::GoalDump> },
+    /// The session's active reminders (harness §12.8), whole list.
+    SchedulesChanged { session_id: u64, rows: Vec<protocol::ScheduleDump> },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -387,9 +390,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
             UiEvent::LlmRetry { session_id, attempt, max, delay_ms, reason }
         }
         Event::TurnUsage {
-            session_id, turn_id, prompt, completion, reasoning, duration_ms, ttft_ms,
+            session_id, turn_id, prompt, completion, reasoning, duration_ms, ttft_ms, last_seq,
         } => UiEvent::TurnUsage {
-            session_id, turn_id, prompt, completion, reasoning, duration_ms, ttft_ms,
+            session_id, turn_id, prompt, completion, reasoning, duration_ms, ttft_ms, last_seq,
         },
         Event::ApprovalRequested { id, session_id, skill, args_preview, reason } => {
             UiEvent::ApprovalRequested { id, session_id, skill, args_preview, reason }
@@ -420,6 +423,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::GoalChanged { session_id, goal } => {
             UiEvent::GoalChanged { session_id, goal }
+        }
+        Event::SchedulesChanged { session_id, rows } => {
+            UiEvent::SchedulesChanged { session_id, rows }
         }
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }

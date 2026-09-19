@@ -32,6 +32,11 @@ pub fn build(skills: &SkillRegistry, skills_dir: &Path, agents_dir: &Path, comma
     names.sort_unstable();
     for name in names {
         let Some(skill) = skills.by_name.get(name) else { continue };
+        // `user-invocable: false` (guide §8.1): the model may call it, the
+        // palette does not offer it.
+        if !skill.user_invocable() {
+            continue;
+        }
         // The registry hands out `Arc<dyn Skill>`, which carries no source
         // path, so the contract file is looked up by convention. Built-ins
         // seed one at startup; a user-authored skill *is* one.

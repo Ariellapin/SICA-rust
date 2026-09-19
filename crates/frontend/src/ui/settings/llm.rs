@@ -304,6 +304,26 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                              A summary cut off by it is discarded and \
                              retried. 0 = default (8192).",
                         );
+                        ui.add_space(6.0);
+                        label_cell(ui, &t, "Retries");
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.compact_retries)
+                                .range(0..=5)
+                                .speed(0.1),
+                        )
+                        .on_hover_text(
+                            "Summariser attempts when a compaction fails \
+                             (harness §9.1). 0 = default (1).",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        label_cell(ui, &t, "Retry always");
+                        ui.checkbox(&mut cfg.retry_always, "").on_hover_text(
+                            "Retry every request failure up to the budget, \
+                             fatal ones included — dsh's `retry: always`, \
+                             for unattended runs (harness §4.2). Takes \
+                             effect on next Connect.",
+                        );
                     });
 
                     ui.add_space(8.0);

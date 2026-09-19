@@ -88,7 +88,18 @@ seams exist *statically*:
 
 ## 2. Core: agent, loop, scope
 
-### 2.1 `dsh-agent-loop` — the turn/step machine
+### 2.1 `dsh-agent-loop` — the turn/step machine — **done** (Waves 1–4; pre-step stages inline)
+
+**Shipped as.** The inbox is `backend::inbox` — `ChatHub.inbox: Arc<Inbox>`, a
+newtype over `Mutex<HashMap<u64, VecDeque<Queued>>>` that also mints row ids so
+`EditQueued` / `RemoveQueued` / `SteerQueued` can address a waiting message;
+steers and injects drain at every hop, a followup is claimed at turn end, and
+the composer stays live with a queue dock (UI guide §5.2). The **pre-step
+trait was deliberately not built**: its four seats — `/name` injection, goal
+rounds, time context, hooks — are wired inline in `start_turn` and the loop's
+`Next` selection, and a trait with one implementation per seat would only add
+a layer to read through. The durability barrier a pre-step would also carry
+is §3.2's `checkpoint`.
 
 **Mechanism.** A *step* is one model request plus the tool calls it produces; a
 *turn* is zero or more steps triggered by one user input. Flow:
@@ -103,7 +114,7 @@ pair. Failures are split: adapter/dispatch errors go to `agent/request-error`
 failure ends the *turn*, never the loop. Turn-end reasons:
 `completed | blocked | max-tokens | aborted | error`; `max-tokens` is sticky.
 
-**sica-rust today.** The hop loop in `chat.rs` is this machine minus the inbox
+**sica-rust before the port.** The hop loop in `chat.rs` is this machine minus the inbox
 and pre-step hook. `TurnStart`/`TurnEnd { finish_reason, hops }` are now logged;
 retry is a step-level listener (§4.2).
 
@@ -133,11 +144,19 @@ ancestors' registrations, nearest shadows farthest). Every registry is built on
 
 **sica-rust.** Not needed as a general primitive. Where dsh uses scope to give
 one agent a different tool set, sica-rust can pass a *view*:
-`SkillRegistry::restricted(&self, allow: &[&str]) -> SkillRegistry` (S) — used
-today by `catalogue_markdown_excluding` for `agent-team`, and needed by plan
-mode (§11.1) and permission presets (§10.3).
+`SkillRegistry::restricted_to(&self, allow: &[&str]) -> SkillRegistry` — used
+by agent presets (§5.2) and the PTC catalogue (§7); plan mode (§11.1) and
+permission presets (§10.3) were built as pipeline policies instead, since a
+refusal the model can read beats a tool that silently is not there.
 
-### 2.3 `dsh-agent-tool-presentation` — native / ptc / both per agent
+### 2.3 `dsh-agent-tool-presentation` — native / ptc / both per agent — **done** (Wave 7; per-agent Wave 10)
+
+**Wave 10.** A preset's frontmatter may carry `tool_mode: text | native | ptc`
+(`agents::preset::AgentPreset::tool_mode`, parsed by `md_skill`); a session
+running that preset uses it in place of the connection's mode for the whole
+turn — `effective_agent` returns it beside the registry view and the persona,
+so the prompt, the `tools` array and the dispatcher all see one answer. `Both`
+stays unported (§7.2).
 
 **Done** (Wave 7) — see §7. `LlmOptions.tool_mode: ToolMode { Text, Native,
 Ptc }` is that enum. It is per-connection rather than per-agent: a preset
@@ -161,7 +180,18 @@ legacy TOML migration. Not ported: zstd-framed checksums (the raw NDJSON mode
 is what we have), `sourceEventSeqs` linking an assistant message to its raw
 chunk events (we do not log chunks).
 
-### 3.2 `dsh-session-checkpoint-policy` — durability barriers
+### 3.2 `dsh-session-checkpoint-policy` — durability barriers — **done** (Wave 10)
+
+**Shipped as.** `chat::checkpoint(sessions, id) -> Result<(), String>` is the
+fail-closed flush, called at the three moments dsh names: at the top of every
+hop before the request is derived, after a `ToolCall` row is appended and
+before its body runs (the text path, `run_native_one`, and once per parallel
+chunk), and inside the reminder tools before they confirm a mutation
+(`persistence_uncertain`). A failure ends the turn with `finish_reason:
+"error"` and an ERROR `LogLine`; a call whose body never ran gets the result
+`ABORTED_BEFORE_DISPATCH: …` so the history stays well-formed, and the rest of
+a native batch is answered as not executed. Only the turn fails, never the
+process. `append_event` still logs-and-continues on the ordinary path.
 
 **Mechanism.** Fail-closed flush *before* each model request and *before* each
 top-level tool body; if the write cannot be confirmed the request/tool does not
@@ -212,7 +242,15 @@ sidebar never shows "Session 63"; `title_gen::summarize` then overwrites it.
 Add the byte caps to `title_gen` (`truncate` on input, `max_tokens: 64` on
 the request, `tokio::time::timeout(60s)`).
 
-### 3.5 `dsh-session-query(-sqlite)`, `dsh-tool-session-query`, `dsh-session-log-export`
+### 3.5 `dsh-session-query(-sqlite)`, `dsh-tool-session-query`, `dsh-session-log-export` — export **done** (UI-9); model-facing search **deliberately not ported**
+
+**Stance.** Export needs no request: the log *is* the export format and the
+frontend shares the disk, so the session row's ⋯ menu has **Export log…**
+(an OS save dialog and a file copy, UI guide §4.2). A model-facing
+`session-search` skill is not built — `@session:<id>` (§3.6) already lets a
+conversation pull another session in, framed untrusted, and the sidebar's
+search (`Request::SearchSessions`) is the human half; a scan skill would be a
+third way to reach the same rows.
 
 **Mechanism.** FTS5 search over session logs; model-facing `session_search`,
 `session_trace`, `session_event_read`; a `/export` command.
@@ -236,7 +274,15 @@ nothing is a `LogLine` and a skipped reference rather than a failed turn —
 dsh ends the turn there, but that would cost the user their whole message
 over a typo. The picker half is UI guide §6.12.
 
-### 3.7 `dsh-session-telemetry(-otel)`, `dsh-message-feedback`, `dsh-command-feedback`, `dsh-anonymous-user-id` — n/a / optional
+### 3.7 `dsh-session-telemetry(-otel)`, `dsh-message-feedback`, `dsh-command-feedback`, `dsh-anonymous-user-id` — feedback **done** (Wave 10, protocol v29); telemetry n/a
+
+**Shipped as.** `Request::RateMessage { session_id, seq, rating, note }` →
+`EventKind::MessageFeedback { seq_ref, rating, note }`, log-only and never
+surfaced; `rating` is `1`, `-1` or `0` to clear, the backend refuses a `seq`
+that is not an `AssistantMessage`, and `sica_core::project::feedback` folds
+the latest row per message into `MessageDump.feedback`. `Event::TurnUsage`
+gained `last_seq` so a live turn's tail knows which message its thumbs rate
+(UI guide §3.5). Labels for `model-eval` are the point; nothing reads them yet.
 
 FEEDBACK_ONLY telemetry is a good stance but there is no server to send to.
 Per-message 👍/👎 (S): `EventKind::MessageFeedback { seq_ref, rating, note }`
@@ -259,7 +305,7 @@ generation refuses even when an older readable one remains. Current-format
 restoration keeps unknown events marked `ignorable: true`; the historical
 migrations refuse an unknown type outright.
 
-**sica-rust today.** No version anywhere. `SessionCreated { id, title,
+**sica-rust before the port.** No version anywhere. `SessionCreated { id, title,
 created_at }` is line 1 and doubles as the header; `EventKind::Unknown`
 (`#[serde(other)]`, Wave 1) makes an older build *silently* accept a newer
 log, which is the opposite of dsh's fail-closed refusal; `sessions_store`
@@ -362,7 +408,7 @@ Windows the rooted-but-driveless `\foo` and an incomplete UNC prefix pass
 rather than rebased. `-auto` samples the host once per boot (loopback bind, no
 `SSH_*`, a display → native; anything ambiguous → browse).
 
-**sica-rust today.** One folder for the whole app: `paths::working_dir()` —
+**sica-rust before the port.** One folder for the whole app: `paths::working_dir()` —
 `SICA_WORKING_DIR` on the BE child, set from Settings › General (the app
 folder, the last five choices, or an `rfd` native chooser; UI guide UI-7).
 Changing it **restarts the BE**, every session shares it, and because no
@@ -472,12 +518,22 @@ and feed §4.3. `MessageSource`/`ContextForm` become the `source` field on
 
 ### 4.2 `dsh-llm-retry` — **done**
 
-`llm::retry` + step-level application in `chat.rs`. Missing: honouring
-`Retry-After` (S: parse the header in `chat_stream`'s error path and carry it
-on the `Failure`), and per-provider policy (`mode: always` for unattended
-runs — S: a field on `LlmOptions`).
+`llm::retry` + step-level application in `chat.rs`. **Wave 10** closed the
+two gaps: `chat_stream` folds a `Retry-After` header into the error's
+context (`retry-after=<secs>`) and `retry::retry_after` reads it back, so
+the loop waits what the server said (capped at two minutes) instead of the
+backoff table; and `LlmOptions.retry_always` (protocol v29, the provider
+TOML's `retry_always`, a checkbox on the Models card) retries fatal
+classifications too, up to the same budget — dsh's `retry: { mode: always }`
+for unattended runs. `retry` is exercised over a real socket by the mock
+server tests (§14.2), not unit-tested only.
 
-### 4.3 `dsh-token-meter` — usage-anchored baseline + delta
+### 4.3 `dsh-token-meter` — usage-anchored baseline + delta — **done** (Wave 2)
+
+**Shipped as** `agents::meter::TokenMeter`, one per session on `ChatHub`,
+anchored on the provider's `usage` for the exact envelope and driving both
+the ring and the compaction trigger (the heuristic is the fallback without an
+anchor). The body below is the design as written before the wave.
 
 **Mechanism.** One replay-aware fold per session. Fixed heuristic
 (`CHARS_PER_TOKEN = 4` + per-block and per-message overheads). If the last
@@ -508,7 +564,17 @@ DeepSeek-API-specific request fields and telemetry.
 
 ## 5. System prompt
 
-### 5.1 `dsh-system-prompt` — composed, ordered, interpolated
+### 5.1 `dsh-system-prompt` — composed, ordered, interpolated — **done** (Wave 2)
+
+**Shipped as** `agents::prompt`: `for_main_agent(memory, registry, mode,
+vars, plan_policy, persona)` over an ordered `Assembly`; `team.rs` builds an
+`Assembly` directly with its persona at the memory slot and `model_eval` uses
+the same module. The `order` module also allocates `PERSONA = -500`, `PTC_SDK
+= 5000` and `WORKFLOW_SDK = 5100` beyond the table below. The runtime
+snapshot is `ContextInjected { source: RuntimeContext }` with a `Replace`
+surface, not a kind of its own. A bad `{{var}}` in `memory.md` fails the turn
+with an ERROR naming the section; in `skills/*.md` it fails the call *and*,
+since Wave 10, logs an ERROR naming the file.
 
 **Mechanism.** Four scoped registrations, all returning disposers:
 `section({name, order, text})`, `context({name, order, text})`,
@@ -529,7 +595,7 @@ usage guidance lives in the tool's own plugin** as a one-sentence section,
 never in the persona ("Check the `[exit code: N]` marker on every bash
 result…").
 
-**sica-rust today.** Three hand-built prompts: `chat::build_wire_history`
+**sica-rust before the port.** Three hand-built prompts: `chat::build_wire_history`
 (memory.md + `## Loaded skills`; native mode drops memory.md), `team.rs::
 teammate_system`, `model_eval.rs`. No interpolation; `MarkdownSkill` ignores
 its args.
@@ -608,7 +674,16 @@ parses from the same frontmatter reader as `skills/` (`skills:` accepts
   control-plane floor, persona ordering against `memory.md`, the
   fixed-after-first-reply rule, refusal without side effects, `/agent off`.
 
-### 5.3 `dsh-agent-instructions` — `AGENTS.md` loading with a byte budget
+### 5.3 `dsh-agent-instructions` — `AGENTS.md` loading with a byte budget — **done** (Wave 2)
+
+**Shipped as** `agents::instructions` with a 64 KiB budget, the
+`<system-reminder>` frame, a shadowing `ContextInjected { Instructions }`
+snapshot per turn, and reconciliation after `read-file`, `write-file` *and*
+`edit-file`. Two deliberate departures from the sketch below: the file record
+carries no `scope` field, and the chain is walked from the **session's own
+folder only** — the backend passes `root == cwd`, because a session's folder
+is its project (§3.9) and a parent directory's `AGENTS.md` is somebody else's
+instructions.
 
 **Mechanism.** Loads `AGENTS.md`/`CLAUDE.md` from the harness home plus the
 project chain (cwd upward) as one durable baseline before the first request;
@@ -621,7 +696,7 @@ precedence over broader ones. They do not override system, developer, or
 direct user instructions."). No file watcher — changes surface on the next
 successful filesystem touch.
 
-**sica-rust today.** `memory.md` is the only instruction file, read every hop,
+**sica-rust before the port.** `memory.md` is the only instruction file, read every hop,
 no budget, no framing.
 
 **Implement (M) — `agents::instructions`.**
@@ -648,7 +723,16 @@ See §9.3 (time), n/a (tmux), §9.5 (`@file`).
 
 ## 6. Tools: registry, pipeline, scheduling
 
-### 6.1 `dsh-tools` — the guarded execution pipeline
+### 6.1 `dsh-tools` — the guarded execution pipeline — **done** (Wave 3)
+
+**Shipped as** `agents::pipeline`: `run_report` runs depth → cancel →
+`pre_execute` (first non-Allow wins; `Ask` → the broker) → guards → timeout /
+body → spill → `post_execute` → summariser → sink, with `PermissionPolicy`,
+`PlanModePolicy`, `ReadBeforeEdit`, `RepeatReminder` and, when configured,
+`HooksPolicy` assembled per dispatch in `ChatHub::sub_agent`. The broker field
+is `brokers: Option<Arc<BrokerSet>>`. Wave 10 added `PreDecision::AllowWith {
+extra_context }` so a *pre*-execute policy can attach context too (§13.1).
+The output split (`SkillOutcome.value` / `presentation`) stays later.
 
 **Mechanism.** `ToolDefinition { name, description, parameters, output:
 {schema, render, presentationMeta?}, execute, finalizeContent?, timeoutMs?,
@@ -681,7 +765,7 @@ well-formed. `ctx.tools.restrict({allow, deny})` intersects per scope;
 tool. `deferContext(userMessage)` lets a tool attach context after its result;
 `concludeTurn()` marks the turn terminal (used by `exit_plan_mode`).
 
-**sica-rust today.** `ToolSubAgent::run` = depth → cancel → timeout → spill →
+**sica-rust before the port.** `ToolSubAgent::run` = depth → cancel → timeout → spill →
 summariser → failure sink. Errors are already results. No pre/post stage.
 
 **Implement (M) — `agents::pipeline`.**
@@ -714,7 +798,10 @@ pub struct CallView<'a> { pub skill: &'a str, pub args: &'a Value, pub args_prev
 - Policies shipped in the same commit: `PermissionPolicy` (§10.3),
   `PlanModePolicy` (§11.1), `RepeatReminder` (§6.4), `ReadBeforeEdit` (§8.5).
 
-### 6.2 Parallel / exclusive scheduling (`agent-loop/tool-calls.ts`)
+### 6.2 Parallel / exclusive scheduling (`agent-loop/tool-calls.ts`) — **done** (Wave 3)
+
+**Shipped as** `Skill::concurrency` and `run_native_batch` (`join_all`, pool of
+4, native mode only).
 
 **Mechanism.** Per-call, from args only, fail-closed: `parallel` calls overlap
 in a bounded rolling pool (`maxParallelToolCalls`, default 10); `exclusive`
@@ -729,13 +816,14 @@ with `futures::future::join_all` (cap 4), then append their `ToolCall`/
 `ToolResult` pairs in model order. Text protocol emits one call per hop, so
 nothing changes there.
 
-### 6.3 `dsh-tool-call-timeout-policy` — **done** (`Skill::timeout`)
+### 6.3 `dsh-tool-call-timeout-policy` — **done** (`Skill::timeout`; per-call `timeout_secs` Wave 10)
 
-Missing: `timeoutMs` per *call* from args (dsh lets `bash` take a `timeout`
-argument). S: honour an optional `timeout_secs` arg in `run-cli`/`run-pwsh`,
-clamped to the skill's `timeout()`.
+`run-cli` / `run-pwsh` take an optional `timeout_secs` (named form, or
+`'timeout_secs=300'` in the text protocol) for the foreground wait, clamped
+to the skill's own `timeout()` so a call can never outlive the wrapper that
+would kill it; the default stays 30 s.
 
-### 6.4 `dsh-repeat-tool-reminder` — the loop guard — **done** (Wave 1: `agents::guard`, `chat::observe_repeat`; lives on `ChatHub::repeat` until the §6.1 pipeline exists)
+### 6.4 `dsh-repeat-tool-reminder` — the loop guard — **done** (Wave 1 → Wave 3: `agents::guard` + the `RepeatReminder` policy; `ChatHub::repeat` holds one policy instance per session and `ChatHub::observe` is the manual path for calls that skip the pipeline; one notice wording for every skill)
 
 **Mechanism.** Per-agent chain `{key, count}` where `key =
 JSON.stringify([toolName, canonicalArgs])` with **deep key-sorted** args.
@@ -765,18 +853,25 @@ throw at load.
 - Tests: identical args with different key order collide; a user message
   resets; the notice appears exactly at the thresholds.
 
-### 6.5 `dsh-fs-observation-policy` — read-before-edit
+### 6.5 `dsh-fs-observation-policy` — read-before-edit — **done** (Wave 3, see §8.5)
+
+
 
 See §8.5.
 
-### 6.6 `dsh-tool-fs`, `-fs-search`, `-str-replace-editor` — the file tools
+### 6.6 `dsh-tool-fs`, `-fs-search`, `-str-replace-editor` — the file tools — **done** (Wave 2; grep overflow spills, Wave 10)
+
+**Shipped as** the line-numbered, ranged `read-file`, `write-file`,
+`edit-file`, `glob` and `grep` built-ins. `grep` caps the model-facing list at
+250 rows; since Wave 10 the remaining matches (up to 20 000) are written
+through the §6.9 spill seam and the marker names the file.
 
 **Mechanism.** `read` (line-numbered), `write`, `edit` (literal replace,
 version-guarded), `read_image`, `glob` (≤100 paths, mtime order), `grep`
 (ripgrep; first 250 matches inline, overflow spilled), `str_replace_editor`
 (view/create/replace/insert; `maxOutputChars 16000`).
 
-**sica-rust today.** `read-file` (whole file ≤ 1 MiB, no line numbers),
+**sica-rust before the port.** `read-file` (whole file ≤ 1 MiB, no line numbers),
 `write-file` (whole file). **Implement (M):**
 - `read-file`: optional `start`/`end` line args; line-numbered output
   (`{n:>5}\t{line}`), which is what makes `edit` reliable.
@@ -786,7 +881,18 @@ version-guarded), `read_image`, `glob` (≤100 paths, mtime order), `grep`
   crates (no ripgrep binary); `grep` caps at 250 matches and spills the rest
   (§6.9 already exists).
 
-### 6.7 `dsh-tool-bash` / `-pwsh` (+ `-persistent`, `dsh-terminal`) — shells
+### 6.7 `dsh-tool-bash` / `-pwsh` (+ `-persistent`, `dsh-terminal`) — shells — one-shot **done**; persistent PTY **later**
+
+**Shipped as.** `cwd` and `background` are declared optional args, reachable
+from the natural-language form as `'cwd=…'` / `'background=true'` (background
+→ §12.4), and Wave 10 added `timeout_secs` (§6.3). A stream over the 32 KiB cap
+is spilled whole and the model reads the head plus a pointer (§6.9) rather
+than losing the tail. The persistent PTY family stays in the roadmap's later
+row: `portable-pty` is fetchable, and the design — owner-scoped ids, one
+active send per session, a bounded scrollback, `terminal_open/send/read/
+signal/list/close`, `run_in_background` through the jobs registry — is dsh's
+`terminal` + `terminal-bash` + `tool-terminal` trio, worth building once a
+model here needs to drive a REPL.
 
 **Mechanism.** Fresh process per call, `workdir` arg instead of `cd`,
 `[exit code: N]` marker on every result, optional `background: true` (→ a job,
@@ -811,7 +917,7 @@ backend dependency) so a killed `cmd /C` also kills its children — today a
 timed-out `npm install` leaves node running. Set `SICA_SESSION_ID` in the
 child env for scripts that want it.
 
-### 6.9 `dsh-spill(-local)`, `dsh-spill-policy` — **done**
+### 6.9 `dsh-spill(-local)`, `dsh-spill-policy` — **done** (`spill::write` is the single writer since Wave 10: `run-cli` / `run-pwsh` streams over the cap and `grep` overflow go through it too)
 
 `agents::spill`. Gap: dsh makes spill a *seam* so `grep` and `subprocess`
 reuse it. S: make `spill::write` the single writer for `run-cli`'s over-cap
@@ -973,7 +1079,17 @@ as a text run would pass for the wrong reason.
 
 ## 8. Skills and workspace instructions
 
-### 8.1 `dsh-skill`, `dsh-skill-filesystem`, `dsh-tool-skill` — catalog + loading
+### 8.1 `dsh-skill`, `dsh-skill-filesystem`, `dsh-tool-skill` — catalog + loading — **done** (Wave 1; caps and invocation flags Wave 10)
+
+**Wave 10.** Descriptions are capped at 500 characters everywhere the model
+sees them (`registry::description_of`: the catalogue line, the `tools`
+array, the PTC SDK). Frontmatter `disable-model-invocation: true` keeps a
+file for the person's `/name` only — `Skill::model_invocable` drops it from
+the catalogue and `resolve` refuses it — and `user-invocable: false` hides it
+from the `/` palette (`Skill::user_invocable`, read by `backend::catalog`).
+**Directory watching is deliberately not ported**: the frontend already
+watches the tree and rebuilds/restarts the backend, and a registry behind a
+lock would make two calls in one turn answer to different catalogues.
 
 **Mechanism.** Registry merges providers (filesystem, embedded, remote),
 winner-per-name, scoped per preset. Filesystem provider: `SKILL.md` bundles or
@@ -1048,7 +1164,16 @@ global ones.
 `EventKind::Command { name, input, ok }` (non-surface). The FE's local
 `APP_COMMANDS` stay local.
 
-### 8.5 `dsh-fs-observation-policy` — read-before-edit
+**Shipped (Wave 3; Wave 10 for the last three).** The table is `compact |
+plan | permission | approval | stats | job-kill | job-output | goal | agent`:
+`approval` sets the session's policy (§10.2), `stats` renders the §3.3 fold
+as one line, and `job-output` is the route the jobs popover's "Show output"
+row needs (UI guide §6.9).
+
+### 8.5 `dsh-fs-observation-policy` — read-before-edit — **done** (Wave 3)
+
+**Shipped as** the `ReadBeforeEdit` policy, one per session; the observed map
+is filled by successful `read-file`, `write-file` and `edit-file` alike.
 
 **Mechanism.** Enforced purely through `fs/*` events: an unseen file may only
 be *created*; an observed file may only be replaced at the version last seen;
@@ -1066,7 +1191,11 @@ again"). Writes to new paths pass.
 
 ## 9. Context management
 
-### 9.1 `dsh-compaction-basic` — the summariser
+### 9.1 `dsh-compaction-basic` — the summariser — **done** (Wave 2)
+
+**Shipped as** the prefix-preserving `compact::summarize_fold` with dsh's eight
+headings and the 80/16 `CompactPolicy`; every knob including `retries` is on
+the provider TOML and the Models card since Wave 10.
 
 **Mechanism.** Policy per routed model: `thresholdRatio 0.8` of the context
 window, `retainRatio 0.16` kept verbatim as a tail (or absolute
@@ -1091,7 +1220,7 @@ follow, without acknowledging this checkpoint." A `max-tokens` finish fails
 closed; summaries with images are rejected. Triggers: pressure before the
 request, and `context-overflow` after a provider error (condense and retry).
 
-**sica-rust today.** `compact::summarize_fold` builds a *separate* request
+**sica-rust before the port.** `compact::summarize_fold` builds a *separate* request
 with its own system prompt and a flattened `ROLE: text` transcript; four
 headings; 95 % trigger; 35 % tail. The `Replace` event is in place.
 
@@ -1131,7 +1260,10 @@ prompt is now under budget, return `true` without summarising and emit a
 = `Request::RunCommand { name: "compact" }` (§8.4) → `compact_session` with
 `force = true` (skip the threshold check).
 
-### 9.3 `dsh-time-context`
+### 9.3 `dsh-time-context` — **done** (Wave 2)
+
+**Shipped as** two lines of the runtime snapshot (§5.1): the local time with
+its offset, and the time since the previous message, refreshed once per turn.
 
 **Mechanism.** Durable, source-attributed clock: current time, the browser
 zone attached to the open request, elapsed time since the previous
@@ -1157,7 +1289,17 @@ untrusted data, not instructions.'`, and the tool descriptions repeat it.
 instructions). `tool_result_block` prepends the notice for untrusted results.
 The same constant frames `session-search` (§3.5) and `@session` snapshots.
 
-### 9.5 `dsh-file-reference(-local)` — `@file`
+### 9.5 `dsh-file-reference(-local)` — `@file` — **done** (UI-6 picker; backend expansion Wave 10)
+
+**Shipped as.** The picker is frontend-local (`at_menu.rs`, an `ignore` walk
+of the session's folder — no `ListWorkspaceFiles` request). Since Wave 10 the
+backend expands every `@path` in a sent message (`chat::parse_file_refs`: a
+word-bounded token, not `@session:`, trailing punctuation dropped) that names
+a file under the session's folder into `ContextInjected { source:
+FileReference { path } }` — the content captured at send time, head + tail
+through `retain` at 32 KiB, inside the untrusted frame (§9.4) — so a file card
+or a typed `@path` is a guarantee, not a hint the model may or may not act on.
+An `@word` that names no file is prose, not an error.
 
 **Mechanism.** `@path` completion with a per-agent fuzzy index rebuilt in the
 background after tool results; never follows directory symlinks; installs a
@@ -1169,7 +1311,15 @@ query }` (walk with `ignore`, cap 200). On send, the BE expands `@path` into
 `ContextInjected { source: FileReference, content: <file body, framed
 untrusted, 32 KiB cap> }`.
 
-### 9.6 `dsh-attachment(-local)`, `dsh-client-file-upload` — **done** (protocol v28)
+### 9.6 `dsh-attachment(-local)`, `dsh-client-file-upload` — **done** (protocol v28; intake limits applied UI-9)
+
+**UI-9.** The frontend now applies the admission numbers on intake
+(`composer::normalise_image`): a long edge over 2048 px is downscaled, PNG
+stays PNG and everything else is re-encoded as JPEG, and an image still over
+4 MiB is refused with a toast; pasted screenshots go through the same rule.
+A text card is capped at 8 MiB and reaches the model through §9.5's
+expansion. dsh's source-side limits (200 MiB source, 64 Mpixel) have no
+counterpart because nothing here uploads.
 
 **Mechanism.** Bytes go to `ctx.attachments` first, and the log gets an
 immutable content-addressed reference (`sha256:<digest>` plus verified
@@ -1186,7 +1336,7 @@ later prompt cites; the host promotes receipts to durable references during
 prompt admission, so a wire caller can never cite an attachment it did not
 upload.
 
-**sica-rust today.** Images ride on `UserImage` inline base64 in
+**sica-rust before the port.** Images ride on `UserImage` inline base64 in
 `UserMessage.images` (paste, drop, the `+` picker) — every pasted screenshot
 bloats the JSONL and re-crosses the pipe on each reload. No generic files.
 
@@ -1228,7 +1378,11 @@ constants in `attachments::limits`.
 
 ## 10. Approval, sandbox, permissions
 
-### 10.1 `dsh-user-questions`, `dsh-tool-ask-user` — `ask_user_question`
+### 10.1 `dsh-user-questions`, `dsh-tool-ask-user` — `ask_user_question` — **done** (Wave 3)
+
+**Shipped as** `agents::broker` + `Event::QuestionAsked { id, session_id,
+question, detail, options, multi }`; the broker's `QUESTION_TIMEOUT` (10 min)
+fires before the skill's own 15-minute timeout.
 
 **Mechanism.** The model asks; the tool blocks until the first scoped answerer
 accepts; the answer returns as an ordinary tool result `{answers: [...]}` so
@@ -1242,7 +1396,14 @@ answer }`. BE `Broker<T>`: `HashMap<u64, oneshot::Sender<T>>` on `ChatHub`; the
 skill timeout (10 min). Teammates (`agent-team`) get a registry view without
 it.
 
-### 10.2 `dsh-user-approval` — one-shot decisions, fail-closed
+### 10.2 `dsh-user-approval` — one-shot decisions, fail-closed — **done** (Wave 3; policy `never` Wave 10)
+
+**Wave 10.** `/approval ask | never` is the per-session policy. Under `never`
+every `Ask` — the permission policy's, a hook's — is refused before it reaches
+the broker (`ToolSubAgent::ask_denied`), audited like a denial and explained
+to the model; the choice survives a restart through the `Command` row the
+command writes. The FE mode pill is a chip in the composer toolbar, not a
+status bar.
 
 **Mechanism.** `ctx.approval.request(req)` → `allowed-once | rejected |
 cancelled | unavailable`; missing / non-owning / throwing answerers fail
@@ -1256,7 +1417,9 @@ Deny → `Request::ResolveApproval { id, allow }`. Pipeline `PreDecision::Ask`
 awaits the broker (timeout 5 min → deny). `EventKind::Approval { skill,
 args_preview, decision }` logged. Policy `never` short-circuits to deny.
 
-### 10.3 `dsh-sandbox-policy`, `dsh-permission-presets` — modes and the selector
+### 10.3 `dsh-sandbox-policy`, `dsh-permission-presets` — modes and the selector — **done** (Wave 3, policy level); OS enforcement §10.4
+
+
 
 **Mechanism.** Sandbox modes `read-only | workspace-write |
 danger-full-access`; the policy resolves mode + workspace root once for every
@@ -1308,7 +1471,11 @@ refuse to run under `ReadOnly` unless enforcement is `Full`.
 
 ## 11. Plan mode, todo
 
-### 11.1 `dsh-plan-mode`
+### 11.1 `dsh-plan-mode` — **done** (Wave 3)
+
+**Shipped as** the `PlanModePolicy` + `skills/plan-mode.md`; `exit-plan-mode`
+concludes the turn through the `(SkillOutcome, bool)` the hub's control
+handler returns rather than a `concludes_turn` field.
 
 **Mechanism.** Deployment-owned prompt text is *config* (`section:`, ~11
 lines): stay in plan mode until `exit_plan_mode` succeeds; conversational
@@ -1340,7 +1507,9 @@ user's feedback.
 - Prompt: a `PLAN_POLICY` section (order 500) from `skills/plan-mode.md` (user
   editable, like memory.md) added by the builder when active.
 
-### 11.2 `dsh-tool-todo` — `todo_write`
+### 11.2 `dsh-tool-todo` — `todo_write` — **done** (Wave 3)
+
+
 
 **Mechanism.** One tool whose parameter is the *complete* list, replacing the
 previous one: `[{content, status: pending|in_progress|completed}]`,
@@ -1361,7 +1530,15 @@ session_id, items }` for the FE checklist above the composer; cleared on
 
 ## 12. Subagents, goals, jobs, workflows
 
-### 12.1 `dsh-subagent*` — providers behind one contract
+### 12.1 `dsh-subagent*` — providers behind one contract — `subagent` / `subagent-fork` **done** (Wave 4); continuable children **later**
+
+**Shipped as** `agents::delegate` over `agents::runner`; children see
+`registry.excluding(control::CHILD_EXCLUDED)` (every orchestrator, `ask-user`,
+the harness controls). **Continuable / background children** — a durable child
+session with its own inbox that `send_message` / `interrupt_agent` (§12.7)
+would address — are not built; a child here is one bounded conversation whose
+report is its whole output, and the jobs registry (§12.4) holds shell work,
+not agents. Listed in the roadmap's later row.
 
 **Mechanism.** Two child shapes: *one-shot* (settles with one result) and
 *continuable* (durable session, FIFO inbox, interruptible). Backends:
@@ -1375,7 +1552,7 @@ conversation** so the model knows whether to write a standalone prompt.
 Control tools `send_message`, `interrupt_agent`, `list_agents`. Only the
 child's final answer or a safe error crosses the boundary.
 
-**sica-rust today.** `ToolSubAgent` wraps *one tool call*; `agent-team` runs
+**sica-rust before the port.** `ToolSubAgent` wraps *one tool call*; `agent-team` runs
 up to 6 LLM teammates concurrently. Neither is a general "delegate a task to a
 fresh conversation" tool.
 
@@ -1390,7 +1567,11 @@ Description wording differs exactly as dsh's `providerWording` does. Children
 get `registry.restricted(exclude: [subagent, subagent-fork, agent-team])` so
 recursion only unwinds at `max_depth`. Continuable/background children → §12.4.
 
-### 12.2 `structured_output` (subagent-in-process-driver/structured.ts)
+### 12.2 `structured_output` (subagent-in-process-driver/structured.ts) — **done** (Wave 4)
+
+**Shipped as** the child-scoped `structured-output` tool and `runner::validate`,
+a subset JSON-Schema validator (type, required, enum, properties, items) — no
+`jsonschema` crate — that ignores keywords it does not know.
 
 **Mechanism.** A caller can demand a JSON-Schema-shaped answer: a
 **child-scoped** tool named `structured_output` is registered with the
@@ -1410,7 +1591,11 @@ as the run's result; a prose-only finish is retried once with the
 [tool call ids]}], open_questions: []}`, which fixes the "fluent prose about
 files never opened" failure mode at the type level.
 
-### 12.3 `dsh-goal`, `dsh-goal-round-driver`, `dsh-tool-goal`, `dsh-command-goal`
+### 12.3 `dsh-goal`, `dsh-goal-round-driver`, `dsh-tool-goal`, `dsh-command-goal` — **done** (Wave 4)
+
+`TurnSource` has five variants today: `Human`, `GoalRound`, `Followup`,
+`AutoContinue` (the completion check, `backend::verdict`) and `Schedule`
+(§12.8); only the first two carry a person's authority.
 
 **Mechanism.** One durable objective per session (`goal/change`) with
 `phase: active | paused | completed | blocked`, `roundsStarted`,
@@ -1443,7 +1628,16 @@ agent; complete/blocked also accept the current automatic round;
   `<goal_round>` prompt and `source: GoalRound`. `/goal continue` arms it.
 - FE: a goal bar above the composer (objective, round n/N, phase).
 
-### 12.4 `dsh-jobs(-local)`, `dsh-tool-jobs` — background work
+### 12.4 `dsh-jobs(-local)`, `dsh-tool-jobs` — background work — **done** (Wave 4; spill-backed output Wave 10)
+
+**Shipped as** `agents::jobs::JobRegistry` (the `agents` crate, so the shell
+skills can start one) with `backend::jobs_bridge` as the notifier. Output is a
+256 KiB window; since Wave 10 the bytes that scroll out of it are appended to
+`spill/<session>/job-<id>.txt` and `job-output` names the file, so nothing a
+job printed is lost. An idle session is **deliberately not woken** by a
+completion: the notice waits in the inbox for the next turn (a build finishing
+is not, by itself, a reason to spend a turn). `JobDump.started_at` (v29) feeds
+the popover's duration column.
 
 **Mechanism.** `ctx.jobs.start()` gives work a stable `<kind>-N` id visible
 only to its owning session. Three generic tools cover every kind (`job_output`
@@ -1569,7 +1763,14 @@ end through `spawn_blocking` with a script that calls no agent.
 - **Thunk-style `parallel`** if the runtime ever gains concurrency (a JS
   engine with a real event loop would).
 
-### 12.6 `dsh-tool-ralph` — fresh-agent rounds
+### 12.6 `dsh-tool-ralph` — fresh-agent rounds — **done** (Wave 4; rounds as run rows Wave 10)
+
+**Shipped as** `agents::ralph` (`max_rounds` is an optional named arg). The
+nesting the sketch below wanted from `parent_seq` is done the way the other
+orchestrators do it: since Wave 10 every round is a member of a `WorkflowRun`
+(one unnamed phase, `round n/m`), so the transcript nests the rounds under the
+call and an interrupted loop is visible by its missing end row. `parent_seq`
+was never declared and is no longer needed for this.
 
 **Mechanism.** A **fixed, deployment-owned** script (a `String.raw` literal
 the model cannot alter) runs up to `maxRounds` (64; ceiling 256) fresh
@@ -1594,7 +1795,12 @@ nests them. Timeout 60 min. The portable idea — *only a small validated struct
 crosses a context boundary* — is the one to keep even if the tool is never
 used.
 
-### 12.7 `dsh-experimental-agent-team`, `dsh-tool-subagent-control` — **present (variant)**
+### 12.7 `dsh-experimental-agent-team`, `dsh-tool-subagent-control` — **present (variant)**; `send_message` / `interrupt_agent` **later**
+
+**Stance.** Teammate reports are not logged as `ToolResult { parent_seq }`;
+the board is reconstructable from the `WorkflowRun` rows `agent-team` writes
+(rounds as phases, teammates as members). The two control tools need
+continuable children (§12.1) and wait with them in the later row.
 
 `agent-team` covers the roster/rounds/board idea; dsh's version adds a durable
 peer mailbox and a shared task DAG. S: log teammate reports as
@@ -1606,16 +1812,56 @@ Since protocol v27 a team also writes the durable `WorkflowRun` rows
 (§12.5, UI guide §6.11): its **rounds are the phases** and each teammate
 is a member of the round it ran in, so a finished team rebuilds as a tree
 rather than a chip and a wall of log lines.
-### 12.8 `dsh-schedule` — after/at/fixed-rate reminders over the log
+### 12.8 `dsh-schedule` — after/at/fixed-rate reminders over the log — **done** (Wave 10, protocol v29; opt-in on `skills/schedule.md`)
 
-**Implement (S, optional).** `EventKind::Schedule { id, fire_at, prompt }` +
-a timer on `ChatHub` that enqueues a `Followup` (§2.1). Needs the inbox.
+**Shipped as** `agents::schedule` + the hub's reminder owner, dsh's design
+kept whole:
+
+- **Three harness controls** — `schedule-create '<prompt>'` with exactly one
+  of `after_seconds`, `at` (an offset-bearing RFC 3339 string, or `{date,
+  time, time_zone}` with `UTC`, a fixed offset or an IANA zone via
+  `chrono-tz`; a daylight-saving gap is refused, an overlap takes the earlier
+  instant), or `every_seconds` (≥ 300, creation-anchored); `schedule-list`;
+  `schedule-delete '<id>'`. Validation returns dsh's stable codes
+  (`invalid_prompt`, `invalid_selector`, `invalid_rule`, `invalid_time_zone`,
+  `not_future`, `time_out_of_range`, `frequency_too_high`,
+  `schedule_not_found`, `persistence_uncertain`). Their bodies run in the hub
+  because they mutate the log. **Opt-in** like `workflow` and `agent-team`:
+  `skills/schedule.md` on disk registers them (Settings › Integrations has
+  the switch), because three catalogue entries cost every request ~250
+  tokens — dsh ships Schedule as an overlay for the same reason.
+- **The log is the only authority.** `EventKind::Schedule { id, op: create |
+  delete | dispatch, prompt, rule, fire_at, after_seconds, every_seconds,
+  accepted_at }` (non-surface); `sica_core::project::schedules` is the strict
+  fold (a reused id or a transition against an inactive record is skipped,
+  an `every` dispatch advances straight to the first anchor-aligned target
+  after `accepted_at`, never replaying a backlog). `ChatHub.schedules` is the
+  resident fold, rebuilt at load; the popover's rows and `SessionMeta.scheduled`
+  come from it.
+- **Delivery never interrupts a turn.** A 10-second timer
+  (`ChatHub::deliver_due_schedules`) claims an *idle* session's slot under the
+  same lock a send takes, appends the dispatch rows, and starts one turn with
+  `TurnSource::Schedule` (no human authority): the earliest due one-shot on its
+  own in dsh's `[SCHEDULE REMINDER]` framing, else every overdue `every`
+  record's *latest* occurrence in one `[SCHEDULE REMINDER BATCH]`. Without a
+  connection the records stay active and overdue. Dispatch means the turn was
+  started and recorded, not that anyone read the answer — no receipt, no
+  external channel.
+- **Wire (v29).** `Event::SchedulesChanged { session_id, rows: Vec<ScheduleDump>
+  }` on every change and on session load; `SessionDump.schedules`;
+  `SessionMeta.scheduled` for the sidebar's alarm glyph. UI guide §6.10 has
+  the popover.
 
 ---
 
 ## 13. Hooks, MCP, web, LSP
 
-### 13.1 `dsh-hook-protocol`, `dsh-hooks-claude-code`, `dsh-hooks-codex` — **done** (Wave 5)
+### 13.1 `dsh-hook-protocol`, `dsh-hooks-claude-code`, `dsh-hooks-codex` — **done** (Wave 5; `PreToolUse` context Wave 10)
+
+**Wave 10.** A `PreToolUse` hook's `additionalContext` now reaches the model:
+`HooksPolicy::pre_execute` answers `PreDecision::AllowWith { extra_context }`
+and the sub-agent carries it into the call's notices after the result, the
+same channel a `PostToolUse` hook's context always used.
 
 **Mechanism.** Reads an existing Claude Code / Codex `hooks.json`; maps
 `SessionStart` → agent creation, `UserPromptSubmit` → `agent/pre-step`,
@@ -1664,6 +1910,10 @@ shape — an MCP tool's arguments are typed, and flattening them would make
 a tool taking a number or an array uncallable.
 
 ### 13.3 `dsh-web`, `dsh-tool-web`, `dsh-web-fetch-http`, `dsh-web-search-*` — **done** (Wave 5)
+
+**As shipped, against the plan below:** `web-search` takes one `query` and an
+optional `count` (1–10, default 5) — not 1–4 queries per call — and the
+providers are Brave, Exa and Tavily (never Perplexity).
 
 **Implement (S for fetch, S per search provider).** `web-fetch 'url'`:
 reqwest GET, HTML → text (`html2text`), 50 KiB cap → spill, framed with the
@@ -1799,7 +2049,13 @@ trimmer legitimately amputates the front, and an invariant that fires
 during normal operation is worse than none. The replay driver runs every
 scenario with the flag on, and treats a backend ERROR line as a failure.
 
-### 14.4 Agent Notes (`.agents/notes/`), `dsh-prose-standard`, "Model Experience" READMEs
+### 14.4 Agent Notes (`.agents/notes/`), `dsh-prose-standard`, "Model Experience" READMEs — notes **done** (Wave 10); Model Experience blocks **later**
+
+**Shipped as** `docs/notes/<date>-<topic>.md` with the skeleton, starting with
+the one decision this port made that the code cannot explain — the event log
+over `Vec<Message>` — and the convention line in CLAUDE.md. The *Model
+Experience* block in the `skills/*.md` seeds (what the model sees / token
+effect / KV-cache effect per built-in) is still to write.
 
 **Mechanism.** Every non-trivial change adds
 `.agents/notes/{proposed|implemented|rejected|archived}/{class}/yyyy-mm-dd-topic.md`
@@ -1837,13 +2093,13 @@ React packages are the UI guide's subject and are not repeated here.
 
 | dsh | Mechanism | sica-rust |
 | --- | --- | --- |
-| `dsh-settings`, `dsh-settings-file`, `dsh-api-settings-controller` | One user-owned document of per-namespace sections; each owner registers a schema and reads `defaults → composition base → user layer`; `applies: live \| restart` is a UI hint the settings surface badges; `validate` refuses a cross-field-invalid *write* rather than storing a value that would disable its owner; writes are revision-fenced; external edits are pushed to owners; the file provider preserves comments | `frontend::settings_store::Settings` (flat, serde defaults) plus one TOML per provider or MCP server. Worth porting: the **`applies` badge** on rows that need a BE restart, and **watching `sica-settings.json` and `sica-settings/**` for external edits** so "Open configuration file" round-trips without a restart (S — the FE already runs a `notify` watcher over the source tree; still to do, and it is a frontend surface, so it belongs with UI guide §7.2). Revision fencing is moot with one writer |
+| `dsh-settings`, `dsh-settings-file`, `dsh-api-settings-controller` | One user-owned document of per-namespace sections; each owner registers a schema and reads `defaults → composition base → user layer`; `applies: live \| restart` is a UI hint the settings surface badges; `validate` refuses a cross-field-invalid *write* rather than storing a value that would disable its owner; writes are revision-fenced; external edits are pushed to owners; the file provider preserves comments | `frontend::settings_store::Settings` (flat, serde defaults) plus one TOML per provider or MCP server. **Done (UI-9):** the frontend's `notify` watcher also watches `sica-settings.json` and `sica-settings/**`; an external edit is re-read and applied live (`App::reload_settings_from_disk` — General preferences, the provider roster, the sidebar prefs; a document identical to what the app holds is ignored, so the app's own writes never churn), which is what makes "Open configuration file" round-trip. Rows that need a backend restart say so in text (`restart_note`) rather than with a badge glyph. Revision fencing is moot with one writer |
 | `dsh-credentials`, `dsh-credentials-local`, `dsh-authorization` | Config carries *references* (env-var names), never values; layers `env → file → project-env → user-env`; consumers re-resolve **per operation**, so a rotated key reaches the next request without a restart; `describe(ref)` answers configured / source / writable without the value, so the read half can cross the wire; an empty value is absent everywhere; a project `.env` may not set proxy variables ("it arrives with `git clone`"). `authorization` is the browser-session token for the HTTP API | Keys sit in `sica-settings/llm-providers/*.toml` and `web.toml` (gitignored). **Done (Wave 9)** — `sica_core::creds`: `api_key = "${DEEPSEEK_API_KEY}"` resolves at request time from the process env, then `<workspace_root>/sica-settings/.env` (never the working directory's `.env` — dsh's rule), with an empty value absent everywhere and `describe` answering configured / source / unresolved *without* the value, which is the half that can safely cross a wire. Wired into `agents::web` (per search) and the FE's `ConnectLlm` (per connect), so a rotated key needs no restart and the stored settings keep the reference rather than the secret. **Done too:** the write-only key row — Settings › Models and the web-search card both show *configured · in file / environment (VAR) / .env (VAR)* and never the value (UI guide §7.2). Authorization is n/a: the pipe is per-user |
 | `dsh-storage`, `-domain`, `-json`, `-sqlite` | A hub of named backends (`json`: one whole human-readable file per unit, republished atomically; `sqlite`: one document per row) under one typed **domain** form: a spec with `name`, `version`, `layout: single \| per-record`, `compatibleVersions`, `invalidRecords: 'backup-and-skip'` for disposable derived data, zod record schemas; a `version-mismatch` read rejects, a per-record document outside the accepted set reads as absent | One JSON file per domain written through `atomic_write`; `workspaces.json` (§3.9) is the first, the projection cache (§3.3) would be the second if session sizes ever warrant it. Keep dsh's two rules: **stamp a version and refuse a newer one**, and **a malformed derived file is moved aside, never fatal** |
-| `dsh-atomic-write`, `dsh-home-paths`, `dsh-launch-environment`, `dsh-app-boot`, `dsh-cmdline`, `dsh-util-workspace-path` | temp + fsync + rename; `$DSH_HOME` (`~/.dsh`) resolution; `.env` loading at launch with the project-`.env` fence; the CLI's profile and patch flags | `sica_core::paths` + `SICA_WORKSPACE_ROOT` / `SICA_WORKING_DIR`. **Done (Wave 9)** — `sica_core::atomic::atomic_write(path, bytes)` (sibling temp file, `sync_all`, `rename`) plus `atomic_write_json`; used by the workspace registry (§3.9) and the §3.8 log rewrite. **Left:** `sica-settings.json` is still written in place by the FE |
-| `dsh-http-proxy` | Honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` read at launch; loopback always direct; credentials in the URL never echoed | **S:** reqwest's builder reads the env proxy by default — verify `LlmClient::new` never calls `no_proxy()`, and name `NO_PROXY` in the connection card's tooltip |
+| `dsh-atomic-write`, `dsh-home-paths`, `dsh-launch-environment`, `dsh-app-boot`, `dsh-cmdline`, `dsh-util-workspace-path` | temp + fsync + rename; `$DSH_HOME` (`~/.dsh`) resolution; `.env` loading at launch with the project-`.env` fence; the CLI's profile and patch flags | `sica_core::paths` + `SICA_WORKSPACE_ROOT` / `SICA_WORKING_DIR`. **Done (Wave 9)** — `sica_core::atomic::atomic_write(path, bytes)` (sibling temp file, `sync_all`, `rename`) plus `atomic_write_json`; used by the workspace registry (§3.9) and the §3.8 log rewrite. `sica-settings.json` goes through `atomic_write` too since UI-9 |
+| `dsh-http-proxy` | Honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` read at launch; loopback always direct; credentials in the URL never echoed | **Done (Wave 10, verified):** `LlmClient::new` builds the client with reqwest's default system-proxy matcher and never calls `no_proxy()`, so `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` apply to the model, `web-search` and MCP over HTTP alike; reqwest bypasses loopback only when `NO_PROXY` names it, which the sidebar's connection tooltip now says |
 | `dsh-api-gateway`, `-remotes`, `-session-controller`, `-workspace-controller`, `dsh-typert-*` | Generated remote RPC (`@Remote` verbs, a stream mode), the HTTP/WS gateway, one controller per surface | `backend::dispatcher` over bincode; a new request is added by hand (architecture.md). The controllers' *shapes* are what §3.9 copies |
-| `dsh-host-webserver`, `-frontend-static`, `dsh-client-connection`, `-hmr`, `-locale`, `-modules`, `-store`, `dsh-client-web`, `dsh-web-app`, `dsh-brand` | Serving the browser client; reconnect; the module roster; the locale registry | n/a — egui in-process. The locale registry is deliberately a `strings` module (UI guide §13) |
+| `dsh-host-webserver`, `-frontend-static`, `dsh-client-connection`, `-hmr`, `-locale`, `-modules`, `-store`, `dsh-client-web`, `dsh-web-app`, `dsh-brand` | Serving the browser client; reconnect; the module roster; the locale registry | n/a — egui in-process. The locale registry is deliberately `frontend::ui::strings`, a module of `pub const`s (UI guide §13) |
 | `dsh-host-plugin-inventory`, `dsh-client-ui-settings-plugin-inventory` | A read-only roster of loaded plugins with Enabled / Disabled / Failed and provenance, per preset | The Skills › Catalogue tab (UI guide §7.2) is the equivalent for skills, agents and commands; MCP servers and hooks get theirs in the Integrations tab (UI guide §7.2) |
 | `dsh-sdk-*` (`client`, `protocol`, `server`, `minimal`, `app`), `dsh-acp-app`, `dsh-headless`, the Python SDK | JSON-RPC over stdio for driving the harness headlessly; the ACP editor protocol; a Python wheel bundling the runtime | **M if a use appears:** `backend --ipc stdio` with a JSON codec in place of bincode is the whole surface — the dispatcher is already transport-agnostic. `replay` and `smoke` are the headless drivers that exist today |
 | `dsh-subagent-acp`, `-claude-code`, `-codex`, `-dsh-sdk` | External CLIs as subagent providers behind the §12.1 contract | **S–M each, only when such a CLI is installed:** a `subagent-<cli>` skill that runs `claude -p` / `codex exec` under `run-cli`'s `JobGuard`, feeds the task on stdin, and frames stdout as an untrusted child report (§9.4) |
@@ -1870,7 +2126,8 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | **7 — PTC** — **done** (protocol v25) | programmatic tool calling (§7, `agents::ptc` on `rhai` + `prompt::order::PTC_SDK` + `ToolMode` + the `ptc-program` replay scenario) | XL×1 | yes (v25) |
 | **8 — workflows** — **done** | model-written orchestration scripts (§12.5, `agents::workflow` on the shared `agents::script` sandbox + `prompt::order::WORKFLOW_SDK`, opt-in on `skills/workflow.md`) | L×1 | no |
 | **9 — workspaces & durability** — **done** (protocol v26) | per-session `cwd` + the format header and its migration chain (§3.8, `event::migrate` + `sessions_store::list_headers`) · workspace registry `backend::workspaces` + `NewSession { workspace_id }` (§3.9) · `sica_core::atomic::atomic_write` · credential references + `sica-settings/.env` (§14.6, `sica_core::creds`) | M×3 + S×2 | yes (v26) — `ListWorkspaces` … `MoveSession`, `Event::WorkspacesChanged`, `SessionMeta.cwd`; log-only `SessionCreated.format` / `.cwd` |
-| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · lazy session bodies (§3.8) · the settings-file watch (§14.6, a frontend surface) | L/XL | — |
+| **10 — durability, reminders, leftovers** — **done** (protocol v29) | fail-closed checkpoints (§3.2, `chat::checkpoint` + `ABORTED_BEFORE_DISPATCH`) · reminders (§12.8, `agents::schedule` + the hub's timer, opt-in on `skills/schedule.md`) · message feedback (§3.7, `RateMessage` + `MessageFeedback`) · approval policy `never` (§10.2) · `Retry-After` + `retry_always` (§4.2) · per-agent `tool_mode:` (§2.3) · `@path` expansion (§9.5) · `timeout_secs` (§6.3) · shell and grep overflow through `spill::write` (§6.6, §6.9) · spill-backed job output (§12.4) · description cap + `disable-model-invocation` / `user-invocable` (§8.1) · `stats` / `approval` / `job-output` commands (§8.4) · `PreToolUse` context (§13.1) · ralph rounds as run rows (§12.6) · `SetWorkingDir` on a live backend (§3.9, UI §7.2) · `docs/notes/` (§14.4) | S×14 + M×3 | yes (v29) — `SetWorkingDir`, `RateMessage`; `Event::SchedulesChanged`, `SessionDump.schedules`, `SessionMeta.scheduled`, `MessageDump.feedback`, `JobDump.started_at`, `TurnUsage.last_seq`, `LlmOptions.retry_always`. Log-only: `EventKind::Schedule`, `EventKind::MessageFeedback`, `TurnSource::Schedule` |
+| **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · lazy session bodies (§3.8) · continuable children + `send_message` / `interrupt_agent` (§12.1, §12.7) · `harness.toml` for the constants the Skills › Harness tab lists (UI §7.2) · Model Experience blocks in the skill seeds (§14.4) · the output split (§6.1) | L/XL | — |
 
 ---
 
@@ -1878,9 +2135,9 @@ Each wave builds and ships on its own; protocol bumps are marked.
 
 | Variant | Surface | Introduced by |
 | --- | --- | --- |
-| `ContextInjected { surface, source: ContextSource, content }` — `source ∈ {Instructions, SkillInvocation(name), FileReference, ToolNotice, JobNotice, GoalRound, RuntimeContext}` | user-role | §2.1, §5.1, §5.3, §6.4, §8.2, §9.5, §12.4 |
-| `ToolResult.pruned: bool` + `ToolResult.parent_seq: Option<u64>` + `ToolResult.trusted: bool` | (existing) | §9.2, §7/§12.6, §9.4 |
-| `TurnStart.source: TurnSource { Human, GoalRound, Followup }` — **done** (Wave 4) | (existing) | §12.3 |
+| `ContextInjected { surface, source: ContextSource, content }` — `source ∈ {Instructions, SkillInvocation { name }, FileReference { path }, SessionReference { id }, ToolNotice, JobNotice, GoalRound, Injected, RuntimeContext}` — **done** | user-role | §2.1, §5.1, §5.3, §6.4, §8.2, §9.5, §12.4 |
+| `ToolResult.pruned: bool` + `ToolResult.trusted: bool` — **done**; `parent_seq` is reserved on paper only and **not declared** (the run rows of §12.5 cover what it was for) | (existing) | §9.2, §7/§12.6, §9.4 |
+| `TurnStart.source: TurnSource { Human, GoalRound, Followup, AutoContinue, Schedule }` — **done** (Wave 4; `AutoContinue` with `backend::verdict`, `Schedule` with Wave 10) | (existing) | §12.3 |
 | `Command { name, input, ok }` | no | §8.4 |
 | `Approval { skill, args_preview, decision }` | no | §10.2 |
 | `PermissionMode { mode }` | no | §10.3 |
@@ -1891,9 +2148,9 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | `Hook { event, command, decision, exit_code }` — **done** (Wave 5) | no | §13.1 |
 | `AgentPreset { name: Option<String> }` — **done** (Wave 6) | no | §5.2 |
 | `SessionCreated += format: u16, cwd: Option<PathBuf>` — **done** (Wave 9) | (existing; line 1 stays the header) | §3.8, §3.9 |
-| `MessageFeedback { seq_ref, rating, note }` | no | §3.7 |
+| `MessageFeedback { seq_ref, rating, note }` — **done** (Wave 10) | no | §3.7 |
 | `WorkflowRun { run_id, call_seq, phase, member, member_id, state }` — **done** (v27) | no | §12.5, UI §6.11 |
-| `Schedule { id, fire_at, prompt }` | no | §12.8 |
+| `Schedule { id, op, prompt, rule, fire_at, after_seconds, every_seconds, accepted_at }` — **done** (Wave 10) | no | §12.8 |
 
 All are additive; `derive_surface` ignores unknown non-surface kinds. Give
 `EventKind` a `#[serde(other)] Unknown` variant before Wave 2 so a log written
@@ -1913,6 +2170,7 @@ by a newer backend still loads on an older one.
 | 9 — shipped as v26 | `ListWorkspaces`, `CreateWorkspace`, `RenameWorkspace`, `DeleteWorkspace`, `MoveWorkspace`, `MoveSession`; `NewSession { workspace_id }` | `Response::Workspaces` (`WorkspaceDump`); `Event::WorkspacesChanged`; `SessionMeta.cwd`. Log-only: `SessionCreated.format`, `SessionCreated.cwd`. Nothing for the registry itself — dsh logs no workspace event either |
 | 10 — shipped as v27 | — | `Event::WorkflowRunChanged` (`WorkflowRunDump`, `RunPhaseDump`, `RunMemberDump`); `SessionDump.runs`. Log-only: `EventKind::WorkflowRun`, `RunState` |
 | 11 — shipped as v28 | — | `UserImage += sha, bytes`, `data_base64` now empty in every dump. Log-only: the same shape, plus `sessions/<id>/attachments/` beside the log |
+| 12 — shipped as v29 | `SetWorkingDir { path }`, `RateMessage { session_id, seq, rating, note }` | `Event::SchedulesChanged` (`ScheduleDump`); `SessionDump.schedules`; `SessionMeta.scheduled`; `MessageDump.feedback`; `JobDump.started_at`; `TurnUsage.last_seq`; `LlmOptions.retry_always`. Log-only: `EventKind::Schedule`, `EventKind::MessageFeedback`, `TurnSource::Schedule` |
 
 Every bump: `.\run.ps1 build --workspace`, restart the GUI, run
 `.\run.ps1 run -p frontend --bin smoke`, and update CLAUDE.md's version note.

@@ -273,6 +273,23 @@ async fn run(args: Args) -> Result<()> {
     skill_registry.register(Arc::new(agents::CreateGoal));
     skill_registry.register(Arc::new(agents::GetGoal));
     skill_registry.register(Arc::new(agents::UpdateGoal));
+    // Reminders (guide §12.8): harness controls like the goal skills, whose
+    // bodies run in the hub because they mutate the session log. Opt-in on
+    // `skills/schedule.md`, on the same terms as `workflow` and
+    // `agent-team` — dsh ships Schedule as an overlay too — because three
+    // more catalogue entries cost every request ~250 tokens whether or not
+    // a session ever sets a reminder. Delivery of reminders already in a
+    // log does not depend on the doc: the timer runs regardless.
+    if let Err(e) = agents::schedule::seed_default(&skills_path) {
+        warn!(error = %e, dir = %skills_path.display(), "seed schedule.md.off failed");
+    }
+    let schedule_doc = skills_path.join(format!("{}.md", agents::schedule::SCHEDULE_DOC_STEM));
+    let schedule_on = schedule_doc.exists();
+    if schedule_on {
+        skill_registry.register(Arc::new(agents::ScheduleCreate));
+        skill_registry.register(Arc::new(agents::ScheduleList));
+        skill_registry.register(Arc::new(agents::ScheduleDelete));
+    }
     // `model-eval` benchmarks the connected model against a prompt suite. It
     // needs the finished registry (for the live catalogue and the known-skill
     // predicate its tool-call checks use), so it is attached below alongside
@@ -494,6 +511,11 @@ async fn run(args: Args) -> Result<()> {
     // owning session's inbox (the model reads it at its next step) and
     // refreshes the FE's list.
     jobs.attach_notifier(Arc::new(jobs_bridge::JobsBridge::new(&chat)));
+
+    // The reminder owner (guide §12.8): delivers due reminders to idle
+    // sessions as follow-up turns. Restored records that came due while the
+    // process was down are simply overdue and go out on the first pass.
+    chat.spawn_schedule_timer();
 
     // Initial broadcasts: ServerHello + initial LLM state so the FE can sync.
     let _ = out_tx.send(Frame {

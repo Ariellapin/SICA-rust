@@ -624,6 +624,7 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
                 .detail("Copy the completed turns into a new session"),
             kit::MenuItem::new("Archive session").detail("Hides the row; the log stays on disk"),
             kit::MenuItem::new("Copy title"),
+            kit::MenuItem::new("Export log…").detail("Save the session's event log as JSONL"),
             kit::MenuItem::new("Delete session")
                 .danger(true)
                 .sep_above(true),
@@ -649,7 +650,26 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
                     ui.ctx().output_mut(|o| o.copied_text = title);
                 }
             }
-            Some(5) => action = Some(RowAction::Arm(id)),
+            // Export (harness §3.5): the log *is* the export format, and the
+            // frontend shares the machine with it, so this is a file copy
+            // through the OS save dialog — no request needed.
+            Some(5) => {
+                app.chat.row_menu = None;
+                let src = sica_core::paths::sessions_dir().join(format!("{id}.jsonl"));
+                if !src.is_file() {
+                    app.show_toast(Icon::Warning, "This session has nothing on disk yet", 3000);
+                } else if let Some(dest) = rfd::FileDialog::new()
+                    .set_file_name(format!("session-{id}.jsonl"))
+                    .add_filter("JSON Lines", &["jsonl"])
+                    .save_file()
+                {
+                    match std::fs::copy(&src, &dest) {
+                        Ok(_) => app.show_toast(Icon::Check, format!("Exported to {}", dest.display()), 3000),
+                        Err(e) => app.show_toast(Icon::Warning, format!("Export failed: {e}"), 6000),
+                    }
+                }
+            }
+            Some(6) => action = Some(RowAction::Arm(id)),
             _ => {}
         }
         if !open {
@@ -1498,6 +1518,20 @@ fn draw_row(
             time_font,
             kit::col(t.alias.label[2]),
         );
+        // The non-interactive alarm (UI §6.10): the session holds an
+        // active reminder. It says the list is non-empty, not that a live
+        // runtime will deliver it.
+        if app.chat.sessions.iter().any(|s| s.id == id && s.scheduled) {
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    egui::pos2(rect.max.x - 16.0 - time_w, rect.center().y),
+                    Vec2::splat(11.0),
+                ),
+                Icon::Clock,
+                kit::col(t.alias.label[2]),
+            );
+        }
     }
 
     if resp.clicked() {
@@ -1691,6 +1725,15 @@ fn connection_detail(app: &App) -> String {
     if let Some(e) = &app.ipc_state.last_error {
         lines.push(e.clone());
     }
+    // Outbound requests (the model, web search, MCP over HTTP) honour the
+    // environment's proxy variables (harness §14.6). Loopback is only
+    // direct when NO_PROXY says so — a proxied localhost provider looks
+    // exactly like a dead one otherwise, so the fact belongs here.
+    lines.push(
+        "proxy: HTTPS_PROXY / HTTP_PROXY / NO_PROXY from the environment apply to \
+         every outbound request; add localhost,127.0.0.1 to NO_PROXY behind a proxy"
+            .into(),
+    );
     lines.push("click to reconnect".into());
     lines.join("\n")
 }

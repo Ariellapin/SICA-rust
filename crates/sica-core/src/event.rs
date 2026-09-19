@@ -347,6 +347,47 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
     },
+    /// One durable change to the session's reminders (guide §12.8). The
+    /// log is the only authority: the live timers, the popover's rows and
+    /// the tool results are all folds of these rows
+    /// ([`crate::project::schedules`]).
+    ///
+    /// `op` is `create` (the whole record rides along), `delete` (id only)
+    /// or `dispatch` — the reminder entered the conversation as a follow-up
+    /// turn. A one-shot's dispatch is terminal; an `every` dispatch carries
+    /// `accepted_at`, the wall-clock moment the decision was taken, and the
+    /// fold advances the record straight to the first anchor-aligned
+    /// target after it — missed intervals are never replayed.
+    ///
+    /// **Not a surface event.** What the model sees is the follow-up
+    /// message the dispatch produced, which is an ordinary `UserMessage`.
+    Schedule {
+        id: String,
+        op: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        /// `after` | `at` | `every` on a `create` row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+        /// Target of the first occurrence, unix seconds UTC.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fire_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        every_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accepted_at: Option<i64>,
+    },
+    /// The user rated an assistant message (guide §3.7). Log-only and
+    /// never surfaced: a label for `model-eval`, and a lit thumb in the
+    /// transcript. Latest row per `seq_ref` wins; `rating: 0` clears.
+    MessageFeedback {
+        seq_ref: u64,
+        rating: i8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     /// A kind this build does not know — written by a newer backend. Kept
     /// so an older binary still loads the log; contributes nothing.
     #[serde(other)]
@@ -374,6 +415,10 @@ pub enum TurnSource {
     /// abnormally with the request unfinished. Machine authority, like a
     /// goal round — a turn that opened itself may not claim a human's say.
     AutoContinue,
+    /// A reminder came due (guide §12.8) and entered the conversation as
+    /// a follow-up. The prompt is the user's own words from earlier, but
+    /// the moment was the clock's, so it carries no human authority.
+    Schedule,
 }
 
 impl TurnSource {
@@ -383,6 +428,7 @@ impl TurnSource {
             TurnSource::GoalRound => "goal round",
             TurnSource::Followup => "followup",
             TurnSource::AutoContinue => "auto-continue",
+            TurnSource::Schedule => "reminder",
         }
     }
 

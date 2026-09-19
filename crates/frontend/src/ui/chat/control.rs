@@ -106,10 +106,19 @@ fn approval(app: &mut App, ui: &mut egui::Ui) -> bool {
                     )));
                     if !preview.is_empty() {
                         ui.add_space(6.0);
-                        ui.add(
-                            egui::Label::new(kit::mono(&preview, 13.0, kit::col(t.alias.label[2])))
-                                .wrap(),
-                        );
+                        // dsh caps the body at 336 px and scrolls inside it,
+                        // so a long argument list cannot push the buttons
+                        // off screen.
+                        egui::ScrollArea::vertical()
+                            .id_source("approval_body")
+                            .max_height(336.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(kit::mono(&preview, 13.0, kit::col(t.alias.label[2])))
+                                        .wrap(),
+                                );
+                            });
                     }
                     ui.add_space(10.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

@@ -200,13 +200,17 @@ fn working_dir_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> boo
     let mut chosen: Option<Option<std::path::PathBuf>> = None;
     row(
         ui,
-        "Working directory",
-        &current.display().to_string(),
+        "Default folder for new sessions",
+        &format!(
+            "{} — where a session started outside a workspace works. Applies \
+             to the next session; open sessions keep their own folder.",
+            current.display()
+        ),
         |ui| {
             let resp = kit::button(ui, &label, kit::Variant::Outline, kit::Size::Sm);
             let anchor = resp.rect;
-            let tip = "Where the agent reads, writes and runs commands. \
-                       Changing it restarts the backend.";
+            let tip = "The folder an Ungrouped session reads, writes and runs \
+                       commands in. Applies live — no restart.";
             if resp.on_hover_text(tip).clicked() {
                 app.menu_open.working_dir = !app.menu_open.working_dir;
             }

@@ -27,6 +27,7 @@ pub mod prompt;
 pub mod ralph;
 pub mod registry;
 pub mod runner;
+pub mod schedule;
 pub mod script;
 pub mod skill;
 pub mod skill_creator;
@@ -53,6 +54,7 @@ pub use parse_tool_call::{
     extract as extract_tool_call, extract_known as extract_tool_call_known, ToolCall,
 };
 pub use registry::SkillRegistry;
+pub use schedule::{ScheduleCreate, ScheduleDelete, ScheduleList};
 pub use skill::{Concurrency, Skill, SkillContext, SkillOutcome};
 pub use skill_creator::SkillCreator;
 pub use subagent::{ToolFailureReport, ToolFailureSink, ToolInvocation, ToolSubAgent};

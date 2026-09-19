@@ -27,6 +27,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use sica_core::event::RunState;
+
 use crate::registry::SkillRegistry;
 use crate::runner::{self, RunSpec};
 use crate::skill::{Skill, SkillContext, SkillOutcome};
@@ -258,16 +260,43 @@ impl Skill for Ralph {
         let mut outcome = Status::Continue;
         let mut round: u8 = 0;
 
+        // The rounds are a run (UI guide §6.11): one member per round under
+        // a single unnamed phase, so the transcript nests them under this
+        // call and an interrupted loop is visible by its missing end row.
+        // Round reports are never logged as tool results of their own —
+        // the run tree is what makes the rounds reconstructable.
+        let run_id = crate::subagent::next_run_id();
+        ctx.sub.run_edge(run_id, None, None, RunState::Started);
+        let round_member = |round: u8| -> (u64, String) {
+            (u64::from(round), format!("round {round}/{max_rounds}"))
+        };
+        let fail_run = |round: u8, ctx: &SkillContext, out: SkillOutcome| -> SkillOutcome {
+            if round > 0 {
+                let (id, label) = round_member(round);
+                ctx.sub.run_edge(run_id, None, Some((id, &label)), RunState::Failed);
+            }
+            ctx.sub.run_edge(run_id, None, None, RunState::Failed);
+            out
+        };
+
         while round < max_rounds {
             if runner::is_cancelled(&cancel) {
-                return fail_with(
-                    &objective,
-                    round,
-                    &history,
-                    "interrupted — the workspace holds whatever the finished rounds left",
+                return fail_run(
+                    0,
+                    &ctx,
+                    fail_with(
+                        &objective,
+                        round,
+                        &history,
+                        "interrupted — the workspace holds whatever the finished rounds left",
+                    ),
                 );
             }
             round += 1;
+            {
+                let (id, label) = round_member(round);
+                ctx.sub.run_edge(run_id, None, Some((id, &label)), RunState::Started);
+            }
             let spec = RunSpec {
                 label:    format!("ralph round {round}/{max_rounds}"),
                 system:   round_system(catalogue.as_deref()),
@@ -286,28 +315,28 @@ impl Skill for Ralph {
 
             let Some(report) = report else {
                 warn!(round, "ralph: round produced nothing");
-                return fail_with(
+                return fail_run(round, &ctx, fail_with(
                     &objective, round, &history,
                     "a round produced no report (every LLM call failed, or the turn \
                      was interrupted)",
-                );
+                ));
             };
             let Some(value) = report.structured else {
                 warn!(round, "ralph: round never reported through structured-output");
-                return fail_with(
+                return fail_run(round, &ctx, fail_with(
                     &objective, round, &history,
                     "a round never reported through `structured-output`, so its work \
                      cannot be handed on",
-                );
+                ));
             };
             let status = match check_report(&value) {
                 Ok(s) => s,
                 Err(problem) => {
                     warn!(round, %problem, "ralph: report failed the cross-field rules");
-                    return fail_with(
+                    return fail_run(round, &ctx, fail_with(
                         &objective, round, &history,
                         &format!("a round's report was self-contradictory: {problem}"),
-                    );
+                    ));
                 }
             };
 
@@ -332,6 +361,10 @@ impl Skill for Ralph {
             });
 
             outcome = status;
+            {
+                let (id, label) = round_member(round);
+                ctx.sub.run_edge(run_id, None, Some((id, &label)), RunState::Done);
+            }
             // Record the round's report before deciding whether to stop:
             // the closing message reads the blocker off it, and on a
             // `blocked` round that blocker is in *this* report, not the
@@ -356,6 +389,12 @@ impl Skill for Ralph {
                 "stopped at the round limit ({max_rounds}) with work still outstanding"
             ),
         };
+        ctx.sub.run_edge(
+            run_id,
+            None,
+            None,
+            if outcome == Status::Blocked { RunState::Failed } else { RunState::Done },
+        );
         SkillOutcome {
             ok:      outcome != Status::Blocked,
             summary: render(&objective, round, &history, &closing),

@@ -28,7 +28,11 @@ use crate::ui::kit::{self, DotState, Elevation, Level, Weight};
 const MIN_INPUT_ROWS: usize = 1;
 /// 14 lines, after which the field scrolls internally (336 px at 24 px).
 const MAX_INPUT_ROWS: usize = 14;
-const THUMB_SIZE: f32 = 56.0;
+const THUMB_SIZE: f32 = 64.0;
+/// A text file larger than this is not offered as a card (§5.3): only
+/// `@path` is sent, but a card is a promise the model will read it, and a
+/// 500 MB log is not a promise anyone should make.
+const MAX_TEXT_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const SEND_CIRCLE: f32 = 34.0;
 
@@ -162,7 +166,7 @@ fn card(app: &mut App, ui: &mut egui::Ui, disabled: bool) {
 
 fn placeholder(app: &App, disabled: bool, busy: bool) -> &'static str {
     if disabled {
-        "No model connected — select one to continue"
+        crate::ui::strings::NO_MODEL
     } else if busy {
         match app.busy_enter {
             BusyEnter::Queue => "Enter queues · Ctrl+Enter steers this turn",
@@ -171,7 +175,7 @@ fn placeholder(app: &App, disabled: bool, busy: bool) -> &'static str {
     } else if app.plan_active {
         "describe your task to generate plan"
     } else if app.chat.turns.is_empty() {
-        "Describe what you want to build... / commands, @ files or sessions"
+        crate::ui::strings::HERO_PLACEHOLDER
     } else {
         "Message or run a task... / commands, @ files or sessions"
     }
@@ -201,13 +205,17 @@ fn toolbar(
             app.chat.slash.dismissed = false;
             ui.memory_mut(|m| m.request_focus(input_id));
         }
-        permission_chip(app, ui);
-        if app.plan_active {
-            plan_chip(app, ui);
-        }
-        if app.session_agent.is_some() {
-            agent_chip(app, ui);
-        }
+        // Blocked composer (§6.8): with no model connected every control is
+        // inert except the model chip, which is the way out.
+        ui.add_enabled_ui(!disabled, |ui| {
+            permission_chip(app, ui);
+            if app.plan_active {
+                plan_chip(app, ui);
+            }
+            if app.session_agent.is_some() {
+                agent_chip(app, ui);
+            }
+        });
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             send_button(app, ui, disabled, turn_in_flight);
@@ -498,6 +506,27 @@ fn model_select(app: &mut App, ui: &mut egui::Ui) {
                 .checked(active.as_deref() == Some(id.as_str()))
         })
         .collect();
+    // Effort (§6.8): the provider's `thinking` toggle, reachable from the
+    // chip rather than only from Settings. It is a per-provider setting
+    // that applies on connect, so a pick saves the TOML and reconnects.
+    let thinking = active
+        .as_deref()
+        .and_then(|id| app.providers.iter().find(|p| p.id == id))
+        .map(|p| p.thinking);
+    let effort_rows: usize = if active.is_some() { 2 } else { 0 };
+    if active.is_some() {
+        items.push(
+            kit::MenuItem::new("Effort · thinking on")
+                .detail("Reasoning before every answer")
+                .checked(thinking == Some(true))
+                .sep_above(true),
+        );
+        items.push(
+            kit::MenuItem::new("Effort · thinking off")
+                .detail("Faster, terser answers")
+                .checked(thinking == Some(false)),
+        );
+    }
     items.push(
         kit::MenuItem::new("Model settings…")
             .detail("Add or edit a provider")
@@ -518,6 +547,17 @@ fn model_select(app: &mut App, ui: &mut egui::Ui) {
         if i < providers.len() {
             let id = providers[i].0.clone();
             app.connect_provider(&id);
+        } else if i < providers.len() + effort_rows {
+            let want = i == providers.len();
+            if let Some(id) = active.clone() {
+                if let Some(cfg) = app.providers.iter_mut().find(|p| p.id == id) {
+                    if cfg.thinking != want {
+                        cfg.thinking = want;
+                        let _ = crate::llm_providers::save(cfg);
+                        app.connect_provider(&id);
+                    }
+                }
+            }
         } else {
             app.settings_open = true;
             app.settings_tab = crate::app::SettingsTab::Models;
@@ -1104,6 +1144,17 @@ fn attach_text_file(app: &mut App, path: &Path) {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     let size = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+    if size as u64 > MAX_TEXT_ATTACHMENT_BYTES {
+        app.show_toast(
+            Icon::Warning,
+            format!(
+                "{name} is {} MB — too large to attach; mention it as @path and the agent can read it in parts",
+                size / (1024 * 1024)
+            ),
+            5000,
+        );
+        return;
+    }
     app.chat.pending_images.push(PendingAttachment {
         mime: "text/plain".into(),
         data_base64: String::new(),
@@ -1135,6 +1186,11 @@ fn attach_from_path(app: &mut App, path: &Path) -> std::io::Result<()> {
             format!("not an image: {}", path.display()),
         ));
     }
+    // dsh's admission numbers (harness §9.6): downscale to the long edge on
+    // intake, and refuse what is still over the byte cap after that.
+    let (bytes, mime) = normalise_image(bytes, &mime).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+    })?;
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let filename = path
         .file_name()
@@ -1149,6 +1205,54 @@ fn attach_from_path(app: &mut App, path: &Path) -> std::io::Result<()> {
         file_path: None,
     });
     Ok(())
+}
+
+/// Bring an image inside dsh's admission limits (harness §9.6): a long edge
+/// over `LONG_EDGE_PX` is downscaled (the provider would do worse), and the
+/// result must fit `BYTES_PER_IMAGE`. An image that is already inside both
+/// passes through untouched — its bytes, and so its content hash, are the
+/// user's own. PNG stays PNG; everything else is re-encoded as JPEG.
+fn normalise_image(bytes: Vec<u8>, mime: &str) -> Result<(Vec<u8>, String), String> {
+    use sica_core::attachments::limits::{BYTES_PER_IMAGE, LONG_EDGE_PX};
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("not a readable image: {e}"))?;
+    let (w, h) = (img.width(), img.height());
+    let too_big = w.max(h) > LONG_EDGE_PX;
+    if !too_big && bytes.len() <= BYTES_PER_IMAGE {
+        return Ok((bytes, mime.to_string()));
+    }
+    let scaled = if too_big {
+        let scale = LONG_EDGE_PX as f64 / w.max(h) as f64;
+        img.resize(
+            ((w as f64 * scale).round() as u32).max(1),
+            ((h as f64 * scale).round() as u32).max(1),
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut out);
+    let (format, out_mime) = if mime == "image/png" {
+        (image::ImageFormat::Png, "image/png")
+    } else {
+        (image::ImageFormat::Jpeg, "image/jpeg")
+    };
+    let encoded = match format {
+        image::ImageFormat::Jpeg => {
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
+            enc.encode_image(&scaled.to_rgb8()).map_err(|e| e.to_string())
+        }
+        _ => scaled.write_to(&mut cursor, format).map_err(|e| e.to_string()),
+    };
+    encoded?;
+    if out.len() > BYTES_PER_IMAGE {
+        return Err(format!(
+            "image is {} MB after downscaling; the cap is {} MB",
+            out.len() / (1024 * 1024),
+            BYTES_PER_IMAGE / (1024 * 1024)
+        ));
+    }
+    Ok((out, out_mime.to_string()))
 }
 
 fn mime_from_path(path: &Path) -> Option<&'static str> {
@@ -1208,6 +1312,15 @@ fn handle_paste(app: &mut App, ui: &mut egui::Ui) {
     {
         return;
     }
+    // A pasted screenshot from a 4K display is well over the long edge;
+    // the same intake rule as a dropped file (harness §9.6).
+    let png = match normalise_image(png, "image/png") {
+        Ok((bytes, _)) => bytes,
+        Err(e) => {
+            app.show_toast(Icon::Warning, e, 5000);
+            return;
+        }
+    };
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
     app.chat.pending_images.push(PendingAttachment {
         mime: "image/png".into(),

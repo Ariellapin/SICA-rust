@@ -122,6 +122,22 @@ pub trait Skill: Send + Sync {
         None
     }
 
+    /// Whether the model may call this skill (guide §8.1, dsh's
+    /// `disable-model-invocation`). `false` keeps it out of the catalogue
+    /// and the `tools` array and makes `resolve` refuse it, while a typed
+    /// `/name` still loads it: the file exists for the person, not the
+    /// model. Default `true`.
+    fn model_invocable(&self) -> bool {
+        true
+    }
+
+    /// Whether the `/` palette lists this skill (dsh's `user-invocable`).
+    /// `false` hides it from the palette only — the model still sees it.
+    /// Default `true`.
+    fn user_invocable(&self) -> bool {
+        true
+    }
+
     /// Scheduling class of one call (native multi-call batches only).
     /// Default `Exclusive`. `read-file` is `Parallel`; the shells are
     /// `Parallel` only for read-only commands (same predicate the

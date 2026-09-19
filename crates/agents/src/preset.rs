@@ -43,6 +43,10 @@ pub struct AgentPreset {
     pub persona:     String,
     /// Skill names from `skills:`. Empty means "every skill stays visible".
     pub skills:      Vec<String>,
+    /// `tool_mode:` from the frontmatter (guide §2.3): `text`, `native` or
+    /// `ptc`, overriding the connection's presentation for a session that
+    /// runs this preset. `None` keeps the connection's mode.
+    pub tool_mode:   Option<protocol::ToolMode>,
     pub source_path: PathBuf,
 }
 
@@ -53,8 +57,20 @@ impl From<MarkdownSkill> for AgentPreset {
             description: s.description,
             persona:     s.body,
             skills:      s.skills,
+            tool_mode:   s.tool_mode.as_deref().and_then(parse_tool_mode),
             source_path: s.source_path,
         }
+    }
+}
+
+/// The `tool_mode:` vocabulary. Unknown words are ignored rather than
+/// refused, so a typo costs the override and not the preset.
+pub fn parse_tool_mode(s: &str) -> Option<protocol::ToolMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "text" => Some(protocol::ToolMode::Text),
+        "native" => Some(protocol::ToolMode::Native),
+        "ptc" => Some(protocol::ToolMode::Ptc),
+        _ => None,
     }
 }
 
@@ -251,6 +267,7 @@ mod tests {
             description: String::new(),
             persona:     "P".into(),
             skills:      vec!["read-file".into(), "grep".into()],
+            tool_mode: None,
             source_path: PathBuf::new(),
         };
         let v = view(&reg, &p);
@@ -268,6 +285,7 @@ mod tests {
             description: String::new(),
             persona:     "P".into(),
             skills:      Vec::new(),
+            tool_mode: None,
             source_path: PathBuf::new(),
         };
         assert_eq!(view(&reg, &p).by_name.len(), reg.by_name.len());
@@ -281,6 +299,7 @@ mod tests {
             description: String::new(),
             persona:     "P".into(),
             skills:      vec!["read-file".into(), "raed-file".into()],
+            tool_mode: None,
             source_path: PathBuf::new(),
         };
         assert_eq!(unknown_skills(&reg, &p), vec!["raed-file".to_string()]);

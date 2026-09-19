@@ -61,6 +61,11 @@ pub enum Icon {
     Sun,
     Moon,
     Monitor,
+    /// A reminder (harness §12.8): the header popover and the sidebar alarm.
+    Clock,
+    /// Message feedback (harness §3.7).
+    ThumbUp,
+    ThumbDown,
 }
 
 impl Icon {
@@ -246,6 +251,28 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Todo => {
             rect_stroke(0.14, 0.14, 0.86, 0.86, 0.14);
             poly(&[(0.30, 0.52), (0.44, 0.66), (0.72, 0.34)]);
+        }
+        Icon::Clock => {
+            painter.circle_stroke(p(0.50, 0.54), 0.32 * w, s);
+            line((0.50, 0.54), (0.50, 0.36));
+            line((0.50, 0.54), (0.62, 0.62));
+            // The bell's shoulders, so it reads as an alarm and not a watch.
+            line((0.24, 0.24), (0.34, 0.16));
+            line((0.76, 0.24), (0.66, 0.16));
+        }
+        Icon::ThumbUp => {
+            rect_stroke(0.14, 0.46, 0.30, 0.84, 0.04);
+            poly(&[
+                (0.30, 0.50), (0.48, 0.16), (0.56, 0.20), (0.52, 0.42), (0.80, 0.42),
+                (0.86, 0.50), (0.78, 0.82), (0.30, 0.82),
+            ]);
+        }
+        Icon::ThumbDown => {
+            rect_stroke(0.14, 0.16, 0.30, 0.54, 0.04);
+            poly(&[
+                (0.30, 0.50), (0.48, 0.84), (0.56, 0.80), (0.52, 0.58), (0.80, 0.58),
+                (0.86, 0.50), (0.78, 0.18), (0.30, 0.18),
+            ]);
         }
         Icon::Inject => {
             line((0.50, 0.14), (0.50, 0.58));

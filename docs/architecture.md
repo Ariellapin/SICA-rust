@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 28) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 29) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -222,6 +222,18 @@ still carries its bytes inline and is read as it is, which is why this
 needed no session-format migration. The request builder resolves a
 reference back to base64; the frontend reads the file directly, sharing a
 disk with the backend.
+
+v29 (harness Wave 10 / UI-9) adds two requests — `SetWorkingDir { path }`,
+which changes the backend's default folder for the sessions created from
+then on without a restart, and `RateMessage { session_id, seq, rating,
+note }`, which writes a log-only `MessageFeedback` row — and the reminder
+surface of harness §12.8: `Event::SchedulesChanged { session_id, rows }`
+carrying `ScheduleDump`s, `SessionDump.schedules`, and `SessionMeta.scheduled`
+for the sidebar's alarm. `MessageDump.feedback`, `JobDump.started_at`,
+`TurnUsage.last_seq` and `LlmOptions.retry_always` are the small additions.
+The log gained `EventKind::Schedule` and `EventKind::MessageFeedback` (both
+non-surface) and `TurnSource::Schedule`; `sica_core::project::schedules` and
+`::feedback` are their folds.
 
 ## On-disk surfaces (all at workspace root)
 

@@ -64,7 +64,7 @@ Seven crates, dependency direction strictly downward. Details in
 ## Reference docs
 
 - **[docs/architecture.md](docs/architecture.md)** — the crate graph, the wire
-  protocol (framing, `PROTOCOL_VERSION` history v17–v28), every on-disk surface,
+  protocol (framing, `PROTOCOL_VERSION` history v17–v29), every on-disk surface,
   how to add a new request, and the conventions to respect when editing.
 - **[docs/agent-loop.md](docs/agent-loop.md)** — one turn end to end: history
   derivation, prune/compact/trim, retry classification, the two tool-calling
@@ -93,7 +93,14 @@ Seven crates, dependency direction strictly downward. Details in
   `sica-settings/mcp/*.toml` (one MCP server each, §13.2), `sica-settings/web.toml`
   (the `web-search` provider key, §13.3). Each reports what it could not load as a
   `LogLine` rather than failing startup.
-- Two skills are off until a doc turns them on: `skills/agent-team.md` registers
-  `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5). Both
-  spend many LLM conversations per call, and `workflow` also adds ~575 tokens of
-  scripting reference to every system prompt while it is on.
+- Three skills are off until a doc turns them on: `skills/agent-team.md` registers
+  `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5), and
+  `skills/schedule.md` registers the three reminder tools (§12.8; seeded as
+  `schedule.md.off`). The first two spend many LLM conversations per call,
+  `workflow` also adds ~575 tokens of scripting reference to every system
+  prompt while it is on, and the reminder tools add ~250 tokens of catalogue.
+  Settings › Integrations has the switches.
+- Decisions the code cannot explain go in `docs/notes/<date>-<topic>.md`
+  (harness guide §14.4): problem, decision, consequences, alternatives.
+- The two guide docs are CRLF like the sources (git's autocrlf checkout);
+  patch them with a universal-newline read and a CRLF write.

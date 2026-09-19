@@ -698,6 +698,18 @@ impl agents::pipeline::ToolPolicy for HooksPolicy {
         let merged = run_all(&hooks, &payload, &cwd).await;
         self.record(HookEvent::PreToolUse, call.session_id, &merged).await;
         match merged.rank {
+            // An allowing hook's `additionalContext` reaches the model
+            // after the result, exactly like a post hook's.
+            Rank::Allow if merged.context.iter().any(|c| !c.trim().is_empty()) => {
+                PreDecision::AllowWith {
+                    extra_context: merged
+                        .context
+                        .iter()
+                        .filter(|c| !c.trim().is_empty())
+                        .cloned()
+                        .collect(),
+                }
+            }
             Rank::Allow => PreDecision::Allow,
             // An `ask` from a hook is the same rendezvous a destructive
             // shell command takes: the human answers once, for this call.

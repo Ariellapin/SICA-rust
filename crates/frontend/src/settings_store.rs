@@ -140,8 +140,18 @@ pub fn load() -> Settings {
     }
 }
 
+/// Write the settings whole, atomically (harness §14.6): a sibling temp
+/// file, fsync, rename — so a crash mid-write leaves the previous file,
+/// never a truncated one, and a watcher sees one complete document.
 pub fn save(s: &Settings) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(s)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    fs::write(settings_file(), text)
+    sica_core::atomic::atomic_write(&settings_file(), text.as_bytes())
+}
+
+/// The document as it is on disk, for change detection: the watcher
+/// reports the app's own writes too, and a reload of what was just written
+/// would only churn the UI.
+pub fn on_disk_text() -> Option<String> {
+    fs::read_to_string(settings_file()).ok()
 }

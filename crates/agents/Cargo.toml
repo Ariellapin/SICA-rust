@@ -22,6 +22,8 @@ once_cell   = { workspace = true }
 toml        = { workspace = true }
 regex       = { workspace = true }
 chrono      = { workspace = true }
+# `schedule`: named time zones for absolute reminders.
+chrono-tz   = { workspace = true }
 # `glob` / `grep`: gitignore-aware walking + gitignore-style glob matching.
 ignore      = { workspace = true }
 # `web`: the fetch/search tools (guide §13.3). HTML is rendered to text

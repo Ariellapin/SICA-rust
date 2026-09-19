@@ -352,6 +352,199 @@ pub fn workflow_runs(events: &[SessionEvent]) -> Vec<Run> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Reminders (guide §12.8)
+// ---------------------------------------------------------------------------
+
+/// One active reminder, folded from the session's `Schedule` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRecord {
+    pub id:            String,
+    pub prompt:        String,
+    /// `after` | `at` | `every`.
+    pub rule:          String,
+    /// Next target, unix seconds UTC. For an `every` record this is the
+    /// earliest anchor-aligned occurrence not yet dispatched.
+    pub fire_at:       i64,
+    pub every_seconds: Option<u64>,
+    /// The creation-time anchor an `every` record aligns to.
+    pub anchor:        i64,
+}
+
+impl ScheduleRecord {
+    /// The first anchor-aligned occurrence strictly after `now`, for an
+    /// `every` record. Integer arithmetic over the interval, so a record
+    /// that missed twenty intervals while the session was cold jumps
+    /// straight to the twenty-first — nothing is enumerated or replayed.
+    pub fn next_after(&self, now: i64) -> Option<i64> {
+        let every = self.every_seconds? as i64;
+        if every <= 0 {
+            return None;
+        }
+        if now < self.anchor {
+            return Some(self.anchor);
+        }
+        let elapsed = now - self.anchor;
+        let steps = elapsed / every + 1;
+        Some(self.anchor.checked_add(steps.checked_mul(every)?)?)
+    }
+}
+
+/// Rebuild the active reminders in `events`.
+///
+/// The fold is strict about what it accepts, the way dsh's decoder is: a
+/// `delete` or `dispatch` naming an inactive id, or a `create` reusing a
+/// live one, is a torn log and is skipped rather than papered over.
+pub fn schedules(events: &[SessionEvent]) -> Vec<ScheduleRecord> {
+    let mut out: Vec<ScheduleRecord> = Vec::new();
+    for ev in events {
+        let EventKind::Schedule {
+            id, op, prompt, rule, fire_at, after_seconds: _, every_seconds, accepted_at,
+        } = &ev.kind
+        else {
+            continue;
+        };
+        let pos = out.iter().position(|r| &r.id == id);
+        match op.as_str() {
+            "create" => {
+                if pos.is_some() {
+                    continue;
+                }
+                let (Some(prompt), Some(rule), Some(fire_at)) = (prompt, rule, fire_at) else {
+                    continue;
+                };
+                out.push(ScheduleRecord {
+                    id:            id.clone(),
+                    prompt:        prompt.clone(),
+                    rule:          rule.clone(),
+                    fire_at:       *fire_at,
+                    every_seconds: *every_seconds,
+                    anchor:        *fire_at,
+                });
+            }
+            "delete" => {
+                if let Some(i) = pos {
+                    out.remove(i);
+                }
+            }
+            "dispatch" => {
+                let Some(i) = pos else { continue };
+                match (out[i].every_seconds, accepted_at) {
+                    // An `every` record advances past the decision time.
+                    (Some(_), Some(at)) => match out[i].next_after(*at) {
+                        Some(next) => out[i].fire_at = next,
+                        None => {
+                            out.remove(i);
+                        }
+                    },
+                    // A one-shot dispatch is terminal.
+                    _ => {
+                        out.remove(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The latest rating per assistant message (guide §3.7): `seq_ref` →
+/// `(rating, note)`, with a `0` rating clearing the entry.
+pub fn feedback(events: &[SessionEvent]) -> std::collections::HashMap<u64, (i8, Option<String>)> {
+    let mut out = std::collections::HashMap::new();
+    for ev in events {
+        if let EventKind::MessageFeedback { seq_ref, rating, note } = &ev.kind {
+            if *rating == 0 {
+                out.remove(seq_ref);
+            } else {
+                out.insert(*seq_ref, (*rating, note.clone()));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    fn ev(seq: u64, kind: EventKind) -> SessionEvent {
+        SessionEvent::now(seq, kind)
+    }
+
+    fn create(id: &str, rule: &str, fire_at: i64, every: Option<u64>) -> EventKind {
+        EventKind::Schedule {
+            id: id.into(),
+            op: "create".into(),
+            prompt: Some(format!("remind {id}")),
+            rule: Some(rule.into()),
+            fire_at: Some(fire_at),
+            after_seconds: None,
+            every_seconds: every,
+            accepted_at: None,
+        }
+    }
+
+    fn row(id: &str, op: &str, accepted_at: Option<i64>) -> EventKind {
+        EventKind::Schedule {
+            id: id.into(),
+            op: op.into(),
+            prompt: None,
+            rule: None,
+            fire_at: None,
+            after_seconds: None,
+            every_seconds: None,
+            accepted_at,
+        }
+    }
+
+    #[test]
+    fn one_shot_dispatch_and_delete_are_terminal() {
+        let events = vec![
+            ev(1, create("s1", "after", 100, None)),
+            ev(2, create("s2", "at", 200, None)),
+            ev(3, row("s1", "dispatch", None)),
+            ev(4, row("s2", "delete", None)),
+            // Torn rows: a delete of something gone, a create reusing an id.
+            ev(5, row("s1", "delete", None)),
+            ev(6, create("s3", "at", 300, None)),
+            ev(7, create("s3", "at", 999, None)),
+        ];
+        let active = schedules(&events);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "s3");
+        assert_eq!(active[0].fire_at, 300);
+    }
+
+    #[test]
+    fn every_dispatch_advances_to_the_first_aligned_target_after_the_decision() {
+        let events = vec![
+            ev(1, create("e", "every", 1000, Some(300))),
+            // The session was cold for several intervals; one dispatch at
+            // t=2050 advances straight to 2200, never 1300/1600/1900.
+            ev(2, row("e", "dispatch", Some(2050))),
+        ];
+        let active = schedules(&events);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].fire_at, 2200);
+        assert_eq!(active[0].anchor, 1000);
+    }
+
+    #[test]
+    fn feedback_latest_wins_and_zero_clears() {
+        let events = vec![
+            ev(1, EventKind::MessageFeedback { seq_ref: 4, rating: 1, note: None }),
+            ev(2, EventKind::MessageFeedback { seq_ref: 4, rating: -1, note: Some("wrong".into()) }),
+            ev(3, EventKind::MessageFeedback { seq_ref: 9, rating: 1, note: None }),
+            ev(4, EventKind::MessageFeedback { seq_ref: 9, rating: 0, note: None }),
+        ];
+        let f = feedback(&events);
+        assert_eq!(f.get(&4).map(|(r, _)| *r), Some(-1));
+        assert!(!f.contains_key(&9));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

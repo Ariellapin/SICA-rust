@@ -91,6 +91,7 @@ impl JobStatus {
 /// scrolled past the cap before you asked".
 struct Job {
     id:        String,
+    session_id: u64,
     kind:      String,
     command:   String,
     status:    JobStatus,
@@ -98,6 +99,12 @@ struct Job {
     produced:  u64,
     read_mark: u64,
     cancel:    CancellationToken,
+    /// Unix milliseconds when the child was spawned.
+    started_at: i64,
+    /// Where the bytes that scrolled out of the window went (guide §12.4):
+    /// `spill/<session>/job-<id>.txt`, created on the first overflow. The
+    /// window is a window, not a cap — nothing the job printed is lost.
+    spill:     Option<std::path::PathBuf>,
 }
 
 impl Job {
@@ -106,20 +113,39 @@ impl Job {
         self.buf.extend_from_slice(chunk);
         if self.buf.len() > OUTPUT_CAP {
             let excess = self.buf.len() - OUTPUT_CAP;
-            self.buf.drain(..excess);
+            let dropped: Vec<u8> = self.buf.drain(..excess).collect();
+            self.spill_bytes(&dropped);
+        }
+    }
+
+    /// Append bytes that left the window to the job's spill file. Best
+    /// effort: a disk that refuses the write leaves the old behaviour (the
+    /// read reports how much scrolled past) rather than failing the job.
+    fn spill_bytes(&mut self, bytes: &[u8]) {
+        use std::io::Write as _;
+        let dir = sica_core::paths::spill_dir().join(self.session_id.to_string());
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = self
+            .spill
+            .get_or_insert_with(|| dir.join(format!("job-{}.txt", self.id)))
+            .clone();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(bytes);
         }
     }
 
     /// Everything not yet handed back, plus how many bytes were lost to the
-    /// cap before the caller got to them.
-    fn take_unread(&mut self) -> (String, u64) {
+    /// cap before the caller got to them, and where those bytes went.
+    fn take_unread(&mut self) -> (String, u64, Option<std::path::PathBuf>) {
         let buf_start = self.produced - self.buf.len() as u64;
         let lost = buf_start.saturating_sub(self.read_mark);
         let from = self.read_mark.max(buf_start);
         let slice = &self.buf[(from - buf_start) as usize..];
         let text = String::from_utf8_lossy(slice).to_string();
         self.read_mark = self.produced;
-        (text, lost)
+        (text, lost, if lost > 0 { self.spill.clone() } else { None })
     }
 
     fn summary(&self) -> JobSummary {
@@ -130,6 +156,7 @@ impl Job {
             status:  self.status.clone(),
             // Bytes the model has not read yet.
             unread:  self.produced - self.read_mark,
+            started_at: self.started_at,
         }
     }
 }
@@ -143,6 +170,8 @@ pub struct JobSummary {
     pub status:  JobStatus,
     /// Bytes produced but not yet handed to the model.
     pub unread:  u64,
+    /// Unix milliseconds when the job started.
+    pub started_at: i64,
 }
 
 /// How the registry tells the rest of the app that something happened.
@@ -215,6 +244,7 @@ impl JobRegistry {
             let mut g = self.by_session.lock().expect("jobs mutex");
             g.entry(session_id).or_default().push(Job {
                 id:        id.clone(),
+                session_id,
                 kind:      kind.to_string(),
                 command:   command.to_string(),
                 status:    JobStatus::Running,
@@ -222,6 +252,8 @@ impl JobRegistry {
                 produced:  0,
                 read_mark: 0,
                 cancel:    cancel.clone(),
+                started_at: chrono::Utc::now().timestamp_millis(),
+                spill:     None,
             });
         }
 
@@ -307,13 +339,17 @@ impl JobRegistry {
             .unwrap_or_default()
     }
 
-    /// Output since the last read, its status line, and how much was lost
-    /// to the retention cap.
-    pub fn read(&self, session_id: u64, id: &str) -> Option<(String, u64, JobStatus)> {
+    /// Output since the last read, its status line, how much scrolled out
+    /// of the window before this read, and the spill file holding it.
+    pub fn read(
+        &self,
+        session_id: u64,
+        id: &str,
+    ) -> Option<(String, u64, JobStatus, Option<std::path::PathBuf>)> {
         let mut g = self.by_session.lock().expect("jobs mutex");
         let job = g.get_mut(&session_id).and_then(|v| find(v, id))?;
-        let (text, lost) = job.take_unread();
-        Some((text, lost, job.status.clone()))
+        let (text, lost, spill) = job.take_unread();
+        Some((text, lost, job.status.clone(), spill))
     }
 
     /// Ask a running job to stop. The watcher task kills the child and
@@ -417,15 +453,23 @@ impl Skill for JobOutput {
         let Some(id) = args.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
             return fail("missing `id` arg — pass a job id like `cli-3`");
         };
-        let Some((text, lost, status)) = self.0.read(session_id, id) else {
+        let Some((text, lost, status, spill)) = self.0.read(session_id, id) else {
             return fail(&format!("no job `{id}` in this session"));
         };
         let mut out = String::new();
         if lost > 0 {
-            out.push_str(&format!(
-                "[{lost} byte(s) of earlier output were dropped — the job \
-                 out-ran the {OUTPUT_CAP}-byte retention window]\n"
-            ));
+            match spill {
+                Some(path) => out.push_str(&format!(
+                    "[{lost} byte(s) of earlier output scrolled out of the \
+                     {OUTPUT_CAP}-byte window — they are saved in {}; read-file it \
+                     if you need them]\n",
+                    path.display()
+                )),
+                None => out.push_str(&format!(
+                    "[{lost} byte(s) of earlier output were dropped — the job \
+                     out-ran the {OUTPUT_CAP}-byte retention window]\n"
+                )),
+            }
         }
         let window = sica_core::retain::head_tail(&text, READ_CAP * 3 / 4, READ_CAP / 4);
         out.push_str(&window.render("output"));
@@ -540,11 +584,11 @@ mod tests {
         let status = wait_until_done(&reg, 1, &id).await;
         assert_eq!(status, JobStatus::Exited { code: 0 });
 
-        let (text, lost, _) = reg.read(1, &id).unwrap();
+        let (text, lost, _, _) = reg.read(1, &id).unwrap();
         assert!(text.contains("hello"), "read: {text:?}");
         assert_eq!(lost, 0);
         // Output is handed back once; a second read sees only what is new.
-        let (again, _, _) = reg.read(1, &id).unwrap();
+        let (again, _, _, _) = reg.read(1, &id).unwrap();
         assert!(again.is_empty(), "read twice: {again:?}");
     }
 
@@ -603,6 +647,7 @@ mod tests {
     fn output_over_the_cap_drops_the_oldest_and_the_read_says_so() {
         let mut job = Job {
             id: "cli-1".into(),
+            session_id: 0,
             kind: "cli".into(),
             command: "x".into(),
             status: JobStatus::Running,
@@ -610,22 +655,25 @@ mod tests {
             produced: 0,
             read_mark: 0,
             cancel: CancellationToken::new(),
+            started_at: 0,
+            spill: None,
         };
         job.append(&vec![b'a'; OUTPUT_CAP]);
         job.append(&vec![b'b'; 100]);
-        let (text, lost) = job.take_unread();
+        let (text, lost, _spill) = job.take_unread();
         assert_eq!(lost, 100, "the oldest 100 bytes fell out of the window");
         assert_eq!(text.len(), OUTPUT_CAP);
         assert!(text.ends_with("bbbb"));
         // Nothing new since: no output, and nothing reported as lost.
         job.append(b"c");
-        let (text, lost) = job.take_unread();
+        let (text, lost, _) = job.take_unread();
         assert_eq!((text.as_str(), lost), ("c", 0));
     }
 
     #[test]
     fn the_completion_notice_names_the_job_status_and_how_to_read_it() {
         let notice = completion_notice(&JobSummary {
+            started_at: 0,
             id:      "cli-2".into(),
             kind:    "cli".into(),
             command: "cargo build".into(),

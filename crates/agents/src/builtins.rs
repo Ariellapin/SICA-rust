@@ -300,7 +300,9 @@ impl Skill for RunCli {
     fn name(&self) -> &str { RUN_CLI_NAME }
     fn description(&self) -> &str { RUN_CLI_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
-    fn optional_args(&self) -> Vec<String> { vec!["cwd".into(), "background".into()] }
+    fn optional_args(&self) -> Vec<String> {
+        vec!["cwd".into(), "background".into(), "timeout_secs".into()]
+    }
     fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
     fn concurrency(&self, args: &Value) -> Concurrency {
         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -331,7 +333,7 @@ impl Skill for RunCli {
         if wants_background(&args) {
             return start_background(&self.0, "cli", &command, cmd, &ctx);
         }
-        run_shell(cmd, "cmd", &ctx).await
+        run_shell(cmd, "cmd", &ctx, shell_timeout(&args, self.timeout())).await
     }
 }
 
@@ -396,6 +398,21 @@ fn start_background(
     }
 }
 
+/// The foreground budget for one shell call: the default cap, or the
+/// call's own `timeout_secs` (guide §6.3), clamped to the skill's pipeline
+/// timeout so a call can never outlive the wrapper that would kill it.
+fn shell_timeout(args: &Value, skill_timeout: Duration) -> Duration {
+    let asked = match args.get("timeout_secs") {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match asked {
+        Some(secs) if secs > 0 => Duration::from_secs(secs).min(skill_timeout),
+        _ => CLI_TIMEOUT,
+    }
+}
+
 /// Spawn a prepared shell command, cap its streams, and report
 /// `exit=N` + stdout + stderr. Shared by `run-cli` and `run-pwsh`.
 ///
@@ -404,7 +421,12 @@ fn start_background(
 /// kill-on-close Job Object so the processes *it* started die with it —
 /// without that a timed-out `cmd /C npm install` leaves `node` running.
 /// `SICA_SESSION_ID` is set for scripts that want to know their caller.
-async fn run_shell(mut cmd: Command, exe: &str, ctx: &SkillContext) -> SkillOutcome {
+async fn run_shell(
+    mut cmd: Command,
+    exe: &str,
+    ctx: &SkillContext,
+    limit: Duration,
+) -> SkillOutcome {
     if let Some(session) = &ctx.sub.spill_label {
         cmd.env("SICA_SESSION_ID", session);
     }
@@ -420,16 +442,19 @@ async fn run_shell(mut cmd: Command, exe: &str, ctx: &SkillContext) -> SkillOutc
     // Held until the child has finished: dropping it closes the job.
     let _job = crate::proc::JobGuard::attach(&child);
 
-    let output = match timeout(CLI_TIMEOUT, child.wait_with_output()).await {
+    let output = match timeout(limit, child.wait_with_output()).await {
         Ok(Ok(o))  => o,
         Ok(Err(e)) => return err(&format!("wait {exe}: {e}")),
-        Err(_)     => return err(&format!("timeout after {}s", CLI_TIMEOUT.as_secs())),
+        Err(_)     => return err(&format!("timeout after {}s", limit.as_secs())),
     };
 
     let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    truncate(&mut stdout, MAX_OUTPUT);
-    truncate(&mut stderr, MAX_OUTPUT);
+    // Over the cap the stream is kept whole on disk (guide §6.9) and the
+    // model gets the head plus a pointer — the same spill seam every other
+    // oversized output goes through, instead of the tail being discarded.
+    cap_stream(&mut stdout, "stdout", exe, ctx);
+    cap_stream(&mut stderr, "stderr", exe, ctx);
     let code = output.status.code().unwrap_or(-1);
     SkillOutcome {
         ok: output.status.success(),
@@ -447,7 +472,9 @@ impl Skill for RunPwsh {
     fn name(&self) -> &str { RUN_PWSH_NAME }
     fn description(&self) -> &str { RUN_PWSH_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["command".into()] }
-    fn optional_args(&self) -> Vec<String> { vec!["cwd".into(), "background".into()] }
+    fn optional_args(&self) -> Vec<String> {
+        vec!["cwd".into(), "background".into(), "timeout_secs".into()]
+    }
     fn prompt_guidance(&self) -> Option<&'static str> { Some(SHELL_PROMPT_GUIDANCE) }
     fn concurrency(&self, args: &Value) -> Concurrency {
         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -490,7 +517,7 @@ impl Skill for RunPwsh {
         if wants_background(&args) {
             return start_background(&self.0, "pwsh", &command, cmd, &ctx);
         }
-        run_shell(cmd, exe, &ctx).await
+        run_shell(cmd, exe, &ctx, shell_timeout(&args, self.timeout())).await
     }
 }
 
@@ -858,6 +885,11 @@ impl Skill for Grep {
         }
 
         let mut rows: Vec<String> = Vec::new();
+        // Matches past the cap, kept for the spill file (never for the
+        // model). Bounded too: a pattern matching every line of a tree
+        // would otherwise hold the tree in memory.
+        let mut overflow: Vec<String> = Vec::new();
+        const OVERFLOW_CAP: usize = 20_000;
         let mut total = 0usize;
         let mut capped = false;
 
@@ -868,10 +900,14 @@ impl Skill for Grep {
                     continue;
                 }
                 total += 1;
+                let row = format!("{}:{}: {}", display_relative(&root, file), i + 1, line);
                 if rows.len() < MAX_GREP_MATCHES {
-                    rows.push(format!("{}:{}: {}", display_relative(&root, file), i + 1, line));
+                    rows.push(row);
                 } else {
                     capped = true;
+                    if overflow.len() < OVERFLOW_CAP {
+                        overflow.push(row);
+                    }
                 }
             }
         };
@@ -894,10 +930,29 @@ impl Skill for Grep {
         }
         let mut out = rows.join("\n");
         if capped {
-            out.push_str(&format!(
-                "\n[{total} matches total — showing the first {MAX_GREP_MATCHES}; \
-                 narrow the pattern or the path]"
-            ));
+            // The rest is not lost: every match goes to the spill seam
+            // (guide §6.9) and the marker names the file.
+            let spilled = ctx.sub.spill_label.as_deref().and_then(|label| {
+                crate::spill::write(
+                    &sica_core::paths::spill_dir(),
+                    label,
+                    GREP_NAME,
+                    ctx.sub.parent_id.unwrap_or(0),
+                    &overflow.join("\n"),
+                )
+                .ok()
+            });
+            match spilled {
+                Some(path) => out.push_str(&format!(
+                    "\n[{total} matches total — showing the first {MAX_GREP_MATCHES}; \
+                     all of them are in {} — read-file it, or narrow the pattern]",
+                    path.display()
+                )),
+                None => out.push_str(&format!(
+                    "\n[{total} matches total — showing the first {MAX_GREP_MATCHES}; \
+                     narrow the pattern or the path]"
+                )),
+            }
         }
         SkillOutcome { ok: true, summary: out }
     }
@@ -1065,6 +1120,34 @@ pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
 /// Cap one output stream at `limit` bytes, keeping the head. The omission
 /// notice uses the shared `retain` wording so the model reads the same
 /// sentence here as on a spill digest or a pruned result.
+/// Cap one shell stream at [`MAX_OUTPUT`]. In a session the full stream is
+/// spilled first, so the marker names a file to `read-file`; outside one
+/// (tests, the catalogue probe) it is plain truncation.
+fn cap_stream(s: &mut String, stream: &str, exe: &str, ctx: &SkillContext) {
+    if s.len() <= MAX_OUTPUT {
+        return;
+    }
+    if let Some(label) = ctx.sub.spill_label.as_deref() {
+        let skill = format!("{exe}-{stream}");
+        let id = ctx.sub.parent_id.unwrap_or(0);
+        if let Ok(path) = crate::spill::write(&sica_core::paths::spill_dir(), label, &skill, id, s) {
+            let window = sica_core::retain::head_only(s, MAX_OUTPUT);
+            let marker = sica_core::retain::notice(
+                window.omitted,
+                &format!(
+                    "full {stream} ({} bytes) saved to {}; use read-file '{}' to inspect it",
+                    s.len(),
+                    path.display(),
+                    path.display()
+                ),
+            );
+            *s = window.render(&marker);
+            return;
+        }
+    }
+    truncate(s, MAX_OUTPUT);
+}
+
 fn truncate(s: &mut String, limit: usize) {
     let window = sica_core::retain::head_only(s, limit);
     if window.omitted != sica_core::retain::Omitted::None {

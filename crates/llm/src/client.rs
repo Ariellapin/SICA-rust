@@ -339,7 +339,23 @@ impl LlmClient {
             },
             None => send_fut.await?,
         };
-        let resp = resp.error_for_status()?;
+        // A `Retry-After` on a 429/503 is the server saying when to come
+        // back; it rides the error as context so `retry::retry_after` can
+        // read it without the header leaving this function.
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let resp = match resp.error_for_status() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(match retry_after {
+                    Some(secs) => anyhow::Error::from(e).context(format!("retry-after={secs}")),
+                    None => e.into(),
+                });
+            }
+        };
 
         let mut splitter = ThinkSplitter::new();
         let mut events = resp.bytes_stream().eventsource();

@@ -133,6 +133,14 @@ pub struct ChatHub {
     /// has registered, and the manual order of the sessions in each.
     /// Invisible to models — no skill reads it.
     pub workspaces:    Arc<crate::workspaces::Registry>,
+    /// Active reminders per session (guide §12.8), a fold of the log's
+    /// `Schedule` rows kept resident so the timer never re-reads a log to
+    /// find out nothing is due.
+    pub schedules:     Arc<Mutex<HashMap<u64, Vec<sica_core::project::ScheduleRecord>>>>,
+    /// Sessions whose approval policy is `never` (guide §10.2): an `Ask`
+    /// is refused deterministically instead of reaching the broker.
+    /// Restored from the log's `Command { name: "approval" }` rows.
+    pub approval_never: Arc<Mutex<HashSet<u64>>>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -162,6 +170,10 @@ struct ControlState {
     hooks:        Arc<hooks::HookConfig>,
     /// Where an orchestrated run's durable rows go (§6.11).
     runs:         Arc<dyn agents::subagent::RunNotifier>,
+    /// See [`ChatHub::schedules`].
+    schedules:    Arc<Mutex<HashMap<u64, Vec<sica_core::project::ScheduleRecord>>>>,
+    /// See [`ChatHub::approval_never`].
+    approval_never: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl ControlState {
@@ -239,7 +251,8 @@ impl ControlState {
             .with_plan_active(plan)
             .with_cwd(Some(root))
             .with_runs(self.runs.clone())
-            .with_policies(policies);
+            .with_policies(policies)
+            .with_ask_denied(self.approval_never.lock().await.contains(&session_id));
         if let Some(fs) = self.failure_sink.clone() {
             sub = sub.with_failure_sink(fs);
         }
@@ -504,6 +517,8 @@ impl ControlState {
                     false,
                 ),
             }
+        } else if agents::control::is_schedule_skill(name) {
+            (self.schedule_control(sessions, name, args, session_id).await, false)
         } else if name == agents::goal::CREATE_GOAL_NAME {
             let objective = args
                 .get("objective")
@@ -645,7 +660,7 @@ impl ControlState {
         ptc: bool,
         client: &LlmClient,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> BatchEnd {
         let call_seq = append_event(sessions, session_id, EventKind::ToolCall {
             name: call.name.clone(),
             args_preview: format!("{} {}", call.name, call.arguments),
@@ -655,6 +670,13 @@ impl ControlState {
         })
         .await
         .unwrap_or(0);
+        // The recorded call is durable before its body runs (guide §3.2).
+        if let Err(e) = checkpoint(sessions, session_id).await {
+            let msg = format!("{ABORTED_BEFORE_DISPATCH}: session log could not be flushed ({e})");
+            append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
+                .await;
+            return BatchEnd::Aborted;
+        }
         if over_limit {
             let msg = format!("tool-hop limit ({MAX_TOOL_HOPS}) reached — call not executed");
             append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
@@ -662,7 +684,7 @@ impl ControlState {
             let args = serde_json::from_str(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
             self.observe(sessions, session_id, &call.name, &args).await;
-            return false;
+            return BatchEnd::Continue;
         }
         // Guide §7: under PTC the model announced one data tool, so a call
         // naming any other is refused here — before the policy pipeline, and
@@ -672,7 +694,7 @@ impl ControlState {
             let msg = agents::ptc::direct_call_refused(&call.name);
             append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
                 .await;
-            return false;
+            return BatchEnd::Continue;
         }
         if agents::control::is_control_skill(&call.name) {
             let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
@@ -681,7 +703,7 @@ impl ControlState {
                     let msg = format!("invalid JSON in tool-call arguments ({e}); raw: {}", call.arguments);
                     append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
                         .await;
-                    return false;
+                    return BatchEnd::Continue;
                 }
             };
             let preview = format!("{} {}", call.name, call.arguments);
@@ -690,7 +712,7 @@ impl ControlState {
                 .await;
             append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), outcome.ok, &outcome.summary, true)
                 .await;
-            return conclude;
+            return if conclude { BatchEnd::Concluded } else { BatchEnd::Continue };
         }
         let Some(skill) = skills.get(&call.name) else {
             let msg = format!("unknown skill `{}`", call.name);
@@ -698,7 +720,7 @@ impl ControlState {
                 .await;
             let args = serde_json::Value::String(call.arguments.clone());
             self.observe(sessions, session_id, &call.name, &args).await;
-            return false;
+            return BatchEnd::Continue;
         };
         let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
             Ok(v) => v,
@@ -709,7 +731,7 @@ impl ControlState {
                 );
                 append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
                     .await;
-                return false;
+                return BatchEnd::Continue;
             }
         };
         let raw_args: Vec<String> = args
@@ -737,7 +759,7 @@ impl ControlState {
             .await;
         self.after_report(sessions, session_id, call_seq, &call.name, Some(&call.id), skill.trusted(), report)
             .await;
-        false
+        BatchEnd::Continue
     }
 
     /// Shared tail for a sub-agent dispatch: approval audit, result,
@@ -820,7 +842,7 @@ impl ControlState {
         ptc: bool,
         client: &LlmClient,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> BatchEnd {
         let mut i = 0;
         while i < calls.len() {
             if cancel.is_cancelled() {
@@ -839,12 +861,12 @@ impl ControlState {
                 }
             }
             if group.len() < 2 {
-                if self
+                let end = self
                     .run_native_one(
                         sessions, session_id, skills, &calls[i], over_limit, ptc, client, cancel,
                     )
-                    .await
-                {
+                    .await;
+                if end != BatchEnd::Continue {
                     // The turn ends here, but the remaining ids in this
                     // batch still need results or the next request's
                     // template carries dangling `tool_calls`.
@@ -852,10 +874,14 @@ impl ControlState {
                         sessions,
                         session_id,
                         &calls[i + 1..],
-                        "not executed — the turn ended when the plan was approved",
+                        if end == BatchEnd::Aborted {
+                            "not executed — the session log could not be flushed"
+                        } else {
+                            "not executed — the turn ended when the plan was approved"
+                        },
                     )
                     .await;
-                    return true;
+                    return end;
                 }
                 i += 1;
                 continue;
@@ -879,6 +905,22 @@ impl ControlState {
                     .await
                     .unwrap_or(0);
                     seqs.push(seq);
+                }
+                // Durability barrier for the whole chunk (guide §3.2): every
+                // recorded call is on disk before any body runs.
+                if let Err(e) = checkpoint(sessions, session_id).await {
+                    let msg = format!("{ABORTED_BEFORE_DISPATCH}: session log could not be flushed ({e})");
+                    for (&k, &seq) in chunk.iter().zip(seqs.iter()) {
+                        let call = &calls[k];
+                        append_tool_result(sessions, session_id, seq, &call.name, Some(&call.id), false, &msg, true)
+                            .await;
+                    }
+                    let rest = group.iter().position(|&g| g == chunk[chunk.len() - 1]).map(|p| p + 1).unwrap_or(0);
+                    let unrun: Vec<agents::turn::NativeToolCall> =
+                        group[rest..].iter().map(|&k| calls[k].clone()).chain(calls[i + group.len()..].iter().cloned()).collect();
+                    self.answer_unrun(sessions, session_id, &unrun, "not executed — the session log could not be flushed")
+                        .await;
+                    return BatchEnd::Aborted;
                 }
                 let mut prepared = Vec::with_capacity(chunk.len());
                 for &k in chunk {
@@ -942,7 +984,7 @@ impl ControlState {
             }
             i += group.len();
         }
-        false
+        BatchEnd::Continue
     }
 }
 
@@ -1018,6 +1060,8 @@ impl ChatHub {
             workspaces:   Arc::new(crate::workspaces::Registry::load(
                 sica_core::paths::workspaces_file(),
             )),
+            schedules:    Arc::new(Mutex::new(HashMap::new())),
+            approval_never: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1075,9 +1119,22 @@ impl ChatHub {
             let mut plans = hub.plans.try_lock().expect("fresh ChatHub");
             let mut presets = hub.presets.try_lock().expect("fresh ChatHub");
             let mut goals = hub.goals.try_lock().expect("fresh ChatHub");
+            let mut schedules = hub.schedules.try_lock().expect("fresh ChatHub");
+            let mut approval_never = hub.approval_never.try_lock().expect("fresh ChatHub");
             let mut max_goal = 0;
             for s in loaded {
                 let (mode, plan, preset, goal) = control_state(&s);
+                // Reminders come back exactly as the log says (§12.8): a
+                // target that passed while the process was down is simply
+                // overdue, and the timer delivers it once the session is
+                // idle. Nothing here starts a turn.
+                let active = sica_core::project::schedules(&s.events);
+                if !active.is_empty() {
+                    schedules.insert(s.id, active);
+                }
+                if approval_never_state(&s) {
+                    approval_never.insert(s.id);
+                }
                 if mode != PermissionMode::default() {
                     perms.insert(s.id, mode);
                 }
@@ -1139,6 +1196,8 @@ impl ChatHub {
                 self.sessions.clone(),
                 self.event_sink.clone(),
             )),
+            schedules:    self.schedules.clone(),
+            approval_never: self.approval_never.clone(),
             // Harness commands are the user acting directly; a turn task
             // overrides this with its own source.
             turn_source:  TurnSource::Human,
@@ -1161,6 +1220,7 @@ impl ChatHub {
 
     pub async fn list_sessions(&self) -> Vec<SessionMeta> {
         let g = self.sessions.lock().await;
+        let scheduled = self.schedules.lock().await;
         let mut out: Vec<SessionMeta> = g
             .values()
             .filter(|s| !s.archived())
@@ -1170,6 +1230,7 @@ impl ChatHub {
                 created_at: s.created_at(),
                 updated_at: s.updated_at(),
                 cwd: s.cwd(),
+                scheduled: scheduled.get(&s.id).is_some_and(|r| !r.is_empty()),
             })
             .collect();
         out.sort_by_key(|s| s.created_at);
@@ -1271,6 +1332,7 @@ impl ChatHub {
                     status:  j.status.label(),
                     running: j.status.is_running(),
                     unread:  j.unread,
+                    started_at: j.started_at,
                 })
                 .collect(),
         });
@@ -1282,8 +1344,11 @@ impl ChatHub {
                 goal: goal.as_ref().map(|g| goal_dump(g, armed)),
             });
         }
+        let schedules = self.schedule_rows(id).await;
+        self.event_sink.emit(Event::SchedulesChanged { session_id: id, rows: schedules.clone() });
         let g = self.sessions.lock().await;
         let log = g.get(&id)?;
+        let feedback = sica_core::project::feedback(&log.events);
         let messages = log
             .derive_surface()
             .into_iter()
@@ -1316,6 +1381,7 @@ impl ChatHub {
                     tool_depth: 0,
                     tool_args_json: tool.as_ref().and_then(|t| t.args_json.clone()),
                     context_source: e.context.as_ref().map(|c| c.label()),
+                    feedback: feedback.get(&e.seq).map(|(r, _)| *r),
                 }
             })
             .collect();
@@ -1346,6 +1412,7 @@ impl ChatHub {
             todos,
             agent,
             runs,
+            schedules,
         })
     }
 
@@ -1866,7 +1933,10 @@ impl ChatHub {
     /// A preset that has since been deleted or broken degrades to the
     /// unrestricted default with a loud `LogLine` — failing every turn of
     /// an existing session because a file was renamed would be worse.
-    async fn effective_agent(&self, session_id: u64) -> (Arc<SkillRegistry>, Option<String>) {
+    async fn effective_agent(
+        &self,
+        session_id: u64,
+    ) -> (Arc<SkillRegistry>, Option<String>, Option<protocol::ToolMode>) {
         self.effective_agent_in(&sica_core::paths::agents_dir(), session_id).await
     }
 
@@ -1876,21 +1946,21 @@ impl ChatHub {
         &self,
         dir: &std::path::Path,
         session_id: u64,
-    ) -> (Arc<SkillRegistry>, Option<String>) {
+    ) -> (Arc<SkillRegistry>, Option<String>, Option<protocol::ToolMode>) {
         let Some(name) = self.presets.lock().await.get(&session_id).cloned() else {
-            return (self.skills.clone(), None);
+            return (self.skills.clone(), None, None);
         };
         match agents::preset::load(dir, &name) {
             Ok(p) => {
                 let view = agents::preset::view(&self.skills, &p);
-                (Arc::new(view), Some(p.persona))
+                (Arc::new(view), Some(p.persona), p.tool_mode)
             }
             Err(e) => {
                 self.event_sink.emit(Event::LogLine {
                     level:   "ERROR".into(),
                     message: format!("agent `{name}` could not be loaded ({e}) — running without it"),
                 });
-                (self.skills.clone(), None)
+                (self.skills.clone(), None, None)
             }
         }
     }
@@ -1918,11 +1988,15 @@ impl ChatHub {
                 "plan" => self.command_plan(session_id, input).await,
                 "permission" => self.command_permission(session_id, input).await,
                 "job-kill" => self.command_job_kill(session_id, input).await,
+                "job-output" => self.command_job_output(session_id, input).await,
                 "goal" => self.command_goal(session_id, input).await,
                 "agent" => self.command_agent(session_id, input).await,
+                "stats" => self.command_stats(session_id).await,
+                "approval" => self.command_approval(session_id, input).await,
                 _ => (
                     false,
-                    "unknown command — want compact | plan | permission | job-kill | goal                      | agent"
+                    "unknown command — want compact | plan | permission | approval | stats \
+                     | job-kill | job-output | goal | agent"
                         .into(),
                 ),
             }
@@ -2042,7 +2116,7 @@ impl ChatHub {
         } else {
             None
         };
-        let (skills, persona) = self.effective_agent(session_id).await;
+        let (skills, persona, _) = self.effective_agent(session_id).await;
         let wh = match build_history(
             &self.sessions, session_id, &skills, tool_mode, &model, plan_policy,
             persona.as_deref(),
@@ -2490,6 +2564,11 @@ available: {}  (`/agent off` clears)", names.join(", "))
         // yet — and so an id that names nothing can be reported without
         // half a turn already on disk.
         let session_refs = self.resolve_session_refs(session_id, &text).await;
+        // `@path` mentions (guide §9.5): a file under the session's folder
+        // travels with the message it was named in, captured now and framed
+        // untrusted, so the model reads the file as it was when the person
+        // pointed at it rather than whatever it becomes.
+        let file_refs = self.resolve_file_refs(session_id, &text).await;
 
         // Ensure the session exists and record the user message straight
         // away — the log is flushed on every append, so the session is
@@ -2541,6 +2620,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 log.append(EventKind::ContextInjected {
                     surface: SurfaceOp::Append,
                     source:  ContextSource::SessionReference { id: *id },
+                    content: content.clone(),
+                });
+            }
+            for (path, content) in &file_refs {
+                log.append(EventKind::ContextInjected {
+                    surface: SurfaceOp::Append,
+                    source:  ContextSource::FileReference { path: path.clone() },
                     content: content.clone(),
                 });
             }
@@ -2635,13 +2721,20 @@ available: {}  (`/agent off` clears)", names.join(", "))
         // preset — the persona section of the prompt and the registry the
         // dispatcher answers from — so the prompt can never advertise a
         // skill the dispatch would refuse.
-        let (skills, persona) = self.effective_agent(session_id).await;
+        let (skills, persona, preset_mode) = self.effective_agent(session_id).await;
         let title_client = client.clone();
         let event_sink = self.event_sink.clone();
         let meters = self.meters.clone();
-        let (tool_mode, opt_max_tokens, compact_policy) = {
+        let (tool_mode, opt_max_tokens, compact_policy, retry_always) = {
             let opts = self.llm_opts.lock().await;
-            (opts.tool_mode, opts.max_tokens, opts.compact)
+            // A preset's `tool_mode:` (guide §2.3) overrides the
+            // connection's presentation for the session that runs it.
+            (
+                preset_mode.unwrap_or(opts.tool_mode),
+                opts.max_tokens,
+                opts.compact,
+                opts.retry_always,
+            )
         };
         // Every wire-shaping site below asks the same yes/no question — PTC
         // rides the native transport, it is not a third one — so the mode
@@ -2667,6 +2760,8 @@ available: {}  (`/agent off` clears)", names.join(", "))
             // read; the initial value is just to satisfy definite assignment.
             #[allow(unused_assignments)]
             let mut last_assistant = String::new();
+            // Seq of the newest assistant message, for the tail's thumbs.
+            let mut last_assistant_seq: u64 = 0;
             // Turn-level accounting for `Event::TurnUsage` (§3.5). The live
             // `TokenUsage` meter is per-session and cumulative; the tail
             // pills need this turn's own numbers, summed over its hops.
@@ -2719,6 +2814,21 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         // leaves them queued.
                         Inbound::Followup { .. } => {}
                     }
+                }
+
+                // Durability barrier before the request (guide §3.2):
+                // everything the previous step committed — its reply and
+                // its tool results — is on disk before the next request is
+                // derived from it. A flush that cannot be confirmed ends
+                // the turn rather than sending a request the log would not
+                // remember.
+                if let Err(e) = checkpoint(&sessions_map, session_id).await {
+                    event_sink.emit(Event::LogLine {
+                        level:   "ERROR".into(),
+                        message: format!("session log could not be flushed — turn ended: {e}"),
+                    });
+                    finish = "error";
+                    break;
                 }
 
                 // Derive the history fresh from the event log each iteration:
@@ -2911,9 +3021,15 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     None => None,
                 };
                 if let Some(failure) = failure {
-                    if failure.is_retryable() && retries < llm::retry::RETRY_MAX {
+                    if (failure.is_retryable() || retry_always) && retries < llm::retry::RETRY_MAX {
                         retries += 1;
-                        let delay = llm::retry::backoff(retries);
+                        // A `Retry-After` the server sent wins over the
+                        // backoff table (guide §4.2).
+                        let delay = out
+                            .error
+                            .as_ref()
+                            .and_then(llm::retry::retry_after)
+                            .unwrap_or_else(|| llm::retry::backoff(retries));
                         let msg = format!(
                             "LLM request failed ({}) — retry {retries}/{} in {} ms",
                             failure.reason(),
@@ -3027,7 +3143,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         debug!(session_id, "session vanished mid-turn, skipping persist");
                         return;
                     };
-                    log.append(EventKind::AssistantMessage {
+                    last_assistant_seq = log.append(EventKind::AssistantMessage {
                         surface: SurfaceOp::Append,
                         content: out.content.clone(),
                         reasoning,
@@ -3072,7 +3188,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     if !over_limit {
                         hops += 1;
                     }
-                    let concluded = control
+                    let batch_end = control
                         .run_native_batch(
                             &sessions_map,
                             session_id,
@@ -3084,6 +3200,15 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             &cancel,
                         )
                         .await;
+                    if batch_end == BatchEnd::Aborted {
+                        event_sink.emit(Event::LogLine {
+                            level:   "ERROR".into(),
+                            message: "session log could not be flushed before a tool call — turn ended".into(),
+                        });
+                        finish = "error";
+                        break;
+                    }
+                    let concluded = batch_end == BatchEnd::Concluded;
                     if over_limit {
                         event_sink.emit(Event::LogLine {
                             level: "WARN".into(),
@@ -3149,6 +3274,17 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 })
                 .await
                 .unwrap_or(0);
+                // The recorded call is durable before its body can have an
+                // external effect (guide §3.2). Fail closed: the body does
+                // not run, the model reads why, and the turn ends.
+                if let Err(e) = checkpoint(&sessions_map, session_id).await {
+                    let msg = format!("{ABORTED_BEFORE_DISPATCH}: session log could not be flushed ({e})");
+                    event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg.clone() });
+                    append_tool_result(&sessions_map, session_id, call_seq, &call.skill, None, false, &msg, true)
+                        .await;
+                    finish = "error";
+                    break;
+                }
                 if hops >= MAX_TOOL_HOPS {
                     let msg = format!(
                         "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
@@ -3266,6 +3402,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 reasoning:   turn_reasoning,
                 duration_ms: turn_clock.elapsed().as_millis() as u64,
                 ttft_ms:     turn_ttft_ms,
+                last_seq:    last_assistant_seq,
             });
 
             // The completion check (`crate::verdict`): a turn the harness
@@ -4218,6 +4355,477 @@ async fn prune_tool_results(
     n
 }
 
+/// Whether a native batch ended the turn, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchEnd {
+    /// Loop for the model's next request.
+    Continue,
+    /// `exit-plan-mode` was approved: the turn's result is the review.
+    Concluded,
+    /// The durability barrier failed (guide §3.2): the turn ends in error.
+    Aborted,
+}
+
+/// dsh's cancellation vocabulary for a call whose body never ran.
+const ABORTED_BEFORE_DISPATCH: &str = "ABORTED_BEFORE_DISPATCH";
+
+/// The durability barrier (guide §3.2): every appended row is on disk, or
+/// the caller learns why not. `append_event` already flushes and logs a
+/// failure; this is the *fail-closed* form the loop uses at the moments
+/// that matter — before a request, before a tool body.
+pub(crate) async fn checkpoint(sessions: &Sessions, session_id: u64) -> Result<(), String> {
+    let mut g = sessions.lock().await;
+    let Some(log) = g.get_mut(&session_id) else {
+        return Err(format!("session {session_id} vanished"));
+    };
+    sessions_store::flush(log).map_err(|e| e.to_string())
+}
+
+/// Whether the session's approval policy is `never` (guide §10.2): the
+/// latest `/approval` command decides, so a restart keeps it.
+fn approval_never_state(log: &SessionLog) -> bool {
+    let mut never = false;
+    for ev in &log.events {
+        if let EventKind::Command { name, input, ok: true } = &ev.kind {
+            if name == "approval" {
+                never = input.trim().eq_ignore_ascii_case("never");
+            }
+        }
+    }
+    never
+}
+
+/// Bytes of a referenced file that travel with the message naming it
+/// (guide §9.5). Head + tail through `retain`, like a session reference.
+const FILE_REF_BYTES: usize = 32 * 1024;
+
+/// The `@path` tokens in `text`, in order, without repeats: a token that
+/// starts at a word boundary, is not `@session:…`, and has at least one
+/// character after the `@`. Trailing sentence punctuation is dropped so
+/// "see @src/main.rs." names the file, not the file with a dot.
+pub(crate) fn parse_file_refs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut prev_boundary = true;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '@' && prev_boundary {
+            let start = i + 1;
+            let mut end = start;
+            for (j, d) in text[start..].char_indices() {
+                if d.is_whitespace() {
+                    break;
+                }
+                end = start + j + d.len_utf8();
+            }
+            let mut token = &text[start..end];
+            while let Some(stripped) = token.strip_suffix(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '"' | '\'')) {
+                token = stripped;
+            }
+            if !token.is_empty() && !token.starts_with("session:") && !out.iter().any(|t| t == token) {
+                out.push(token.to_string());
+            }
+            // Skip what was consumed.
+            while let Some(&(j, _)) = chars.peek() {
+                if j < end {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            prev_boundary = false;
+            continue;
+        }
+        prev_boundary = c.is_whitespace() || matches!(c, '(' | '[' | '"' | '\'');
+    }
+    out
+}
+
+/// One line of the `/stats` answer per counter (guide §3.3).
+fn render_stats(s: &protocol::StatsDump) -> String {
+    format!(
+        "turns: {} · messages: {} user / {} assistant · tool calls: {} ({} failed) · \
+         retries: {} · wall: {}s",
+        s.turns,
+        s.user_msgs,
+        s.assistant_msgs,
+        s.tool_calls,
+        s.tool_failures,
+        s.retries,
+        s.wall_ms / 1000
+    )
+}
+
+/// The unix-seconds clock the reminder logic runs on.
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+impl ControlState {
+    /// The bodies of the three reminder tools (guide §12.8). Every read and
+    /// every decision goes through the log: a create appends its row and
+    /// re-folds, so the tool's answer is what a restart would also see.
+    async fn schedule_control(
+        &self,
+        sessions: &Sessions,
+        name: &str,
+        args: &serde_json::Value,
+        session_id: u64,
+    ) -> agents::SkillOutcome {
+        let fail = |summary: String| agents::SkillOutcome { ok: false, summary };
+        let now = now_secs();
+        if name == agents::schedule::SCHEDULE_LIST_NAME {
+            let rows = self.schedules.lock().await.get(&session_id).cloned().unwrap_or_default();
+            if rows.is_empty() {
+                return agents::SkillOutcome { ok: true, summary: "no active reminders".into() };
+            }
+            let lines: Vec<String> = rows
+                .iter()
+                .map(|r| agents::schedule::view_line(&r.id, &r.rule, r.fire_at, r.every_seconds, &r.prompt, now))
+                .collect();
+            return agents::SkillOutcome { ok: true, summary: lines.join("\n") };
+        }
+        if name == agents::schedule::SCHEDULE_DELETE_NAME {
+            let id = args.get("id").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+            let known = self
+                .schedules
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|rows| rows.iter().any(|r| r.id == id));
+            if id.is_empty() || !known {
+                return fail(format!("schedule_not_found: no active reminder `{id}` (deleted: false)"));
+            }
+            append_event(sessions, session_id, EventKind::Schedule {
+                id: id.to_string(),
+                op: "delete".into(),
+                prompt: None,
+                rule: None,
+                fire_at: None,
+                after_seconds: None,
+                every_seconds: None,
+                accepted_at: None,
+            })
+            .await;
+            if let Err(e) = checkpoint(sessions, session_id).await {
+                return fail(format!("persistence_uncertain: {e} — list again before trusting this"));
+            }
+            self.refold_schedules(sessions, session_id).await;
+            return agents::SkillOutcome { ok: true, summary: format!("deleted reminder `{id}` (deleted: true)") };
+        }
+        // create
+        let new = match agents::schedule::parse_create(args, now) {
+            Ok(n) => n,
+            Err(e) => return fail(e),
+        };
+        let id = {
+            let g = sessions.lock().await;
+            let Some(log) = g.get(&session_id) else {
+                return fail(format!("internal_error: session {session_id} vanished"));
+            };
+            // Never reused: the seq the row will take is unique for the
+            // life of the log, so an id derived from it is too.
+            format!("sched-{}", log.last_seq() + 1)
+        };
+        append_event(sessions, session_id, EventKind::Schedule {
+            id: id.clone(),
+            op: "create".into(),
+            prompt: Some(new.prompt.clone()),
+            rule: Some(new.rule.to_string()),
+            fire_at: Some(new.fire_at),
+            after_seconds: new.after_seconds,
+            every_seconds: new.every_seconds,
+            accepted_at: None,
+        })
+        .await;
+        if let Err(e) = checkpoint(sessions, session_id).await {
+            return fail(format!("persistence_uncertain: {e} — schedule-list before trusting this"));
+        }
+        self.refold_schedules(sessions, session_id).await;
+        agents::SkillOutcome {
+            ok: true,
+            summary: format!(
+                "created reminder:\n{}",
+                agents::schedule::view_line(&id, new.rule, new.fire_at, new.every_seconds, &new.prompt, now)
+            ),
+        }
+    }
+
+    /// Re-fold one session's reminders from its log, store them, and push
+    /// the new list to the frontend.
+    async fn refold_schedules(&self, sessions: &Sessions, session_id: u64) {
+        let active = {
+            let g = sessions.lock().await;
+            g.get(&session_id).map(|log| sica_core::project::schedules(&log.events)).unwrap_or_default()
+        };
+        let rows: Vec<protocol::ScheduleDump> = active.iter().map(schedule_dump).collect();
+        {
+            let mut m = self.schedules.lock().await;
+            if active.is_empty() {
+                m.remove(&session_id);
+            } else {
+                m.insert(session_id, active);
+            }
+        }
+        self.events.emit(Event::SchedulesChanged { session_id, rows });
+    }
+}
+
+fn schedule_dump(r: &sica_core::project::ScheduleRecord) -> protocol::ScheduleDump {
+    protocol::ScheduleDump {
+        id: r.id.clone(),
+        prompt: r.prompt.clone(),
+        rule: r.rule.clone(),
+        fire_at: r.fire_at,
+        every_seconds: r.every_seconds,
+    }
+}
+
+impl ChatHub {
+    /// The popover's rows for one session.
+    async fn schedule_rows(&self, session_id: u64) -> Vec<protocol::ScheduleDump> {
+        self.schedules
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|rows| rows.iter().map(schedule_dump).collect())
+            .unwrap_or_default()
+    }
+
+    /// `/stats` — the session's projection line as text (guide §8.4).
+    async fn command_stats(&self, session_id: u64) -> (bool, String) {
+        match self.session_stats(session_id).await {
+            Some((stats, _, through)) => (true, format!("{} (through seq {through})", render_stats(&stats))),
+            None => (false, format!("session {session_id} not found")),
+        }
+    }
+
+    /// `/approval ask | never` (guide §10.2). `never` short-circuits every
+    /// `Ask` to a denial for this session; `ask` restores the broker. The
+    /// `Command` row `run_command` writes is what restores it on load.
+    async fn command_approval(&self, session_id: u64, input: &str) -> (bool, String) {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                let never = self.approval_never.lock().await.contains(&session_id);
+                (true, format!("approval policy: {}", if never { "never" } else { "ask" }))
+            }
+            "never" => {
+                self.approval_never.lock().await.insert(session_id);
+                (true, "approval policy: never — asked-for calls are refused without prompting".into())
+            }
+            "ask" => {
+                self.approval_never.lock().await.remove(&session_id);
+                (true, "approval policy: ask".into())
+            }
+            other => (false, format!("unknown approval policy `{other}` — want ask | never")),
+        }
+    }
+
+    /// `/job-output <id>` — the same read the model's `job-output` skill
+    /// does, so the popover's "Show output" lands in the transcript.
+    async fn command_job_output(&self, session_id: u64, input: &str) -> (bool, String) {
+        let id = input.trim();
+        if id.is_empty() {
+            return (false, "which job? pass an id like `cli-3`".into());
+        }
+        let Some((text, lost, status, spill)) = self.jobs.read(session_id, id) else {
+            return (false, format!("no job `{id}` in this session"));
+        };
+        let mut out = String::new();
+        if lost > 0 {
+            out.push_str(&match spill {
+                Some(path) => format!("[{lost} byte(s) scrolled out of the window — saved in {}]\n", path.display()),
+                None => format!("[{lost} byte(s) of earlier output were dropped]\n"),
+            });
+        }
+        let window = sica_core::retain::head_tail(&text, agents::jobs::READ_CAP * 3 / 4, agents::jobs::READ_CAP / 4);
+        out.push_str(&window.render("output"));
+        if text.is_empty() {
+            out.push_str("(no new output)");
+        }
+        out.push_str(&format!("\n[status: {}]", status.label()));
+        (true, out)
+    }
+
+    /// Record the user's rating of an assistant message (guide §3.7).
+    pub async fn rate_message(
+        &self,
+        session_id: u64,
+        seq: u64,
+        rating: i8,
+        note: Option<String>,
+    ) -> Result<(), String> {
+        if !(-1..=1).contains(&rating) {
+            return Err(format!("rating must be -1, 0 or 1, got {rating}"));
+        }
+        {
+            let g = self.sessions.lock().await;
+            let log = g.get(&session_id).ok_or_else(|| format!("session {session_id} not found"))?;
+            let is_assistant = log
+                .events
+                .iter()
+                .any(|e| e.seq == seq && matches!(e.kind, EventKind::AssistantMessage { .. }));
+            if !is_assistant {
+                return Err(format!("seq {seq} is not an assistant message"));
+            }
+        }
+        append_event(
+            &self.sessions,
+            session_id,
+            EventKind::MessageFeedback { seq_ref: seq, rating, note: note.filter(|n| !n.trim().is_empty()) },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Capture the files named by `@path` in `text` (guide §9.5), relative
+    /// to the session's folder. Content, not a pointer, for the same reason
+    /// a session reference is; bounded by `retain`; framed untrusted.
+    async fn resolve_file_refs(&self, session_id: u64, text: &str) -> Vec<(String, String)> {
+        let wanted = parse_file_refs(text);
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let root = session_cwd(&self.sessions, session_id).await;
+        let mut out = Vec::new();
+        for token in wanted {
+            let path = if Path::new(&token).is_absolute() {
+                PathBuf::from(&token)
+            } else {
+                root.join(&token)
+            };
+            if !path.is_file() {
+                // Not every `@word` is a file — a handle in prose is not
+                // an error, it is just not a reference.
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.event_sink.emit(Event::LogLine {
+                        level:   "WARN".into(),
+                        message: format!("@{token}: could not be read ({e}) — reference skipped"),
+                    });
+                    continue;
+                }
+            };
+            let body = String::from_utf8_lossy(&bytes);
+            let bounded = sica_core::retain::head_tail(&body, FILE_REF_BYTES * 3 / 4, FILE_REF_BYTES / 4)
+                .render(&format!("[… middle of {token} omitted — {} bytes in all; read-file it for the rest …]", bytes.len()));
+            out.push((
+                token.clone(),
+                format!("{}\nFile {token}\n\n{bounded}", sica_core::event::UNTRUSTED_NOTICE),
+            ));
+        }
+        out
+    }
+
+    /// Start the reminder timer (guide §12.8): every few seconds, deliver
+    /// what is due to sessions that are idle. Bounded segments and a fresh
+    /// wall-clock read each wake, as dsh does, so a laptop that slept
+    /// through a target wakes up overdue rather than confused.
+    pub fn spawn_schedule_timer(&self) {
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                hub.deliver_due_schedules().await;
+            }
+        });
+    }
+
+    /// One pass of the reminder owner. For every session with something
+    /// due: skip it unless an LLM is connected and no turn is running
+    /// (never interrupt); otherwise reserve the session's slot, record the
+    /// dispatch, and start one follow-up turn — the earliest one-shot on
+    /// its own, else every overdue `every` record's latest occurrence in
+    /// one batch.
+    pub async fn deliver_due_schedules(&self) {
+        let now = now_secs();
+        let due_sessions: Vec<u64> = self
+            .schedules
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, rows)| rows.iter().any(|r| r.fire_at <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        if due_sessions.is_empty() {
+            return;
+        }
+        if self.llm.lock().await.is_none() {
+            // Cold: the records stay active and overdue until a connection
+            // makes a live root agent possible.
+            return;
+        }
+        for session_id in due_sessions {
+            // Claim the slot under the same lock a send takes, so a message
+            // arriving right now queues behind the reminder rather than
+            // racing it.
+            let marker = self.next_marker.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut guard = self.active_turns.lock().await;
+                if guard.contains_key(&session_id) {
+                    continue;
+                }
+                guard.insert(session_id, (marker, CancellationToken::new()));
+            }
+            let rows = self.schedules.lock().await.get(&session_id).cloned().unwrap_or_default();
+            let mut one_shots: Vec<&sica_core::project::ScheduleRecord> =
+                rows.iter().filter(|r| r.every_seconds.is_none() && r.fire_at <= now).collect();
+            one_shots.sort_by_key(|r| r.fire_at);
+            let (text, dispatched): (String, Vec<(String, Option<i64>)>) = if let Some(r) = one_shots.first() {
+                (
+                    agents::schedule::reminder_framing(&r.id, r.fire_at, &r.prompt),
+                    vec![(r.id.clone(), None)],
+                )
+            } else {
+                let mut batch: Vec<(String, i64, String)> = rows
+                    .iter()
+                    .filter(|r| r.every_seconds.is_some() && r.fire_at <= now)
+                    .map(|r| {
+                        let every = r.every_seconds.unwrap_or(1).max(1) as i64;
+                        // The latest occurrence that is already due — never
+                        // the backlog behind it.
+                        let latest = r.fire_at + ((now - r.fire_at) / every) * every;
+                        (r.id.clone(), latest, r.prompt.clone())
+                    })
+                    .collect();
+                batch.sort_by_key(|(_, at, _)| *at);
+                let ids = batch.iter().map(|(id, _, _)| (id.clone(), Some(now))).collect();
+                (agents::schedule::batch_framing(&batch), ids)
+            };
+            if dispatched.is_empty() {
+                self.active_turns.lock().await.remove(&session_id);
+                continue;
+            }
+            for (id, accepted_at) in &dispatched {
+                append_event(&self.sessions, session_id, EventKind::Schedule {
+                    id: id.clone(),
+                    op: "dispatch".into(),
+                    prompt: None,
+                    rule: None,
+                    fire_at: None,
+                    after_seconds: None,
+                    every_seconds: None,
+                    accepted_at: *accepted_at,
+                })
+                .await;
+            }
+            self.control().refold_schedules(&self.sessions, session_id).await;
+            self.event_sink.emit(Event::LogLine {
+                level:   "INFO".into(),
+                message: format!(
+                    "reminder due — starting a follow-up turn ({} record(s))",
+                    dispatched.len()
+                ),
+            });
+            tokio::spawn(self.start_boxed(session_id, text, Vec::new(), TurnSource::Schedule));
+        }
+    }
+}
+
 /// Derive `session_id`'s history from its log and assemble the wire form.
 /// Returns `None` when the session vanished; `Err` when the prompt failed to
 /// assemble (a bad `{{variable}}` reference in `memory.md`), which the
@@ -4882,6 +5490,8 @@ mod tests {
             turn_source: source,
             hooks: Arc::new(crate::hooks::HookConfig::default()),
             runs: Arc::new(NoRuns),
+            schedules: Arc::new(Mutex::new(HashMap::new())),
+            approval_never: Arc::new(Mutex::new(HashSet::new())),
         };
         (cs, Arc::new(Mutex::new(HashMap::new())), cap)
     }
@@ -5161,7 +5771,7 @@ BE A REVIEWER
         assert!(msg.contains("reviewer"), "{msg}");
         assert_eq!(hub.presets.lock().await.get(&id).cloned(), Some("reviewer".into()));
 
-        let (skills, persona) = hub.effective_agent_in(&dir, id).await;
+        let (skills, persona, _) = hub.effective_agent_in(&dir, id).await;
         assert_eq!(persona.as_deref(), Some("BE A REVIEWER"));
         assert!(skills.by_name.contains_key("read-file"));
         assert!(skills.by_name.contains_key("grep"));
@@ -5233,7 +5843,7 @@ BE A REVIEWER
         // default rather than failing the turn.
         hub.set_session_agent_in(&dir, id, Some("reviewer".into())).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        let (skills, persona) = hub.effective_agent_in(&dir, id).await;
+        let (skills, persona, _) = hub.effective_agent_in(&dir, id).await;
         assert!(persona.is_none());
         assert_eq!(skills.by_name.len(), hub.skills.by_name.len());
     }
@@ -5490,5 +6100,21 @@ BE A REVIEWER
         assert!(out.ok);
         assert!(out.summary.contains("rev 1"), "{}", out.summary);
         assert!(out.summary.contains("rounds armed: true"), "{}", out.summary);
+    }
+}
+
+#[cfg(test)]
+mod file_ref_tests {
+    use super::parse_file_refs;
+
+    #[test]
+    fn file_refs_are_word_bounded_and_skip_sessions_and_emails() {
+        let t = "look at @src/main.rs, then @docs/a.md. mail me@example.com and @session:4 (@Cargo.toml)";
+        assert_eq!(
+            parse_file_refs(t),
+            vec!["src/main.rs".to_string(), "docs/a.md".into(), "Cargo.toml".into()]
+        );
+        assert!(parse_file_refs("no refs here").is_empty());
+        assert!(parse_file_refs("@").is_empty());
     }
 }

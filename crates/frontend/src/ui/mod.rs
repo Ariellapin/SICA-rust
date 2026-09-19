@@ -16,6 +16,7 @@ pub mod log_panel;
 mod onboarding;
 mod settings;
 mod sidebar;
+pub mod strings;
 
 pub use onboarding::wanted as onboarding_wanted;
 pub use settings::open_path as open_path_public;
@@ -78,7 +79,8 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         })
         .inner;
 
-    // Seams + the invisible 8 px drag strip on the sidebar edge.
+    // Seams + the invisible 8 px drag strips on the sidebar edge and, when
+    // the details column is open, on the conversation|details edge (§2.2).
     let painter = ctx.layer_painter(egui::LayerId::background());
     kit::vseam(
         &painter,
@@ -89,6 +91,16 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     );
     if !app.layout.sidebar_collapsed {
         sidebar_drag(app, ctx, central.min.x);
+    }
+    if app.layout.details_w > 0.0 {
+        kit::vseam(
+            &painter,
+            &t,
+            central.max.x + 0.5,
+            ctx.screen_rect().y_range(),
+            kit::Level::L3,
+        );
+        details_drag(app, ctx, central.max.x);
     }
 
     settings::draw(app, ctx);
@@ -101,7 +113,13 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
 /// Auto-collapse rule: under 1024 px the sidebar collapses through a separate
 /// override, so widening again restores whatever the user had chosen.
+///
+/// Concession order when the window is narrow (§2.2): the details column
+/// shrinks towards its minimum first, then closes, so the conversation
+/// column never drops under `CENTER_MIN`. The sidebar never concedes for
+/// the details column — it has its own rule above.
 fn layout_pass(app: &mut App, ctx: &egui::Context) {
+    use sica_core::theme::tokens::{CENTER_MIN, DETAILS_MIN};
     let w = ctx.screen_rect().width();
     let narrow = w < SIDEBAR_AUTO_COLLAPSE;
     match (narrow, app.layout.narrow_override) {
@@ -114,6 +132,66 @@ fn layout_pass(app: &mut App, ctx: &egui::Context) {
             app.layout.narrow_override = None;
         }
         _ => {}
+    }
+    if app.layout.details_w > 0.0 {
+        let sidebar = if app.layout.sidebar_collapsed {
+            SIDEBAR_COLLAPSED
+        } else {
+            app.layout.sidebar_w
+        };
+        let room = w - sidebar - CENTER_MIN;
+        if room < DETAILS_MIN {
+            app.layout.details_w = 0.0;
+        } else if app.layout.details_w > room {
+            app.layout.details_w = room;
+        }
+    }
+}
+
+/// The 8 px drag strip on the conversation|details seam (§2.2), the same
+/// mechanism as the sidebar's: raw pointer state against a strip centred on
+/// the seam, width clamped to the details column's own range.
+fn details_drag(app: &mut App, ctx: &egui::Context, seam_x: f32) {
+    use sica_core::theme::tokens::{DETAILS_MAX, DETAILS_MIN};
+    let strip = Rect::from_min_size(
+        egui::pos2(seam_x - 4.0, ctx.screen_rect().min.y),
+        Vec2::new(8.0, ctx.screen_rect().height()),
+    );
+    let hovered = ctx
+        .input(|i| i.pointer.hover_pos())
+        .map(|p| strip.contains(p))
+        .unwrap_or(false);
+    let id = egui::Id::new("details_dragging");
+    let mut dragging: bool = ctx.data(|d| d.get_temp(id).unwrap_or(false));
+    if hovered && ctx.input(|i| i.pointer.primary_pressed()) {
+        dragging = true;
+    }
+    if ctx.input(|i| i.pointer.primary_released()) {
+        dragging = false;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, dragging));
+    if hovered || dragging {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        // The 12×32 pill dsh shows on hover.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("details_drag_pill"),
+        ));
+        let t = app.theme;
+        painter.rect_filled(
+            Rect::from_center_size(
+                egui::pos2(seam_x, ctx.screen_rect().center().y),
+                Vec2::new(4.0, 32.0),
+            ),
+            egui::Rounding::same(2.0),
+            kit::col(t.alias.label[3]),
+        );
+    }
+    if dragging {
+        if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+            let right = ctx.screen_rect().max.x;
+            app.layout.details_w = (right - p.x).clamp(DETAILS_MIN, DETAILS_MAX);
+        }
     }
 }
 

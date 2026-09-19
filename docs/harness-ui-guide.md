@@ -17,13 +17,16 @@ For every surface it does three things:
 Sizes: **S** = an afternoon · **M** = a day or two, maybe a protocol bump ·
 **L** = a week, FE + BE · **XL** = its own project.
 
-> **Status.** Waves **UI-1, UI-2 and UI-3** are implemented, along with the
-> UI-4 settings modal and session rows — everything in them that needs no
-> protocol change. §0 below therefore describes the *old* frontend; the
-> current one is the design system in `sica_core::theme` + `crates/frontend/src/ui/kit.rs`,
-> the three-column shell in `ui/mod.rs`, the transcript in `ui/chat/`, and the
-> settings modal in `ui/settings/`. What is still open is listed in §12's
-> table after each wave row.
+> **Status.** Waves **UI-1 through UI-9** are implemented. §0 below describes
+> the *old* frontend as it was before UI-1 and its file names are historical
+> (`ui/widgets.rs`, `sessions_panel.rs`, `status_bar.rs`, `tool_chips.rs` and
+> `input_bar.rs` no longer exist); the current one is the design system in
+> `sica_core::theme` + `crates/frontend/src/ui/kit.rs`, the three-column
+> shell in `ui/mod.rs`, the transcript in `ui/chat/`, and the settings modal
+> in `ui/settings/`. Every **sica-rust, before the port:** line in the
+> sections below is likewise the pre-port state, kept so the deltas read;
+> each section's *As shipped* paragraph is the truth. What is deliberately
+> not ported is §13; what is still to do is the last row of §12.
 
 Two ground rules up front:
 
@@ -207,7 +210,20 @@ has a `prefers-reduced-motion` freeze.
 Everything is monospace because Plex Mono is prepended to `Proportional`.
 `log_panel.rs` and `status_bar.rs` hard-code colours outside the palette.
 
-### 1.3 Port — `sica_core::theme` v2 + `ui::kit` (**M**)
+### 1.3 Port — `sica_core::theme` v2 + `ui::kit` (**M**) — **done** (UI-1; details UI-9)
+
+**Deviations, recorded once.** The UI face is the platform sans loaded at
+runtime (weight families `ui_medium` / `ui_semibold` / `ui_bold`) and the code
+face stays IBM Plex Mono — no Inter or JetBrains Mono is bundled. `Elevation`
+is a four-variant enum returning one `Shadow` plus the real hairline stroke;
+the second blur layer is invisible on an opaque desktop window and is not
+painted. Named text styles exist in `apply_visuals` but surfaces size their
+text through `kit::font` directly. `ScrollStyle` carries the scrollbar rule
+(8 px, r=4, thumbs invisible until the pointer is in the column) and tooltips
+get the 500 ms delay — both UI-9. Nothing in `llm` or `agents` strips ANSI
+escapes, so the terminal block shows the bytes a command printed. The one
+literal colour below `kit` (the meter's middle segment) became a ramp step
+in UI-9.
 
 **Tokens.** Replace `Palette` with two structs and keep `Rgb`:
 
@@ -357,7 +373,21 @@ fade from transparent to `bg-base` over the transcript. In the **hero phase**
 selected tool call's full payload (empty state: "Click a tool row in the
 message flow to view its details").
 
-### 2.2 Port (**M**, layout only; details column **S** on top)
+### 2.2 Port (**M**, layout only; details column **S** on top) — **done** (UI-1; details column UI-9)
+
+**As shipped.** `LayoutState { sidebar_w, sidebar_collapsed, narrow_override,
+details_w, content_w }`; only `content_w` is persisted (`chat_content_width`).
+Both panels are `resizable(false)` with the custom drag strips doing the
+clamping; the content width is `(avail × 0.64).clamp(680, 920).min(avail −
+48).max(320)` with the persisted override replacing the clamp term. UI-9
+added the details column's half: a 0.5 px seam on the conversation|details
+edge, the 8 px drag strip with the hover pill (300–520), and the concession
+order — the column shrinks towards its minimum and then closes so the
+conversation never drops under 640. The title crumb opens the sidebar's
+inline rename. The header has no subagent count: children here are
+conversations inside the parent's turn, not sessions, so there is nothing to
+count (§6.10). The "Preview" badge reads the rebuild-profile setting
+(Preview / Release), not the running binary's compile profile.
 
 Panel order in `ui::draw`:
 
@@ -402,7 +432,12 @@ Everything here is `ui-chat`, `ui-tool`, `ui-primitives`. The flow is one
 column of **flow items** separated by 16 px (8 px between a collapsed
 process fold and its answer). No avatars, no role labels anywhere.
 
-### 3.1 User message
+### 3.1 User message — **done** (UI-2)
+
+**As shipped.** The optimistic bubble keeps its "queued — runs when the
+current turn ends" caption until the backend reports the message running:
+a send that vanished into a dock row with no bubble read as lost in testing,
+so the caption stays. A deliberate departure from the paragraph below.
 
 **dsh:** right-aligned bubble, `specific-bubble` fill, **r=22**, pad `10 16`,
 14 px / `22+δ` line-height, max-width `min(content × 0.702, 82 %)`;
@@ -412,7 +447,7 @@ hover-revealed action row (28 px circles: copy · timestamp before the icons
 in `label[2]` 13 px). Images: one image renders at a 240 px long edge,
 several as 64×64 tiles, r=16, 0.5 `border-l2`, zoom-in cursor → lightbox.
 
-**sica-rust:** `messages::draw_user` — right-aligned `surface_sunk` box r=2,
+**sica-rust, before the port:** `messages::draw_user` — right-aligned `surface_sunk` box r=2,
 pad 14 10, 78 % max width; "queued — runs when the current turn ends"
 caption below when `turn.queued`.
 
@@ -423,7 +458,12 @@ appears in the flow. Decorate `/name` and `@path` runs via a small tokenizer
 in `frontend::user_text` painted as `RichText` spans (the BE already records
 `ContextInjected { source: SkillInvocation }` for a leading `/name`).
 
-### 3.2 Assistant message
+### 3.2 Assistant message — **done** (UI-2; code fences UI-9)
+
+**UI-9.** A closed fence in an assistant body is split out by `md_blocks`
+(`Block::Code { lang, body }`) and drawn by `kit::code_block` — the language
+banner and Copy → Copied — while an unclosed fence stays prose until the
+closer streams. The status string is `ui::strings::TURN_STATUS`.
 
 **dsh:** flat, full column width, `label[0]`, 14 px / `24+δ`, 16 px between
 blocks; markdown per §1.1 (code block card with sticky language banner +
@@ -435,7 +475,7 @@ linear), h=`26+δ`, 14/500; after 15 s a `label[3]` 13 px mono clock
 (`{s}s` / `{m}m {s}s`) appears beside it. An interrupted reply ends with a
 **"Stopped"** tag: pad 0 6, r=6, `hover` fill, `label[2]`, fixed 11/18.
 
-**sica-rust:** "ASSISTANT" caps + hairline + `CommonMarkViewer` + Copy;
+**sica-rust, before the port:** "ASSISTANT" caps + hairline + `CommonMarkViewer` + Copy;
 the working strip (`working_sweep` + "Thinking"/"Running · name") sits
 *below* the tool chips.
 
@@ -451,7 +491,9 @@ streaming); the "Deep diving..." string is a `strings::TURN_STATUS` constant
 (sica wording: "Working…"). The stopped tag keys off
 `finish_reason == "interrupted"`.
 
-### 3.3 Reasoning
+### 3.3 Reasoning — **done** (UI-2)
+
+
 
 **dsh** (`ReasoningRow`): a `DisclosureRow` — think icon, title **"Think"**,
 dot, one-line summary: while running the *latest* reasoning line
@@ -460,7 +502,7 @@ dot, one-line summary: while running the *latest* reasoning line
 band of `bg-base @ 60 %` gliding left→right, 2.6 s ease-out. Expanded body is
 plain text (not markdown), 13/20 `label[2]`, indented `22+δ`. No duration.
 
-**sica-rust:** `+ REASONING` / `− REASONING` / `· REASONING (LIVE)` caps
+**sica-rust, before the port:** `+ REASONING` / `− REASONING` / `· REASONING (LIVE)` caps
 chips and an italic-serif body with a blue rule.
 
 **Port (S):** `kit::disclosure_row(Icon::Think, "Think", summary, open)` +
@@ -468,7 +510,16 @@ plain-text body in the secondary tier. Sweep = a translucent gradient rect
 painted over the row while `!finished`, `x = (t / 2.6).fract() * (w + 300) - 300`.
 Keep `reasoning_collapsed` semantics (auto-collapse on `TurnFinished`).
 
-### 3.4 Tool calls
+### 3.4 Tool calls — **done** (UI-2)
+
+**As shipped, against the spec below.** The variant mapping lives in
+`Icon::for_skill` / `tool_row::title_of`: delegation (`subagent`,
+`subagent-fork`, `ralph`, `agent-team`, `workflow`) is titled *Delegate*, the
+harness controls get their own titles, the `job-*` skills take the Bash icon.
+`run_shell` writes `exit=N\n--- stdout ---\n…\n--- stderr ---\n…` and the
+terminal block parses that dashed form. The diff block is an
+old-then-new listing rather than a unified hunk; expanded bodies check diff
+before terminal, and the two never overlap by skill name.
 
 **dsh** (`ui-tool/ToolRow.*`, `tool-call-model.ts`): a **row, not a card**,
 `[16 px icon] 6 [title 13/24] 8 [2×2 dot] 8 [summary flex, ellipsized] [suffix]`.
@@ -501,7 +552,7 @@ Nested calls (`ToolCallTree`): children in a column with `gap 4; margin 4 0 2
 line, recursive. **Parallel calls have no grouping chrome** — they are
 consecutive sibling rows.
 
-**sica-rust:** `tool_chips::draw` — one `horizontal_wrapped` row of
+**sica-rust, before the port:** `tool_chips::draw` — one `horizontal_wrapped` row of
 `RUN/OK/ERR` + caps name chips with hover tooltips; depth and parent are
 carried on `ToolChip` and never drawn.
 
@@ -527,7 +578,18 @@ by computing `similar`-style line diff on the FE from `old`/`new` args
 (`edit-file` args are literal). Terminal block: parse the `run-cli` result's
 `[stdout]`/`[stderr]`/`exit` framing (`builtins::run_shell` output shape).
 
-### 3.5 Turn structure
+### 3.5 Turn structure — **done** (UI-2; error text and thumbs UI-9)
+
+**UI-9.** The turn error row shows the ERROR the backend logged while the
+turn ran (`Turn.error`, captured from the `LogLine` stream) instead of
+"see Diagnostics". The tail gained the thumbs (harness §3.7): a lit thumb is
+the whole feedback, clicking it again clears it, and a live turn learns which
+message it rates from `TurnUsage.last_seq`. Structural deviations that stand:
+the turn holds typed vectors (`tool_chips`, `retries`, notices as marker
+turns) rather than one `events: Vec<TurnRow>`, so arrival-order interleaving
+of retries with tool rows is lost; only `/name` loads become injection rows on
+reload; a retry cancelled by Stop settles as "Retried model request"; the
+compaction marker's wording differs from dsh's.
 
 **Turn process fold** (`TurnProcessNodeView`, only in the **Compact**
 transcript setting, for closed turns): a full-width 33 px button with a
@@ -573,7 +635,7 @@ framing kept verbatim because "the framing is part of what the model read"),
 (`From session {id}`). The whole system prompt gets its own **"System
 prompt"** row at the top.
 
-**sica-rust:** notices are centred caps lines between half-strength rules
+**sica-rust, before the port:** notices are centred caps lines between half-strength rules
 (`draw_notice`) — compaction, steer echoes, loaded-skill markers; retries are
 invisible (only `LogLine`); errors are `Request failed · see log`.
 
@@ -595,7 +657,17 @@ invisible (only `LogLine`); errors are `Request failed · see log`.
   duration_ms, ttft_ms }` emitted from `chat.rs` at `TurnEnd` (the `llm`
   crate has the `usage` trailer and timestamps). The tail pills read it.
 
-### 3.6 Scroll behaviour
+### 3.6 Scroll behaviour — **done** (UI-2; pagination and the turn rail UI-9)
+
+**UI-9.** Sessions still load eagerly, so the page is a *render* window:
+a session opens on its newest 50 turns (`ChatState.hidden_before`) and a
+centred **Load earlier (n more)** button at the top walks back a page; the
+scroll offset is left alone, so the reader's row keeps its place and the older
+turns appear above it. The right-gutter **turn rail** (`messages::turn_rail`,
+hidden under 900 px) paints one tick per rendered turn at its position in the
+whole transcript with the viewport as a lighter band; hovering a tick shows
+the turn's opening words and a click scrolls to it. The back-to-bottom control
+is the 34 px circle with an arrow — the "↓ FOLLOW" pill is gone.
 
 **dsh** (`ChatView.tsx`): "at bottom" = within **24 px**; a scroll is
 attributed to the reader only if it moved more than 0.5 px from the last
@@ -609,7 +681,7 @@ centred r=14 12 px button at the top of the column, pages 50 nodes, keeps the
 reader's row in place. A right-gutter **turn rail** (10 px pitch ticks, hover
 preview card, hidden under 900 px) scrubs between turns.
 
-**sica-rust:** `stick_to_bottom(!autoscroll_paused)`, manual
+**sica-rust, before the port:** `stick_to_bottom(!autoscroll_paused)`, manual
 `state.offset.y = max` snap, a "↓ FOLLOW" pill at the bottom centre,
 middle-click pan, Ctrl+A/Ctrl+C message selection.
 
@@ -620,7 +692,9 @@ Ctrl+A/C and middle-click pan (dsh has neither; they are sica-rust
 strengths). Pagination and the turn rail are **L / later** — sessions load
 eagerly today.
 
-### 3.7 Empty state
+### 3.7 Empty state — **done** (UI-3; `chat::hero_view`)
+
+
 
 **dsh:** headline `[34 px mark] [26/32 500 title] [Preview badge]`,
 workspace chip beneath (r=16, folder icon + name + chevron), composer with the
@@ -645,7 +719,7 @@ turn's changed files), and the renderer resolves those to clickable
 references; **CJK** strong text is rendered where CommonMark's word-boundary
 rule would drop it; every link is clickable and opens externally.
 
-**sica-rust:** `egui_commonmark` — no math, images only if a loader is
+**sica-rust, before the port:** `egui_commonmark` — no math, images only if a loader is
 installed, tables at natural width (a wide one pushes the column), inline
 code is plain.
 
@@ -744,7 +818,16 @@ snippets, capped at 20. Rename pins the automatic title. Archive has no
 confirmation and no unarchive UI. **There is no delete session** and no
 keyboard switching.
 
-### 4.2 Port (**M**)
+### 4.2 Port (**M**) — **done** (UI-4; export UI-9)
+
+**As shipped.** `SessionMeta.updated_at`, `RenameSession` (there is no
+user-pinned mark: the auto-titler only writes while the title still equals
+the provisional one it wrote, and re-checks before writing), `ForkSession`
+(`SessionLog::fork` cut at the last `TurnEnd`), `ArchiveSession`
+(`EventKind::SessionArchived`), the debounced search with a 20-hit cap, the
+armed Delete, and — UI-9 — **Export log…** in the ⋯ menu, an OS save dialog
+copying the session's JSONL (harness §3.5). Rows also carry the alarm glyph
+of §6.10 when the session holds a reminder.
 
 UI-4 shipped the **flat list, Last updated**, sorted by the newest event;
 grouping by workspace is §4.3, on the harness registry (guide §3.9). Row chrome per above.
@@ -819,7 +902,7 @@ the 24 px bottom fade is a gradient rect painted over the scroll area.
   listed level, / **Cancel**; a level cut at 1000 entries says "Too many
   folders to list; only the beginning is shown."
 
-**sica-rust:** one folder for the whole app (Settings › General "Working
+**sica-rust, before the port:** one folder for the whole app (Settings › General "Working
 directory": the app folder · five recents · "Choose folder…" through `rfd`;
 changing it restarts the BE), a flat session list, and the hero chip that
 names the folder and copies its path.
@@ -925,11 +1008,15 @@ mutation.
   being looked at has never been flushed. The chip and the crumb both name
   `App::session_workspace()`: the session's own workspace, or the app-wide
   folder for an Ungrouped one.
-- **Settings › General** still says "Working directory" and still restarts
-  the backend. Renaming it to "Default folder for ungrouped sessions" *and*
-  dropping the restart needs a request that sets it on a live backend;
-  protocol v26 has none, and `SICA_WORKING_DIR` is read from the child's
-  environment at spawn.
+- **Settings › General — done (UI-9, protocol v29).** The row is now
+  **Default folder for new sessions**, and changing it sends
+  `Request::SetWorkingDir { path }` to the live backend, which changes the
+  process default for the sessions created from then on; open sessions keep
+  the folder in their header, and nothing restarts. `SICA_WORKING_DIR` is
+  still passed at spawn so a fresh child starts on the same answer.
+- **Still later:** a frontend affordance for a workspace's *manual* session
+  order (`Request::MoveSession` has no caller; "Manual" today is the
+  backend's prepend-on-create order).
 
 ---
 
@@ -1014,7 +1101,17 @@ card.
 user-questions **replace the whole composer stack** in place — the
 transcript stays scrollable above. See §6.
 
-### 5.2 Port (**M**; dock **S**; takeovers in §6)
+### 5.2 Port (**M**; dock **S**; takeovers in §6) — **done** (UI-3; stats line UI-9)
+
+**As shipped.** Three flat files rather than a `composer/` directory:
+`ui/chat/composer.rs` (card, toolbar, keymap, attachments), `ui/chat/dock.rs`
+(to-dos, goal, queue, stats line) and `ui/chat/meter.rs` (context ring). The
+queue's verbs are `EditQueued` / `RemoveQueued` / `SteerQueued` over
+`Event::QueueChanged`. The stats line folds every turn's own `TurnUsage`
+since UI-9 — `Input · Output` tokens and `TTFT avg` join turns · steps, tok/s
+and used/budget — ellipsised to the column with the full line as tooltip.
+Cache-hit % and a split of LLM vs tool time need numbers no local provider
+reports and are not shown.
 
 `input_bar.rs` becomes `ui/chat/composer/{card, toolbar, keymap, dock,
 queue, stats, context_ring}.rs`.
@@ -1055,7 +1152,15 @@ queue, stats, context_ring}.rs`.
   progress: reuse the ring with a rotating arc and the tooltip "Compacting
   context…"; the `⟳ COMPRESSING` status text goes.
 
-### 5.3 Attachments — the rail, files, the lightbox — **done**
+### 5.3 Attachments — the rail, files, the lightbox — **done** (UI-8; sizes and intake rules UI-9)
+
+**UI-9.** Rail items are 64 px (the file card 240 × 64). A text card is refused
+over 8 MiB with a toast. `@path` is a guarantee now: the backend expands every
+`@path` in a sent message into a `ContextInjected { FileReference }` captured
+at send time (harness §9.5), so a card's promise is kept by the harness, not
+by the model choosing to read the file. Images are downscaled to a 2048 px
+long edge and refused over 4 MiB on intake — pasted screenshots too (harness
+§9.6).
 
 **dsh** (`ui-attachment`, `client/file-upload`): one ordered **draft rail**
 under the text, non-wrapping, horizontal; edge arrows page the overflow, the
@@ -1074,7 +1179,7 @@ beside 240 × 64 cards, wrapping. A loaded image opens the document-level
 failed load shows a retry control. The same gallery serves the Trajectory
 view and tool results that carry images.
 
-**sica-rust:** images by paste, drop and the `+` picker into
+**sica-rust, before the port:** images by paste, drop and the `+` picker into
 `pending_images`, drawn as thumbnails; the drop overlay (UI-3); no generic
 files, no lightbox, history images at a fixed size.
 
@@ -1120,7 +1225,10 @@ without guessing which words the app put there.
 
 ## 6. Control plane surfaces
 
-### 6.1 Approval
+### 6.1 Approval — **done** (UI-3; 336 px body UI-9)
+
+**UI-9.** The card's body scrolls inside 336 px, so a long argument list
+cannot push Allow once / Reject off the screen.
 
 **dsh** (`ui-approval/ApprovalPanel.*`): a **composer takeover**. Card
 max-width = content width, **1 px `warn_secondary` border** (state borders
@@ -1134,7 +1242,7 @@ keyboard accelerators**; the request carries an abort signal and unmounts on
 cancel. The command text is fetched from the already-streamed tool row by
 `callId` rather than duplicated on the request.
 
-**sica-rust:** `draw_approval_strip` — caps "APPROVAL", `{skill} — {reason}`,
+**sica-rust, before the port:** `draw_approval_strip` — caps "APPROVAL", `{skill} — {reason}`,
 `args_preview`, `Allow once` / `Deny` ghost buttons, "no answer in 5 min
 denies automatically".
 
@@ -1144,7 +1252,13 @@ but as the tooltip of the strip, not a line (dsh renders no timer; the BE
 deadline is real, so hint it quietly). Button labels: "Reject" / "Allow once".
 No protocol change.
 
-### 6.2 User questions and plan review
+### 6.2 User questions and plan review — **done** (UI-3, UI-6)
+
+**Not ported:** the pager (the backend asks one question per call), "Skip
+this question" and "Dismiss all" — both would need a cancel path on
+`AnswerQuestion` that the broker answers as a denial, and the timeout already
+does that; and `header` / `intent` (§11). The takeover lives in
+`ui/chat/control.rs`, shared with the approval card.
 
 **dsh** (`ui-user-questions/QuestionComposer.*`): also a takeover, **one
 question at a time**: header `[eyebrow] [h2 question] [collapse] [×]`; body
@@ -1162,7 +1276,7 @@ the `exit-plan-mode` review — strip **"Plan review"**, body = the plan as
 markdown, footer **Chat about it** (ghost + pencil, cancels) · **Refuse**
 (outline) · **Approve** (primary).
 
-**sica-rust:** a centred `egui::Window` "❓ Answer needed" with plain
+**sica-rust, before the port:** a centred `egui::Window` "❓ Answer needed" with plain
 buttons and a single-line field.
 
 **Port (M):** `question_panel.rs` as a takeover. `QuestionAsked` carries one
@@ -1174,7 +1288,9 @@ per call). Numbered badges: 20 px r=999 `hover` fill, 12/500. Recommended:
 strip the `(recommended)` suffix, render `kit::pill("Recommended")`, but
 **send the original label** (dsh does; the model asked with it).
 
-### 6.3 `/` and `@` menus
+### 6.3 `/` and `@` menus — **done** (UI-3, UI-6, UI-7)
+
+
 
 **dsh** (`ui-input-trigger`): `/` opens only at start-of-draft, after
 whitespace, or after punctuation (`//` and `:/` are dead); `@` anywhere,
@@ -1195,7 +1311,7 @@ generate plan`, `hint.goal = describe the objective for a long-running task`,
 **popupSelect** (search field, ↑↓, Enter, Esc; rows `label + detail +
 check`) serves `/permission` and `/model`.
 
-**sica-rust:** `slash_menu.rs` ranks with the dsh fuzzy scorer, groups
+**sica-rust, before the port:** `slash_menu.rs` ranks with the dsh fuzzy scorer, groups
 Commands → Skills → Agents, has ↑↓/Enter/Tab/Esc, and rewrites the draft to
 `/name `. Both menus float in one shared `Area` (`slash_menu::overlay`)
 pinned by its `LEFT_BOTTOM` pivot 4 px above the composer card — the card's
@@ -1220,7 +1336,10 @@ FE-side walk of `workspace_root()` honouring `.gitignore` via the `ignore`
 crate (the BE `glob` skill uses it already — or add `Request::ListFiles {
 query }`), inserting the relative path. `@session` → §6.12.
 
-### 6.4 Goal
+### 6.4 Goal — **done** (UI-3, UI-6)
+
+dsh's fourth icon action, *Clear*, is mapped onto the ⋯ menu's Mark complete /
+Block: a goal here ends in a phase, never in nothing, so the log says why.
 
 **dsh** (`ui-goal/GoalBar.*`): a dock row (order 10): `[goal icon 14] [phase
 label] [objective] [error?] [actions]`. Phase labels **"Ongoing Goal" /
@@ -1230,7 +1349,7 @@ Clear. **No rounds, no complete/block button, no armed indicator** — those
 are host-side. All verbs are compare-and-set on `{id, revision}`; failures
 render inline as `{message} ({code})`.
 
-**sica-rust:** `draw_goal_strip` — `GOAL RUNNING/PAUSED/DONE/BLOCKED` caps,
+**sica-rust, before the port:** `draw_goal_strip` — `GOAL RUNNING/PAUSED/DONE/BLOCKED` caps,
 `round n/m`, objective, Pause/Continue/Complete ghost buttons.
 
 **Port (S):** dock row per above; keep **rounds** as the tooltip on the
@@ -1240,7 +1359,9 @@ a menu item under a ⋯ rather than a bar button. Edit needs `RunCommand
 not: dsh has no indicator; sica-rust's "PAUSED while active-but-disarmed"
 mapping stays, since pressing Stop disarms and the label must not lie.
 
-### 6.5 Plan mode
+### 6.5 Plan mode — **done** (UI-3)
+
+
 
 **dsh** (`ui-plan/PlanModeControl.*`): entered only via `/plan` (or `/plan
 <message>`), exited via `/plan off` or the chip. The chip lives in the
@@ -1248,12 +1369,14 @@ toolbar's plan seat **only while on**: r=999, pad 2 8, `warn_tertiary` fill,
 `warn_label` text, 13/500, label **"Plan"** + a 12 px × glyph; tooltip "Plan
 mode on — click to turn off (/plan)". No off-state toggle.
 
-**sica-rust:** `PLAN ON` / `PLAN OFF` ghost toggle in the plan/todo row.
+**sica-rust, before the port:** `PLAN ON` / `PLAN OFF` ghost toggle in the plan/todo row.
 
 **Port (S):** `plan_chip` in the toolbar, shown only when `plan_active`;
 click → `Request::SetPlanMode { active: false }`. Entering stays `/plan`.
 
-### 6.6 To-dos
+### 6.6 To-dos — **done** (UI-3)
+
+
 
 **dsh** (`TodoPanel.*`): dock card (order 0), 0.5 `border-l1`, r=12, `tip`
 fill, pad 6 12; header button **"To-dos"** + progress `{done} completed ·
@@ -1261,13 +1384,15 @@ fill, pad 6 12; header button **"To-dos"** + progress `{done} completed ·
 items with 14 px glyphs: pending = dashed ring, in-progress = spinning
 blue gradient ring, completed = solid ring + check. Empty → nothing.
 
-**sica-rust:** `○ ◐ ●` glyph list in the plan/todo row.
+**sica-rust, before the port:** `○ ◐ ●` glyph list in the plan/todo row.
 
 **Port (S):** `todo_card` in the dock; paint the three glyphs with
 `Painter` (dashed ring = 8 dashes; spinner = arc rotating on
 `input.time`). Data is already `TodosChanged`.
 
-### 6.7 Permission presets
+### 6.7 Permission presets — **done** (UI-3, UI-7)
+
+
 
 **dsh:** a toolbar chip `[shield glyph 16] [label] [chevron]` (h=28, r=24,
 13/20 500 `label[1]`, collapses to icon-only under 460 px): **Read Only**
@@ -1280,7 +1405,7 @@ continue", **Cancel / Enable Full access**. A second copy of the same gate
 lives in Settings › General "Permission — Choose the default permission mode
 for new sessions". No colour per preset.
 
-**sica-rust:** `PERM WORKSPACE-WRITE` caps in the status bar, right-click
+**sica-rust, before the port:** `PERM WORKSPACE-WRITE` caps in the status bar, right-click
 context menu; `default_permission_mode` has no UI.
 
 **Port (S):** `permission_chip` → `kit::menu` → `Request::SetPermissionMode`.
@@ -1294,7 +1419,13 @@ is spelled out where the choice is made — the menu item and the Settings row
 carry it — and switching back is one click. `kit::modal` stays in the design
 system for the next dialog that earns one.
 
-### 6.8 Model selection
+### 6.8 Model selection — **done** (UI-3; effort and the inert composer UI-9)
+
+**UI-9.** The chip's menu carries the Effort pane as two rows — *thinking on*
+/ *thinking off* — which set the active provider's `thinking`, save its TOML
+and reconnect, since the toggle applies on connect. With no model connected
+the toolbar's left-side controls (permission, plan, agent) are inert; the
+chip stays live because it is the way out.
 
 **dsh** (`ui-model-selection/ModelSelect.*`): toolbar chip `[model name]
 [effort in label[3]] [chevron]`, h=28 r=24; a two-level upward menu (r=20,
@@ -1309,7 +1440,7 @@ Deleted default → chip reads "Select model" and the composer blocks with
 "This model is unavailable — select one to continue" while the chip stays
 live.
 
-**sica-rust:** connect/disconnect lives on each provider card in Settings ›
+**sica-rust, before the port:** connect/disconnect lives on each provider card in Settings ›
 LLM; the status bar shows the LLM dot + model name.
 
 **Port (M):** `model_select` chip listing `llm_providers::load_all()`
@@ -1322,7 +1453,13 @@ message as tooltip). Blocked composer when `llm_state` is `Disconnected` or
 `Error`: placeholder "No model connected — select one to continue", every
 control inert except the chip (replaces `draw_no_llm`).
 
-### 6.9 Jobs
+### 6.9 Jobs — **done** (UI-3; rows UI-9)
+
+**UI-9.** Rows read `[id] · [status] · [duration]` over the command (`killed`
+shown as *cancelled*, duration from `JobDump.started_at`); a pick shows the
+job's output through the backend's `job-output` command route, which now
+exists; one **Kill <id>** row per running job precedes the bulk kill. No
+per-row live dot: the header pill's dot says something is running.
 
 **dsh** (`ui-jobs/JobListAction.*`): a **session-header action**, not a
 dock row, rendered only when the session has ≥1 job: trigger `[green dot if
@@ -1332,14 +1469,30 @@ running / stopping / completed / **cancelled** (for killed) / failed;
 durations tick every 1 s only while open. **Read-only — no kill button, no
 output viewer**; output surfaces through the transcript's tool rows.
 
-**sica-rust:** `draw_jobs_strip` — `JOBS cli-3 [running]` + `Kill`.
+**sica-rust, before the port:** `draw_jobs_strip` — `JOBS cli-3 [running]` + `Kill`.
 
 **Port (S):** header popover per above; keep **Kill** as a row action (the
 harness has `job-kill` and a human door matters) and add "Show output"
 which sends `RunCommand { name: "job-output", … }` — today only the model
 can call `job-output`; a `RunCommand` route for it is a 10-line BE change.
 
-### 6.10 Schedule, subagent lineage, feedback, deliverables
+### 6.10 Schedule, subagent lineage, feedback, deliverables — schedule, feedback and UNVERIFIED **done** (UI-9); lineage n/a
+
+**As shipped (UI-9).** The **schedule catalogue** (`chat::schedule_action`) is
+a header action that appears only while the session holds an active reminder
+— `[clock] {n overdue | n reminders} [chevron]` — opening a read-only 336 px
+popover: overdue rows first, then by target; each row is the prompt over
+`Scheduled | Overdue · Once | Every {n} {unit} · local target · in 12m / 3h
+ago`, all derived from the viewer's clock; no actions (the tools own
+mutation, and the catalogue is not a delivery receipt). The sidebar row
+carries a small clock glyph while `SessionMeta.scheduled` — it says the list
+is non-empty, not that a live runtime will deliver it. **Feedback thumbs**
+are on the turn tail (§3.5). **UNVERIFIED** on a delegate row (a report no
+successful tool call backed) is an amber `StateDot` with the summary
+"unverified — no successful tool call backed this report". **Subagent
+lineage** stays n/a: children are conversations inside the parent's turn,
+rendered as its nested rows and run tree (§6.11), not sessions. Produced-file
+chips landed with UI-6.
 
 dsh renders a **schedule** popover (header action, "Scheduled"/"Overdue",
 "Every {n} {unit}") — sica-rust has no schedule (§12.8 of the harness
@@ -1355,7 +1508,15 @@ put `UNVERIFIED` (which dsh does not have) as an amber `StateDot` +
 files need `write-file` path collection at `TurnEnd` — **S**, worth doing:
 the tail row `Produced [chip] [chip] + 2 files`, click opens in Explorer).
 
-### 6.11 Workflow runs and the agent-team panel — **done** (UI-8, protocol v27)
+### 6.11 Workflow runs and the agent-team panel — **done** (UI-8, protocol v27; ralph and the phase-list rule UI-9)
+
+**UI-9.** `ralph` writes run rows too (one member per round, harness §12.6)
+and its progress lines route to its chip. The run tree yields to the live
+phase list until the run's first member exists, which is the case the list
+was kept for. Deviations that stand: the tree is drawn as footnote lines with
+✓ ✕ ⋯ • glyphs under dsh's open/close rule rather than with `disclosure_row`
++ `StateDot`, phases are not user-toggleable, and `[id: call-N]` citations
+in a team report are plain text rather than links to the member rows.
 
 **dsh** (`ui-workflow-run`, the experimental `client-ui-agent-team`): a
 top-level workflow run is its **own conversation node**, rebuilt from four
@@ -1374,7 +1535,7 @@ with missing terminal events shows the run as **interrupted** without
 touching the tool result. The agent-team panel is the same shape for a team:
 one row per teammate with its report state.
 
-**sica-rust:** `workflow` (harness §12.5) and `agent-team` render as a
+**sica-rust, before the port:** `workflow` (harness §12.5) and `agent-team` render as a
 **Delegate** tool row (§3.4) whose nested children are the live
 `ToolCallStarted` rows; `phase()` / `log()` are `LogLine`s, so history shows
 the row and the printed result only.
@@ -1440,6 +1601,10 @@ has no members to report — shows throughout.
 
 ### 6.12 `@session` references — **done** (UI-8)
 
+**As shipped:** resolution is `start_turn`'s `resolve_session_refs` (6 KiB
+head + 2 KiB tail), an unknown id is a WARN and a skipped reference — never
+`Response::Error` — and the `@` picker lists sessions under the files.
+
 **dsh** (`ui-reference`, `dsh-session-reference`): the `@` menu is one list
 — **Files & folders** first (a directory row carries **Browse folder** on
 Tab or its chevron and keeps the menu open at the trailing slash), then
@@ -1450,7 +1615,7 @@ host validates the mention and captures the referenced session's context at
 the pre-step boundary inside the untrusted frame, and a failed capture ends
 that turn. `@"…` searches files only.
 
-**sica-rust:** the `@` picker (UI-6) lists files and drills folders; no
+**sica-rust, before the port:** the `@` picker (UI-6) lists files and drills folders; no
 sessions.
 
 **Port (S FE + S BE):** a **Sessions** group under the files, fed by
@@ -1527,7 +1692,31 @@ models; Web search) with "Overridden" badges and "Reset to default", and
 **Plugin list** (read-only inventory with Enabled / Disabled / Failed tags,
 runtime status, search).
 
-### 7.2 Port (**M–L**)
+### 7.2 Port (**M–L**) — **done** (UI-4 / UI-8 / UI-9; Models card extras later)
+
+**As shipped, names and gaps.** The per-change writer is `App::save_general`
+and files open through `settings::open_path` / `reveal_path` (nothing is
+named `open_in_explorer`). `ListModels { base_url, api_key }` answers with
+`Event::ModelsListed` and the picker is a row of pills on the card. The
+Skills section's tabs are Catalogue / Folders / Harness: Open-folder and the
+skill-creator seed are on Folders, the optional-skill switches (`workflow`,
+`agent-team`, `schedule`) are Integrations › Optional skills, and the
+child-excluded list is not shown. **General — done (UI-9):** the row is
+*Default folder for new sessions* and applies live over `SetWorkingDir`
+(§4.3). **Integrations — UI-9:** an MCP card that started nothing shows the
+backend's own warning as its Failed reason (`App::mcp_notes`, the WARN lines
+that begin `mcp`); the settings document and `sica-settings/**` are watched,
+so an external edit applies without a restart (harness §14.6). The hooks card
+reads `.sica/hooks.json` under the process default folder, which is also
+where the backend loads it from at startup. **Agents:** the Duplicate dialog
+has no separate *Name* field on purpose — a preset's `name:` is its filename
+(harness §5.2 refuses a mismatch), so one identifier is the whole identity;
+Delete is the armed Keep/Delete pair on the card. **Diagnostics:** the
+auto-watch toggle lives under General › Startup. **Models — later:** the
+collapsible *Customized settings* fold, the Cancel / Apply footer (today a
+field applies on the next Connect, which is the card's Apply) and a dashed
+*+ Add provider* card; the Harness tab stays read-only until the constants
+become a `harness.toml` (harness roadmap, later).
 
 `settings::draw` → `kit::modal`-style panel (800 × min(800, h−48), r=32) with
 a 188 px nav and a content column. Sections:
@@ -1603,6 +1792,12 @@ live backend).
 
 ### 7.3 Onboarding — **done** (UI-8)
 
+**As shipped:** the provider pills are exactly the provider files — no
+trailing *custom* option, because a provider here *is* a file and Settings ›
+Models is where one is added; the key-missing mark is a warn-coloured text
+label, not a `StateDot`; and *Save and continue* is never disabled by an
+empty key, since a local provider legitimately has none.
+
 **dsh:** on a first run with no usable provider the app root is made inert
 behind a body-level stage: a **welcome** dialog (the preview notice,
 **Continue**), then **"Add an API key to get started"** — "Configure the
@@ -1613,7 +1808,7 @@ official DeepSeek provider to start building.", one **API key** field,
 list marks a provider with an **"API key missing"** badge; **Open
 configuration file** sits in the settings header.
 
-**sica-rust:** a fresh checkout starts disconnected with the §6.8 blocked
+**sica-rust, before the port:** a fresh checkout starts disconnected with the §6.8 blocked
 composer and no hint that Settings › Models is where to go.
 
 **Port:** at startup, when `llm_providers::load_all()` has no provider with a
@@ -1654,12 +1849,21 @@ Covered by §2.2 (header) and §4 (rows). Title generation already matches dsh
 header's first crumb is the **session's own** workspace (`SessionMeta.cwd` →
 its `WorkspaceDump.title`, or the folder name for an Ungrouped session),
 tooltip = full path, click copies it — dsh's hover-card copy behaviour; the
-picker and the grouping are §4.3. Until harness §3.9 lands the crumb shows
-the app-wide `working_dir()`, as it does today.
+picker and the grouping are §4.3. Harness §3.9 landed (Wave 9): the crumb shows the registered workspace's
+title, and — since UI-9 — an Ungrouped session's *own* folder name from its
+header rather than the app-wide default, which the two differ from as soon as
+the default has moved. `RenameSession` exists; the title-gen pass re-checks
+for a manual rename before writing.
 
 ---
 
-## 9. Diagnostics, connection, toasts
+## 9. Diagnostics, connection, toasts — **done** (UI-4)
+
+**As shipped:** `kit::connection_indicator` in the sidebar foot (silent while
+healthy; its tooltip names the proxy variables, harness §14.6), the
+Rebuild & restart / protocol-mismatch chip beside it, the level-preserving
+log pipeline with a filter, WARN/ERROR toasts and the single-slot toast
+queue. The paragraphs below are the design as written before the wave.
 
 **dsh:** connection indicator (§1.3 `kit::connection_indicator`) inline by
 the Settings trigger: **silent while healthy**, "Disconnected" / "Connecting…"
@@ -1669,7 +1873,7 @@ version, no log viewer in the client. Toasts: top-centre over the
 conversation, one at a time, caller-owned hold, no severity kinds; **inline
 error text is the dominant pattern** (`role="alert"` spans inside cards).
 
-**sica-rust:** three status-bar icons (BE / IPC / LLM) with tooltips, a
+**sica-rust, before the port:** three status-bar icons (BE / IPC / LLM) with tooltips, a
 pulsing RESTART pill on version drift, a protocol-mismatch banner, and a
 log panel that has lost the tracing level.
 
@@ -1696,7 +1900,7 @@ log panel that has lost the tracing level.
 
 ---
 
-## 10. Trajectory view (**L**)
+## 10. Trajectory view (**L**) — **done** (UI-5, UI-6)
 
 **dsh** (`ui-trajectory`): the second tab. Full-bleed on `bg_layer[0]`, a
 32 px toolbar (Duration toggle "Use actual duration / equal-width", Turns
@@ -1712,7 +1916,7 @@ per-request usage and a running cumulative; sticky 44 px turn headers
 Payload · Result · Schema · Timing · Diff · Source · System Prompt · Tools ·
 Options · Usage · Raw. History pages 50 nodes.
 
-**sica-rust:** `sessions/<id>.jsonl` *is* this ledger, and the FE already
+**sica-rust, before the port:** `sessions/<id>.jsonl` *is* this ledger, and the FE already
 receives `SessionDump` as a derived surface — so the view's whole value is
 that it shows the *other* thing: the log, including everything the fold
 shadowed.
@@ -1774,7 +1978,7 @@ different unit.
 
 ---
 
-## 11. Protocol impact (one bump, v17)
+## 11. Protocol impact (v17 … v29)
 
 Additive only; `#[serde(default)]` on every new field so old logs load.
 
@@ -1797,7 +2001,9 @@ Additive only; `#[serde(default)]` on every new field so old logs load.
 | `TurnFinished.finish_reason` gains `"max_tokens"` and `"interrupted"` as stable strings | §3.2, §3.5 | ✅ (`run_turn` normalises the provider's `"length"`; `chat.rs` ends the turn on it rather than hunting for a tool call in a truncated reply) |
 | `Request::ListWorkspaces` · `CreateWorkspace` · `RenameWorkspace` · `DeleteWorkspace` · `MoveWorkspace` · `MoveSession` → `Response::Workspaces { rows, ungrouped }` · `Event::WorkspacesChanged` · `NewSession { workspace_id }` · `SessionMeta += cwd` | workspace grouping, picker, add / rename / delete §4.3, header crumb §8 | ⏳ v26 — harness Wave 9 (§3.9) |
 | `ContextInjected` source `SessionReference(id)`; `@session:<id>` resolved in `send_user_message` | `@session` references §6.12 | ⏳ log-only, no bump |
-| `EventKind::WorkflowRun { run_id, phase, member, state }` | the workflow run body §6.11 | ⏳ log-only; harness §12.5 "left for later" |
+| `EventKind::WorkflowRun { run_id, call_seq, phase, member, member_id, state }` + `Event::WorkflowRunChanged` + `SessionDump.runs` | the workflow run body §6.11 | ✅ (v27) |
+| `UserImage += sha, bytes` | content-addressed attachments §5.3 | ✅ (v28) |
+| `Request::SetWorkingDir { path }` · `Request::RateMessage { session_id, seq, rating, note }` · `Event::SchedulesChanged { session_id, rows }` (`ScheduleDump`) · `SessionDump.schedules` · `SessionMeta.scheduled` · `MessageDump.feedback` · `JobDump.started_at` · `TurnUsage.last_seq` · `LlmOptions.retry_always` | live default folder §7.2, thumbs §3.5, the schedule catalogue and alarm §6.10, job durations §6.9, the Models card's retry toggle | ✅ (v29) |
 
 `forward_event` keeps `LogLine.level` (no wire change). `PROTOCOL_VERSION`
 is **22** (v17 batch → v18 prompt editing → v19 queue verbs → v20 trajectory
@@ -1822,6 +2028,7 @@ Each wave is one commit series that builds, passes `.\run.ps1 test
 | **UI-5 Trajectory** ✅ | second tab over the event log; toolbar (live search that dims non-matches, collapse-all turns, actual-duration / equal-width); timeline strip (`Total · Started · Requests` + one clickable segment per turn); ledger with kind tags, turn headers, numbered request boundaries carrying per-request usage and a running cumulative, and **shadowed rows struck through** — the fold's leavings are the point of the view; the event inspector in the details column (Summary · Payload · Result · Timing · Raw); the Inspect pill on tool rows jumping to the call's own row. **Deviations:** no **Think** column (no durable per-event reasoning count exists — `Event::TurnUsage` carries one but is never logged; the reasoning body is in the inspector's Result tab instead); turn headers scroll rather than stick (egui has no sticky row); a segment click scrolls to that turn rather than drag-filtering a range; paging is a **Load more** button over the backend's 500-row cap rather than 50-node infinite scroll; the ledger is painted rather than built on `egui_extras::TableBuilder`, which would have been a new dependency for a fixed-width table. **Open:** nothing. The Schema / System Prompt / Tools / Options tabs landed with UI-6 on a durable `EventKind::RequestEnvelope` — see the deviation note in §10. | **L** | `LoadSessionEvents` (v20) ✅ |
 | **UI-6 Open items** ✅ | The leavings of the five waves, each named in the rows above: the `@` file picker (a frontend-side `ignore` walk of `workspace_root()`, re-walked when it is over 30 s old, opening on an `@` token under the caret and browsing into a directory on accept); produced-file chips and the branch action on the turn tail (the chips are derived from the turn's own successful `write-file` / `edit-file` rows, so nothing has to be collected backend-side for them to be true, and branching is `ForkSession`, offered only on the newest finished turn because that is where the fork actually cuts); `/goal edit <text>` with the goal bar's inline objective field; the question takeover's `detail` body and `multi` checkboxes; and the **request envelope** (§10) behind the inspector's Schema / System Prompt / Tools / Options tabs. With it the guide has no Open items left. | **M** | v21 · v22 ✅ |
 | **UI-7 Overlay + working directory** ✅ | The last two leavings of UI-3: the `/` and `@` menus move out of the bottom panel into one shared foreground `Area` 4 px above the composer card (pivoted at its bottom edge, so a list that grows or shrinks never nudges the transcript), closing on an outside pointerdown; and the ghost hint after a claimed `/command `, painted at the caret. Alongside them, two things the guide had no row for: the **working directory** (§7.2) — the agent's folder split from the app's own root, picked in Settings › General and passed to the backend child in `SICA_WORKING_DIR` — and the retirement of the Full-access risk gate (§6.7). | **M** | none |
+| **UI-9 Leftovers** — **done** | The audit's open items, each named in the rows above: the live *Default folder for new sessions* (§7.2, over `SetWorkingDir`) · the settings-file watch and the atomic settings write (§7.2, harness §14.6) · the schedule catalogue and sidebar alarm (§6.10) · feedback thumbs (§3.5) · the turn error's message (§3.5) · code fences through `kit::code_block` and `ui::strings` (§3.2) · Load earlier and the turn rail (§3.6) · the details column's seam, drag strip and concession order, and the title crumb's rename (§2.2) · scrollbar and tooltip rules, the meter's ramp step (§1.3) · export (§4.2) · the stats line's token and TTFT groups (§5.2) · 64 px rail items, the text cap, image downscaling (§5.3) · the approval body cap (§6.1) · Effort rows and the inert composer (§6.8) · job rows with duration, per-row Kill and a working Show output (§6.9) · UNVERIFIED on delegate rows, `workflow` titled Delegate, ralph's rows, the phase-list rule (§6.10–6.11) · the MCP Failed reason (§7.2) · the Ungrouped crumb (§8). | **M** | v29 (harness Wave 10) |
 | **UI-8 Workspaces, onboarding, integrations** — **done** | ~~Workspace grouping in the sidebar and Add workspace over `rfd` (§4.3)~~ · ~~the hero picker and the session's workspace as the header crumb (§4.3, §8)~~ · ~~the first-run onboarding modal and "key missing" badges (§7.3)~~ · ~~Settings › Agents and Settings › Integrations (§7.2)~~ · ~~attachments: rail, file cards, lightbox, history sizing (§5.3)~~ · ~~markdown extras (§3.8)~~ · ~~`@session` (§6.12)~~ · ~~the workflow run body (§6.11)~~ | **L** | v26 (harness Wave 9) |
 
 UI-1 is the visible "looks like dsh" step and is independent of the BE;
@@ -1833,10 +2040,12 @@ power-user view.
 **UI-8 is done.** Both of the things it once waited on were built rather
 than deferred: §6.11's durable `WorkflowRun` events (protocol v27) and
 §9.6's content-addressed attachment store (v28).
-One more carry-over sits in §7.1 rather than UI-8: Settings › General still
-says "Working directory" and still restarts the backend, because renaming
-it to the default-for-ungrouped-sessions *and* dropping the restart needs a
-request that sets it on a live backend, which protocol v26 does not have.
+**UI-9 is done** too (2026-09-19). What remains is small and named where it
+belongs: the Models card's fold / footer / add-provider card and the Harness
+tab's editability (§7.2, waiting on `harness.toml`), a caller for
+`MoveSession` (§4.3), the sidebar collapse choreography (§13), and the
+surfaces the two big harness items still to come would bring — a terminal
+block that follows a persistent PTY and a search card for LSP results.
 
 **One layout bug found while finishing UI-8, worth remembering.** The
 sidebar foot — the connection chip and the **Settings** button — was laid
@@ -1868,8 +2077,8 @@ and an explicit rect cannot be pushed down by whatever ran above it.
   chooser is always available.
 - **Brand assets** — whale mark, wordmark, "Into the Unknown", "Preview".
   sica-rust keeps the blade and its name.
-- **Locale registry** — worth a `frontend::strings` module of `pub const`s
-  (every string above is one), not a runtime registry; one language.
+- **Locale registry** — `frontend::ui::strings`, a module of `pub const`s
+  (UI-9), not a runtime registry; one language.
 - **No-delete sessions, no unarchive** — product decisions for a hosted
   server; the desktop app keeps Delete behind the armed confirmation.
 - **Message feedback, schedule popover** — the features do not exist in the
@@ -1881,8 +2090,8 @@ and an explicit rect cannot be pushed down by whatever ran above it.
   layout in egui is its own project.
 - **The Cordis inspector** (Chrome DevTools over the host) — the Trajectory
   inspector and `--invariants` are the sica-rust windows into a run.
-- **Sidebar collapse choreography** (freeze-fade-slide) and the **turn
-  rail** scrubber — nice, later.
+- **Sidebar collapse choreography** (freeze-fade-slide) — nice, later. The
+  turn rail landed with UI-9 (§3.6).
 
 ---
 

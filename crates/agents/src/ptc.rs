@@ -153,6 +153,9 @@ pub fn sdk_markdown(registry: &SkillRegistry) -> String {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for name in names {
         let Some(skill) = registry.by_name.get(name) else { continue };
+        if !skill.model_invocable() {
+            continue;
+        }
         let args = skill.positional_args();
         let fname = fn_name(name);
         // A collision (two skills whose names differ only in punctuation)
@@ -181,10 +184,10 @@ pub fn sdk_markdown(registry: &SkillRegistry) -> String {
             out.push(')');
         }
         out.push('`');
-        let desc = skill.description();
+        let desc = crate::registry::description_of(skill.as_ref());
         if !desc.is_empty() {
             out.push_str(" — ");
-            out.push_str(desc);
+            out.push_str(&desc);
         }
         let optional = skill.optional_args();
         if !optional.is_empty() {

@@ -1,0 +1,25 @@
+---
+name: schedule
+description: Reminders that return to this conversation as follow-up messages (opt-in).
+disable-model-invocation: true
+---
+# Reminders
+
+While this file is `skills/schedule.md` the agent has three tools:
+
+- `schedule-create '<prompt>'` with exactly one selector — `after_seconds`
+  (a positive integer), `at` (an RFC 3339 time *with an offset*, or
+  `{date, time, time_zone}` with an IANA zone such as `Europe/Berlin`), or
+  `every_seconds` (300 or more; fixed-rate, creation-aligned, missed
+  occurrences are skipped).
+- `schedule-list` — every active reminder: id, rule, UTC target, scheduled
+  or overdue.
+- `schedule-delete '<id>'`.
+
+Delivery is session-local: a due reminder starts one follow-up turn in
+this session, only while the backend is running with a model connected and
+the session is idle. Otherwise it becomes overdue and goes out on the next
+chance. There is no notification outside the app, and no receipt.
+
+Rename this file to `schedule.md.off` (or use Settings › Integrations) to
+turn the tools off; the backend reads it at startup.

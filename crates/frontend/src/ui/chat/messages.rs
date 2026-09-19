@@ -60,7 +60,29 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             // Flow items carry their own 16 px separation (§3); egui's default
             // inter-widget spacing would double it.
             ui.spacing_mut().item_spacing.y = 2.0;
-            for i in 0..app.chat.turns.len() {
+            // Pagination (§3.6): the window starts at `hidden_before`; the
+            // centred button walks it back a page. The scroll offset is
+            // left alone, so the reader's row keeps its place on screen
+            // and the older turns appear above it.
+            let hidden = app.chat.hidden_before.min(app.chat.turns.len());
+            if hidden > 0 {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    if kit::button(
+                        ui,
+                        &format!("Load earlier ({hidden} more)"),
+                        kit::Variant::Outline,
+                        kit::Size::Sm,
+                    )
+                    .clicked()
+                    {
+                        app.chat.hidden_before = hidden.saturating_sub(crate::app::PAGE_TURNS);
+                        app.chat.autoscroll_paused = true;
+                    }
+                });
+                ui.add_space(8.0);
+            }
+            for i in hidden..app.chat.turns.len() {
                 if let Some(notice) = app.chat.turns[i].notice.clone() {
                     draw_marker(app, ui, i, &notice);
                     continue;
@@ -74,6 +96,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // A floating control has no business painting over an open modal.
     if output.content_size.y > output.inner_rect.height() && !app.settings_open {
         back_to_bottom(app, ui, visible_viewport(ui, &output));
+        turn_rail(app, ui, &output, &assistant_rects);
     }
     // A "Run again" is applied here, after every reader of `turns` has run:
     // `edit_user_message` truncates the vector, and both the loop above and
@@ -91,7 +114,7 @@ fn draw_turn(
     selected: Option<usize>,
     t: &Theme,
 ) {
-    let (user, assistant, reasoning, finished, collapsed, finish_reason, queued) = {
+    let (user, assistant, reasoning, finished, collapsed, finish_reason, queued, error_text) = {
         let turn = &app.chat.turns[i];
         (
             turn.user.clone(),
@@ -101,6 +124,7 @@ fn draw_turn(
             turn.reasoning_collapsed,
             turn.finish_reason.clone(),
             turn.queued,
+            turn.error.clone(),
         )
     };
     let has_images = !app.chat.turns[i].images.is_empty();
@@ -171,6 +195,10 @@ fn draw_turn(
             .response
             .rect;
         assistant_rects.push((i, body));
+        if app.chat.scroll_to_turn == Some(i) {
+            app.chat.scroll_to_turn = None;
+            ui.scroll_to_rect(body, Some(egui::Align::TOP));
+        }
         if selected == Some(i) {
             ui.painter().rect_filled(
                 body.expand2(egui::vec2(6.0, 4.0)),
@@ -184,7 +212,7 @@ fn draw_turn(
         turn_status(app, ui, i, t);
     } else if finished {
         match finish_reason.as_deref() {
-            Some(r) if r.starts_with("error") => turn_error(ui, t),
+            Some(r) if r.starts_with("error") => turn_error(ui, t, error_text.as_deref()),
             Some("interrupted") => stopped_tag(ui, t),
             Some("max_tokens") | Some("length") => max_tokens_row(ui, t),
             _ => {}
@@ -519,6 +547,10 @@ fn draw_assistant(
                     // beats a formula the parser has eaten.
                     kit::code_block(ui, "math", &src);
                 }
+                super::md_blocks::Block::Code { lang, body } => {
+                    // The kit's card: language banner, Copy → Copied.
+                    kit::code_block(ui, if lang.is_empty() { "text" } else { &lang }, &body);
+                }
                 super::md_blocks::Block::Table(src) => {
                     egui::ScrollArea::horizontal()
                         .id_source(("md_table", &id))
@@ -578,7 +610,7 @@ fn turn_status(app: &mut App, ui: &mut egui::Ui, i: usize, t: &Theme) {
         match active {
             Some(c) if c.depth > 0 => format!("Sub-agent · {}", c.name),
             Some(c) => format!("Running · {}", super::tool_row::title_of(&c.name).to_lowercase()),
-            None => "Working…".to_string(),
+            None => crate::ui::strings::TURN_STATUS.to_string(),
         }
     };
     ui.add_space(6.0);
@@ -624,20 +656,20 @@ fn stopped_tag(ui: &mut egui::Ui, t: &Theme) {
 }
 
 /// `[10px dot] "This turn failed" [message]` — grid 10px 1fr auto (§3.5).
-fn turn_error(ui: &mut egui::Ui, t: &Theme) {
+fn turn_error(ui: &mut egui::Ui, t: &Theme, message: Option<&str>) {
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         kit::state_dot(ui, DotState::Error, 10.0);
         ui.add_space(8.0);
         kit::label(
             ui,
-            kit::txt("This turn failed", 14.0, Weight::Semibold, kit::col(t.alias.error)),
+            kit::txt(crate::ui::strings::TURN_FAILED, 14.0, Weight::Semibold, kit::col(t.alias.error)),
         );
         ui.add_space(8.0);
         kit::label(
             ui,
             kit::txt(
-                "the request did not complete — see Diagnostics for the error",
+                message.unwrap_or("the request did not complete — see Diagnostics for the error"),
                 13.0,
                 Weight::Regular,
                 kit::col(t.alias.label[1]),
@@ -775,6 +807,36 @@ fn turn_tail(app: &mut App, ui: &mut egui::Ui, i: usize, assistant: &str, t: &Th
             .clicked()
         {
             ui.output_mut(|o| o.copied_text = assistant.to_owned());
+        }
+        // Thumbs (harness §3.7): a rating is log-only bookkeeping — a label
+        // for `model-eval`, never something the model sees — so the lit
+        // thumb is the whole feedback, and clicking it again clears it.
+        if let Some(seq) = app.chat.turns[i].assistant_seq {
+            let current = app.chat.turns[i].feedback;
+            let mut pick: Option<i8> = None;
+            for (icon, value, tip) in [
+                (Icon::ThumbUp, 1i8, "Good response"),
+                (Icon::ThumbDown, -1i8, "Poor response"),
+            ] {
+                let lit = current == Some(value);
+                let tint = lit.then(|| kit::col(t.alias.business));
+                if kit::icon_button_tinted(ui, icon, 28.0, tint)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    pick = Some(if lit { 0 } else { value });
+                }
+            }
+            if let Some(rating) = pick {
+                let session_id = app.chat.session_id;
+                app.chat.turns[i].feedback = (rating != 0).then_some(rating);
+                app.send(UiCommand::SendRequest(protocol::Request::RateMessage {
+                    session_id,
+                    seq,
+                    rating,
+                    note: None,
+                }));
+            }
         }
         // Branching forks the session at its last completed turn, which is
         // this turn only while it is the newest finished one. On any earlier
@@ -1184,6 +1246,85 @@ fn transcript_input(
                 ctx.output_mut(|o| o.copied_text = turn.assistant.clone());
             }
         }
+    }
+}
+
+/// The right-gutter turn rail (§3.6): one tick per rendered turn at its
+/// position in the whole transcript, the viewport as a lighter band, a
+/// hover preview of the turn's opening words, and a click that scrolls to
+/// the turn. Hidden under 900 px, as dsh's is.
+fn turn_rail(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+    assistant_rects: &[(usize, Rect)],
+) {
+    const RAIL_MIN_WIDTH: f32 = 900.0;
+    if ui.available_width() < RAIL_MIN_WIDTH || assistant_rects.is_empty() {
+        return;
+    }
+    let t = app.theme;
+    let inner = output.inner_rect;
+    let content_h = output.content_size.y.max(1.0);
+    let offset_y = output.state.offset.y;
+    let rail = Rect::from_min_max(
+        egui::pos2(inner.max.x - 14.0, inner.min.y + 8.0),
+        egui::pos2(inner.max.x - 4.0, inner.max.y - 8.0),
+    );
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("turn_rail"),
+    ));
+    let scale = rail.height() / content_h;
+    // The viewport band.
+    let band_top = rail.min.y + offset_y * scale;
+    let band_h = (inner.height() * scale).max(4.0);
+    painter.rect_filled(
+        Rect::from_min_size(egui::pos2(rail.min.x, band_top), Vec2::new(rail.width(), band_h)),
+        egui::Rounding::same(2.0),
+        kit::cola(t.alias.hover),
+    );
+    let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+    let clicked = ui.ctx().input(|i| i.pointer.primary_clicked());
+    let mut jump: Option<usize> = None;
+    for (i, rect) in assistant_rects {
+        // Screen-space rect this frame → content-space y → rail y.
+        let content_y = rect.min.y - inner.min.y + offset_y;
+        let y = rail.min.y + content_y * scale;
+        let tick = Rect::from_min_size(egui::pos2(rail.min.x, y), Vec2::new(rail.width(), 2.0));
+        let hot = pointer.is_some_and(|p| tick.expand2(Vec2::new(4.0, 5.0)).contains(p));
+        painter.rect_filled(
+            tick,
+            egui::Rounding::same(1.0),
+            kit::col(if hot { t.alias.business } else { t.alias.label[3] }),
+        );
+        if hot {
+            let words: String = app.chat.turns[*i]
+                .user
+                .split_whitespace()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(" ");
+            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new(("turn_rail_tip", *i)), |ui| {
+                kit::label(
+                    ui,
+                    kit::txt(
+                        format!("Turn {} · {}", app.chat.turns[*i].turn_id, kit::one_line(&words, 80)),
+                        12.0,
+                        Weight::Regular,
+                        kit::col(t.alias.label[1]),
+                    ),
+                );
+            });
+            if clicked {
+                jump = Some(*i);
+            }
+        }
+    }
+    if let Some(i) = jump {
+        app.chat.selected_turn = Some(i);
+        app.chat.autoscroll_paused = true;
+        app.chat.scroll_to_turn = Some(i);
     }
 }
 

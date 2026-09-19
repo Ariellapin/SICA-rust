@@ -123,9 +123,11 @@ fn panel(
                 let total = (system + tools + history).max(1) as f32;
                 let (bar, _) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
+                // Three ramp steps rather than a literal (the kit rule):
+                // system, tools, history.
                 let seg_colors = [
                     kit::col(t.statics.bluish[8]),
-                    egui::Color32::from_rgb(167, 139, 250),
+                    kit::col(t.statics.bluish[5]),
                     kit::col(t.statics.accent[4]),
                 ];
                 let mut x = bar.min.x;

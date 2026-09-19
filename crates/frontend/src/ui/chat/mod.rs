@@ -135,7 +135,11 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                     ui,
                     kit::txt("/", 14.0, Weight::Regular, kit::col(t.alias.label[3])),
                 );
-                crumb(ui, &title, true, &t);
+                // The title crumb opens the inline rename in the sidebar row
+                // (§2.2) — one rename surface, reached from two places.
+                if crumb(ui, &title, true, &t).on_hover_text("Rename session").clicked() {
+                    app.chat.renaming = Some(app.chat.session_id);
+                }
                 // The preset this session runs (§7.2). Read-only on purpose:
                 // it is fixed once the session has produced anything, and a
                 // control that pretends otherwise would fail on click.
@@ -153,6 +157,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     jobs_action(app, ui);
+                    schedule_action(app, ui);
                 });
             });
             stats_line(app, ui);
@@ -318,6 +323,130 @@ fn crumb(
 /// Header action (§6.9): rendered only when the session has jobs. Read-mostly
 /// — but Kill stays, because a human door onto a runaway process matters more
 /// than matching dsh exactly here.
+/// The reminder catalogue (UI guide §6.10, harness §12.8): a header action
+/// that appears only while the session holds an active reminder, opening a
+/// read-only popover — overdue rows first, then by target time — with the
+/// prompt, Scheduled / Overdue, the rule and the target in local time. No
+/// actions: creating and deleting reminders is the model's job through
+/// the schedule tools, and the catalogue is not a delivery receipt.
+fn schedule_action(app: &mut App, ui: &mut egui::Ui) {
+    if app.schedules.is_empty() {
+        return;
+    }
+    let t = app.theme;
+    let now = chrono::Utc::now().timestamp();
+    let overdue = app.schedules.iter().filter(|s| s.fire_at <= now).count();
+    let label = if overdue > 0 {
+        format!("{overdue} overdue")
+    } else {
+        format!(
+            "{} reminder{}",
+            app.schedules.len(),
+            if app.schedules.len() == 1 { "" } else { "s" }
+        )
+    };
+    let font = kit::font(13.0, Weight::Medium);
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE));
+    let (rect, resp) =
+        ui.allocate_exact_size(galley.size() + Vec2::new(44.0, 12.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::Rounding::same(sica_core::theme::tokens::RADIUS_PILL),
+            kit::cola(t.alias.hover),
+        );
+    }
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(
+            egui::pos2(rect.min.x + 14.0, rect.center().y),
+            Vec2::splat(13.0),
+        ),
+        Icon::Clock,
+        kit::col(if overdue > 0 { t.alias.warn } else { t.alias.label[2] }),
+    );
+    ui.painter().text(
+        egui::pos2(rect.min.x + 26.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &label,
+        font,
+        kit::col(t.alias.label[1]),
+    );
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(
+            egui::pos2(rect.max.x - 12.0, rect.center().y),
+            Vec2::splat(12.0),
+        ),
+        Icon::ChevronDown,
+        kit::col(t.alias.label[2]),
+    );
+    if resp.on_hover_text("Reminders this session will get as follow-up messages").clicked() {
+        app.menu_open.schedule = !app.menu_open.schedule;
+    }
+
+    let mut rows = app.schedules.clone();
+    // Overdue first, then by target; ties keep creation order.
+    rows.sort_by_key(|s| (s.fire_at > now, s.fire_at));
+    let items: Vec<kit::MenuItem> = rows
+        .iter()
+        .map(|s| {
+            let state = if s.fire_at <= now { "Overdue" } else { "Scheduled" };
+            let rule = match s.every_seconds {
+                Some(secs) => format!("Every {}", human_interval(secs)),
+                None => "Once".to_string(),
+            };
+            let local = chrono::DateTime::from_timestamp(s.fire_at, 0)
+                .map(|dt| dt.with_timezone(&chrono::Local).format("%a %d %b %H:%M").to_string())
+                .unwrap_or_default();
+            kit::MenuItem::new(kit::one_line(&s.prompt, 80))
+                .detail(format!("{state} · {rule} · {local} · {}", relative_target(s.fire_at, now)))
+        })
+        .collect();
+    let mut open = app.menu_open.schedule;
+    let _ = kit::menu(
+        ui.ctx(),
+        egui::Id::new("schedule_menu"),
+        rect,
+        kit::MenuSide::Below,
+        336.0,
+        &items,
+        &mut open,
+    );
+    app.menu_open.schedule = open;
+}
+
+/// The largest exact whole unit of an interval: `5 minutes`, `2 hours`,
+/// `90 minutes` — never rounded, as dsh does.
+fn human_interval(secs: u64) -> String {
+    for (unit, name) in [(86_400, "day"), (3_600, "hour"), (60, "minute")] {
+        if secs % unit == 0 {
+            let n = secs / unit;
+            return format!("{n} {name}{}", if n == 1 { "" } else { "s" });
+        }
+    }
+    format!("{secs} second{}", if secs == 1 { "" } else { "s" })
+}
+
+/// `in 12m` / `3h ago`, from the viewer's clock.
+fn relative_target(fire_at: i64, now: i64) -> String {
+    let d = (fire_at - now).abs();
+    let text = if d < 60 {
+        format!("{d}s")
+    } else if d < 3_600 {
+        format!("{}m", d / 60)
+    } else if d < 86_400 {
+        format!("{}h", d / 3_600)
+    } else {
+        format!("{}d", d / 86_400)
+    };
+    if fire_at > now {
+        format!("in {text}")
+    } else {
+        format!("{text} ago")
+    }
+}
+
 fn jobs_action(app: &mut App, ui: &mut egui::Ui) {
     if app.jobs.is_empty() {
         return;
@@ -373,12 +502,32 @@ fn jobs_action(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let jobs = app.jobs.clone();
+    // One row per job — `[id] [status] [duration]` over the command — a
+    // pick shows its output; then one Kill per running job (dsh keeps Kill
+    // a row action, so one job can be stopped while the rest run on), and
+    // the bulk kill last.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let running_ids: Vec<String> = jobs.iter().filter(|j| j.running).map(|j| j.id.clone()).collect();
     let items: Vec<kit::MenuItem> = jobs
         .iter()
         .map(|j| {
-            kit::MenuItem::new(format!("{} · {}", j.id, j.status))
+            let age = if j.started_at > 0 { (now_ms - j.started_at).max(0) / 1000 } else { 0 };
+            let duration = if age >= 3600 {
+                format!("{}h {}m", age / 3600, (age % 3600) / 60)
+            } else if age >= 60 {
+                format!("{}m {}s", age / 60, age % 60)
+            } else {
+                format!("{age}s")
+            };
+            let status = if j.status == "killed" { "cancelled".to_string() } else { j.status.clone() };
+            kit::MenuItem::new(format!("{} · {status} · {duration}", j.id))
                 .detail(kit::one_line(&j.command, 60))
         })
+        .chain(running_ids.iter().enumerate().map(|(k, id)| {
+            kit::MenuItem::new(format!("Kill {id}"))
+                .danger(true)
+                .sep_above(k == 0)
+        }))
         .chain(std::iter::once(
             kit::MenuItem::new("Kill the running jobs")
                 .danger(true)
@@ -406,6 +555,12 @@ fn jobs_action(app: &mut App, ui: &mut egui::Ui) {
                 session_id,
                 name: "job-output".into(),
                 input: jobs[i].id.clone(),
+            }));
+        } else if let Some(id) = running_ids.get(i - jobs.len()) {
+            app.send(UiCommand::SendRequest(protocol::Request::RunCommand {
+                session_id,
+                name: "job-kill".into(),
+                input: id.clone(),
             }));
         } else {
             for j in jobs.iter().filter(|j| j.running) {
