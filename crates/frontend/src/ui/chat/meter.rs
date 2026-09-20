@@ -108,8 +108,10 @@ fn panel(
                 kit::footnote(
                     ui,
                     &format!(
-                        "{pct}% of the {budget}-token prompt budget · compaction fires at {}%",
-                        protocol::COMPACT_TRIGGER_PCT
+                        "{pct}% of the {budget}-token prompt budget · compaction fires at {}% \
+                         · hard ceiling {}% of the window",
+                        protocol::COMPACT_TRIGGER_PCT,
+                        protocol::CONTEXT_CEILING_PCT,
                     ),
                 );
                 ui.add_space(8.0);

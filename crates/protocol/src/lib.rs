@@ -17,6 +17,17 @@ pub const PROTOCOL_VERSION: u32 = 29;
 /// against when it has not been told otherwise.
 pub const COMPACT_TRIGGER_PCT: u32 = 80;
 
+/// Hard ceiling, as a percent of the server's *context window*, that the
+/// assembled prompt is never allowed to reach: at this occupancy the backend
+/// compacts before sending, whatever [`CompactPolicy::threshold_pct`] says.
+/// The policy threshold is a share of the prompt *budget* (window minus the
+/// reply reserve) and is tunable; this one is the safety line above it and
+/// is not. The window itself is what the server reported at connect time
+/// (llama.cpp `/props`, then `/v1/models`) unless the provider TOML pins one,
+/// and it is corrected downwards when the server refuses a prompt as too
+/// long and names its real limit.
+pub const CONTEXT_CEILING_PCT: u32 = 95;
+
 /// Compaction policy knobs sent with `ConnectLlm`. Mirrors dsh's per-routed-
 /// model compaction config: trigger early enough to leave room for the reply,
 /// keep a verbatim tail, cap the summary, and retry once on a bad summary.

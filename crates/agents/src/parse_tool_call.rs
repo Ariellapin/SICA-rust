@@ -30,6 +30,13 @@
 //! write a `write-file` body with real newlines rather than the `\n` escape
 //! above. See [`parse_multiline`] for the shape and the guard that keeps it
 //! from swallowing prose.
+//!
+//! Hermes-style chat templates (Qwen 3.x among them) train the model to wrap
+//! a call in `<tool_call>` … `</tool_call>` with a `<function=name>` opener.
+//! Under the text protocol the model then mixes the two: the wrapper from
+//! its training data around this contract's line. [`unwrap_xml_call`]
+//! strips the wrapper before the scan, and a `{"name": …, "arguments": …}`
+//! body inside the envelope is read like the JSON fence (`sessions/84`).
 
 // `Eq` is not derived because `serde_json::Value` only implements `PartialEq`
 // (`f64` inside `Value::Number` rules out total equality).
@@ -68,8 +75,19 @@ pub fn extract(text: &str) -> Option<ToolCall> {
 /// model's intent to call a tool is unambiguous, so an unknown name should
 /// surface as an "unknown skill" error the model can correct.
 pub fn extract_known(text: &str, is_known: impl Fn(&str) -> bool) -> Option<ToolCall> {
+    let wrapped = has_xml_wrapper(text);
+    let text = unwrap_xml_call(text);
+    let text = text.as_ref();
     if let Some(tc) = extract_json_fence(text) {
         return Some(tc);
+    }
+    if wrapped {
+        // The envelope makes the intent unambiguous, so a JSON body inside
+        // it is read even without a fence — but only inside it, so a stray
+        // `{` in prose never becomes a call.
+        if let Some(tc) = extract_json_envelope(text) {
+            return Some(tc);
+        }
     }
     let mut offset = 0usize;
     for line in text.split('\n') {
@@ -100,7 +118,7 @@ pub fn extract_known(text: &str, is_known: impl Fn(&str) -> bool) -> Option<Tool
 /// conservative: the explicit ```tool_call fence, and the OpenAI-ish
 /// `"skill": … "args": …` JSON pair.
 pub fn looks_like_attempt(text: &str) -> bool {
-    if text.contains("```tool_call") {
+    if text.contains("```tool_call") || has_xml_wrapper(text) {
         return true;
     }
     let has_skill_key = text.contains("\"skill\"") || text.contains("'skill'");
@@ -118,6 +136,9 @@ pub fn looks_like_attempt(text: &str) -> bool {
 /// quote or a `>`, so prose like "read-file is the skill you want" is not
 /// mistaken for a botched call.
 pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<String> {
+    let wrapped = has_xml_wrapper(text);
+    let text = unwrap_xml_call(text);
+    let text = text.as_ref();
     if text.contains("```tool_call") {
         return Some(
             "a ```tool_call fence whose body the parser could not read \
@@ -148,6 +169,14 @@ pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<S
         return Some(format!(
             "a `{name}` line whose arguments are not correctly quoted"
         ));
+    }
+    if wrapped {
+        return Some(
+            "a `<tool_call>` / `<function=…>` wrapper whose call the parser \
+             could not read (the skill name and its quoted arguments belong \
+             on one line, followed by ` > <expectation>`)"
+                .into(),
+        );
     }
     if looks_like_attempt(text) {
         return Some(
@@ -186,11 +215,21 @@ fn extract_json_fence(text: &str) -> Option<ToolCall> {
 fn parse_json_body(body: &str) -> Option<ToolCall> {
     let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
     let obj = value.as_object()?;
-    let skill = obj.get("skill")?.as_str()?.to_string();
+    // `name` / `arguments` are the OpenAI and Hermes spellings of the same
+    // pair; a model that wraps the call in `<tool_call>` uses those.
+    let skill = obj
+        .get("skill")
+        .or_else(|| obj.get("name"))?
+        .as_str()?
+        .to_string();
     if !is_valid_skill_name(&skill) {
         return None;
     }
-    let args = obj.get("args").cloned().unwrap_or(serde_json::Value::Null);
+    let args = obj
+        .get("args")
+        .or_else(|| obj.get("arguments"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let expectation = obj
         .get("expectation")
         .and_then(|v| v.as_str())
@@ -238,6 +277,108 @@ fn strip_fence_indent(line: &str) -> &str {
     } else {
         trimmed
     }
+}
+
+/// One recognised piece of the Hermes / Qwen wrapper.
+enum XmlTag<'a> {
+    /// `<tool_call>` or `</tool_call>`.
+    Envelope,
+    /// `<function=name>`: the skill name it carries.
+    FunctionOpen(&'a str),
+    /// `</function>`.
+    FunctionClose,
+}
+
+/// Recognise a wrapper tag starting at byte `at` of `text` (which must be a
+/// `<`). Returns the tag and the byte offset just past its `>`. Whitespace
+/// inside the angle brackets is tolerated — chat surfaces sometimes insert
+/// it when the text is pasted back.
+fn xml_tag_at(text: &str, at: usize) -> Option<(XmlTag<'_>, usize)> {
+    let s = text.get(at..)?;
+    let mut s = s.strip_prefix('<')?.trim_start();
+    let closing = if let Some(r) = s.strip_prefix('/') {
+        s = r.trim_start();
+        true
+    } else {
+        false
+    };
+    let word_end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    let word = &s[..word_end];
+    let rest = s[word_end..].trim_start();
+    let consumed = |rest_after: &str| text.len() - rest_after.len();
+    if word.eq_ignore_ascii_case("tool_call") {
+        let r = rest.strip_prefix('>')?;
+        return Some((XmlTag::Envelope, consumed(r)));
+    }
+    if !word.eq_ignore_ascii_case("function") {
+        return None;
+    }
+    if closing {
+        let r = rest.strip_prefix('>')?;
+        return Some((XmlTag::FunctionClose, consumed(r)));
+    }
+    let after_eq = rest.strip_prefix('=')?.trim_start();
+    let name_end = after_eq
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '<')
+        .unwrap_or(after_eq.len());
+    let name = &after_eq[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let r = after_eq[name_end..].trim_start().strip_prefix('>')?;
+    Some((XmlTag::FunctionOpen(name), consumed(r)))
+}
+
+/// True when `text` carries the `<tool_call>` envelope or a
+/// `<function=name>` opener anywhere.
+pub fn has_xml_wrapper(text: &str) -> bool {
+    text.match_indices('<').any(|(i, _)| xml_tag_at(text, i).is_some())
+}
+
+/// Strip the Hermes / Qwen wrapper so the contract's line scan sees
+/// `read-file 'x' > expectation` where the model wrote
+/// `<tool_call>\n<function=read-file> 'x' > expectation\n</function>\n</tool_call>`.
+/// Envelope and closing tags become line breaks, a `<function=name>` opener
+/// becomes the bare name. Text without a wrapper is returned untouched.
+pub fn unwrap_xml_call(text: &str) -> std::borrow::Cow<'_, str> {
+    if !has_xml_wrapper(text) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text.as_bytes()[i] == b'<' {
+            if let Some((tag, end)) = xml_tag_at(text, i) {
+                match tag {
+                    XmlTag::Envelope | XmlTag::FunctionClose => out.push('\n'),
+                    XmlTag::FunctionOpen(name) => {
+                        out.push_str(name);
+                        out.push(' ');
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Read a `{ "name": …, "arguments": … }` body that sat inside a
+/// `<tool_call>` envelope: the first `{` to the last `}` of the unwrapped
+/// text. Only called when the envelope was present.
+fn extract_json_envelope(text: &str) -> Option<ToolCall> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    parse_json_body(&text[start..=end])
 }
 
 fn parse_line(line: &str) -> Option<ToolCall> {
@@ -607,6 +748,59 @@ mod tests {
         // raw_args mirrors the JSON's *values* for the UI preview.
         assert_eq!(tc.raw_args, vec!["curl example.com".to_string()]);
         assert_eq!(tc.expectation, "");
+    }
+
+    /// The exact shape session 84 recorded from Qwen 3.6 under the text
+    /// protocol: the contract's line inside the Hermes wrapper.
+    #[test]
+    fn unwraps_qwen_function_wrapper() {
+        let s = "I'll investigate.\n\n<tool_call>\n<function=read-file> 'src/Utils/OutputMetadataTracker.cs' > understand how the metadata DB is read\n</function>\n</tool_call>";
+        let tc = extract_known(s, |n| n == "read-file").unwrap();
+        assert_eq!(tc.skill, "read-file");
+        assert_eq!(tc.raw_args, vec!["src/Utils/OutputMetadataTracker.cs".to_string()]);
+        assert_eq!(tc.expectation, "understand how the metadata DB is read");
+    }
+
+    /// Same wrapper on one line, no `</function>`, and spaces inside the
+    /// angle brackets — the shape the operator pasted back from the GUI.
+    #[test]
+    fn unwraps_single_line_wrapper_with_spaces() {
+        let s = "< tool_call> < function=read-file> 'src/x.cs' > where the file lives  </tool_call>";
+        let tc = extract_known(s, |n| n == "read-file").unwrap();
+        assert_eq!(tc.skill, "read-file");
+        assert_eq!(tc.raw_args, vec!["src/x.cs".to_string()]);
+        assert_eq!(tc.expectation, "where the file lives");
+    }
+
+    /// The pure Hermes shape: a JSON body with `name`/`arguments` inside
+    /// the envelope, no fence.
+    #[test]
+    fn reads_hermes_json_envelope() {
+        let s = "<tool_call>\n{\"name\": \"read-file\", \"arguments\": {\"path\": \"a.md\"}}\n</tool_call>";
+        let tc = extract_known(s, |n| n == "read-file").unwrap();
+        assert_eq!(tc.skill, "read-file");
+        assert_eq!(tc.args_json.unwrap()["path"], "a.md");
+    }
+
+    /// A wrapper whose body still does not parse is reported as an attempt,
+    /// not passed off as prose.
+    #[test]
+    fn wrapper_with_parameter_tags_is_a_rejected_attempt() {
+        let s = "<tool_call>\n<function=read-file>\n<parameter=path>a.md</parameter>\n</function>\n</tool_call>";
+        assert!(extract_known(s, |n| n == "read-file").is_none());
+        assert!(looks_like_attempt(s));
+        let why = rejected_attempt(s, |n| n == "read-file").unwrap();
+        assert!(why.contains("<tool_call>"), "{why}");
+    }
+
+    /// Angle brackets in prose are not a wrapper.
+    #[test]
+    fn plain_angle_brackets_are_not_a_wrapper() {
+        let s = "Use <path> as the argument, and a < b holds for these.";
+        assert!(!has_xml_wrapper(s));
+        assert!(matches!(unwrap_xml_call(s), std::borrow::Cow::Borrowed(_)));
+        assert!(extract(s).is_none());
+        assert!(rejected_attempt(s, |_| true).is_none());
     }
 
     #[test]

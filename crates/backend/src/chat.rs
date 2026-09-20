@@ -1022,6 +1022,34 @@ fn parse_session_refs(text: &str) -> Vec<u64> {
 /// Fallback prompt window when neither the user nor the server reports one.
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 24_000;
 
+/// Overflow recoveries per step. Each one compacts (and, when the server
+/// did not name its real window, shrinks the prompt budget by
+/// [`OVERFLOW_SHRINK_STEP_PCT`]) and re-sends; after this many the step
+/// fails visibly instead of paying for a fourth refused request.
+const MAX_OVERFLOW_RETRIES: u32 = 3;
+
+/// How much of the prompt budget each unexplained overflow gives up. The
+/// heuristic tokenizer under-prices some content (dense code, CJK text,
+/// long tool schemas) by up to 20 %; three steps of this cover that and
+/// more.
+const OVERFLOW_SHRINK_STEP_PCT: u32 = 10;
+
+/// Has the prompt reached the hard ceiling (guide: 95 % of the server's
+/// window)? Independent of the policy threshold, which is a share of the
+/// smaller *budget* — see [`protocol::CONTEXT_CEILING_PCT`].
+fn at_ceiling(tokens: u32, window: u32) -> bool {
+    u64::from(tokens) * 100 >= u64::from(window) * u64::from(protocol::CONTEXT_CEILING_PCT)
+}
+
+/// The prompt budget for one request: the window minus the reply reserve,
+/// then minus whatever share overflow recoveries have given up this turn.
+/// Never below 1024 so a tiny window still carries a request.
+fn prompt_budget(window: u32, reserve: u32, shrink_pct: u32) -> u32 {
+    let base = u64::from(window.saturating_sub(reserve));
+    let scaled = base * u64::from(100u32.saturating_sub(shrink_pct.min(90))) / 100;
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(1024)
+}
+
 impl ChatHub {
     pub fn new(
         out_tx: mpsc::UnboundedSender<Frame>,
@@ -2131,6 +2159,7 @@ impl ChatHub {
             &client,
             &self.event_sink,
             budget,
+            window,
             &compact_policy,
             &wh,
             tool_mode.native(),
@@ -2741,18 +2770,29 @@ available: {}  (`/agent off` clears)", names.join(", "))
         // itself only reaches the two places that narrow the catalogue.
         let native_tools = tool_mode.native();
         let model_name = client.model.clone();
-        let window = self.context_window.load(Ordering::Relaxed);
+        let mut window = self.context_window.load(Ordering::Relaxed);
         // The options half of the request envelope. Snapshotted per turn
         // like the rest: a mid-turn settings change reaches the next turn,
-        // and the envelope must describe the request that was sent.
-        let envelope_options = {
+        // and the envelope must describe the request that was sent. Only
+        // an overflow recovery that learns a smaller window rewrites it.
+        let mut envelope_options = {
             let opts = self.llm_opts.lock().await;
             envelope_options_json(&model_name, &opts, window)
         };
         tokio::spawn(async move {
             let mut hops: u8 = 0;
+            // A reply shaped like a tool call that the parser rejects buys one
+            // `SYNTAX_CORRECTION` round per turn, as in the subagent runner;
+            // a second miscall is accepted as the (unverified) answer.
+            let mut syntax_nudged = false;
             // Retry budget for the *current* step; reset once a step lands.
             let mut retries: u32 = 0;
+            // Overflow recoveries for the current step (see
+            // `MAX_OVERFLOW_RETRIES`), and the budget share given up by
+            // the ones the server did not explain. The shrink outlives
+            // the step: a tokenizer that under-priced once will again.
+            let mut overflow_retries: u32 = 0;
+            let mut budget_shrink_pct: u32 = 0;
             // Why the loop ended, for the durable `TurnEnd`. An interrupt is
             // detected from the token after the loop.
             let mut finish = "done";
@@ -2859,9 +2899,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 };
 
                 // Prompt budget: window minus room for the response (and a
-                // small safety margin for template overhead).
+                // small safety margin for template overhead), less any
+                // share an unexplained overflow gave up this turn.
                 let reserve = opt_max_tokens.unwrap_or(4096).saturating_add(512);
-                let budget = window.saturating_sub(reserve).max(1024);
+                let budget = prompt_budget(window, reserve, budget_shrink_pct);
 
                 // Auto-compaction. Once the assembled prompt fills the
                 // policy's threshold share of that budget, fold the older
@@ -2882,11 +2923,15 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     .get(&session_id)
                     .and_then(|m| m.estimate(wh.envelope, &wh.entries));
                 let prompt_tokens = anchored.unwrap_or(heuristic);
+                // Two triggers: the policy's share of the budget, and the
+                // hard ceiling on the window itself, which no policy
+                // setting can push the prompt past.
                 let over = u64::from(prompt_tokens) * 100
-                    >= u64::from(budget) * u64::from(compact_policy.threshold_pct);
+                    >= u64::from(budget) * u64::from(compact_policy.threshold_pct)
+                    || at_ceiling(prompt_tokens, window);
                 if over
                     && compact_session(
-                        &sessions_map, session_id, &client, &event_sink, budget,
+                        &sessions_map, session_id, &client, &event_sink, budget, window,
                         &compact_policy, &wh, native_tools, &cancel,
                     )
                     .await
@@ -2933,8 +2978,11 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 record_envelope(&sessions_map, session_id, &wh, &envelope_options).await;
 
                 // The trimmer's "context notice" marker is wire-only: it is
-                // inserted here and never enters the log.
-                let trimmed = agents::context::trim_to_budget(wh.messages, budget);
+                // inserted here and never enters the log. The messages are
+                // taken, not moved, so `wh` stays whole for an overflow
+                // recovery below (which reads its envelope, not its wire).
+                let trimmed =
+                    agents::context::trim_to_budget(std::mem::take(&mut wh.messages), budget);
                 if trimmed.dropped > 0 {
                     event_sink.emit(Event::LogLine {
                         level: "WARN".into(),
@@ -3021,6 +3069,92 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     None => None,
                 };
                 if let Some(failure) = failure {
+                    // The server refused the prompt as too long. The
+                    // request that failed persisted nothing, so the loop
+                    // can shrink the history and rebuild: learn the real
+                    // window when the refusal names it (or the server
+                    // reports one now), force a compaction against the
+                    // corrected budget, and re-enter the step. dsh's
+                    // `context-overflow` trigger (guide §9.1, §4.2).
+                    if failure.is_context_overflow() && overflow_retries < MAX_OVERFLOW_RETRIES {
+                        overflow_retries += 1;
+                        let named = failure.context_limit();
+                        let probed = if named.is_some() || client.replay().is_some() {
+                            None
+                        } else {
+                            client.detect_context_window().await
+                        };
+                        // Only a *smaller* window explains the refusal; a
+                        // larger report means the prompt was under-priced,
+                        // which the shrink below covers.
+                        let learned = named.or(probed).filter(|&n| n > 0 && n < window);
+                        let how = match learned {
+                            Some(n) => {
+                                let was = window;
+                                window = n;
+                                hub.context_window.store(n, Ordering::Relaxed);
+                                hub.set_llm_state(LlmState::Ready {
+                                    model: model_name.clone(),
+                                    context_window: n,
+                                })
+                                .await;
+                                envelope_options = {
+                                    let opts = hub.llm_opts.lock().await;
+                                    envelope_options_json(&model_name, &opts, n)
+                                };
+                                format!("the server's window is {n} tokens (was {was}) — adopting it")
+                            }
+                            None => {
+                                budget_shrink_pct = budget_shrink_pct
+                                    .saturating_add(OVERFLOW_SHRINK_STEP_PCT)
+                                    .min(90);
+                                format!(
+                                    "the server did not name its limit — prompt budget \
+                                     reduced by {budget_shrink_pct}% for this turn"
+                                )
+                            }
+                        };
+                        let budget = prompt_budget(window, reserve, budget_shrink_pct);
+                        let compacted = compact_session(
+                            &sessions_map, session_id, &client, &event_sink, budget, window,
+                            &compact_policy, &wh, native_tools, &cancel,
+                        )
+                        .await;
+                        let msg = format!(
+                            "context: the server rejected the prompt as too long — {how}; {} \
+                             and retrying ({overflow_retries}/{MAX_OVERFLOW_RETRIES})",
+                            if compacted { "history compacted" } else { "nothing left to fold, trimming" },
+                        );
+                        warn!(session_id, turn_id, "{msg}");
+                        event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg });
+                        let reason = format!("context overflow — {}", one_line(failure.reason(), 160));
+                        event_sink.emit(Event::LlmRetry {
+                            session_id,
+                            attempt:  overflow_retries,
+                            max:      MAX_OVERFLOW_RETRIES,
+                            delay_ms: 0,
+                            reason:   reason.clone(),
+                        });
+                        append_event(&sessions_map, session_id, EventKind::LlmRetry {
+                            attempt: overflow_retries,
+                            max: MAX_OVERFLOW_RETRIES,
+                            delay_ms: 0,
+                            reason,
+                        })
+                        .await;
+                        continue;
+                    }
+                    if failure.is_context_overflow() {
+                        let msg = format!(
+                            "LLM request failed ({}) — the prompt still does not fit the \
+                             {window}-token window after {overflow_retries} compaction(s)",
+                            one_line(failure.reason(), 200)
+                        );
+                        warn!(session_id, turn_id, "{msg}");
+                        event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg });
+                        finish = "error";
+                        break;
+                    }
                     if (failure.is_retryable() || retry_always) && retries < llm::retry::RETRY_MAX {
                         retries += 1;
                         // A `Retry-After` the server sent wins over the
@@ -3086,6 +3220,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     break;
                 }
                 retries = 0;
+                overflow_retries = 0;
 
                 // Anchor the usage meter on the provider's own count for
                 // this exact envelope — the next request prices only what
@@ -3110,6 +3245,22 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 if let Some(u) = out.usage.as_ref() {
                     turn_prompt = turn_prompt.saturating_add(u.prompt_tokens);
                     turn_completion = turn_completion.saturating_add(u.completion_tokens);
+                    // The provider's own count of what this exchange
+                    // occupies. Past the ceiling, the next hop's meter
+                    // (anchored on exactly this number) trips the
+                    // compaction before anything else is sent; say so now
+                    // so the operator is not surprised by it.
+                    let used = u.prompt_tokens.saturating_add(u.completion_tokens);
+                    if at_ceiling(used, window) {
+                        let pct = u64::from(used) * 100 / u64::from(window.max(1));
+                        event_sink.emit(Event::LogLine {
+                            level: "WARN".into(),
+                            message: format!(
+                                "context: {used} of the {window}-token window in use ({pct}%) — \
+                                 older history will be compacted before the next request"
+                            ),
+                        });
+                    }
                 }
                 turn_reasoning = turn_reasoning.saturating_add(out.reasoning.len() as u32);
                 if turn_ttft_ms == 0 {
@@ -3243,15 +3394,33 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         &out.content,
                         |name| skills.by_name.contains_key(name),
                     ) {
+                        let retrying = !syntax_nudged && hops < MAX_TOOL_HOPS;
                         let msg = format!(
-                            "assistant emitted {reason} — no skill ran, so treat \
-                             its reply as unverified"
+                            "assistant emitted {reason} — no skill ran; {}",
+                            if retrying {
+                                "asking it to retry with the correct syntax"
+                            } else {
+                                "treat its reply as unverified"
+                            }
                         );
                         warn!(session_id, "{msg}");
                         event_sink.emit(Event::LogLine {
                             level:   "WARN".into(),
                             message: msg,
                         });
+                        if retrying {
+                            // The correction rides the derived history like
+                            // a loop-guard notice (guide §3.3): durable, and
+                            // a user-role message on the wire.
+                            syntax_nudged = true;
+                            append_event(&sessions_map, session_id, EventKind::ContextInjected {
+                                surface: SurfaceOp::Append,
+                                source:  ContextSource::ToolNotice,
+                                content: agents::runner::SYNTAX_CORRECTION.to_string(),
+                            })
+                            .await;
+                            continue;
+                        }
                     }
                     break;
                 };
@@ -3426,13 +3595,27 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 };
                 // No human turn behind this one means nothing to check
                 // against; the verdict would be auditing the machine's own
-                // prompt. `check` returning `None` (no connection, timeout,
-                // unparseable reply) lands here too and ends the turn as it
-                // would have ended anyway.
+                // prompt. A failed check (no connection, timeout, no
+                // verdict in the reply) ends the turn as it would have
+                // ended anyway — but says so, because an idle session with
+                // no line explaining the stop is the failure this check
+                // exists to remove.
                 let v = if objective.is_empty() {
                     None
                 } else {
-                    verdict::check(&client, &objective, finish, &digest).await
+                    match verdict::check(&client, &objective, finish, &digest).await {
+                        Ok(v) => Some(v),
+                        Err(why) => {
+                            event_sink.emit(Event::LogLine {
+                                level:   "WARN".into(),
+                                message: format!(
+                                    "turn {outer_turn} stopped ({finish}) and the completion \
+                                     check failed: {why} · say `continue` to resume"
+                                ),
+                            });
+                            None
+                        }
+                    }
                 };
                 if let Some(v) = v {
                     append_event(&sessions_map, session_id, EventKind::TurnVerdict {
@@ -4146,6 +4329,7 @@ async fn compact_session(
     client: &LlmClient,
     events: &Arc<dyn EventSink>,
     budget: u32,
+    window: u32,
     policy: &protocol::CompactPolicy,
     wh: &WireHistory,
     native_tools: bool,
@@ -4175,8 +4359,12 @@ async fn compact_session(
         let entries = log.derive_surface();
         let snapshot: Vec<Message> = entries.iter().map(|e| e.message.clone()).collect();
         // Enough on its own? Then the summariser round-trip is not needed.
+        // Both triggers have to be clear — the policy's share of the
+        // budget and the hard ceiling on the window.
         let tokens = agents::compact::approx_total(&snapshot).saturating_add(overhead);
-        if u64::from(tokens) * 100 < u64::from(budget) * u64::from(policy.threshold_pct) {
+        if u64::from(tokens) * 100 < u64::from(budget) * u64::from(policy.threshold_pct)
+            && !at_ceiling(tokens, window)
+        {
             events.emit(Event::ContextCompacted {
                 session_id,
                 ok: true,
@@ -5121,6 +5309,50 @@ mod tests {
 
     fn registry() -> SkillRegistry {
         SkillRegistry::new()
+    }
+
+    /// The hard ceiling is a share of the window and nothing else: 95 %
+    /// exactly is over, one token under is not, and a zero window never
+    /// divides.
+    #[test]
+    fn ceiling_is_ninety_five_percent_of_the_window() {
+        assert!(at_ceiling(950, 1000));
+        assert!(at_ceiling(1000, 1000));
+        assert!(!at_ceiling(949, 1000));
+        assert!(!at_ceiling(0, 1000));
+        assert!(at_ceiling(0, 0));
+        // Large windows do not overflow the arithmetic.
+        assert!(at_ceiling(u32::MAX - 1, u32::MAX));
+        assert!(!at_ceiling(1_000_000, 1_048_576 * 4));
+    }
+
+    /// The budget is the window minus the reply reserve, scaled down by
+    /// whatever share overflow recoveries gave up, never below the floor.
+    #[test]
+    fn prompt_budget_reserves_then_shrinks_then_floors() {
+        assert_eq!(prompt_budget(24_000, 4_608, 0), 19_392);
+        assert_eq!(prompt_budget(24_000, 4_608, 10), 17_452);
+        assert_eq!(prompt_budget(24_000, 4_608, 30), 13_574);
+        // The shrink is capped so a runaway never empties the budget.
+        assert_eq!(prompt_budget(24_000, 4_608, 100), prompt_budget(24_000, 4_608, 90));
+        // A reserve larger than the window floors instead of underflowing.
+        assert_eq!(prompt_budget(2_000, 4_608, 0), 1024);
+        assert_eq!(prompt_budget(4_000, 100, 90), 1024);
+    }
+
+    /// The policy trigger and the ceiling are independent: a 99 % policy
+    /// on a big window with a small reserve would otherwise let the
+    /// prompt past 95 % of the window before compacting.
+    #[test]
+    fn the_ceiling_fires_where_a_lax_policy_would_not() {
+        let window = 131_072;
+        let reserve = 1_024 + 512;
+        let budget = prompt_budget(window, reserve, 0);
+        let policy_pct = 99u64;
+        let prompt = 125_000; // 95.4 % of the window
+        let policy_over = u64::from(prompt) * 100 >= u64::from(budget) * policy_pct;
+        assert!(!policy_over, "the policy alone lets this through");
+        assert!(at_ceiling(prompt, window), "the ceiling catches it");
     }
 
     /// The ordering rule `start_turn` depends on when re-running an edited

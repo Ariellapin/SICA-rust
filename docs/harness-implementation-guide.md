@@ -528,6 +528,20 @@ classifications too, up to the same budget — dsh's `retry: { mode: always }`
 for unattended runs. `retry` is exercised over a real socket by the mock
 server tests (§14.2), not unit-tested only.
 
+**Context overflow (2026-09-20)** closed the last classification gap:
+`Failure::ContextOverflow { reason, limit }`. `chat_stream` keeps the body
+of an error status as an `HTTP <code>: <excerpt>` context (one line, 400
+chars), `classify` judges the wording before the status split
+(`is_context_overflow_text`: llama.cpp `exceed_context_size_error`, vLLM /
+OpenAI `context_length_exceeded` and "maximum context length is N tokens",
+Anthropic-style "prompt is too long: … > N maximum"), and `context_limit_in`
+reads the window the refusal names. The loop's handling — adopt the smaller
+window, force-compact, re-enter the step, three times per step, else shrink
+the budget 10 % per attempt — is dsh's `context-overflow` compaction trigger
+(§9.1), and `protocol::CONTEXT_CEILING_PCT` (95 % of the window) is the
+pre-request guard above the tunable policy threshold. See
+`docs/notes/2026-09-20-context-ceiling-and-overflow-recovery.md`.
+
 ### 4.3 `dsh-token-meter` — usage-anchored baseline + delta — **done** (Wave 2)
 
 **Shipped as** `agents::meter::TokenMeter`, one per session on `ChatHub`,

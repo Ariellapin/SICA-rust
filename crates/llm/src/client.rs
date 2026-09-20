@@ -165,6 +165,30 @@ impl ModelEntry {
     }
 }
 
+/// One line of an error body, whitespace collapsed, capped at
+/// [`BODY_EXCERPT_CHARS`] characters. Enough for the operator to read the
+/// provider's reason and for the classifier to recognise it; never a
+/// multi-kilobyte HTML error page in a log line.
+const BODY_EXCERPT_CHARS: usize = 400;
+
+fn body_excerpt(body: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = true;
+    for c in body.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if c == ' ' && last_space {
+            continue;
+        }
+        last_space = c == ' ';
+        out.push(c);
+        if out.chars().count() >= BODY_EXCERPT_CHARS {
+            out.push('…');
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
 impl LlmClient {
     pub fn new(
         base_url: impl Into<String>,
@@ -347,13 +371,27 @@ impl LlmClient {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
-        let resp = match resp.error_for_status() {
-            Ok(r) => r,
+        // An error status keeps the `reqwest` error (its status code is
+        // what `retry::classify` keys on) and carries an excerpt of the
+        // body as context. The body is the only place a provider says
+        // *why* a 400 happened — and "the prompt did not fit the context"
+        // is the one 400 the loop can recover from, by compacting.
+        let resp = match resp.error_for_status_ref() {
+            Ok(_) => resp,
             Err(e) => {
-                return Err(match retry_after {
-                    Some(secs) => anyhow::Error::from(e).context(format!("retry-after={secs}")),
-                    None => e.into(),
-                });
+                let code = e.status().map(|s| s.as_u16()).unwrap_or(0);
+                let body = resp.text().await.unwrap_or_default();
+                let excerpt = body_excerpt(&body);
+                let mut err = anyhow::Error::from(e);
+                err = if excerpt.is_empty() {
+                    err.context(format!("HTTP {code}"))
+                } else {
+                    err.context(format!("HTTP {code}: {excerpt}"))
+                };
+                if let Some(secs) = retry_after {
+                    err = err.context(format!("retry-after={secs}"));
+                }
+                return Err(err);
             }
         };
 

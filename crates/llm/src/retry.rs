@@ -20,9 +20,16 @@ pub enum Failure {
     /// Worth another attempt: transport dropped, server overloaded/broken,
     /// stream cut mid-way, or the server answered with nothing at all.
     Retryable(String),
-    /// Retrying would reproduce the same answer: bad request (typically a
-    /// prompt over the context limit), auth, unknown model.
+    /// Retrying would reproduce the same answer: bad request, auth,
+    /// unknown model.
     Fatal(String),
+    /// The prompt did not fit the server's context window. Repeating the
+    /// request reproduces the refusal; *shrinking* it does not — the loop
+    /// compacts the history and tries again. `limit` is the window the
+    /// server named in its message, when it named one (vLLM's "maximum
+    /// context length is N tokens", llama.cpp's `"n_ctx":N`), so the
+    /// loop can adopt the real number instead of guessing.
+    ContextOverflow { reason: String, limit: Option<u32> },
 }
 
 impl Failure {
@@ -30,11 +37,78 @@ impl Failure {
         matches!(self, Failure::Retryable(_))
     }
 
+    /// The request has to be made smaller before it can succeed.
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Failure::ContextOverflow { .. })
+    }
+
+    /// The context window the provider named in an overflow refusal.
+    pub fn context_limit(&self) -> Option<u32> {
+        match self {
+            Failure::ContextOverflow { limit, .. } => *limit,
+            _ => None,
+        }
+    }
+
     pub fn reason(&self) -> &str {
         match self {
             Failure::Retryable(r) | Failure::Fatal(r) => r,
+            Failure::ContextOverflow { reason, .. } => reason,
         }
     }
+}
+
+/// Does an error text say the prompt did not fit the context? Matched on
+/// the provider's own wording — llama.cpp's `exceed_context_size_error`
+/// / "exceeds the available context size", vLLM's and OpenAI's
+/// `context_length_exceeded` / "maximum context length is N tokens",
+/// Anthropic-compatible "prompt is too long", and the generic "context …
+/// exceeded / too long / too large / too many tokens" family.
+pub fn is_context_overflow_text(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    if t.contains("context_length_exceeded")
+        || t.contains("exceed_context_size")
+        || t.contains("prompt is too long")
+        || t.contains("reduce the length of the messages")
+        || t.contains("too many tokens")
+    {
+        return true;
+    }
+    (t.contains("context length") || t.contains("context size") || t.contains("context window"))
+        && (t.contains("exceed") || t.contains("too long") || t.contains("too large")
+            || t.contains("maximum") || t.contains("larger than") || t.contains("greater than"))
+}
+
+/// The window an overflow refusal names, if it names one. Reads the first
+/// number after any of a few provider phrasings; the *requested* size
+/// (vLLM's "However, you requested N tokens") comes later in the message
+/// and is never picked up.
+pub fn context_limit_in(text: &str) -> Option<u32> {
+    let t = text.to_ascii_lowercase();
+    const KEYS: &[&str] = &[
+        "\"n_ctx\"",
+        "maximum context length is",
+        "maximum context length of",
+        "context length is",
+        "context length of",
+        "context window of",
+        "context window is",
+        "context size of",
+        "context size is",
+        "tokens >",
+    ];
+    KEYS.iter()
+        .find_map(|k| number_after(&t, k))
+        .filter(|&n| n >= 512)
+}
+
+/// The first run of digits after `key`, skipping the punctuation and
+/// filler between (`": `, ` is `, ` `).
+fn number_after(text: &str, key: &str) -> Option<u32> {
+    let idx = text.find(key)? + key.len();
+    let rest = text[idx..].trim_start_matches(|c: char| !c.is_ascii_digit());
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Classify a `chat_stream` error. `reqwest` errors are inspected directly
@@ -42,6 +116,14 @@ impl Failure {
 /// by the message prefixes `client.rs` uses.
 pub fn classify(err: &anyhow::Error) -> Failure {
     let text = format!("{err:#}");
+    // Judged before the status code: a context overflow *is* an HTTP 400
+    // on every provider, and it is the one 400 the loop can act on.
+    if is_context_overflow_text(&text) {
+        return Failure::ContextOverflow {
+            reason: text.clone(),
+            limit: context_limit_in(&text),
+        };
+    }
     if let Some(re) = err.downcast_ref::<reqwest::Error>() {
         if let Some(status) = re.status() {
             let code = status.as_u16();
@@ -143,5 +225,75 @@ mod tests {
     #[test]
     fn empty_response_is_retryable() {
         assert!(empty_response().is_retryable());
+    }
+
+    #[test]
+    fn vllm_overflow_names_its_limit() {
+        let err = anyhow::anyhow!(
+            "HTTP 400: {{\"object\":\"error\",\"message\":\"This model's maximum context \
+             length is 8192 tokens. However, you requested 9107 tokens (8595 in the \
+             messages, 512 in the completion). Please reduce the length of the messages \
+             or completion.\",\"type\":\"BadRequestError\",\"code\":400}}"
+        );
+        let f = classify(&err);
+        assert!(f.is_context_overflow(), "{f:?}");
+        assert!(!f.is_retryable());
+        assert_eq!(f.context_limit(), Some(8192));
+    }
+
+    #[test]
+    fn llama_cpp_overflow_names_n_ctx() {
+        let err = anyhow::anyhow!(
+            "HTTP 400: {{\"error\":{{\"code\":400,\"message\":\"the request exceeds the \
+             available context size. try increasing the context size or enable context \
+             shift\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":5210,\
+             \"n_ctx\":4096}}}}"
+        );
+        let f = classify(&err);
+        assert!(f.is_context_overflow(), "{f:?}");
+        assert_eq!(f.context_limit(), Some(4096));
+    }
+
+    #[test]
+    fn an_overflow_without_a_number_still_classifies() {
+        let err = anyhow::anyhow!(
+            "HTTP 400: {{\"error\":\"the request exceeds the available context size\"}}"
+        );
+        let f = classify(&err);
+        assert!(f.is_context_overflow(), "{f:?}");
+        assert_eq!(f.context_limit(), None);
+    }
+
+    #[test]
+    fn anthropic_style_overflow_names_the_maximum() {
+        let err = anyhow::anyhow!("HTTP 400: prompt is too long: 213000 tokens > 200000 maximum");
+        let f = classify(&err);
+        assert!(f.is_context_overflow(), "{f:?}");
+        assert_eq!(f.context_limit(), Some(200000));
+    }
+
+    #[test]
+    fn a_400_that_is_not_about_context_stays_fatal() {
+        let err = anyhow::anyhow!("HTTP 400: {{\"error\":\"your messages are malformed\"}}");
+        assert_eq!(classify(&err), Failure::Fatal(format!("{err:#}")));
+        assert!(!classify(&anyhow::anyhow!("model not found")).is_context_overflow());
+    }
+
+    #[test]
+    fn an_overflow_body_on_a_real_400_beats_the_status_split() {
+        // What `chat_stream` actually produces: the reqwest status error
+        // wrapped with the body excerpt as context.
+        let resp = http::Response::builder().status(400).body("").unwrap();
+        let inner: anyhow::Error =
+            reqwest::Response::from(resp).error_for_status().unwrap_err().into();
+        let err = inner.context("HTTP 400: maximum context length is 32768 tokens");
+        let f = classify(&err);
+        assert!(f.is_context_overflow(), "{f:?}");
+        assert_eq!(f.context_limit(), Some(32768));
+    }
+
+    #[test]
+    fn a_tiny_number_is_not_a_window() {
+        assert_eq!(context_limit_in("context length is 3 tokens"), None);
     }
 }

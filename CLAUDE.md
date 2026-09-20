@@ -78,6 +78,8 @@ Seven crates, dependency direction strictly downward. Details in
   every UI surface. Read it before restyling or adding a frontend surface.
 - [docs/deepseek-harness-ideas.md](docs/deepseek-harness-ideas.md) — the ported
   ideas catalogue, and the ones deliberately left for later.
+- [docs/remaining-work.md](docs/remaining-work.md) — what is still open after
+  Wave 10 / UI-9, with a recipe per item. Start there for the next wave.
 
 ## Before you edit
 

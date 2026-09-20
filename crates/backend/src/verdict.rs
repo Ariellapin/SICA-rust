@@ -22,8 +22,16 @@
 //!   person just cancelled would make the Stop button a lie — the same
 //!   reasoning that disarms the goal driver there.
 //! - **The check never fails a turn.** Any error — no connection, a timeout,
-//!   an unparseable reply — returns `None` and the turn ends exactly as it
-//!   would have. A broken judge must not be able to hold a session.
+//!   an unparseable reply — returns `Err` with a one-line reason, the caller
+//!   surfaces it as a WARN `LogLine`, and the turn ends exactly as it would
+//!   have. A broken judge must not be able to hold a session, and a broken
+//!   judge must not be invisible either: session 85 stopped at the hop
+//!   limit and went idle with no verdict and no line saying why.
+//!
+//! The judge runs with thinking **off**. It is a tool-less classification
+//! with a small completion cap, and a reasoning model (Qwen 3.x) given that
+//! cap otherwise spends all of it inside `<think>` and never reaches the
+//! JSON — the reply is empty and the hop-limit stop goes unaudited.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -41,8 +49,10 @@ pub const MAX_AUTO_CONTINUES: u8 = 2;
 
 /// Bytes of the objective and of the turn digest the judge is shown.
 const MAX_INPUT_BYTES: usize = 3072;
-/// Completion cap on the verdict request.
-const MAX_OUTPUT_TOKENS: u32 = 256;
+/// Completion cap on the verdict request. Thinking is disabled for the
+/// call, so this only has to hold a three-field object plus the prose a
+/// small model wraps it in.
+const MAX_OUTPUT_TOKENS: u32 = 512;
 /// Wall clock for the whole round-trip.
 const TIMEOUT: Duration = Duration::from_secs(90);
 /// Sanity cap on the accumulated reply.
@@ -184,14 +194,15 @@ pub fn digest(events: &[SessionEvent], turn_id: u64) -> String {
     sica_core::retain::utf8_head(&out, MAX_INPUT_BYTES).to_string()
 }
 
-/// Ask the connected model whether `objective` was met. `None` on any
-/// failure — the caller then ends the turn exactly as it would have.
+/// Ask the connected model whether `objective` was met. `Err` carries a
+/// one-line reason on any failure — the caller reports it and then ends
+/// the turn exactly as it would have.
 pub async fn check(
     client: &LlmClient,
     objective: &str,
     finish_reason: &str,
     digest: &str,
-) -> Option<Verdict> {
+) -> Result<Verdict, String> {
     let objective = sica_core::retain::utf8_head(objective, MAX_INPUT_BYTES);
     let prompt = format!(
         "The user asked for:\n{objective}\n\n\
@@ -205,6 +216,9 @@ pub async fn check(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut client = client.clone();
     client.max_tokens = Some(MAX_OUTPUT_TOKENS);
+    // A judge that reasons out loud never answers within the cap; see the
+    // module note. Servers that do not template the toggle ignore it.
+    client.thinking = false;
     let stream_task =
         tokio::spawn(async move { client.chat_stream(messages, None, tx, None).await });
 
@@ -220,14 +234,28 @@ pub async fn check(
     if tokio::time::timeout(TIMEOUT, collect).await.is_err() {
         warn!("completion check timed out after {}s", TIMEOUT.as_secs());
         stream_task.abort();
-        return None;
+        return Err(format!("timed out after {}s", TIMEOUT.as_secs()));
     }
     match stream_task.await {
-        Ok(Ok(())) | Ok(Err(_)) => {}
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(error = %e, "completion check request failed");
+            return Err(format!("request failed: {}", one_line(&e.to_string(), MAX_FIELD_LEN)));
+        }
         Err(e) if e.is_cancelled() => {}
         Err(e) => warn!(error = %e, "completion check task join failed"),
     }
-    parse(&buf)
+    if buf.trim().is_empty() {
+        return Err("the model returned an empty reply".into());
+    }
+    parse(&buf).ok_or_else(|| {
+        warn!(bytes = buf.len(), "completion check reply carried no verdict");
+        format!(
+            "the reply carried no `reached` verdict ({} bytes: {})",
+            buf.len(),
+            one_line(&buf, 120)
+        )
+    })
 }
 
 /// Pull the verdict object out of a model reply.

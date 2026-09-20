@@ -452,7 +452,32 @@ mod tests {
         let (res, _) = collect(&client).await;
         // A 400 is the request's fault. Retrying it is an infinite loop
         // that costs the user money and never converges.
-        assert!(!retry::classify(&res.unwrap_err()).is_retryable());
+        let f = retry::classify(&res.unwrap_err());
+        assert!(!f.is_retryable());
+        assert!(!f.is_context_overflow(), "{f:?}");
+    }
+
+    #[tokio::test]
+    async fn a_400_whose_body_names_the_context_limit_is_an_overflow() {
+        // llama.cpp's refusal, verbatim shape: the body — not the status —
+        // is what tells the loop it can compact and try again, so the
+        // client has to carry it out of `chat_stream`.
+        let server = MockServer::start(vec![Behaviour::ServerError {
+            status: 400,
+            body: r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"exceed_context_size_error","n_prompt_tokens":5210,"n_ctx":4096}}"#.into(),
+        }])
+        .await
+        .unwrap();
+        let client = LlmClient::new(&server.base_url, "mock", None);
+        let (res, _) = collect(&client).await;
+        let err = res.unwrap_err();
+        let f = retry::classify(&err);
+        assert!(f.is_context_overflow(), "{f:?}");
+        assert_eq!(f.context_limit(), Some(4096));
+        // The excerpt is on the error the operator sees, one line.
+        let text = format!("{err:#}");
+        assert!(text.contains("HTTP 400: "), "{text}");
+        assert!(text.contains("exceed_context_size_error"), "{text}");
     }
 
     #[tokio::test]
