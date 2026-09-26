@@ -11,6 +11,7 @@
 //! max_hops          = 12     # tool calls per investigation
 //! timeout_secs      = 300    # wall clock per investigation
 //! lessons_in_prompt = false  # add diagnosed lessons to the system prompt
+//! auto_fix_session  = false  # open a fix session for sure harness bugs
 //! ```
 
 use std::path::PathBuf;
@@ -28,6 +29,11 @@ pub struct IdealistConfig {
     /// Off by default: every lesson costs prompt tokens on every turn, and
     /// the rule for anything with a standing prompt cost is opt-in.
     pub lessons_in_prompt: bool,
+    /// Off by default. When on, a verified, high-confidence `harness_bug`
+    /// diagnosis opens a session in the sica-rust checkout with a fix
+    /// prompt waiting in the composer. Nothing is sent: a person reads the
+    /// diagnosis and presses Send.
+    pub auto_fix_session:  bool,
 }
 
 impl Default for IdealistConfig {
@@ -39,6 +45,7 @@ impl Default for IdealistConfig {
             max_hops:          12,
             timeout_secs:      300,
             lessons_in_prompt: false,
+            auto_fix_session:  false,
         }
     }
 }
@@ -77,5 +84,6 @@ mod tests {
         assert_eq!(c.idle_minutes, 3);
         assert!(c.investigate);
         assert!(!c.lessons_in_prompt);
+        assert!(!c.auto_fix_session);
     }
 }

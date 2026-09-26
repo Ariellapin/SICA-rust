@@ -33,6 +33,10 @@ use protocol::{Event, TicketSummary};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+/// How long one blocking wait for a trigger lasts before the daemon checks
+/// in again. Bounds how long the process takes to exit.
+const DAEMON_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub trait IdealistEventSink: Send + Sync {
     fn emit(&self, ev: Event);
 }
@@ -66,6 +70,7 @@ pub fn summary(t: &Ticket, store: &TicketStore) -> TicketSummary {
         category:     m.diagnosis.as_ref().map(|d| d.category.clone()),
         confidence:   m.diagnosis.as_ref().map(|d| d.confidence.clone()),
         lesson:       m.diagnosis.as_ref().and_then(|d| d.lesson.clone()),
+        fix_session:  m.fix_session,
         path:         store.path(&m.id).to_string_lossy().into_owned(),
     }
 }
@@ -154,13 +159,19 @@ impl Idealist {
         tokio::spawn(async move {
             let bus_rx = me.bus.subscribe();
             loop {
-                let trigger = match tokio::task::spawn_blocking({
+                // A bounded wait, never a bare `recv()`: the runtime waits
+                // for every blocking thread when the backend exits, and
+                // process-wide holders of the bus (`backend::incident`,
+                // the investigator's hub) keep a sender alive to the end —
+                // an unbounded wait here hung shutdown.
+                let got = tokio::task::spawn_blocking({
                     let rx = bus_rx.clone();
-                    move || rx.recv().ok()
+                    move || rx.recv_timeout(DAEMON_POLL)
                 })
-                .await
-                {
-                    Ok(Some(t)) => t,
+                .await;
+                let trigger = match got {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => continue,
                     _ => {
                         info!("idealist: trigger bus closed — daemon loop exiting");
                         break;

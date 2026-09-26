@@ -179,6 +179,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 Response::Tickets { tickets } => {
                                     bridge.send(UiEvent::Tickets { tickets });
                                 }
+                                Response::FixSession { session_id, ticket_id, draft } => {
+                                    bridge.send(UiEvent::FixSession { session_id, ticket_id, draft });
+                                }
                                 Response::Error { message } => {
                                     bridge.send(UiEvent::RequestFailed { message });
                                 }

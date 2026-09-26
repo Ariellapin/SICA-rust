@@ -36,8 +36,12 @@
 //! pipeline as [`HooksPolicy`]; `UserPromptSubmit` and `SessionStart` are
 //! called directly from `chat.rs`, where a deny refuses the prompt and
 //! `additionalContext` becomes a `ContextInjected` the model reads.
-//! `Stop` is defined by the config schema but not yet dispatched — a hook
-//! configured for it is reported at load rather than silently ignored.
+//! `SessionEnd` runs when a session ends (idle past `idle_minutes`, or
+//! archived — `backend::investigate` decides); the payload carries a
+//! `reason`, as Claude Code's does, and the answer is audit only: there is
+//! nothing left to deny. `Stop` is defined by the config schema but not yet
+//! dispatched — a hook configured for it is reported at load rather than
+//! silently ignored.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,6 +70,7 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     Stop,
+    SessionEnd,
 }
 
 impl HookEvent {
@@ -78,6 +83,7 @@ impl HookEvent {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::Stop => "Stop",
+            HookEvent::SessionEnd => "SessionEnd",
         }
     }
 
@@ -88,6 +94,7 @@ impl HookEvent {
             "PreToolUse" => HookEvent::PreToolUse,
             "PostToolUse" => HookEvent::PostToolUse,
             "Stop" => HookEvent::Stop,
+            "SessionEnd" => HookEvent::SessionEnd,
             _ => return None,
         })
     }
@@ -795,7 +802,42 @@ pub async fn run_event(
     }
     let cwd = crate::chat::session_cwd(sessions, session_id).await;
     let payload = payload(event, session_id, None, None, None, prompt, &cwd);
-    let merged = run_all(&hooks, &payload, &cwd).await;
+    run_and_record(&hooks, payload, &cwd, sessions, events, event, session_id).await
+}
+
+/// `SessionEnd` hooks. The payload gains Claude Code's `reason` field
+/// (`idle`, `archived`); the merged answer is audit only.
+pub async fn run_session_end(
+    config: &HookConfig,
+    sessions: &crate::chat::Sessions,
+    events: &Arc<dyn agents::EventSink>,
+    session_id: u64,
+    reason: &str,
+) {
+    let hooks: Vec<&Hook> = config.for_event(HookEvent::SessionEnd).iter().collect();
+    if hooks.is_empty() {
+        return;
+    }
+    let cwd = crate::chat::session_cwd(sessions, session_id).await;
+    let mut payload = payload(HookEvent::SessionEnd, session_id, None, None, None, None, &cwd);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("reason".into(), json!(reason));
+    }
+    run_and_record(&hooks, payload, &cwd, sessions, events, HookEvent::SessionEnd, session_id).await;
+}
+
+/// Run `hooks`, warn about any that failed, and write one `Hook` audit row
+/// per hook to the session log.
+async fn run_and_record(
+    hooks: &[&Hook],
+    payload: Value,
+    cwd: &Path,
+    sessions: &crate::chat::Sessions,
+    events: &Arc<dyn agents::EventSink>,
+    event: HookEvent,
+    session_id: u64,
+) -> Merged {
+    let merged = run_all(hooks, &payload, cwd).await;
     for (command, decision, exit_code) in &merged.ran {
         if decision == "error" {
             events.emit(protocol::Event::LogLine {
@@ -879,6 +921,17 @@ mod tests {
         assert_eq!(for_read.len(), 1);
         assert_eq!(for_read[0].command, "log-all.sh");
         assert_eq!(cfg.matching(HookEvent::PostToolUse, "read-file").len(), 0);
+    }
+
+    #[test]
+    fn session_end_hooks_load_without_a_warning() {
+        let cfg = cfg_from(
+            r#"{ "hooks": { "SessionEnd": [
+                   { "hooks": [{ "type": "command", "command": "notify.sh" }] } ] } }"#,
+        );
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        assert_eq!(cfg.for_event(HookEvent::SessionEnd).len(), 1);
+        assert_eq!(HookEvent::parse("SessionEnd"), Some(HookEvent::SessionEnd));
     }
 
     #[test]

@@ -72,6 +72,10 @@ problems:
 
 ## Alternatives not taken
 
+*Update:* the invariant and the fix session below were later built in a
+narrower form — see
+[2026-09-26-idealist-followups.md](2026-09-26-idealist-followups.md).
+
 - **Investigate at the moment of failure.** This would compete with the
   running turn for a single-slot local LLM, and it would investigate
   failures the agent was about to recover from.

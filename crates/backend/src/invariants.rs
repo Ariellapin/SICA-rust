@@ -8,7 +8,7 @@
 //! if they ever do then compaction replay, prompt editing and the
 //! Trajectory view are all quietly lying.
 //!
-//! Three ship here, one per relationship the codebase relies on and cannot
+//! Four ship here, one per relationship the codebase relies on and cannot
 //! otherwise observe:
 //!
 //! 1. [`check_request_matches_log`] — what went on the wire is a suffix of
@@ -21,6 +21,11 @@
 //! 3. [`check_retry_appended_nothing`] — a retried attempt persisted
 //!    nothing. That is the entire reason a retry is safe: re-entering the
 //!    loop must rebuild the identical request.
+//! 4. [`check_error_turn_ticketed`] — a turn the log says ended in error has
+//!    a turn-error ticket in the session's idealist ledger. The log and the
+//!    ledger are two files written by two code paths; an error exit added
+//!    without `incident::turn_error` makes them disagree, and the failure
+//!    would never reach the end-of-session investigator.
 //!
 //! Off unless the backend was started with `--invariants`, because each
 //! check re-derives the log. Failures are ERROR `LogLine`s naming the
@@ -220,6 +225,35 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::LegacyMessage { .. } => "LegacyMessage",
         _ => "other",
     }
+}
+
+/// **error-turn-ticketed.** A `TurnEnd { finish_reason: "error" }` for
+/// `turn_id` has a matching turn-error entry in the session's ledger — one
+/// whose `turns` names this turn. `ledger` is `None` when the session has
+/// no ledger file at all, which for an errored turn is itself the defect.
+pub fn check_error_turn_ticketed(
+    finish_reason: &str,
+    turn_id: u64,
+    ledger: Option<&idealist::SessionLedger>,
+) -> Vec<Violation> {
+    if finish_reason != "error" {
+        return Vec::new();
+    }
+    let ticketed = ledger.is_some_and(|l| {
+        l.entries.iter().any(|e| {
+            e.origin == idealist::TriggerOrigin::TurnError && e.turns.contains(&turn_id)
+        })
+    });
+    if ticketed {
+        return Vec::new();
+    }
+    vec![Violation::new(
+        "error-turn-ticketed",
+        format!(
+            "turn {turn_id} ended in error but the idealist ledger has no turn-error ticket \
+             for it — an error exit is missing its `incident::turn_error` call"
+        ),
+    )]
 }
 
 #[cfg(test)]
@@ -436,5 +470,36 @@ mod tests {
         // binary, which is exactly the kind of shared-state bug the flag
         // being a global invites.
         assert!(!enabled() || cfg!(feature = "never"));
+    }
+
+    #[test]
+    fn an_errored_turn_needs_a_ledger_entry_for_that_turn() {
+        use idealist::{LedgerEntry, SessionLedger, TriggerOrigin};
+        let entry = |origin, turns: Vec<u64>| LedgerEntry {
+            ticket_id: "t".into(),
+            origin,
+            skill: None,
+            seq: None,
+            last_seq: None,
+            count: 1,
+            recovered_turns: 0,
+            unrecovered_turns: 0,
+            investigated: false,
+            turns,
+        };
+        let ledger = SessionLedger {
+            session_id: 1,
+            entries: vec![
+                entry(TriggerOrigin::ToolCall, vec![5]),
+                entry(TriggerOrigin::TurnError, vec![3]),
+            ],
+            investigated_at: None,
+        };
+        assert!(check_error_turn_ticketed("done", 9, None).is_empty(), "only error turns");
+        assert!(check_error_turn_ticketed("error", 3, Some(&ledger)).is_empty());
+        let v = check_error_turn_ticketed("error", 5, Some(&ledger));
+        assert_eq!(v.len(), 1, "a tool ticket in that turn is not a turn-error ticket");
+        assert_eq!(v[0].invariant, "error-turn-ticketed");
+        assert_eq!(check_error_turn_ticketed("error", 3, None).len(), 1);
     }
 }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -479,6 +479,10 @@ pub enum Request {
     /// `status` is one of `open`, `resolved`, `wontfix`, `noise`. Answers
     /// `Tickets` with the updated list.
     SetTicketStatus { ticket_id: String, status: String },
+    /// Open (or reopen) a session in the sica-rust checkout for fixing this
+    /// ticket (v31). Answers `FixSession`; the draft is *not* sent — the
+    /// FE puts it in the composer for a person to review.
+    StartFixSession { ticket_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +532,9 @@ pub enum Response {
     },
     /// Every improvement ticket, newest `last_seen` first.
     Tickets { tickets: Vec<TicketSummary> },
+    /// `StartFixSession`: the session to switch to and the prompt to put in
+    /// its composer.
+    FixSession { session_id: u64, ticket_id: String, draft: String },
 }
 
 /// One improvement ticket as the FE lists it (`idealist_workspace/tickets`).
@@ -551,6 +558,8 @@ pub struct TicketSummary {
     pub category:     Option<String>,
     pub confidence:   Option<String>,
     pub lesson:       Option<String>,
+    /// The session opened to fix it, once there is one (v31).
+    pub fix_session:  Option<u64>,
     /// The ticket file, for "open in editor".
     pub path:         String,
 }
@@ -1164,6 +1173,14 @@ pub enum Event {
     },
     /// The end-of-session investigator finished one ticket. `ok = false`
     /// means it ran but produced nothing usable (see the ticket body).
+    /// `auto_fix_session` opened a fix session for a sure harness bug
+    /// (v31). The FE keeps `draft` for when the person opens that session;
+    /// nothing has been sent.
+    FixSessionReady {
+        session_id: u64,
+        ticket_id:  String,
+        draft:      String,
+    },
     IdealistInvestigated {
         ticket_id:  String,
         session_id: u64,

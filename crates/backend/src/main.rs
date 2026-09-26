@@ -537,13 +537,7 @@ async fn run(args: Args) -> Result<()> {
     }
     investigate::configure(idealist_cfg.clone());
     if args.replay.is_none() {
-        investigate::install(idealist_cfg, investigate::Deps {
-            llm:          chat.llm.clone(),
-            active_turns: chat.active_turns.clone(),
-            sessions:     chat.sessions.clone(),
-            skills:       chat.skills.clone(),
-            events:       chat.event_sink.clone(),
-        });
+        investigate::install(idealist_cfg, chat.clone());
     }
 
     // The reminder owner (guide §12.8): delivers due reminders to idle

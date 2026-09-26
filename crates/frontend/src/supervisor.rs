@@ -205,6 +205,10 @@ pub enum UiEvent {
     IdealistInvestigated { ticket_id: String, ok: bool, summary: String },
     /// `Response::Tickets` — the whole ticket list.
     Tickets { tickets: Vec<protocol::TicketSummary> },
+    /// `Response::FixSession` — switch there, draft in the composer.
+    FixSession { session_id: u64, ticket_id: String, draft: String },
+    /// `auto_fix_session` opened one; its draft waits until it is opened.
+    FixSessionReady { session_id: u64, ticket_id: String, draft: String },
 }
 
 pub struct UiBridge {
@@ -439,6 +443,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::IdealistInvestigated { ticket_id, ok, summary, .. } => {
             UiEvent::IdealistInvestigated { ticket_id, ok, summary }
+        }
+        Event::FixSessionReady { session_id, ticket_id, draft } => {
+            UiEvent::FixSessionReady { session_id, ticket_id, draft }
         }
     };
     bridge.send(ui_ev);
