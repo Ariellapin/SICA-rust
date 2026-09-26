@@ -92,6 +92,12 @@ impl Idealist {
             // them would let one investigation schedule the next.
             return;
         }
+        if analyzer::is_caller_error(trigger) {
+            // The model's own bad input, and the tool's error already says
+            // how to recover: not a harness defect, so not a ticket.
+            info!(module = %trigger.module, "idealist: caller-input error — no ticket");
+            return;
+        }
         info!(
             kind = %trigger.kind,
             module = %trigger.module,
@@ -211,6 +217,20 @@ mod tests {
         assert_eq!(s.status, "open");
         assert_eq!(s.origin, "turn_error");
         assert_eq!(s.sessions, vec![5]);
+    }
+
+    #[test]
+    fn caller_errors_file_nothing() {
+        let sink = Arc::new(Capture::default());
+        let store = TicketStore::at(ticket::tests::scratch("daemon-caller"));
+        let d = Idealist::with_store(sink.clone(), store.clone());
+        d.handle(&Trigger {
+            module: "agents::tool::read-file".into(),
+            message: "no such file: x.txt — check the path".into(),
+            origin: TriggerOrigin::ToolCall,
+            ..Default::default()
+        });
+        assert!(store.list().is_empty());
     }
 
     #[test]

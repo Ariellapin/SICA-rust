@@ -565,6 +565,13 @@ impl Skill for ReadFile {
         };
         let meta = match fs::metadata(&resolved) {
             Ok(m)  => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err(&format!(
+                    "no such file: {} — check the path is relative to the workspace root, \
+                     or find it with `{GLOB_NAME}`",
+                    resolved.display()
+                ))
+            }
             Err(e) => return err(&format!("stat {}: {e}", resolved.display())),
         };
         if meta.len() > MAX_FILE {
@@ -716,6 +723,12 @@ impl Skill for EditFile {
         };
         let text = match fs::read_to_string(&resolved) {
             Ok(t)  => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err(&format!(
+                    "no such file: {} — edit-file only edits existing files; use write-file to create one",
+                    resolved.display()
+                ))
+            }
             Err(e) => {
                 return err(&format!(
                     "read {}: {e} — edit-file only edits existing files; use write-file to create one",
@@ -1246,7 +1259,18 @@ mod tests {
         let r = ReadFile::new(dir);
         let out = r.run(json!({ "path": "nope.txt" }), ctx()).await;
         assert!(!out.ok);
-        assert!(out.summary.contains("stat"));
+        assert!(out.summary.starts_with("no such file: "), "{}", out.summary);
+        assert!(out.summary.contains("glob"), "{}", out.summary);
+    }
+
+    #[tokio::test]
+    async fn edit_missing_file_points_at_write_file() {
+        let dir = tempdir();
+        let e = EditFile::new(dir);
+        let out = e.run(json!({ "path": "nope.txt", "old": "a", "new": "b" }), ctx()).await;
+        assert!(!out.ok);
+        assert!(out.summary.starts_with("no such file: "), "{}", out.summary);
+        assert!(out.summary.contains("write-file"), "{}", out.summary);
     }
 
     #[tokio::test]

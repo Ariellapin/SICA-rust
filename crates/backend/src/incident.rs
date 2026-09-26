@@ -59,6 +59,11 @@ pub fn installed() -> bool {
 /// must not become a second problem.
 pub fn report(t: Trigger) {
     let Some(r) = REPORTER.get() else { return };
+    // Filtered here as well as in the daemon: a caller error gets no ticket,
+    // so it must not get a `TicketOpened` row or a ledger entry either.
+    if idealist::analyzer::is_caller_error(&t) {
+        return;
+    }
     if t.session_id.is_none() {
         r.bus.publish(t);
         return;
