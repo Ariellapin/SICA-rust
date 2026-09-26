@@ -104,7 +104,10 @@ v23 adds **session projections** (harness guide §3.3). `sica_core::project`
 holds pure folds over the log — `SessionStats` (turns, messages, tool calls
 and failures, retries, wall time), `TurnOutline` (one row per turn: the
 opening user line, its source, hops, finish reason, and the `TurnStart` seq)
-and `LastTokenUsage` — behind a `Projection { init, apply }` trait, and
+`LastTokenUsage`, and — since 2026-09-26 — `TurnSeries` (one row of numbers
+per turn: largest prompt, completion tokens, first-hop `ttft_ms`,
+compactions, pruned results, retries; printed by `/stats`) — behind a
+`Projection { init, apply }` trait, and
 `Request::SessionStats { session_id }` answers `Response::SessionStats
 { stats, outline, through_seq }`. They count *events*, not the derived
 surface: a turn a compaction shadowed still happened, and a stats line that

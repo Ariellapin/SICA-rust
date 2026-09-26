@@ -227,7 +227,13 @@ Shipped as `sica_core::project` (`Projection { init, apply, fold }` with
 and `Request::SessionStats` → `Response::SessionStats { stats, outline,
 through_seq }`. The folds count *events*, not surface entries — a turn a
 compaction shadowed still happened — and `through_seq` says how current an
-answer is, since a projection is never wrong, only ever behind.
+answer is, since a projection is never wrong, only ever behind. A fourth
+fold, `TurnSeries` (long-session-plan F3, 2026-09-26), gives one row of
+numbers per turn — largest prompt, completion tokens, the first hop's
+`ttft_ms` (now a log-only field on `TokenUsage`), compactions, pruned
+results, retries — and `/stats` prints the newest twenty as a table; it is
+the instrument for prefix stability, and reaches the FE as the command's
+text rather than a wire type.
 
 ### 3.4 `dsh-session-title*` — **done** (Wave 1: `title_gen::fallback` + budgets)
 
@@ -1181,8 +1187,8 @@ global ones.
 **Shipped (Wave 3; Wave 10 for the last three).** The table is `compact |
 plan | permission | approval | stats | job-kill | job-output | goal | agent`:
 `approval` sets the session's policy (§10.2), `stats` renders the §3.3 fold
-as one line, and `job-output` is the route the jobs popover's "Show output"
-row needs (UI guide §6.9).
+as one line plus the per-turn `TurnSeries` table, and `job-output` is the
+route the jobs popover's "Show output" row needs (UI guide §6.9).
 
 ### 8.5 `dsh-fs-observation-policy` — read-before-edit — **done** (Wave 3)
 
@@ -2063,7 +2069,9 @@ invariant.
 Shipped as `backend::invariants` behind `--invariants`, with the three
 checks as pure functions (`request-matches-log`,
 `compaction-span-balanced`, `retry-appends-nothing`) called from the turn
-loop. `request-matches-log` asserts a **suffix**, not equality: the
+loop, and a fourth since 2026-09-26 (`summary-chain`, long-session-plan
+F2): a compaction whose span shadows an earlier checkpoint must carry every
+backticked identifier of that checkpoint forward. `request-matches-log` asserts a **suffix**, not equality: the
 trimmer legitimately amputates the front, and an invariant that fires
 during normal operation is worse than none. The replay driver runs every
 scenario with the flag on, and treats a backend ERROR line as a failure.

@@ -3019,6 +3019,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         event_sink.as_ref(),
                         crate::invariants::check_compaction_span_balanced(&events),
                     );
+                    crate::invariants::report(
+                        event_sink.as_ref(),
+                        crate::invariants::check_summary_chain(&events),
+                    );
                     events.last().map(|e| e.seq).unwrap_or(0)
                 } else {
                     0
@@ -3298,6 +3302,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         budget,
                         prompt_tokens: out.usage.map(|u| u.prompt_tokens),
                         completion_tokens: out.usage.map(|u| u.completion_tokens),
+                        ttft_ms: out.ttft_ms,
                     });
                     if let Err(e) = sessions_store::flush(log) {
                         warn!(error = %e, session_id, "flush session (after assistant msg) failed");
@@ -4698,6 +4703,32 @@ fn render_stats(s: &protocol::StatsDump) -> String {
     )
 }
 
+/// Newest turns `/stats` prints in its per-turn table.
+const STATS_SERIES_ROWS: usize = 20;
+
+/// The per-turn table under the counters (long-session-plan F3): one row
+/// per turn, newest `limit` of them, oldest first so a climbing column
+/// reads as a trend. `ttft` is the first hop's time to first token — the
+/// number that says whether the prefix was served from cache.
+fn render_turn_series(turns: &[sica_core::project::TurnStat], limit: usize) -> String {
+    let shown = &turns[turns.len().saturating_sub(limit)..];
+    let mut out = String::new();
+    if shown.len() < turns.len() {
+        out.push_str(&format!("last {} of {} turns:\n", shown.len(), turns.len()));
+    }
+    out.push_str("turn  source         hops  finish      prompt   compl  ttft_ms  compact  pruned  retries\n");
+    for t in shown {
+        let finish = if t.finish_reason.is_empty() { "(open)" } else { t.finish_reason.as_str() };
+        let ttft = t.ttft_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        out.push_str(&format!(
+            "{:<5} {:<14} {:>4}  {:<10} {:>7} {:>7} {:>8} {:>8} {:>7} {:>8}\n",
+            t.turn_id, t.source, t.hops, finish, t.prompt_tokens, t.completion_tokens, ttft,
+            t.compactions, t.pruned, t.retries,
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 /// The unix-seconds clock the reminder logic runs on.
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
@@ -4836,10 +4867,20 @@ impl ChatHub {
 
     /// `/stats` — the session's projection line as text (guide §8.4).
     async fn command_stats(&self, session_id: u64) -> (bool, String) {
-        match self.session_stats(session_id).await {
-            Some((stats, _, through)) => (true, format!("{} (through seq {through})", render_stats(&stats))),
-            None => (false, format!("session {session_id} not found")),
+        let Some((stats, _, through)) = self.session_stats(session_id).await else {
+            return (false, format!("session {session_id} not found"));
+        };
+        let series = {
+            use sica_core::project::{Projection, TurnSeries};
+            let g = self.sessions.lock().await;
+            g.get(&session_id).map(|log| TurnSeries::fold(&log.events).turns).unwrap_or_default()
+        };
+        let mut text = format!("{} (through seq {through})", render_stats(&stats));
+        if !series.is_empty() {
+            text.push('\n');
+            text.push_str(&render_turn_series(&series, STATS_SERIES_ROWS));
         }
+        (true, text)
     }
 
     /// `/approval ask | never` (guide §10.2). `never` short-circuits every
@@ -5684,6 +5725,127 @@ mod tests {
         log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u2".into(), images: Vec::new() });
         fold_all(&mut log);
         assert_eq!(log.derive_surface().len(), 1, "a finished list is not re-attached");
+    }
+
+    /// A checkpoint with the eight sections, naming `ids` in Files and Code.
+    fn checkpoint_text(ids: &[&str]) -> String {
+        let files = ids.iter().map(|i| format!("- `{i}`")).collect::<Vec<_>>().join("\n");
+        agents::compact::REQUIRED_HEADINGS
+            .iter()
+            .map(|h| {
+                if *h == "## Files and Code" { format!("{h}\n{files}\n") } else { format!("{h}\n(none)\n") }
+            })
+            .collect::<String>()
+    }
+
+    fn replay_client(replies: &[String]) -> LlmClient {
+        let calls = replies
+            .iter()
+            .map(|r| llm::replay::ReplayCall::Message { content: r.clone(), reasoning: None, tool_calls: None })
+            .collect();
+        LlmClient::new("replay://test", "replay", None)
+            .with_replay(Arc::new(llm::replay::ReplayScript::new(calls)))
+    }
+
+    async fn push_long_exchange(sessions: &Sessions, id: u64, n: usize, tag: &str) {
+        for i in 0..n {
+            let text = format!("{tag}{i} {}", "word ".repeat(80));
+            append_event(sessions, id, EventKind::UserMessage { surface: SurfaceOp::Append, content: text.clone(), images: Vec::new() }).await;
+            append_event(sessions, id, EventKind::AssistantMessage { surface: SurfaceOp::Append, content: text, reasoning: None, tool_calls: None }).await;
+        }
+    }
+
+    async fn wire_history(sessions: &Sessions, id: u64) -> WireHistory {
+        build_history(sessions, id, &registry(), protocol::ToolMode::Text, "replay", None, None)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Two compactions in a row, driven through the real `compact_session`
+    /// with the summariser served from a script (long-session-plan F1):
+    /// the second fold shadows the first checkpoint, the chain invariant
+    /// holds when the second checkpoint carries the first one's
+    /// identifiers and fires when it does not, and the open todo list is
+    /// re-attached after each fold.
+    #[tokio::test]
+    async fn two_chained_compactions_carry_the_first_checkpoint_forward() {
+        let id = 9_101;
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(id, SessionLog::new(id, "chain"))])));
+        let sink: Arc<dyn EventSink> = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let policy = protocol::CompactPolicy { threshold_pct: 80, retain_pct: 16, max_tokens: 2048, retries: 1 };
+        let cancel = CancellationToken::new();
+        let (budget, window) = (600, 100_000);
+
+        let first = checkpoint_text(&["src/lib.rs", "cargo test"]);
+        let second_good = checkpoint_text(&["src/lib.rs", "cargo test", "src/main.rs"]);
+        let client = replay_client(&[first.clone(), second_good.clone()]);
+
+        append_event(&sessions, id, EventKind::TodoWrite { items: vec![
+            protocol::TodoItem { content: "wire it".into(), status: protocol::TodoStatus::InProgress },
+        ] }).await;
+        push_long_exchange(&sessions, id, 8, "a").await;
+
+        let wh = wire_history(&sessions, id).await;
+        assert!(compact_session(&sessions, id, &client, &sink, budget, window, &policy, &wh, false, &cancel).await);
+        {
+            let g = sessions.lock().await;
+            let surface = g[&id].derive_surface();
+            assert!(surface[0].message.content.contains(&first), "first checkpoint landed at the front");
+            assert!(surface.iter().any(|e| matches!(e.context, Some(ContextSource::ToolNotice)) && e.message.content.contains("wire it")));
+        }
+
+        push_long_exchange(&sessions, id, 8, "b").await;
+        let wh = wire_history(&sessions, id).await;
+        assert!(compact_session(&sessions, id, &client, &sink, budget, window, &policy, &wh, false, &cancel).await);
+        let events = sessions.lock().await[&id].events.clone();
+        let summaries: Vec<&SessionEvent> = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::CompactionSummary { .. }))
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        let EventKind::CompactionSummary { surface: SurfaceOp::Replace { start_seq, end_seq }, summary, .. } = &summaries[1].kind else { panic!() };
+        assert!(*start_seq <= summaries[0].seq && summaries[0].seq <= *end_seq, "the second fold shadows the first checkpoint");
+        assert_eq!(summary, second_good.trim_end(), "the summariser's reply, as `clean` trims it");
+        assert!(crate::invariants::check_summary_chain(&events).is_empty());
+        let surface = sessions.lock().await[&id].derive_surface();
+        assert_eq!(surface.iter().filter(|e| e.message.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX)).count(), 1, "one checkpoint is ever visible");
+        assert!(surface.last().is_some_and(|e| e.message.content.contains("wire it")), "the todo list follows the newest fold");
+
+        // The same chain with a second checkpoint that forgot `cargo test`.
+        let mut forgetful = events.clone();
+        let forgetful_summary_idx = forgetful.iter().rposition(|e| matches!(e.kind, EventKind::CompactionSummary { .. })).unwrap();
+        if let EventKind::CompactionSummary { summary, .. } = &mut forgetful[forgetful_summary_idx].kind {
+            *summary = checkpoint_text(&["src/lib.rs"]);
+        }
+        let v = crate::invariants::check_summary_chain(&forgetful);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].detail.contains("`cargo test`"), "{}", v[0].detail);
+    }
+
+    #[test]
+    fn turn_series_renders_newest_rows_oldest_first() {
+        use sica_core::project::TurnStat;
+        let turns: Vec<TurnStat> = (1..=25)
+            .map(|i| TurnStat {
+                turn_id: i,
+                source: "human".into(),
+                hops: 2,
+                finish_reason: if i == 25 { String::new() } else { "done".into() },
+                prompt_tokens: 1_000 * i as u32,
+                ttft_ms: if i % 2 == 0 { Some(100 * i) } else { None },
+                ..TurnStat::default()
+            })
+            .collect();
+        let text = render_turn_series(&turns, 20);
+        assert!(text.starts_with("last 20 of 25 turns:"));
+        assert!(text.contains("ttft_ms"));
+        assert!(!text.contains("\n1  "), "turn 1 fell outside the window");
+        assert!(text.contains("(open)"), "the running turn shows as open");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 22, "header line + table header + 20 rows");
+        assert!(lines[2].trim_start().starts_with("6 "));
+        assert!(lines[21].trim_start().starts_with("25 "));
     }
 
     /// The Replace fold must produce exactly what the old in-place splice

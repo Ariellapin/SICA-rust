@@ -252,6 +252,13 @@ pub enum EventKind {
         prompt_tokens: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion_tokens: Option<u32>,
+        /// Time to the first streamed token of this hop, when the stream
+        /// reported one. Durable because it is the one number that says
+        /// whether the provider re-read the whole prompt (a cold prefix)
+        /// or only what was new — the series over a long session is the
+        /// instrument for prefix stability (long-session-plan F3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u64>,
     },
     /// A message imported from a pre-event-log TOML session. Passed through
     /// verbatim; its tool metadata is unrecoverable.
@@ -877,7 +884,7 @@ mod tests {
             ev(2, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
             user(3, "hi"),
             assistant(4, "hello"),
-            ev(5, EventKind::TokenUsage { used: 1, limit: 2, budget: 3, prompt_tokens: None, completion_tokens: None }),
+            ev(5, EventKind::TokenUsage { used: 1, limit: 2, budget: 3, prompt_tokens: None, completion_tokens: None, ttft_ms: None }),
             ev(6, EventKind::TurnEnd { turn_id: 1, finish_reason: "done".into(), hops: 0 }),
             ev(7, EventKind::Unknown),
         ];
@@ -1152,7 +1159,7 @@ mod tests {
                 content: "f".into(),
             },
             EventKind::LlmRetry { attempt: 1, max: 5, delay_ms: 500, reason: "HTTP 503".into() },
-            EventKind::TokenUsage { used: 1, limit: 2, budget: 3, prompt_tokens: Some(1), completion_tokens: None },
+            EventKind::TokenUsage { used: 1, limit: 2, budget: 3, prompt_tokens: Some(1), completion_tokens: None, ttft_ms: None },
             EventKind::LegacyMessage { surface: SurfaceOp::Append, message: Message::user("old") },
         ];
         for (i, kind) in kinds.into_iter().enumerate() {

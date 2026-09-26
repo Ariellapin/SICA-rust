@@ -21,6 +21,11 @@
 //! 3. [`check_retry_appended_nothing`] — a retried attempt persisted
 //!    nothing. That is the entire reason a retry is safe: re-entering the
 //!    loop must rebuild the identical request.
+//! 4. [`check_summary_chain`] — a compaction that folds an earlier
+//!    checkpoint carries its exact identifiers forward. The summariser is
+//!    told to consolidate the earlier checkpoint and to keep paths and
+//!    commands verbatim; the log holds both summaries, so the two can be
+//!    compared (long-session-plan F2).
 //!
 //! Off unless the backend was started with `--invariants`, because each
 //! check re-derives the log. Failures are ERROR `LogLine`s naming the
@@ -175,6 +180,79 @@ pub fn check_compaction_span_balanced(events: &[SessionEvent]) -> Vec<Violation>
     out
 }
 
+/// **summary-chain.** When a `CompactionSummary`'s span shadows an earlier
+/// `CompactionSummary`, every backticked identifier of the earlier summary
+/// (a path, a command, an error string — the directive says to keep them
+/// exact) must appear in the later one. A checkpoint chain that drops
+/// identifiers is how a session forgets which file it was editing; the
+/// summariser saw the whole earlier checkpoint, so nothing excuses the
+/// loss.
+///
+/// Only the *newest* earlier summary inside the span is held to this: an
+/// older one was already consolidated into it, and its identifiers are
+/// judged there.
+pub fn check_summary_chain(events: &[SessionEvent]) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for ev in events {
+        let EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace { start_seq, end_seq },
+            summary: later,
+            ..
+        } = &ev.kind
+        else {
+            continue;
+        };
+        let earlier = events
+            .iter()
+            .filter(|e| e.seq >= *start_seq && e.seq <= *end_seq && e.seq < ev.seq)
+            .filter_map(|e| match &e.kind {
+                EventKind::CompactionSummary { summary, .. } => Some((e.seq, summary)),
+                _ => None,
+            })
+            .last();
+        let Some((earlier_seq, earlier)) = earlier else { continue };
+        let lost: Vec<&str> = backticked(earlier)
+            .into_iter()
+            .filter(|id| !later.contains(id))
+            .collect();
+        if !lost.is_empty() {
+            out.push(Violation::new(
+                "summary-chain",
+                format!(
+                    "the checkpoint at seq {} folded the one at seq {earlier_seq} but                      dropped {} identifier(s) it named: {}",
+                    ev.seq,
+                    lost.len(),
+                    lost.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// The distinct backticked spans of `text`, in order, ignoring empty ones
+/// and fenced code (a triple backtick opens nothing here).
+fn backticked(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        if after.starts_with('`') {
+            // A fence or an empty pair: skip the run of backticks.
+            let run = after.len() - after.trim_start_matches('`').len();
+            rest = &after[run..];
+            continue;
+        }
+        let Some(close) = after.find('`') else { break };
+        let id = after[..close].trim();
+        if !id.is_empty() && !out.contains(&id) {
+            out.push(id);
+        }
+        rest = &after[close + 1..];
+    }
+    out
+}
+
 /// **retry-appends-nothing.** Between the seq the log stood at when an
 /// attempt began and the `LlmRetry` that records its failure, no *surface*
 /// event may have been appended: a retry that persisted something is no
@@ -243,6 +321,65 @@ mod tests {
             call_id: None,
             args_json: None,
         })
+    }
+
+    fn summary(seq: u64, start: u64, end: u64, text: &str) -> SessionEvent {
+        ev(seq, EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace { start_seq: start, end_seq: end },
+            content: text.into(),
+            summary: text.into(),
+            folded: 1,
+            before_tokens: 0,
+            after_tokens: 0,
+        })
+    }
+
+    #[test]
+    fn summary_chain_passes_when_identifiers_are_carried_forward() {
+        let events = vec![
+            ev(1, EventKind::UserMessage { surface: SurfaceOp::Append, content: "a".into(), images: Vec::new() }),
+            summary(2, 1, 1, "## Files and Code\n- `src/lib.rs` — run `cargo test`"),
+            ev(3, EventKind::UserMessage { surface: SurfaceOp::Append, content: "b".into(), images: Vec::new() }),
+            summary(4, 1, 3, "## Files and Code\n- `src/lib.rs` (edited); `cargo test` green"),
+        ];
+        assert!(check_summary_chain(&events).is_empty());
+    }
+
+    #[test]
+    fn summary_chain_names_every_identifier_a_later_checkpoint_dropped() {
+        let events = vec![
+            ev(1, EventKind::UserMessage { surface: SurfaceOp::Append, content: "a".into(), images: Vec::new() }),
+            summary(2, 1, 1, "- `src/lib.rs` and `cargo test`, error `E0425`"),
+            ev(3, EventKind::UserMessage { surface: SurfaceOp::Append, content: "b".into(), images: Vec::new() }),
+            summary(4, 1, 3, "- `src/lib.rs` was edited"),
+        ];
+        let v = check_summary_chain(&events);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].invariant, "summary-chain");
+        assert!(v[0].detail.contains("seq 4"), "{}", v[0].detail);
+        assert!(v[0].detail.contains("seq 2"), "{}", v[0].detail);
+        assert!(v[0].detail.contains("`cargo test`"), "{}", v[0].detail);
+        assert!(v[0].detail.contains("`E0425`"), "{}", v[0].detail);
+        assert!(!v[0].detail.contains("lib.rs"), "{}", v[0].detail);
+    }
+
+    #[test]
+    fn summary_chain_ignores_a_summary_outside_the_span_and_prose_without_backticks() {
+        let events = vec![
+            ev(1, EventKind::UserMessage { surface: SurfaceOp::Append, content: "a".into(), images: Vec::new() }),
+            summary(2, 1, 1, "plain prose, nothing exact"),
+            ev(3, EventKind::UserMessage { surface: SurfaceOp::Append, content: "b".into(), images: Vec::new() }),
+            summary(4, 3, 3, "unrelated fold that does not reach seq 2"),
+            summary(5, 1, 4, "consolidates both, still no identifiers"),
+        ];
+        assert!(check_summary_chain(&events).is_empty());
+    }
+
+    #[test]
+    fn backticked_reads_single_spans_and_skips_fences() {
+        assert_eq!(backticked("run `cargo test` on `a/b.rs`; not ``` fenced ``` and `` nothing"), vec!["cargo test", "a/b.rs"]);
+        assert_eq!(backticked("`dup` and `dup`"), vec!["dup"]);
+        assert!(backticked("no ticks").is_empty());
     }
 
     fn result(seq: u64, call_seq: u64, skill: &str) -> SessionEvent {
@@ -393,7 +530,7 @@ mod tests {
             }),
             ev(3, EventKind::TokenUsage {
                 used: 10, limit: 100, budget: 80,
-                prompt_tokens: None, completion_tokens: None,
+                prompt_tokens: None, completion_tokens: None, ttft_ms: None,
             }),
         ];
         assert!(check_retry_appended_nothing(&events, 1).is_empty());

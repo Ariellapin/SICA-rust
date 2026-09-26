@@ -298,7 +298,7 @@ fn describe(kind: &EventKind) -> Described {
         )
         .payload(reason.clone())
         .ok(false),
-        EventKind::TokenUsage { used, limit, budget, prompt_tokens, completion_tokens } => row(
+        EventKind::TokenUsage { used, limit, budget, prompt_tokens, completion_tokens, .. } => row(
             EventTag::Usage,
             format!(
                 "{used} / {budget} tok (window {limit}){}",
@@ -571,6 +571,7 @@ mod tests {
             budget: 3600,
             prompt_tokens: Some(1000),
             completion_tokens: Some(200),
+            ttft_ms: None,
         }]);
         let (rows, _, _, _) = page(&log, 2, 0);
         assert_eq!(rows[0].tag, EventTag::Usage);
@@ -586,6 +587,7 @@ mod tests {
             budget: 3600,
             prompt_tokens: None,
             completion_tokens: None,
+            ttft_ms: None,
         }]);
         let (rows, _, _, _) = page(&log, 2, 0);
         assert!(rows[0].text.contains("estimated"));

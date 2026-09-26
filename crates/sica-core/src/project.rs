@@ -230,7 +230,7 @@ impl Projection for LastTokenUsage {
     fn apply(state: &mut UsageState, ev: &SessionEvent) {
         state.through_seq = state.through_seq.max(ev.seq);
         if let EventKind::TokenUsage {
-            used, limit, budget, prompt_tokens, completion_tokens,
+            used, limit, budget, prompt_tokens, completion_tokens, ..
         } = &ev.kind
         {
             state.used = *used;
@@ -239,6 +239,109 @@ impl Projection for LastTokenUsage {
             state.prompt_tokens = *prompt_tokens;
             state.completion_tokens = *completion_tokens;
             state.seen = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn series (long-session-plan F3)
+// ---------------------------------------------------------------------------
+
+/// One turn of [`TurnSeries`]: the numbers that say how a long session is
+/// behaving over time — is the prompt growing, is the first token getting
+/// slower (a prefix that stopped caching), how often does compaction run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnStat {
+    pub turn_id: u64,
+    pub source: String,
+    pub start_seq: u64,
+    /// Hops from `TurnEnd`; `0` while the turn is open.
+    pub hops: u8,
+    /// `TurnEnd.finish_reason`, empty while the turn is open.
+    pub finish_reason: String,
+    /// The largest prompt the turn sent: the provider's count when it
+    /// reported one, else the meter's `used`. The *largest* rather than
+    /// the sum, because the question is how full the window got.
+    pub prompt_tokens: u32,
+    /// Completion tokens over the turn's hops (provider counts only).
+    pub completion_tokens: u32,
+    /// Time to first token of the turn's *first* hop. Later hops ride a
+    /// warm prefix by construction; the first hop is where a cold prefix
+    /// shows.
+    pub ttft_ms: Option<u64>,
+    /// Compaction summaries that landed during the turn.
+    pub compactions: u32,
+    /// Tool results pruned to head/tail windows during the turn.
+    pub pruned: u32,
+    pub retries: u32,
+    pub tool_calls: u32,
+}
+
+/// What [`TurnSeries`] accumulates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesState {
+    pub turns: Vec<TurnStat>,
+    pub through_seq: u64,
+}
+
+/// One row of numbers per turn, oldest first (long-session-plan F3). This
+/// is the instrument the plan's later waves are judged with: a `ttft_ms`
+/// that climbs with `prompt_tokens` says the prefix is being re-read every
+/// turn; one that stays flat says it is cached.
+pub struct TurnSeries;
+
+impl Projection for TurnSeries {
+    type State = SeriesState;
+
+    fn init() -> SeriesState {
+        SeriesState::default()
+    }
+
+    fn apply(state: &mut SeriesState, ev: &SessionEvent) {
+        state.through_seq = state.through_seq.max(ev.seq);
+        match &ev.kind {
+            EventKind::TurnStart { turn_id, source } => state.turns.push(TurnStat {
+                turn_id: *turn_id,
+                source: source.label().to_string(),
+                start_seq: ev.seq,
+                ..TurnStat::default()
+            }),
+            EventKind::TurnEnd { finish_reason, hops, .. } => {
+                if let Some(row) = state.turns.last_mut() {
+                    row.hops = *hops;
+                    row.finish_reason = finish_reason.clone();
+                }
+            }
+            EventKind::TokenUsage { used, prompt_tokens, completion_tokens, ttft_ms, .. } => {
+                if let Some(row) = state.turns.last_mut() {
+                    row.prompt_tokens = row.prompt_tokens.max(prompt_tokens.unwrap_or(*used));
+                    row.completion_tokens += completion_tokens.unwrap_or(0);
+                    if row.ttft_ms.is_none() {
+                        row.ttft_ms = *ttft_ms;
+                    }
+                }
+            }
+            EventKind::CompactionSummary { .. } => {
+                if let Some(row) = state.turns.last_mut() {
+                    row.compactions += 1;
+                }
+            }
+            EventKind::ToolResult { pruned: true, .. } => {
+                if let Some(row) = state.turns.last_mut() {
+                    row.pruned += 1;
+                }
+            }
+            EventKind::ToolCall { .. } => {
+                if let Some(row) = state.turns.last_mut() {
+                    row.tool_calls += 1;
+                }
+            }
+            EventKind::LlmRetry { .. } => {
+                if let Some(row) = state.turns.last_mut() {
+                    row.retries += 1;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -672,7 +775,7 @@ mod tests {
             }),
             ev(8, 1_600, EventKind::TokenUsage {
                 used: 4_000, limit: 32_000, budget: 25_600,
-                prompt_tokens: Some(3_800), completion_tokens: Some(200),
+                prompt_tokens: Some(3_800), completion_tokens: Some(200), ttft_ms: None,
             }),
             ev(9, 1_700, EventKind::TurnEnd {
                 turn_id: 1, finish_reason: "stop".into(), hops: 2,
@@ -757,12 +860,60 @@ mod tests {
         let mut events = log();
         events.push(ev(10, 1_900, EventKind::TokenUsage {
             used: 5_000, limit: 32_000, budget: 25_600,
-            prompt_tokens: None, completion_tokens: None,
+            prompt_tokens: None, completion_tokens: None, ttft_ms: None,
         }));
         let u = LastTokenUsage::fold(&events);
         assert!(u.seen);
         assert_eq!(u.used, 5_000);
         assert_eq!(u.prompt_tokens, None);
+    }
+
+    #[test]
+    fn turn_series_reads_one_row_per_turn() {
+        use crate::event::{SurfaceOp, TurnSource};
+        let events = vec![
+            ev(1, 1_000, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
+            ev(2, 1_100, EventKind::TokenUsage {
+                used: 900, limit: 8_000, budget: 6_000,
+                prompt_tokens: Some(1_000), completion_tokens: Some(50), ttft_ms: Some(120),
+            }),
+            ev(3, 1_200, EventKind::ToolCall {
+                name: "read-file".into(), args_preview: "read-file 'x'".into(),
+                expectation: String::new(), call_id: None, args_json: None,
+            }),
+            ev(4, 1_300, EventKind::ToolResult {
+                surface: SurfaceOp::Replace { start_seq: 3, end_seq: 3 }, call_seq: 3,
+                skill: "read-file".into(), tool_call_id: None, ok: true,
+                summary: "pruned".into(), trusted: false, pruned: true,
+            }),
+            ev(5, 1_400, EventKind::LlmRetry { attempt: 1, max: 5, delay_ms: 500, reason: "503".into() }),
+            ev(6, 1_500, EventKind::TokenUsage {
+                used: 1_500, limit: 8_000, budget: 6_000,
+                prompt_tokens: Some(1_400), completion_tokens: Some(70), ttft_ms: Some(40),
+            }),
+            ev(7, 1_600, EventKind::CompactionSummary {
+                surface: SurfaceOp::Replace { start_seq: 1, end_seq: 2 },
+                content: "s".into(), summary: "s".into(), folded: 2, before_tokens: 0, after_tokens: 0,
+            }),
+            ev(8, 1_700, EventKind::TurnEnd { turn_id: 1, finish_reason: "done".into(), hops: 2 }),
+            ev(9, 1_800, EventKind::TurnStart { turn_id: 2, source: TurnSource::GoalRound }),
+            // No provider count: the meter's `used` stands in.
+            ev(10, 1_900, EventKind::TokenUsage {
+                used: 2_000, limit: 8_000, budget: 6_000,
+                prompt_tokens: None, completion_tokens: None, ttft_ms: None,
+            }),
+        ];
+        let s = TurnSeries::fold(&events);
+        assert_eq!(s.turns.len(), 2);
+        let t1 = &s.turns[0];
+        assert_eq!((t1.turn_id, t1.source.as_str(), t1.hops, t1.finish_reason.as_str()), (1, "human", 2, "done"));
+        assert_eq!(t1.prompt_tokens, 1_400, "the largest prompt, not the sum");
+        assert_eq!(t1.completion_tokens, 120);
+        assert_eq!(t1.ttft_ms, Some(120), "the first hop's, not the warm one's");
+        assert_eq!((t1.compactions, t1.pruned, t1.retries, t1.tool_calls), (1, 1, 1, 1));
+        let t2 = &s.turns[1];
+        assert_eq!((t2.source.as_str(), t2.hops, t2.prompt_tokens, t2.ttft_ms), ("goal round", 0, 2_000, None));
+        assert_eq!(s.through_seq, 10);
     }
 
     #[test]

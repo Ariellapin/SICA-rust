@@ -265,20 +265,7 @@ pub async fn summarize_fold(
     folded: Vec<ChatMessage>,
     cancel: Option<CancellationToken>,
 ) -> Option<FoldSummary> {
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(system_wire.len() + folded.len() + 1);
-    messages.extend_from_slice(system_wire);
-    messages.extend(folded);
-    messages.push(ChatMessage::text("user", COMPACTION_INSTRUCTION));
-
-    // Per-message excerpt guard: one pathological entry must not crowd out
-    // the rest of the fold. (The directive itself is exempt.)
-    let folded_count = messages.len().saturating_sub(system_wire.len() + 1);
-    for m in messages.iter_mut().skip(system_wire.len()).take(folded_count) {
-        let text = m.content.text();
-        if text.len() > MAX_EXCERPT_CHARS && !is_checkpoint(&text) {
-            m.content = llm::client::ChatContent::Text(excerpt(&text, MAX_EXCERPT_CHARS));
-        }
-    }
+    let messages = fold_request(system_wire, folded);
 
     let mut summarizer = client.clone();
     if summarizer.max_tokens.is_none() || summarizer.max_tokens.unwrap_or(0) < policy.max_tokens {
@@ -316,6 +303,26 @@ pub async fn summarize_fold(
         }
     }
     degraded
+}
+
+/// The summarisation request: the conversation's own system prompt, the
+/// folded messages (each excerpted to [`MAX_EXCERPT_CHARS`] except an
+/// earlier checkpoint, which goes whole), then the directive as the final
+/// user message. Pure, so the shape can be tested without a client.
+pub fn fold_request(system_wire: &[ChatMessage], folded: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(system_wire.len() + folded.len() + 1);
+    messages.extend_from_slice(system_wire);
+    for mut m in folded {
+        // Per-message excerpt guard: one pathological entry must not crowd
+        // out the rest of the fold.
+        let text = m.content.text();
+        if text.len() > MAX_EXCERPT_CHARS && !is_checkpoint(&text) {
+            m.content = llm::client::ChatContent::Text(excerpt(&text, MAX_EXCERPT_CHARS));
+        }
+        messages.push(m);
+    }
+    messages.push(ChatMessage::text("user", COMPACTION_INSTRUCTION));
+    messages
 }
 
 /// Whether a wire message is an earlier compaction checkpoint.
@@ -589,15 +596,36 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_checkpoint_is_never_excerpted() {
-        // The guard `summarize_fold` applies, exercised on its own inputs:
-        // a checkpoint over the cap stays whole, a tool dump does not.
-        let checkpoint = summary_message(&"## Primary Request and Intent\n- keep me\n".repeat(200));
-        assert!(checkpoint.len() > MAX_EXCERPT_CHARS);
-        assert!(is_checkpoint(&checkpoint));
-        let dump = "x".repeat(MAX_EXCERPT_CHARS * 4);
-        assert!(!is_checkpoint(&dump));
-        assert!(excerpt(&dump, MAX_EXCERPT_CHARS).len() < dump.len());
+    fn fold_request_keeps_an_earlier_checkpoint_whole_and_excerpts_the_rest() {
+        // A checkpoint well over the excerpt cap, with a marker deep in its
+        // middle — exactly the part a head/tail excerpt would drop.
+        let middle = "## Files and Code\n- `crates/agents/src/compact.rs` line 214\n";
+        let checkpoint = summary_message(&format!(
+            "## Primary Request and Intent\n{}{middle}{}",
+            "- context\n".repeat(400),
+            "- more\n".repeat(400)
+        ));
+        assert!(checkpoint.len() > MAX_EXCERPT_CHARS * 2);
+        let dump = format!("HEAD{}TAIL", "x".repeat(MAX_EXCERPT_CHARS * 4));
+        let system = vec![ChatMessage::text("system", "sys")];
+        let req = fold_request(
+            &system,
+            vec![
+                ChatMessage::text("user", checkpoint.clone()),
+                ChatMessage::text("user", dump.clone()),
+                ChatMessage::text("assistant", "short"),
+            ],
+        );
+        assert_eq!(req.len(), 5, "system + 3 folded + directive");
+        assert_eq!(req[0].content.text(), "sys");
+        assert_eq!(req[1].content.text(), checkpoint, "the checkpoint went whole");
+        assert!(req[1].content.text().contains(middle));
+        let excerpted = req[2].content.text();
+        assert!(excerpted.len() < dump.len(), "the dump was excerpted");
+        assert!(excerpted.starts_with("HEAD") && excerpted.ends_with("TAIL"));
+        assert_eq!(req[3].content.text(), "short");
+        assert_eq!(req[4].content.text(), COMPACTION_INSTRUCTION);
+        assert_eq!(req[4].role, "user");
     }
 
     #[test]

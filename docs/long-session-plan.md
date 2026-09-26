@@ -273,35 +273,68 @@ each summariser request stays under half the window. Keep the prefix
 property for the first chunk (it is the conversation's own prefix); the
 second chunk cannot be a prefix and that is the price.
 
-## Wave F — measuring long sessions (S × 3)
+## Wave F — measuring long sessions (S × 3) — **shipped**
+
+**Shipped as** (2026-09-26): `project::TurnSeries` and the `/stats`
+per-turn table, with `ttft_ms` made durable on `TokenUsage` (F3);
+`invariants::check_summary_chain`, run with the other companions under
+`--invariants` and on every replay (F2); and, in place of a recording, a
+harness test in `chat.rs` that drives two chained compactions through the
+real `compact_session` with the summariser served from a replay script,
+plus a pure `compact::fold_request` whose test pins the checkpoint
+exemption (F1). Two departures from the recipes below, both in
+[notes/2026-09-26-long-session-instruments.md](notes/2026-09-26-long-session-instruments.md):
+the series reaches the FE as the command's text instead of a new wire
+type, and the `compaction-chain` recording is deferred to a Windows
+session with the recipe under F1.
 
 ### F1. A chained-compaction replay scenario
 
-A new `snapshots/compaction-chain` recording with a session that compacts
-twice, where a fact stated in turn 1 (a file path and an error string) is
-asked about after the second compaction. The replay diff then catches any
-regression of A1, and the scenario is the fixture for E4's chunked fold.
-Bless once, on the model the other scenarios use.
+Shipped as two tests rather than a recording. A recording cannot catch an
+A1 regression: the replay serves the *recorded* summaries whatever request
+the harness builds, and the request is not logged. So the guard is
+`compact::tests::fold_request_keeps_an_earlier_checkpoint_whole…`, which
+pins the request shape, and
+`chat::tests::two_chained_compactions_carry_the_first_checkpoint_forward`,
+which runs `compact_session` twice over a scripted summariser and checks
+the second span shadows the first checkpoint, the chain invariant holds
+and fires, and the todo list follows each fold.
+
+A `snapshots/compaction-chain` recording is still worth having as the
+fixture for E4's chunked fold and to run F2 on a real model's summaries.
+Recipe, on the Windows machine: connect the model the other scenarios
+use, open a session with `window` pinned small enough to compact twice in
+six turns (the `compaction-replace` scenario uses 9 000), state a file
+path and an error string in turn 1, ask about both in turn 6, then
+`.\run.ps1 --% run -p frontend --bin replay -- --bless compaction-chain`
+with a `scenario.toml` copied from `compaction-replace` (`pad = 8`).
 
 ### F2. `check_summary_chain` invariant
 
 In `backend::invariants`: every `CompactionSummary` whose folded span
-contains an earlier summary must have a `summary` at least as long as the
-earlier one's **Files and Code** section, and must contain every
-backticked path the earlier one contained. Cheap, purely over the log,
-and the kind of invariant a second observer can check.
+contains an earlier summary must contain every backticked identifier the
+newest such summary contained (paths, commands, error strings — what the
+directive says to keep exact). Cheap, purely over the log, and the kind of
+invariant a second observer can check. The length rule first proposed here
+was dropped: a shorter consolidated checkpoint is not a defect, a lost
+identifier is.
 
 ### F3. A per-session series in `SessionStats`
 
-Extend `sica_core::project::stats` with, per turn: `ttft_ms`,
-`prompt_tokens`, `hops`, and whether a compaction happened. The FE's
-`stats` command prints the table. This is the instrument for B1 and E4;
-without it the two waves are opinions.
+`sica_core::project::TurnSeries` folds, per turn: source, hops, finish
+reason, the largest `prompt_tokens`, summed completion tokens, the first
+hop's `ttft_ms`, compactions, pruned results, retries and tool calls.
+`ttft_ms` had only ever been a wire event, so it is now a log-only
+optional field on `TokenUsage` (older logs read as `None`). `/stats`
+prints the newest twenty rows under the counters, oldest first so a
+climbing column reads as a trend. No protocol change: the table travels
+as the command's text. This is the instrument for B1 and E4; without it
+the two waves are opinions.
 
 ## Suggested order
 
 1. ~~**A1 → A2 → A3 → A4**~~ shipped, see above.
-2. **F3 → F1 → F2** next, so B and E are measured rather than assumed.
+2. ~~**F3 → F1 → F2**~~ shipped, see above.
 3. **B1 → B2** (one protocol bump).
 4. **C1 → C2** (one protocol bump); D1–D3 ride the same session since
    they touch the continuation point C2 also edits.
