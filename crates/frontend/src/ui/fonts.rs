@@ -115,10 +115,23 @@ pub fn install(ctx: &egui::Context) {
     weighted(FAMILY_SEMIBOLD, "ui_semibold");
     weighted(FAMILY_BOLD, "ui_bold");
 
-    fonts.families.insert(
-        egui::FontFamily::Name(FAMILY_MONO.into()),
-        vec!["mono_regular".to_owned(), "mono_bold".to_owned()],
-    );
+    // Plex Mono has no Greek, Hebrew or most symbols, so the family ends in
+    // egui's monospace faces and then the proportional chain — otherwise a
+    // glyph like the usage row's `Σ` or a non-Latin path renders as `?`.
+    let mut mono = vec!["mono_regular".to_owned(), "mono_bold".to_owned()];
+    let monospace = fonts
+        .families
+        .get(&egui::FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    for key in monospace.into_iter().chain(proportional) {
+        if !mono.contains(&key) {
+            mono.push(key);
+        }
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(FAMILY_MONO.into()), mono);
 
     ctx.set_fonts(fonts);
 }

@@ -69,6 +69,10 @@ impl Idealist {
                     module = %trigger.module,
                     "idealist: received trigger"
                 );
+                if analyzer::is_caller_error(&trigger) {
+                    info!(module = %trigger.module, "idealist: caller-input error — no ticket");
+                    continue;
+                }
                 me.events.emit(Event::LogLine {
                     level: "INFO".into(),
                     message: format!(
