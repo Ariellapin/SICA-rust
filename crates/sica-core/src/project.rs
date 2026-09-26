@@ -498,6 +498,19 @@ impl ScheduleRecord {
 /// The fold is strict about what it accepts, the way dsh's decoder is: a
 /// `delete` or `dispatch` naming an inactive id, or a `create` reusing a
 /// live one, is a torn log and is skipped rather than papered over.
+/// The session's working notes: the content of the newest `Notes` row,
+/// or `None` when there is none or the newest cleared them.
+pub fn notes(events: &[SessionEvent]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|ev| match &ev.kind {
+            EventKind::Notes { content } => Some(content.clone()),
+            _ => None,
+        })
+        .filter(|c| !c.trim().is_empty())
+}
+
 pub fn schedules(events: &[SessionEvent]) -> Vec<ScheduleRecord> {
     let mut out: Vec<ScheduleRecord> = Vec::new();
     for ev in events {

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -433,6 +433,11 @@ pub enum Request {
     /// start of the next turn when idle). Injected content is model-visible
     /// but never attributed to the user.
     InjectContext { session_id: u64, text: String },
+    /// Replace the session's working notes on the operator's behalf
+    /// (long-session-plan C1). Durable like a `notes-write` call, mirrored
+    /// to `sessions/<id>/notes.md`, and handed to the model at its next
+    /// hop as `WorkingMemory` context so an edit is not silently ignored.
+    WriteNotes { session_id: u64, content: String },
 
     /// Rewrite a message still waiting in the queue. Addressed by the
     /// [`QueuedDump::id`] the last `QueueChanged` carried; a row already
@@ -818,6 +823,10 @@ pub struct SessionDump {
     /// Latest durable todo list — drives the FE checklist on reload.
     #[serde(default)]
     pub todos: Vec<TodoItem>,
+    /// The session's working notes (`notes-write`, long-session-plan C1)
+    /// — drives the FE notes card on reload. Empty when there are none.
+    #[serde(default)]
+    pub notes: String,
     /// Selected agent preset (`agents/<name>.md`), when the session runs
     /// one — drives the FE composer chip without a second round-trip.
     #[serde(default)]
@@ -1152,6 +1161,13 @@ pub enum Event {
     TodosChanged {
         session_id: u64,
         items: Vec<TodoItem>,
+    },
+    /// The working notes changed — by the model (`notes-write`), by the
+    /// operator (`WriteNotes` or an edit of `sessions/<id>/notes.md`), or
+    /// cleared. Unlike the todo list they do not clear on a turn start.
+    NotesChanged {
+        session_id: u64,
+        content: String,
     },
     /// Plan mode flipped (via `/plan`, `SetPlanMode`, or `exit-plan-mode`).
     PlanModeChanged {

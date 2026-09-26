@@ -238,6 +238,18 @@ The log gained `EventKind::Schedule` and `EventKind::MessageFeedback` (both
 non-surface) and `TurnSource::Schedule`; `sica_core::project::schedules` and
 `::feedback` are their folds.
 
+v30 (long-session-plan Wave C) adds the working notes: `Request::WriteNotes
+{ session_id, content }` (the operator's `notes-write`), `Event::NotesChanged
+{ session_id, content }` and `SessionDump.notes` for the FE's notes card.
+The log gained `EventKind::Notes { content }` (non-surface, latest wins,
+mirrored to `sessions/<id>/notes.md`; `sica_core::project::notes` is its
+fold) and two `ContextSource`s: `WorkingMemory`, the notes re-attached
+verbatim after a compaction or in a restart brief, and `Clock` (Wave B).
+A restart repairs each log at load by appending: `TurnEnd { finish_reason:
+"restart" }` for an open turn, `ABORTED_BY_RESTART` results for its
+dangling calls, `JobFinished { status: "lost" }` for background jobs the
+process took with it (`backend::restart`).
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:

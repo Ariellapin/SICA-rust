@@ -29,6 +29,7 @@ use sica_core::message::{Message, Role};
 
 use crate::hooks;
 use crate::inbox::{Inbound, Inbox};
+use crate::restart;
 use crate::sessions_store::{self, SessionLog};
 use crate::title_gen;
 use crate::verdict;
@@ -137,6 +138,9 @@ pub struct ChatHub {
     /// `Schedule` rows kept resident so the timer never re-reads a log to
     /// find out nothing is due.
     pub schedules:     Arc<Mutex<HashMap<u64, Vec<sica_core::project::ScheduleRecord>>>>,
+    /// Restart repairs (C2) found at load and not yet handed to their
+    /// sessions' inboxes. Drained once by `deliver_restart_briefs`.
+    pub pending_briefs: Arc<std::sync::Mutex<Vec<(u64, restart::Repair)>>>,
     /// Sessions whose approval policy is `never` (guide §10.2): an `Ask`
     /// is refused deterministically instead of reaching the broker.
     /// Restored from the log's `Command { name: "approval" }` rows.
@@ -448,6 +452,27 @@ impl ControlState {
                             summary: format!(
                                 "todo list updated: {total} items, {active} in progress"
                             ),
+                        },
+                        false,
+                    )
+                }
+            }
+        } else if name == agents::control::NOTES_WRITE_NAME {
+            let raw = args.get("notes").unwrap_or(&serde_json::Value::Null);
+            match agents::control::validate_notes(raw) {
+                Err(e) => (fail(&e), false),
+                Ok(content) => {
+                    append_event(sessions, session_id, EventKind::Notes { content: content.clone() }).await;
+                    persist_notes_file(session_id, &content, self.events.as_ref());
+                    self.events.emit(Event::NotesChanged { session_id, content: content.clone() });
+                    (
+                        agents::SkillOutcome {
+                            ok: true,
+                            summary: if content.is_empty() {
+                                "working notes cleared".into()
+                            } else {
+                                format!("working notes updated ({} bytes)", content.len())
+                            },
                         },
                         false,
                     )
@@ -1090,7 +1115,80 @@ impl ChatHub {
             )),
             schedules:    Arc::new(Mutex::new(HashMap::new())),
             approval_never: Arc::new(Mutex::new(HashSet::new())),
+            pending_briefs: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Hand every restart repair found at load to its session as injected
+    /// context (long-session-plan C2): the brief itself, then the todo
+    /// list and the working notes so the model resumes from its own state
+    /// rather than from a summary of it. Rides the inbox, so it reaches
+    /// the model at the first hop of the session's next turn — a person or
+    /// the goal driver still decides when that is.
+    pub async fn deliver_restart_briefs(&self) {
+        let briefs: Vec<(u64, restart::Repair)> =
+            std::mem::take(&mut *self.pending_briefs.lock().expect("briefs lock"));
+        for (session_id, repair) in briefs {
+            let (todos, notes) = {
+                let g = self.sessions.lock().await;
+                match g.get(&session_id) {
+                    Some(log) => (
+                        latest_todos(&log.events),
+                        sica_core::project::notes(&log.events),
+                    ),
+                    None => continue,
+                }
+            };
+            let brief = restart_brief(&repair);
+            self.event_sink.emit(Event::LogLine {
+                level: "WARN".into(),
+                message: format!("session {session_id}: {}", one_line(&brief, 200)),
+            });
+            self.inbox
+                .push(session_id, Inbound::Inject { content: brief, source: ContextSource::Injected })
+                .await;
+            if let Some(list) = agents::control::render_todo_checklist(&todos) {
+                self.inbox
+                    .push(session_id, Inbound::Inject { content: list, source: ContextSource::ToolNotice })
+                    .await;
+            }
+            if let Some(notes) = notes {
+                self.inbox
+                    .push(
+                        session_id,
+                        Inbound::Inject {
+                            content: agents::control::render_working_memory(&notes),
+                            source: ContextSource::WorkingMemory,
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Replace a session's working notes on the operator's behalf
+    /// (`Request::WriteNotes`): the same durable row a `notes-write` call
+    /// leaves, the same file, and a `WorkingMemory` context queued for the
+    /// model's next hop so the edit is read rather than silently stored.
+    pub async fn write_notes(&self, session_id: u64, content: String) -> Result<(), String> {
+        let content = agents::control::validate_notes(&serde_json::Value::String(content))?;
+        if !self.session_exists(session_id).await {
+            return Err(format!("session {session_id} not found"));
+        }
+        append_event(&self.sessions, session_id, EventKind::Notes { content: content.clone() }).await;
+        persist_notes_file(session_id, &content, self.event_sink.as_ref());
+        self.event_sink.emit(Event::NotesChanged { session_id, content: content.clone() });
+        if !content.is_empty() {
+            self.enqueue(
+                session_id,
+                Inbound::Inject {
+                    content: agents::control::render_working_memory(&content),
+                    source: ContextSource::WorkingMemory,
+                },
+            )
+            .await;
+        }
+        Ok(())
     }
 
     /// Sessions as the workspace registry sees them (guide §3.9): id,
@@ -1150,7 +1248,17 @@ impl ChatHub {
             let mut schedules = hub.schedules.try_lock().expect("fresh ChatHub");
             let mut approval_never = hub.approval_never.try_lock().expect("fresh ChatHub");
             let mut max_goal = 0;
-            for s in loaded {
+            let mut briefs = hub.pending_briefs.lock().expect("fresh ChatHub");
+            for mut s in loaded {
+                // What the last process left half-done (C2): repaired by
+                // appending, flushed, and remembered for the brief.
+                let repair = restart::repair(&mut s);
+                if !repair.is_empty() {
+                    if let Err(e) = sessions_store::flush(&mut s) {
+                        warn!(error = %e, session_id = s.id, "flush session (after restart repair) failed");
+                    }
+                    briefs.push((s.id, repair));
+                }
                 let (mode, plan, preset, goal) = control_state(&s);
                 // Reminders come back exactly as the log says (§12.8): a
                 // target that passed while the process was down is simply
@@ -1418,6 +1526,7 @@ impl ChatHub {
         let plan_active = self.plans.lock().await.get(&id).copied().unwrap_or(false);
         let agent = self.presets.lock().await.get(&id).cloned();
         let todos = latest_todos(&log.events);
+        let notes = sica_core::project::notes(&log.events).unwrap_or_default();
         let runs = sica_core::project::workflow_runs(&log.events)
             .into_iter()
             .map(run_dump)
@@ -1430,6 +1539,7 @@ impl ChatHub {
             permission_mode,
             plan_active,
             todos,
+            notes,
             agent,
             runs,
             schedules,
@@ -2625,6 +2735,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 });
             }
             append_runtime_context(log, &client.model, perm_mode, turn_plan_active);
+            if let Some(content) = reconcile_notes_file(log) {
+                self.event_sink.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: "working notes picked up from notes.md".into(),
+                });
+                self.event_sink.emit(Event::NotesChanged { session_id, content });
+            }
             if let Some(exp) = expansion {
                 log.append(EventKind::ContextInjected {
                     surface: SurfaceOp::Append,
@@ -4155,14 +4272,6 @@ fn refresh_instructions(log: &mut SessionLog) -> bool {
         .rev()
         .find(|e| matches!(e.context, Some(ContextSource::Instructions)))
         .map(|e| e.seq);
-    let prev_content = prev.and_then(|seq| {
-        log.events.iter().find_map(|ev| match &ev.kind {
-            EventKind::ContextInjected {
-                source: ContextSource::Instructions, content, ..
-            } if ev.seq == seq => Some(content.clone()),
-            _ => None,
-        })
-    });
 
     let content = if baseline.is_empty() {
         // Only supersede when there is a previous snapshot to supersede.
@@ -4562,6 +4671,92 @@ fn land_compaction(
             content: checklist,
         });
     }
+    // The working notes too (C1): the one piece of the model's own state
+    // the harness carries verbatim, where the summary is a paraphrase.
+    if let Some(notes) = sica_core::project::notes(&log.events) {
+        log.append(EventKind::ContextInjected {
+            surface: SurfaceOp::Append,
+            source: ContextSource::WorkingMemory,
+            content: agents::control::render_working_memory(&notes),
+        });
+    }
+}
+
+/// Mirror the working notes to `sessions/<id>/notes.md` (C1). A write
+/// failure is reported, never fatal: the log row is the record.
+fn persist_notes_file(session_id: u64, content: &str, events: &dyn EventSink) {
+    let path = sica_core::paths::notes_file(session_id);
+    let result = if content.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        sica_core::atomic::atomic_write(&path, content.as_bytes())
+    };
+    if let Err(e) = result {
+        events.emit(Event::LogLine {
+            level: "WARN".into(),
+            message: format!("working notes: could not write {}: {e}", path.display()),
+        });
+    }
+}
+
+/// At turn start, pick up an operator's edit of `notes.md`: when the file
+/// says something other than the newest `Notes` row, that becomes the
+/// newest row and is handed to the model as `WorkingMemory` context.
+/// Returns the new content when one landed.
+fn reconcile_notes_file(log: &mut SessionLog) -> Option<String> {
+    let on_disk = std::fs::read_to_string(sica_core::paths::notes_file(log.id)).ok()?;
+    let on_disk = on_disk.trim().to_string();
+    if on_disk.is_empty() || on_disk.len() > agents::control::NOTES_CAP {
+        return None;
+    }
+    let current = sica_core::project::notes(&log.events).unwrap_or_default();
+    if on_disk == current {
+        return None;
+    }
+    log.append(EventKind::Notes { content: on_disk.clone() });
+    log.append(EventKind::ContextInjected {
+        surface: SurfaceOp::Append,
+        source: ContextSource::WorkingMemory,
+        content: agents::control::render_working_memory(&on_disk),
+    });
+    Some(on_disk)
+}
+
+/// The text of a restart brief (C2), from what `restart::repair` did.
+fn restart_brief(r: &restart::Repair) -> String {
+    let mut out = format!(
+        "<restart-notice>\nThe backend restarted at {}.",
+        chrono::Local::now().format("%Y-%m-%d %H:%M (%:z)")
+    );
+    if let Some(turn) = r.cut_turn {
+        out.push_str(&format!(
+            " The turn in progress (turn {turn}) was cut short after {} tool call(s)",
+            r.hops
+        ));
+        if r.dangling > 0 {
+            out.push_str(&format!(
+                "; {} call(s) never reported a result and are marked failed — whether they \
+                 ran is unknown, so check the workspace before repeating them",
+                r.dangling
+            ));
+        }
+        out.push('.');
+    }
+    if !r.lost_jobs.is_empty() {
+        out.push_str(&format!(
+            " Background job(s) {} were lost with the process; start them again if you \
+             still need them.",
+            r.lost_jobs.iter().map(|j| format!("`{j}`")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push_str(
+        " Your todo list and working notes follow when you have them. Continue from \
+         the workspace, which is authoritative.\n</restart-notice>",
+    );
+    out
 }
 
 /// The session's current todo list: the items of the newest `TodoWrite`,
@@ -5780,6 +5975,66 @@ mod tests {
         assert!(after[1].message.content.contains("- [x] read it"));
         // The UI's copy is the same list.
         assert_eq!(latest_todos(&log.events).len(), 2);
+    }
+
+    #[test]
+    fn compaction_reattaches_the_working_notes_verbatim() {
+        let mut log = SessionLog::new(1, "t");
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u1".into(), images: Vec::new() });
+        log.append(EventKind::Notes { content: "- editing `src/lib.rs`\n- `cargo test` was green".into() });
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a1".into(), reasoning: None, tool_calls: None });
+        fold_all(&mut log);
+        let after = log.derive_surface();
+        assert_eq!(after.len(), 2, "summary, then the notes: {after:?}");
+        assert!(matches!(after[1].context, Some(ContextSource::WorkingMemory)));
+        assert!(after[1].message.content.contains("<working-notes>\n- editing `src/lib.rs`\n- `cargo test` was green\n</working-notes>"));
+        // Cleared notes are not re-attached.
+        log.append(EventKind::Notes { content: String::new() });
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u2".into(), images: Vec::new() });
+        fold_all(&mut log);
+        assert_eq!(log.derive_surface().len(), 1);
+    }
+
+    #[test]
+    fn a_restart_brief_names_what_was_lost() {
+        let r = restart::Repair { cut_turn: Some(7), hops: 3, dangling: 1, lost_jobs: vec!["cli-2".into()] };
+        let text = restart_brief(&r);
+        assert!(text.starts_with("<restart-notice>"));
+        assert!(text.contains("turn 7"));
+        assert!(text.contains("3 tool call(s)"));
+        assert!(text.contains("1 call(s) never reported"));
+        assert!(text.contains("`cli-2`"));
+        assert!(text.ends_with("</restart-notice>"));
+        let jobs_only = restart_brief(&restart::Repair { lost_jobs: vec!["cli-9".into()], ..Default::default() });
+        assert!(!jobs_only.contains("turn in progress"));
+        assert!(jobs_only.contains("`cli-9`"));
+    }
+
+    #[tokio::test]
+    async fn notes_write_control_persists_and_emits() {
+        let (cs, sessions, cap) = control();
+        with_log(&sessions, 1).await;
+        let args = serde_json::json!({ "notes": "- `src/x.rs` is the entry point" });
+        let cancel = CancellationToken::new();
+        let (out, _) = cs
+            .handle_control(&sessions, "notes-write", &args, "notes-write", "", 1, 0, &cancel)
+            .await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("updated"));
+        let evs = cap.0.lock().unwrap().clone();
+        assert!(evs.iter().any(|e| matches!(e, Event::NotesChanged { session_id: 1, content } if content.contains("src/x.rs"))));
+        {
+            let g = sessions.lock().await;
+            assert_eq!(sica_core::project::notes(&g[&1].events).as_deref(), Some("- `src/x.rs` is the entry point"));
+        }
+        let too_big = serde_json::json!({ "notes": "x".repeat(agents::control::NOTES_CAP + 1) });
+        let (out, _) = cs.handle_control(&sessions, "notes-write", &too_big, "", "", 1, 0, &cancel).await;
+        assert!(!out.ok);
+        let (out, _) = cs.handle_control(&sessions, "notes-write", &serde_json::json!({ "notes": "" }), "", "", 1, 0, &cancel).await;
+        assert!(out.ok && out.summary.contains("cleared"));
+        let g = sessions.lock().await;
+        assert_eq!(sica_core::project::notes(&g[&1].events), None);
+        let _ = std::fs::remove_file(sica_core::paths::notes_file(1));
     }
 
     #[test]

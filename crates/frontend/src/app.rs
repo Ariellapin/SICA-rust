@@ -300,6 +300,13 @@ pub struct App {
     /// Durable todo list of the active session (checklist above the
     /// composer). Clears on the next turn start.
     pub todos: Vec<protocol::TodoItem>,
+    /// Working notes of the active session (`notes-write`, long-session
+    /// plan C1): the notes card above the composer. Unlike the todo list
+    /// they persist across turns; empty is "no notes".
+    pub notes: String,
+    /// The notes card's edit buffer while the operator is editing; `None`
+    /// when the card is read-only.
+    pub notes_draft: Option<String>,
     /// Background jobs of the active session (strip above the composer).
     /// Replaced wholesale on every `JobsChanged`.
     pub jobs: Vec<protocol::JobDump>,
@@ -1365,6 +1372,8 @@ impl App {
             pending_approval: None,
             pending_question: None,
             todos: Vec::new(),
+            notes: String::new(),
+            notes_draft: None,
             jobs: Vec::new(),
             goal: None,
             schedules: Vec::new(),
@@ -2532,6 +2541,8 @@ impl App {
                 self.plan_active = session.plan_active;
                 self.session_agent = session.agent;
                 self.todos = session.todos;
+                self.notes = session.notes;
+                self.notes_draft = None;
                 // The backend pushes this session's `JobsChanged` alongside
                 // the dump; clearing here keeps the previous session's jobs
                 // off screen in the frame before it lands.
@@ -2628,6 +2639,13 @@ impl App {
                 if session_id == self.chat.session_id {
                     self.todos = items;
                     self.chat.scroll_to_bottom = true;
+                }
+            }
+            UiEvent::NotesChanged { session_id, content } => {
+                if session_id == self.chat.session_id {
+                    self.notes = content;
+                    // An edit in progress is not thrown away by a push
+                    // from the model; Save will replace what it wrote.
                 }
             }
             UiEvent::PlanModeChanged { session_id, active } => {

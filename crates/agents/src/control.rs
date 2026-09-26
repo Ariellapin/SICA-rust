@@ -20,6 +20,10 @@ use serde_json::Value;
 use crate::skill::{Skill, SkillContext, SkillOutcome};
 
 pub const TODO_WRITE_NAME: &str = "todo-write";
+pub const NOTES_WRITE_NAME: &str = "notes-write";
+/// Cap on the working notes, in bytes. Small on purpose: the notes ride
+/// every compaction and every restart brief verbatim.
+pub const NOTES_CAP: usize = 4096;
 pub const EXIT_PLAN_MODE_NAME: &str = "exit-plan-mode";
 pub const ASK_USER_NAME: &str = "ask-user";
 
@@ -40,6 +44,7 @@ pub const CHILD_EXCLUDED: &[&str] = &[
     crate::workflow::WORKFLOW_NAME,
     ASK_USER_NAME,
     TODO_WRITE_NAME,
+    NOTES_WRITE_NAME,
     EXIT_PLAN_MODE_NAME,
     crate::goal::CREATE_GOAL_NAME,
     crate::goal::GET_GOAL_NAME,
@@ -212,6 +217,64 @@ pub fn render_todo_checklist(items: &[protocol::TodoItem]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
+/// Validate a `notes-write` argument: markdown text under [`NOTES_CAP`]
+/// bytes. Empty clears the notes.
+pub fn validate_notes(raw: &Value) -> Result<String, String> {
+    let text = match raw {
+        Value::String(s) => s.trim().to_string(),
+        Value::Null => return Err("missing `notes` arg — pass the full notes markdown".into()),
+        other => other.to_string(),
+    };
+    if text.len() > NOTES_CAP {
+        return Err(format!(
+            "notes are {} bytes; the cap is {NOTES_CAP} — keep decisions, paths, \
+             commands and open questions, drop narration",
+            text.len()
+        ));
+    }
+    Ok(text)
+}
+
+/// The working notes as the model reads them when the harness re-attaches
+/// them — after a compaction folded the `notes-write` call that last set
+/// them, or in a restart brief.
+pub fn render_working_memory(notes: &str) -> String {
+    format!(
+        "Your working notes, carried over verbatim from before the context checkpoint \
+         (update them with notes-write when a decision is made or a step completes):\n\
+         <working-notes>\n{}\n</working-notes>",
+        notes.trim()
+    )
+}
+
+/// Full-replacement working notes. Validated and persisted by the harness
+/// (see module docs); this stub only carries the catalogue entry + guidance.
+pub struct NotesWrite;
+
+#[async_trait]
+impl Skill for NotesWrite {
+    fn name(&self) -> &str {
+        NOTES_WRITE_NAME
+    }
+    fn description(&self) -> &str {
+        "Replace your working notes (markdown, 4 KiB max): decisions taken, files in play, \
+         commands that worked, open questions. They survive context compaction verbatim."
+    }
+    fn positional_args(&self) -> Vec<String> {
+        vec!["notes".into()]
+    }
+    fn prompt_guidance(&self) -> Option<&'static str> {
+        Some(
+            "Keep working notes with notes-write on long tasks — what you would want to know \
+             after your memory is wiped; update them when a decision is made or a step \
+             completes, not every hop.",
+        )
+    }
+    async fn run(&self, _args: Value, _ctx: SkillContext) -> SkillOutcome {
+        unreachable(NOTES_WRITE_NAME)
+    }
+}
+
 /// Full-replacement todo list. Validated and persisted by the harness (see
 /// module docs); this stub only carries the catalogue entry + guidance.
 pub struct TodoWrite;
@@ -293,6 +356,19 @@ mod tests {
         .unwrap();
         assert_eq!(render_todo_checklist(&done), None);
         assert_eq!(render_todo_checklist(&[]), None);
+    }
+
+    #[test]
+    fn notes_validate_and_render() {
+        assert_eq!(validate_notes(&Value::String("  - `src/x.rs` edited  ".into())).unwrap(), "- `src/x.rs` edited");
+        assert_eq!(validate_notes(&Value::String(String::new())).unwrap(), "");
+        assert!(validate_notes(&Value::Null).is_err());
+        let big = Value::String("x".repeat(NOTES_CAP + 1));
+        assert!(validate_notes(&big).unwrap_err().contains("4096"));
+        let framed = render_working_memory("- keep me\n");
+        assert!(framed.contains("<working-notes>\n- keep me\n</working-notes>"));
+        assert!(framed.contains("notes-write"));
+        assert!(CHILD_EXCLUDED.contains(&NOTES_WRITE_NAME));
     }
 
     #[test]

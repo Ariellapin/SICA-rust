@@ -193,6 +193,18 @@ chunk), and inside the reminder tools before they confirm a mutation
 a native batch is answered as not executed. Only the turn fails, never the
 process. `append_event` still logs-and-continues on the ordinary path.
 
+**The restart brief** (long-session-plan C2, 2026-09-26) is the other half:
+what the log says after the process died. `backend::restart::repair` runs
+on every log at load and appends — never edits — `TurnEnd { finish_reason:
+"restart" }` for a `TurnStart` with no end, a failed `ABORTED_BY_RESTART`
+result for every call of that turn whose result never landed (a logged
+`ToolCall`, or a native `tool_calls` id the batch never reached), and
+`JobFinished { status: "lost" }` for a background job the log says started
+and never says finished. `ChatHub::deliver_restart_briefs` then queues, per
+repaired session, a `<restart-notice>` (`Injected`), the todo list
+(`ToolNotice`) and the working notes (`WorkingMemory`) in the inbox, so the
+model reads them at the first hop of its next turn. Nothing starts a turn.
+
 **Mechanism.** Fail-closed flush *before* each model request and *before* each
 top-level tool body; if the write cannot be confirmed the request/tool does not
 run.
@@ -1558,6 +1570,27 @@ gets `ok: true, "3 items, 1 in progress"`). `Event::TodosChanged {
 session_id, items }` for the FE checklist above the composer; cleared on
 `TurnStart` (FE hides it, log keeps it). Add a one-line guidance section
 (§5.1): "Use todo-write for multi-step tasks; send the whole list each time."
+
+### 11.2a `notes-write` — working memory — **done** (long-session-plan C1, protocol v30)
+
+Ours, not dsh's. The compaction checkpoint is an LLM's paraphrase of the
+model's state; the working notes are the small piece of it the harness
+carries **verbatim**. `notes-write '<markdown>'` replaces the session's
+notes (cap `control::NOTES_CAP`, 4 KiB; empty clears), appends
+`EventKind::Notes { content }` (non-surface, latest wins,
+`sica_core::project::notes`), mirrors them to `sessions/<id>/notes.md`
+through `atomic_write`, and emits `Event::NotesChanged`. They reach the
+model three ways: its own call while that is in the tail; a
+`ContextInjected { source: WorkingMemory }` appended by
+`chat::land_compaction` after every compaction summary (with the todo
+list, Wave A3), framed by `control::render_working_memory`; and the
+restart brief (§3.2). An operator edit — `Request::WriteNotes` from the
+notes card, or the file on disk, picked up by `reconcile_notes_file` at
+turn start — lands the same row and hands the model a `WorkingMemory`
+context at its next hop. The compaction directive says not to restate
+them; `memory.md`'s rules say when to write them (a decision made, a step
+completed — not every hop). Excluded from children like the other
+controls.
 
 ---
 

@@ -281,6 +281,15 @@ pub enum EventKind {
     /// is the cleared state. Never surfaced — the persona reaches the model
     /// through the system prompt, not the transcript.
     AgentPreset { name: Option<String> },
+    /// Full-replacement working notes (`notes-write`, long-session-plan
+    /// C1): the small piece of state the harness carries across a
+    /// compaction *verbatim*, where the checkpoint summary is an LLM's
+    /// paraphrase. Latest wins; never surfaced directly — the model sees
+    /// its own `notes-write` call while that is in the tail, and a
+    /// `ContextInjected { source: WorkingMemory }` copy re-attached after
+    /// every compaction and in a restart brief once it is not. Mirrored to
+    /// `sessions/<id>/notes.md` for the operator.
+    Notes { content: String },
     /// Full-replacement todo list. Latest wins; never surfaced (the FE
     /// renders the checklist from the pushed event).
     TodoWrite { items: Vec<protocol::TodoItem> },
@@ -473,6 +482,9 @@ pub enum ContextSource {
     /// The stable runtime facts (cwd, OS, model, permission mode, plan
     /// mode), replaced only when one of them changes.
     RuntimeContext,
+    /// The session's working notes, re-attached verbatim after a
+    /// compaction or a restart (long-session-plan C1).
+    WorkingMemory,
     /// The clock line — local time and time since the previous message —
     /// appended at the top of every turn and never replaced. Kept apart
     /// from [`ContextSource::RuntimeContext`] because it is the one fact
@@ -496,6 +508,7 @@ impl ContextSource {
             ContextSource::Injected => "injected".into(),
             ContextSource::RuntimeContext => "runtime context".into(),
             ContextSource::Clock => "clock".into(),
+            ContextSource::WorkingMemory => "working memory".into(),
         }
     }
 }

@@ -1136,7 +1136,7 @@ queue, stats, context_ring}.rs`.
   looping `SteerTurn` + `Request::DropQueued` — see §11). Swallow
   `Key::Enter` repeats via `i.events` `repeat: true`. Esc order: slash menu →
   interrupt (exists).
-- **Dock:** `dock::draw(app, ui)` renders in order the todo card (§6.6), the
+- **Dock:** `dock::draw(app, ui)` renders in order the todo card (§6.6), the notes card (§6.6a), the
   goal bar (§6.4), the queue dock. The queue needs the BE to *expose* the
   inbox: `Event::InboxChanged` carries only a count today. Add
   `Event::QueueChanged { session_id, rows: Vec<QueuedDump { id, text,
@@ -1389,6 +1389,21 @@ blue gradient ring, completed = solid ring + check. Empty → nothing.
 **Port (S):** `todo_card` in the dock; paint the three glyphs with
 `Painter` (dashed ring = 8 dashes; spinner = arc rotating on
 `input.time`). Data is already `TodosChanged`.
+
+### 6.6a Notes — **done** (long-session-plan C1, protocol v30)
+
+The working notes the model keeps with `notes-write` (harness §11.2a): a
+dock card between To-dos and Goal, same frame as the to-do card, header
+**"Notes"** + `{n} bytes · working memory the model keeps across
+compaction` + chevron, **collapsed by default**, hidden when there are no
+notes. Open, the notes render as wrapped text with a ghost **Edit**
+button; editing swaps in a six-row text field with **Save** (primary,
+disabled over the 4 KiB cap) and **Cancel**, and a footnote saying saved
+notes reach the model at its next step. Save sends `Request::WriteNotes`;
+the card updates from the backend's `NotesChanged`, never from the draft,
+so it never shows notes the backend refused. Unlike the to-do card it does
+not clear on a turn start: the notes are state, not a checklist for one
+request. `SessionDump.notes` fills it on load.
 
 ### 6.7 Permission presets — **done** (UI-3, UI-7)
 
@@ -1978,7 +1993,7 @@ different unit.
 
 ---
 
-## 11. Protocol impact (v17 … v29)
+## 11. Protocol impact (v17 … v30)
 
 Additive only; `#[serde(default)]` on every new field so old logs load.
 
@@ -2004,6 +2019,8 @@ Additive only; `#[serde(default)]` on every new field so old logs load.
 | `EventKind::WorkflowRun { run_id, call_seq, phase, member, member_id, state }` + `Event::WorkflowRunChanged` + `SessionDump.runs` | the workflow run body §6.11 | ✅ (v27) |
 | `UserImage += sha, bytes` | content-addressed attachments §5.3 | ✅ (v28) |
 | `Request::SetWorkingDir { path }` · `Request::RateMessage { session_id, seq, rating, note }` · `Event::SchedulesChanged { session_id, rows }` (`ScheduleDump`) · `SessionDump.schedules` · `SessionMeta.scheduled` · `MessageDump.feedback` · `JobDump.started_at` · `TurnUsage.last_seq` · `LlmOptions.retry_always` | live default folder §7.2, thumbs §3.5, the schedule catalogue and alarm §6.10, job durations §6.9, the Models card's retry toggle | ✅ (v29) |
+
+| `Request::WriteNotes { session_id, content }` · `Event::NotesChanged { session_id, content }` · `SessionDump.notes` | the notes card §6.6a (long-session-plan C1) | ✅ (v30) |
 
 `forward_event` keeps `LogLine.level` (no wire change). `PROTOCOL_VERSION`
 is **22** (v17 batch → v18 prompt editing → v19 queue verbs → v20 trajectory

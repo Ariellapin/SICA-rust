@@ -177,6 +177,9 @@ pub enum UiEvent {
         multi: bool,
     },
     TodosChanged { session_id: u64, items: Vec<protocol::TodoItem> },
+    /// The working notes changed (`notes-write`, an operator edit, or a
+    /// clear). Empty content is "no notes".
+    NotesChanged { session_id: u64, content: String },
     PlanModeChanged { session_id: u64, active: bool },
     PermissionModeChanged { session_id: u64, mode: protocol::PermissionMode },
     /// The session's agent preset (`agents/*.md`) changed, or was pushed
@@ -402,6 +405,9 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         }
         Event::TodosChanged { session_id, items } => {
             UiEvent::TodosChanged { session_id, items }
+        }
+        Event::NotesChanged { session_id, content } => {
+            UiEvent::NotesChanged { session_id, content }
         }
         Event::PlanModeChanged { session_id, active } => {
             UiEvent::PlanModeChanged { session_id, active }

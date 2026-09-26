@@ -119,8 +119,8 @@ error strings, URLs. Never paraphrase them.
 - Capture corrections the user made and decisions taken, with their reasons.
 - If an earlier checkpoint summary appears in the conversation, consolidate \
 it into this one rather than mentioning it.
-- If a todo list was maintained with `todo-write`, do not restate it under \
-Current Work; it is re-attached after this checkpoint.
+- If a todo list (`todo-write`) or working notes (`notes-write`) were \
+maintained, do not restate them; both are re-attached after this checkpoint.
 - Do not mention that the conversation is being summarized or compressed.
 - Do not call any tools. Do not address the user. Output only the eight \
 sections.";
@@ -593,6 +593,7 @@ mod tests {
             assert!(COMPACTION_INSTRUCTION.contains(h), "directive lacks {h}");
         }
         assert!(COMPACTION_INSTRUCTION.contains("todo-write"));
+        assert!(COMPACTION_INSTRUCTION.contains("notes-write"));
     }
 
     #[test]

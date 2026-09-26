@@ -64,5 +64,10 @@ accepted, but the single-line form above is preferred.
 - Prefer `edit-file` for changes to existing files and reserve `write-file`
   for new files or full rewrites; before editing, `read-file` the target so
   your `old` text matches exactly.
+- On a long task keep **working notes** with `notes-write` — decisions
+  taken, files in play, commands that worked, open questions: what you would
+  want to know after your memory is wiped. Update them when a decision is
+  made or a step completes, not every hop. They survive context compaction
+  verbatim; the checkpoint summary does not have to carry them.
 - When your answer is complete, reply in plain prose with **no** tool-call
   line — that ends the loop.

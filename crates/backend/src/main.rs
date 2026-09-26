@@ -22,6 +22,7 @@ mod inbox;
 mod jobs_bridge;
 mod ipc;
 mod parent_watch;
+mod restart;
 mod sessions_store;
 mod title_gen;
 mod trajectory;
@@ -265,6 +266,7 @@ async fn run(args: Args) -> Result<()> {
     // dispatcher intercepts them before any sub-agent spins up.
     skill_registry.register(Arc::new(agents::AskUser));
     skill_registry.register(Arc::new(agents::control::TodoWrite));
+    skill_registry.register(Arc::new(agents::control::NotesWrite));
     skill_registry.register(Arc::new(agents::control::ExitPlanMode));
     // The goal skills (Wave 4, guide §12.3) are harness controls too: they
     // mutate the session log and drive the round loop, so their bodies run
@@ -471,6 +473,9 @@ async fn run(args: Args) -> Result<()> {
     )
     .with_jobs(jobs.clone())
     .with_hooks(hook_config.clone());
+    // What the restart owes each session it cut (C2): queued as context for
+    // the session's next turn, never a turn of its own.
+    chat.deliver_restart_briefs().await;
 
     // Replay mode (guide §14.1): the recording is the provider. Installed
     // here rather than through `ConnectLlm` because there is nothing to

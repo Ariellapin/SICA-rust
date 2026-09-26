@@ -337,6 +337,11 @@ fn describe(kind: &EventKind) -> Described {
             EventTag::Command,
             format!("agent · {}", name.as_deref().unwrap_or("cleared")),
         ),
+        EventKind::Notes { content } => row(
+            EventTag::Command,
+            if content.is_empty() { "working notes cleared".to_string() } else { format!("working notes · {} bytes", content.len()) },
+        )
+        .payload(content.clone()),
         EventKind::TodoWrite { items } => {
             row(EventTag::Command, format!("todos · {} item(s)", items.len())).payload(
                 items

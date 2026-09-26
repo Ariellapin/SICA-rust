@@ -22,6 +22,14 @@ pub fn attachments_dir(session_id: u64) -> PathBuf {
     sessions_dir().join(session_id.to_string()).join("attachments")
 }
 
+/// The operator's copy of one session's working notes (long-session-plan
+/// C1): written on every `notes-write`, read back at turn start so an edit
+/// on disk reaches the model. The log's `Notes` row is the record; this
+/// file is the door.
+pub fn notes_file(session_id: u64) -> PathBuf {
+    sessions_dir().join(session_id.to_string()).join("notes.md")
+}
+
 /// Where raw-LLM logs are written when `log_raw_llm` is on (Python parity).
 pub fn raw_llm_log_dir() -> PathBuf {
     workspace_root().join("logs").join("model")

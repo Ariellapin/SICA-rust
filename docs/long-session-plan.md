@@ -172,7 +172,23 @@ pins it) and the pruner, whose replacement is by construction a change.
 `@session` and `@file` snapshots, job notices, tool notices and the
 re-attached todo list are all appends.
 
-## Wave C — durable working memory (M × 2, protocol bump)
+## Wave C — durable working memory (M × 2, protocol bump) — **shipped**
+
+**Shipped as** (2026-09-26, protocol v30): `notes-write`
+(`control::NotesWrite`, `EventKind::Notes`, `project::notes`,
+`sessions/<id>/notes.md`, `ContextSource::WorkingMemory`, re-attached by
+`chat::land_compaction` and picked up from disk by
+`reconcile_notes_file`), `Request::WriteNotes` / `Event::NotesChanged` /
+`SessionDump.notes` and the FE notes card (UI guide §6.6a); and
+`backend::restart::repair` plus `ChatHub::deliver_restart_briefs` for the
+restart brief. Two departures from the recipes below: the notes are not
+re-injected at the start of *every* first turn after a restart, only in
+the brief of a session the restart actually cut (otherwise the notes are
+already visible, as the model's own call or the copy after the last
+compaction); and the smoke step is replaced by unit tests over the log
+(`restart::tests`), since the smoke binary needs Windows. Decisions in
+[notes/2026-09-26-working-memory.md](notes/2026-09-26-working-memory.md).
+The replay recordings are unaffected: no scenario writes notes or is cut.
 
 The compaction summary is the only thing that carries the agent's own
 state across a fold, and it is LLM-written and lossy (item 1 made it
@@ -355,6 +371,5 @@ the two waves are opinions.
 1. ~~**A1 → A2 → A3 → A4**~~ shipped, see above.
 2. ~~**F3 → F1 → F2**~~ shipped, see above.
 3. ~~**B1 → B2**~~ shipped, see above; re-bless the recordings.
-4. **C1 → C2** (one protocol bump); D1–D3 ride the same session since
-   they touch the continuation point C2 also edits.
+4. ~~**C1 → C2**~~ shipped (v30), see above. D1–D3 next.
 5. **E1 → E2**, then E3 and E4 only if the numbers from F3 say so.

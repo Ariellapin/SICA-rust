@@ -1,6 +1,7 @@
 //! The composer dock (§5.1 "Dock stack", §6.4, §6.6): full-width cards
 //! *above* the composer card, 6 px apart, in dsh's order — **To-dos** (0),
-//! **Goal** (10), **Queue** (20) — plus the stats line under the card.
+//! **Notes** (5, ours: the `notes-write` working memory, long-session plan
+//! C1), **Goal** (10), **Queue** (20) — plus the stats line under the card.
 //!
 //! The queue dock is tucked 3 px under the composer so the two read as one
 //! surface. Its rows are the backend's own inbox (`Event::QueueChanged`), so
@@ -20,8 +21,147 @@ use crate::ui::kit::{self, Level, Weight};
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     todo_card(app, ui);
+    notes_card(app, ui);
     goal_bar(app, ui);
     queue_dock(app, ui);
+}
+
+// ---------------------------------------------------------------------------
+// Notes (working memory)
+// ---------------------------------------------------------------------------
+
+/// The working notes the model keeps with `notes-write`. Collapsed by
+/// default like the to-do card; open, it shows the notes as markdown with
+/// an Edit button, and while editing a plain text field with Save / Cancel.
+/// Save sends `Request::WriteNotes`; the backend answers with
+/// `NotesChanged`, which is what updates the card — the draft is not
+/// applied locally, so the card never shows notes the backend refused.
+fn notes_card(app: &mut App, ui: &mut egui::Ui) {
+    if app.notes.is_empty() && app.notes_draft.is_none() {
+        return;
+    }
+    let t = app.theme;
+    let id = ui.id().with("notes_open");
+    let mut open: bool = ui.ctx().data(|d| d.get_temp(id).unwrap_or(false));
+    // Editing forces the card open: a hidden field would be a trap.
+    if app.notes_draft.is_some() {
+        open = true;
+    }
+    let session_id = app.chat.session_id;
+    let mut save: Option<String> = None;
+    let mut cancel = false;
+    let mut start_edit = false;
+
+    egui::Frame::none()
+        .fill(kit::col(t.alias.tip))
+        .stroke(Stroke::new(HAIRLINE, Level::L1.color(&t)))
+        .rounding(Rounding::same(RADIUS_CARD))
+        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (rect, resp) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+            ui.painter().text(
+                rect.left_center(),
+                Align2::LEFT_CENTER,
+                "Notes",
+                kit::font(13.0, Weight::Medium),
+                kit::col(t.alias.label[0]),
+            );
+            ui.painter().text(
+                egui::pos2(rect.min.x + 60.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                if app.notes_draft.is_some() {
+                    "editing".to_string()
+                } else {
+                    format!("{} bytes · working memory the model keeps across compaction", app.notes.len())
+                },
+                kit::font(12.0, Weight::Regular),
+                kit::col(t.alias.label[2]),
+            );
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    egui::pos2(rect.max.x - 10.0, rect.center().y),
+                    Vec2::splat(12.0),
+                ),
+                if open { Icon::ChevronDown } else { Icon::ChevronRight },
+                kit::col(t.alias.label[2]),
+            );
+            if resp.clicked() && app.notes_draft.is_none() {
+                open = !open;
+                ui.ctx().data_mut(|d| d.insert_temp(id, open));
+            }
+            if !open {
+                return;
+            }
+            match app.notes_draft.as_mut() {
+                None => {
+                    ui.add(
+                        egui::Label::new(kit::txt(
+                            &app.notes,
+                            13.0,
+                            Weight::Regular,
+                            kit::col(t.alias.label[0]),
+                        ))
+                        .wrap(),
+                    );
+                    ui.add_space(4.0);
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if kit::button(ui, "Edit", kit::Variant::Ghost, kit::Size::Sm).clicked() {
+                            start_edit = true;
+                        }
+                    });
+                }
+                Some(draft) => {
+                    let field = egui::TextEdit::multiline(draft)
+                        .desired_width(ui.available_width())
+                        .desired_rows(6)
+                        .font(kit::font(13.0, Weight::Regular));
+                    ui.add(field);
+                    ui.add_space(4.0);
+                    let over = draft.len() > agents_notes_cap();
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if kit::button_enabled(ui, "Save", kit::Variant::Primary, kit::Size::Sm, !over)
+                            .clicked()
+                        {
+                            save = Some(draft.clone());
+                        }
+                        if kit::button(ui, "Cancel", kit::Variant::Ghost, kit::Size::Sm).clicked() {
+                            cancel = true;
+                        }
+                    });
+                    kit::footnote(
+                        ui,
+                        &if over {
+                            format!("{} bytes — the cap is {}", draft.len(), agents_notes_cap())
+                        } else {
+                            "saved notes reach the model at its next step".to_string()
+                        },
+                    );
+                }
+            }
+            ui.add_space(2.0);
+        });
+    ui.add_space(6.0);
+
+    if start_edit {
+        app.notes_draft = Some(app.notes.clone());
+    }
+    if cancel {
+        app.notes_draft = None;
+    }
+    if let Some(content) = save {
+        app.send(UiCommand::SendRequest(Request::WriteNotes { session_id, content }));
+        app.notes_draft = None;
+    }
+}
+
+/// The backend's `NOTES_CAP`, stated here rather than imported: the FE
+/// does not depend on `agents`, and the number is part of the tool's
+/// description the model reads, so it is not going to drift quietly.
+fn agents_notes_cap() -> usize {
+    4096
 }
 
 // ---------------------------------------------------------------------------

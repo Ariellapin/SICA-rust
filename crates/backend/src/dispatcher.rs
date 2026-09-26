@@ -201,6 +201,10 @@ pub async fn handle(
             chat.inject_context(session_id, text).await;
             Response::Ok
         }
+        Request::WriteNotes { session_id, content } => match chat.write_notes(session_id, content).await {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error { message },
+        },
         // The default folder for sessions created from now on (guide §3.9,
         // UI §7.2). Live: no restart, and no effect on any session that
         // already has its directory in its header.
