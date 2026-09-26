@@ -388,6 +388,19 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// Something went wrong here and the idealist filed it (ticket
+    /// `ticket_id` under `idealist_workspace/tickets/`). Logged once per
+    /// ticket per session, at its first failure — later repeats only bump
+    /// the ticket. Audit only, never surfaced: it marks *where* in the log
+    /// the end-of-session investigator should look.
+    TicketOpened {
+        ticket_id: String,
+        /// `tool_call`, `turn_error`, `llm_connect`, `panic`, … .
+        origin:    String,
+        module:    String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id:   Option<u64>,
+    },
     /// A kind this build does not know — written by a newer backend. Kept
     /// so an older binary still loads the log; contributes nothing.
     #[serde(other)]

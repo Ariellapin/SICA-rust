@@ -200,7 +200,11 @@ pub enum UiEvent {
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
-    IdealistTicketWritten { path: String, kind: TicketKind },
+    IdealistTicketWritten { path: String, kind: TicketKind, ticket_id: String, reopened: bool },
+    /// The end-of-session investigator finished one ticket.
+    IdealistInvestigated { ticket_id: String, ok: bool, summary: String },
+    /// `Response::Tickets` — the whole ticket list.
+    Tickets { tickets: Vec<protocol::TicketSummary> },
 }
 
 pub struct UiBridge {
@@ -430,8 +434,11 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }
         }
-        Event::IdealistTicketWritten { path, kind } => {
-            UiEvent::IdealistTicketWritten { path, kind }
+        Event::IdealistTicketWritten { path, kind, ticket_id, reopened, .. } => {
+            UiEvent::IdealistTicketWritten { path, kind, ticket_id, reopened }
+        }
+        Event::IdealistInvestigated { ticket_id, ok, summary, .. } => {
+            UiEvent::IdealistInvestigated { ticket_id, ok, summary }
         }
     };
     bridge.send(ui_ev);

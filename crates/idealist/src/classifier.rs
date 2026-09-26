@@ -48,6 +48,7 @@ mod tests {
             module: module.into(),
             message: "x".into(),
             traceback: None,
+            ..Default::default()
         }
     }
 

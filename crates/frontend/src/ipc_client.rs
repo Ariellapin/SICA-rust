@@ -110,6 +110,13 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                         events.len()
                                     )));
                                 }
+                                Response::Tickets { tickets } => {
+                                    bridge.send(UiEvent::Log(format!(
+                                        "RSP#{} Tickets {{ {} }}",
+                                        frame.id,
+                                        tickets.len()
+                                    )));
+                                }
                                 other => {
                                     bridge.send(UiEvent::Log(format!("RSP#{} {other:?}", frame.id)))
                                 }
@@ -168,6 +175,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 }
                                 Response::Workspaces { rows, ungrouped } => {
                                     bridge.send(UiEvent::WorkspacesChanged { rows, ungrouped });
+                                }
+                                Response::Tickets { tickets } => {
+                                    bridge.send(UiEvent::Tickets { tickets });
                                 }
                                 Response::Error { message } => {
                                     bridge.send(UiEvent::RequestFailed { message });

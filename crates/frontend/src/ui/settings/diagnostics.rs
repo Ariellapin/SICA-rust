@@ -1,7 +1,8 @@
 //! Settings › Diagnostics — the old Communication tab, rehoused (§7.2):
 //! the backend/IPC connection card with the build controls, the demo request
 //! row `smoke` also exercises, and the log panel, which now carries the
-//! backend's own level instead of flattening everything to INF.
+//! backend's own level instead of flattening everything to INF — and the
+//! idealist's improvement tickets (`tickets`).
 
 use crate::app::App;
 use crate::ui::kit::{self, Weight};
@@ -74,6 +75,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(6.0);
     controls::draw_request(app, ui);
+
+    super::tickets::draw(app, ui);
 
     section(ui, "Log");
     log_panel::draw(app, ui);

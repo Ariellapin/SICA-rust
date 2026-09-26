@@ -145,8 +145,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     row(
         ui,
         "Idealist auto-apply",
-        "When off, idealist only writes Improvement-BE-*.md tickets. \
-         Frontend issues always get a ticket and are never auto-patched.",
+        "Reserved — not wired to the backend yet. Tickets are always written to \
+         idealist_workspace/tickets and investigated read-only; nothing is ever \
+         auto-patched. See Diagnostics › Improvement tickets.",
         |ui| {
             if ui.checkbox(&mut app.idealist_auto_apply_be, "").changed() {
                 dirty = true;

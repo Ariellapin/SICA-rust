@@ -17,7 +17,9 @@ mod catalog;
 mod chat;
 mod dispatcher;
 mod hooks;
+mod incident;
 mod invariants;
+mod investigate;
 mod inbox;
 mod jobs_bridge;
 mod ipc;
@@ -443,6 +445,13 @@ async fn run(args: Args) -> Result<()> {
 
     for w in &hook_config.warnings {
         warn!(warning = %w, "hooks");
+        idealist_bus.publish(idealist::Trigger {
+            kind:    "config".into(),
+            module:  "backend::hooks".into(),
+            message: w.clone(),
+            origin:  idealist::TriggerOrigin::Config,
+            ..Default::default()
+        });
         let _ = out_tx.send(Frame::event(Event::LogLine {
             level:   "WARN".into(),
             message: w.clone(),
@@ -511,6 +520,31 @@ async fn run(args: Args) -> Result<()> {
     // owning session's inbox (the model reads it at its next step) and
     // refreshes the FE's list.
     jobs.attach_notifier(Arc::new(jobs_bridge::JobsBridge::new(&chat)));
+
+    // Failure reporting (idealist tickets): from here on every turn error,
+    // tool failure, invariant violation and panic lands in the session log,
+    // the session's ledger and the ticket store.
+    incident::install(idealist_bus.clone(), chat.sessions.clone());
+    incident::install_panic_hook();
+
+    // The end-of-session investigator (`investigate`). Not in replay: a
+    // recording is the provider there, and an investigation would ask it
+    // for completions it never recorded.
+    let (idealist_cfg, idealist_warning) = idealist::config::load();
+    if let Some(w) = idealist_warning {
+        warn!(warning = %w, "idealist config");
+        let _ = out_tx.send(Frame::event(Event::LogLine { level: "WARN".into(), message: w }));
+    }
+    investigate::configure(idealist_cfg.clone());
+    if args.replay.is_none() {
+        investigate::install(idealist_cfg, investigate::Deps {
+            llm:          chat.llm.clone(),
+            active_turns: chat.active_turns.clone(),
+            sessions:     chat.sessions.clone(),
+            skills:       chat.skills.clone(),
+            events:       chat.event_sink.clone(),
+        });
+    }
 
     // The reminder owner (guide §12.8): delivers due reminders to idle
     // sessions as follow-up turns. Restored records that came due while the
@@ -611,11 +645,21 @@ impl agents::ToolFailureSink for ToolFailureBridge {
             "host_os={}\nhost_family={}\ndepth={}\nargs={}",
             r.host_os, r.host_family, r.depth, r.args_preview,
         ));
-        self.bus.publish(idealist::Trigger {
-            kind:    "tool_failed".into(),
-            module:  format!("agents::tool::{}", r.skill),
-            message: r.summary,
+        let trigger = idealist::Trigger {
+            kind:       "tool_failed".into(),
+            module:     format!("agents::tool::{}", r.skill),
+            message:    r.summary,
             traceback,
-        });
+            origin:     idealist::TriggerOrigin::ToolCall,
+            session_id: r.session_id,
+            ..Default::default()
+        };
+        // Through `incident` when it is wired, so the failure lands in the
+        // session log and ledger too; straight to the bus otherwise.
+        if incident::installed() {
+            incident::report(trigger);
+        } else {
+            self.bus.publish(trigger);
+        }
     }
 }

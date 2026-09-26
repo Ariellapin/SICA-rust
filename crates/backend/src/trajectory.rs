@@ -191,6 +191,38 @@ impl Described {
     }
 }
 
+/// One log row as plain text — `#seq TAG text`, then the row's payload and
+/// result, each clipped to `cap` characters. What the idealist investigator
+/// reads: the same wording the Trajectory view shows a person.
+pub(crate) fn line(ev: &SessionEvent, cap: usize) -> String {
+    let d = describe(&ev.kind);
+    let mut out = format!("#{} {}", ev.seq, d.tag.label());
+    if d.ok == Some(false) {
+        out.push_str(" [FAILED]");
+    }
+    out.push(' ');
+    out.push_str(&clip(&d.text, cap));
+    for part in [&d.payload, &d.result] {
+        if !part.trim().is_empty() && part.trim() != d.text.trim() {
+            out.push_str("\n    ");
+            out.push_str(&clip(part, cap).replace('\n', "\n    "));
+        }
+    }
+    out
+}
+
+fn clip(s: &str, cap: usize) -> String {
+    let s = s.trim();
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} …[{} more bytes]", &s[..end], s.len() - end)
+}
+
 fn describe(kind: &EventKind) -> Described {
     match kind {
         EventKind::SessionCreated { id, title, .. } => {
@@ -412,6 +444,11 @@ fn describe(kind: &EventKind) -> Described {
             };
             row(EventTag::Other, format!("message {seq_ref} · {word}"))
                 .payload(note.clone().unwrap_or_default())
+        }
+        EventKind::TicketOpened { ticket_id, origin, module, .. } => {
+            // Red like a failed tool row: this is where something broke.
+            row(EventTag::Other, format!("ticket {ticket_id} opened · {origin} · {module}"))
+                .ok(false)
         }
         EventKind::Unknown => row(
             EventTag::Other,

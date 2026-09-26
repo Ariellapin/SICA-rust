@@ -73,6 +73,11 @@ pub fn report(events: &dyn agents::EventSink, violations: Vec<Violation>) {
             level:   "ERROR".into(),
             message: v.message(),
         });
+        crate::incident::outside_turn(
+            idealist::TriggerOrigin::Invariant,
+            &format!("backend::invariants::{}", v.invariant),
+            v.message(),
+        );
     }
 }
 

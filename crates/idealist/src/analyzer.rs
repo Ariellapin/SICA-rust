@@ -6,7 +6,7 @@
 //! `SubAgentTool`), the analyzer also detects environment mismatches:
 //! e.g. when `run-cli` fails on Windows because `cmd.exe` cannot resolve a
 //! command that PowerShell would. In that case `suggested_skill` is set so
-//! `be_autofix` can record an actionable suggestion in the improvement
+//! the ticket store can record an actionable suggestion in the improvement
 //! ticket.
 
 use crate::trigger_bus::Trigger;
@@ -232,6 +232,7 @@ mod tests {
             module:    module.into(),
             message:   msg.into(),
             traceback: tb.map(String::from),
+            ..Default::default()
         }
     }
 

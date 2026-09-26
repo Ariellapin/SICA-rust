@@ -1,23 +1,35 @@
-//! Idealist daemon: classifies BE vs FE failures, writes improvement tickets,
-//! and (when explicitly enabled) attempts auto-patches for BE issues.
+//! Idealist daemon: files every failure the harness reports as an
+//! improvement ticket, one ticket per *kind* of failure.
 //!
-//! Default policy:
-//! - **BE issues** → write `Improvement-BE-<kind>-<iso>.md`. Auto-apply only if
-//!   the runtime toggle is on.
-//! - **FE issues** → write `Improvement-FE-<iso>.md`. Never auto-patch.
+//! - [`trigger_bus`] carries `Trigger`s from wherever things go wrong.
+//! - [`classifier`] and [`analyzer`] give each one a source, a category and
+//!   a heuristic fix (a skill swap, where one is known).
+//! - [`ticket`] files it: a fingerprint-derived id, so repeats bump one
+//!   ticket and a resolved ticket that fires again reopens.
+//! - [`ledger`] remembers which tickets each session raised, for the
+//!   end-of-session investigator (`backend::investigate`), which is the only
+//!   part that talks to an LLM and so lives in `backend`.
+//! - [`lessons`] keeps what investigations taught, for the prompt.
+//!
+//! Nothing here edits source. FE tickets are never auto-patched.
 
 pub mod analyzer;
-pub mod be_autofix;
 pub mod classifier;
-pub mod fe_ticket;
+pub mod config;
+pub mod ledger;
+pub mod lessons;
+pub mod ticket;
 pub mod trigger_bus;
 
 pub use classifier::{classify, TriggerSource};
-pub use trigger_bus::{Trigger, TriggerBus};
+pub use config::IdealistConfig;
+pub use ledger::{Ledger, LedgerEntry, SessionLedger};
+pub use ticket::{Diagnosis, Ticket, TicketStatus, TicketStore};
+pub use trigger_bus::{Trigger, TriggerBus, TriggerOrigin};
 
 use std::sync::Arc;
 
-use protocol::Event;
+use protocol::{Event, TicketSummary};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -33,14 +45,105 @@ pub struct Idealist {
     pub bus:      TriggerBus,
     pub settings: Arc<Mutex<Settings>>,
     pub events:   Arc<dyn IdealistEventSink>,
+    pub store:    TicketStore,
+}
+
+/// The wire shape of a ticket.
+pub fn summary(t: &Ticket, store: &TicketStore) -> TicketSummary {
+    let m = &t.meta;
+    TicketSummary {
+        id:           m.id.clone(),
+        status:       m.status.as_str().into(),
+        origin:       m.origin.as_str().into(),
+        module:       m.module.clone(),
+        severity:     m.severity.clone(),
+        occurrences:  m.occurrences,
+        regressions:  m.regressions,
+        first_seen:   m.first_seen.clone(),
+        last_seen:    m.last_seen.clone(),
+        sessions:     m.sessions.clone(),
+        last_message: m.last_message.clone(),
+        category:     m.diagnosis.as_ref().map(|d| d.category.clone()),
+        confidence:   m.diagnosis.as_ref().map(|d| d.confidence.clone()),
+        lesson:       m.diagnosis.as_ref().and_then(|d| d.lesson.clone()),
+        path:         store.path(&m.id).to_string_lossy().into_owned(),
+    }
 }
 
 impl Idealist {
     pub fn new(events: Arc<dyn IdealistEventSink>) -> Self {
+        Self::with_store(events, TicketStore::open_default())
+    }
+
+    pub fn with_store(events: Arc<dyn IdealistEventSink>, store: TicketStore) -> Self {
         Self {
-            bus:      TriggerBus::new(),
+            bus: TriggerBus::new(),
             settings: Arc::new(Mutex::new(Settings { auto_apply_be: false })),
             events,
+            store,
+        }
+    }
+
+    /// File one trigger. Public so a test (or a caller with no daemon) can
+    /// run the same path synchronously.
+    pub fn handle(&self, trigger: &Trigger) {
+        if trigger.origin == TriggerOrigin::Investigator {
+            // The investigator's own failures are its run's problem; filing
+            // them would let one investigation schedule the next.
+            return;
+        }
+        if analyzer::is_caller_error(trigger) {
+            // The model's own bad input, and the tool's error already says
+            // how to recover: not a harness defect, so not a ticket.
+            info!(module = %trigger.module, "idealist: caller-input error — no ticket");
+            return;
+        }
+        info!(
+            kind = %trigger.kind,
+            module = %trigger.module,
+            origin = trigger.origin.as_str(),
+            "idealist: received trigger"
+        );
+        let src = classify(trigger);
+        let analysis = analyzer::analyze(trigger);
+        match self.store.upsert(trigger, &analysis, src) {
+            Ok(up) => {
+                let path = up.path.to_string_lossy().to_string();
+                let kind = match src {
+                    TriggerSource::Frontend => protocol::TicketKind::FeBug,
+                    _ => protocol::TicketKind::BeFix,
+                };
+                if up.created || up.reopened {
+                    let what = if up.reopened { "reopened (regression)" } else { "opened" };
+                    info!(id = %up.id, path = %path, ?kind, "idealist: ticket {what}");
+                    self.events.emit(Event::LogLine {
+                        level:   if up.reopened { "WARN".into() } else { "INFO".into() },
+                        message: format!(
+                            "idealist: ticket {} {what} — {} · {}",
+                            up.id, trigger.module, path
+                        ),
+                    });
+                }
+                self.events.emit(Event::IdealistTicketWritten {
+                    path: path.clone(),
+                    kind,
+                    ticket_id: up.id.clone(),
+                    occurrences: up.occurrences,
+                    reopened: up.reopened,
+                });
+                self.events.emit(Event::IdealistStatus {
+                    activity: "idle".into(),
+                    severity: protocol::Severity::Info,
+                    last_ticket: Some(path),
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "idealist: filing ticket failed");
+                self.events.emit(Event::LogLine {
+                    level:   "ERROR".into(),
+                    message: format!("idealist: filing ticket failed — {e}"),
+                });
+            }
         }
     }
 
@@ -63,97 +166,85 @@ impl Idealist {
                         break;
                     }
                 };
-
-                info!(
-                    kind = %trigger.kind,
-                    module = %trigger.module,
-                    "idealist: received trigger"
-                );
-                if analyzer::is_caller_error(&trigger) {
-                    info!(module = %trigger.module, "idealist: caller-input error — no ticket");
-                    continue;
-                }
-                me.events.emit(Event::LogLine {
-                    level: "INFO".into(),
-                    message: format!(
-                        "idealist: analyzing trigger kind=`{}` module=`{}`",
-                        trigger.kind, trigger.module
-                    ),
-                });
-                me.events.emit(Event::IdealistStatus {
-                    activity: format!("analyzing: {}", trigger.kind),
-                    severity: protocol::Severity::Info,
-                    last_ticket: None,
-                });
-
-                let src = classify(&trigger);
-                let auto_apply = me.settings.lock().await.auto_apply_be;
-                info!(
-                    source = ?src,
-                    auto_apply,
-                    "idealist: classified trigger"
-                );
-                me.events.emit(Event::LogLine {
-                    level: "INFO".into(),
-                    message: format!(
-                        "idealist: classified as {:?} (auto_apply_be={})",
-                        src, auto_apply
-                    ),
-                });
-
-                let ticket_path = match src {
-                    TriggerSource::Frontend => {
-                        match fe_ticket::write_fe_ticket(&trigger) {
-                            Ok(p) => Some(p),
-                            Err(e) => {
-                                warn!(error = %e, "idealist: write_fe_ticket failed");
-                                me.events.emit(Event::LogLine {
-                                    level: "ERROR".into(),
-                                    message: format!("idealist: write_fe_ticket failed — {e}"),
-                                });
-                                None
-                            }
-                        }
-                    }
-                    // SubAgentTool failures share the BE write path: they
-                    // produce an Improvement-BE-*.md ticket with the
-                    // analyzer's suggested skill swap surfaced inline.
-                    _ => {
-                        match be_autofix::write_be_ticket(&trigger, auto_apply) {
-                            Ok(p) => Some(p),
-                            Err(e) => {
-                                warn!(error = %e, "idealist: write_be_ticket failed");
-                                me.events.emit(Event::LogLine {
-                                    level: "ERROR".into(),
-                                    message: format!("idealist: write_be_ticket failed — {e}"),
-                                });
-                                None
-                            }
-                        }
-                    }
-                };
-                if let Some(path) = ticket_path {
-                    let kind = match src {
-                        TriggerSource::Frontend => protocol::TicketKind::FeBug,
-                        _ => protocol::TicketKind::BeFix,
-                    };
-                    let path_str = path.to_string_lossy().to_string();
-                    info!(path = %path_str, ?kind, "idealist: ticket written");
-                    me.events.emit(Event::LogLine {
-                        level: "INFO".into(),
-                        message: format!("idealist: ticket written ({:?}) → {}", kind, path_str),
-                    });
-                    me.events.emit(Event::IdealistTicketWritten {
-                        path: path_str.clone(),
-                        kind,
-                    });
-                    me.events.emit(Event::IdealistStatus {
-                        activity: "idle".into(),
-                        severity: protocol::Severity::Info,
-                        last_ticket: Some(path_str),
-                    });
-                }
+                let me2 = Arc::clone(&me);
+                // File I/O under a std mutex: off the async workers.
+                let _ = tokio::task::spawn_blocking(move || me2.handle(&trigger)).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct Capture(StdMutex<Vec<Event>>);
+    impl IdealistEventSink for Capture {
+        fn emit(&self, ev: Event) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+
+    #[test]
+    fn handle_files_and_reports_repeats() {
+        let sink = Arc::new(Capture::default());
+        let store = TicketStore::at(ticket::tests::scratch("daemon"));
+        let d = Idealist::with_store(sink.clone(), store.clone());
+        let t = Trigger {
+            kind: "turn_error".into(),
+            module: "backend::turn::llm".into(),
+            message: "LLM request failed (500) — giving up after 3 retries".into(),
+            origin: TriggerOrigin::TurnError,
+            session_id: Some(5),
+            ..Default::default()
+        };
+        d.handle(&t);
+        d.handle(&t);
+        let evs = sink.0.lock().unwrap();
+        let written: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Event::IdealistTicketWritten { occurrences, .. } => Some(*occurrences),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(written, vec![1, 2]);
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        let s = summary(&list[0], &store);
+        assert_eq!(s.status, "open");
+        assert_eq!(s.origin, "turn_error");
+        assert_eq!(s.sessions, vec![5]);
+    }
+
+    #[test]
+    fn caller_errors_file_nothing() {
+        let sink = Arc::new(Capture::default());
+        let store = TicketStore::at(ticket::tests::scratch("daemon-caller"));
+        let d = Idealist::with_store(sink.clone(), store.clone());
+        d.handle(&Trigger {
+            module: "agents::tool::read-file".into(),
+            message: "no such file: x.txt — check the path".into(),
+            origin: TriggerOrigin::ToolCall,
+            ..Default::default()
+        });
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn investigator_triggers_are_dropped() {
+        let sink = Arc::new(Capture::default());
+        let store = TicketStore::at(ticket::tests::scratch("daemon-inv"));
+        let d = Idealist::with_store(sink.clone(), store.clone());
+        d.handle(&Trigger {
+            module: "agents::tool::read-file".into(),
+            message: "boom".into(),
+            origin: TriggerOrigin::Investigator,
+            ..Default::default()
+        });
+        assert!(store.list().is_empty());
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 }

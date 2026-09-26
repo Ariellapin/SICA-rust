@@ -1021,6 +1021,12 @@ pub struct IdealistUiState {
     pub activity:    String,
     pub last_ticket: Option<String>,
     pub severity:    Option<Severity>,
+    /// Settings › Diagnostics › Improvement tickets. `None` until the first
+    /// `ListTickets` answer; refreshed whenever a ticket is written or
+    /// investigated.
+    pub tickets:     Option<Vec<protocol::TicketSummary>>,
+    /// Show resolved / wontfix / noise tickets too.
+    pub show_closed: bool,
 }
 
 #[allow(dead_code)]
@@ -1796,6 +1802,14 @@ impl App {
         ctx.set_style(style);
     }
 
+    /// Ask for the ticket list again — only once the Diagnostics panel has
+    /// loaded it, so a session nobody is looking at costs no requests.
+    pub fn refresh_tickets(&mut self) {
+        if self.chat.idealist.tickets.is_some() {
+            self.send(UiCommand::SendRequest(Request::ListTickets));
+        }
+    }
+
     pub fn push_log(&mut self, kind: LogKind, text: String) {
         if self.log.len() >= LOG_CAPACITY {
             self.log.pop_front();
@@ -2430,12 +2444,29 @@ impl App {
                     self.chat.idealist.last_ticket = last_ticket;
                 }
             }
-            UiEvent::IdealistTicketWritten { path, kind } => {
+            UiEvent::IdealistTicketWritten { path, kind, ticket_id, reopened } => {
                 self.push_log(
                     LogKind::Event,
-                    format!("idealist ticket written ({kind:?}): {path}"),
+                    format!(
+                        "idealist ticket {ticket_id} {} ({kind:?}): {path}",
+                        if reopened { "reopened" } else { "written" }
+                    ),
                 );
                 self.chat.idealist.last_ticket = Some(path);
+                self.refresh_tickets();
+            }
+            UiEvent::IdealistInvestigated { ticket_id, ok, summary } => {
+                self.push_log(
+                    LogKind::Event,
+                    format!(
+                        "idealist ticket {ticket_id} {}: {summary}",
+                        if ok { "diagnosed" } else { "not diagnosed" }
+                    ),
+                );
+                self.refresh_tickets();
+            }
+            UiEvent::Tickets { tickets } => {
+                self.chat.idealist.tickets = Some(tickets);
             }
             UiEvent::SessionList { mut sessions } => {
                 // Newest on top — the list reads most-recent-first.
