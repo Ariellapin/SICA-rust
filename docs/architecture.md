@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 30) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 31) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -245,6 +245,13 @@ and `Event::IdealistInvestigated`. `IdealistTicketWritten` gained
 ticket per session at its first failure. See
 [notes/2026-09-26-idealist-investigator.md](notes/2026-09-26-idealist-investigator.md).
 
+v31 (idealist fix sessions) adds `StartFixSession { ticket_id }`, answered by
+`Response::FixSession { session_id, ticket_id, draft }`: a session in the
+sica-rust checkout whose fix prompt the FE puts in the composer, unsent.
+`Event::FixSessionReady` carries the same when `auto_fix_session` opened one
+by itself, and `TicketSummary.fix_session` names it. See
+[notes/2026-09-26-idealist-followups.md](notes/2026-09-26-idealist-followups.md).
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
@@ -265,10 +272,10 @@ ticket per session at its first failure. See
 | `idealist_workspace/sessions/<id>.toml` | `idealist::ledger` | Which tickets a session raised, where (`seq` of the `TicketOpened` row), how often, whether each tool failure was recovered from in its turn, and whether the investigator has looked. The startup sweep queues every ledger with uninvestigated entries. |
 | `idealist_workspace/lessons.md` | `idealist::lessons` | One line per diagnosed `model_mistake` / `environment` ticket. Added to the system prompt only with `lessons_in_prompt = true`; delete a line to retire it. |
 | `idealist_workspace/crash-<ts>.md` | `backend::incident` | Written synchronously by the panic hook, before anything else can fail. |
-| `sica-settings/idealist.toml` | `idealist::config` | Optional: `investigate`, `idle_minutes` (10), `max_per_session` (5), `max_hops` (12), `timeout_secs` (300), `lessons_in_prompt` (false). Absent means those defaults; malformed is a `LogLine` and the defaults. Read at BE start. |
+| `sica-settings/idealist.toml` | `idealist::config` | Optional: `investigate`, `idle_minutes` (10), `max_per_session` (5), `max_hops` (12), `timeout_secs` (300), `lessons_in_prompt` (false), `auto_fix_session` (false). Absent means those defaults; malformed is a `LogLine` and the defaults. Read at BE start. |
 | `evals/*.toml` | `agents::model_eval` | One prompt suite per file; `default.toml` seeded once at BE start, user-owned after. Read per run, so edits need no restart. |
 | `evals/reports/<suite>-<ts>.{md,json}` | `agents::model_eval` | Report + machine-readable baseline the next run of that suite diffs against. `.gitignore`d. |
-| `.sica/hooks.json` (under the **working** directory) | `backend::hooks` | User hooks (guide §13.1), in Claude Code's own schema so an existing file can be copied across. Read once at BE start — a hooks file that could change under a running turn would make two calls in one turn answer to different rules. Absent by default; malformed is a `LogLine`, never fatal. `PreToolUse`/`PostToolUse` ride the tool pipeline as `HooksPolicy`; `UserPromptSubmit`/`SessionStart` are dispatched from `chat.rs`. A hook that fails to spawn, times out, or writes non-JSON **abstains** — the operator's script being broken must not become a permission decision. |
+| `.sica/hooks.json` (under the **working** directory) | `backend::hooks` | User hooks (guide §13.1), in Claude Code's own schema so an existing file can be copied across. Read once at BE start — a hooks file that could change under a running turn would make two calls in one turn answer to different rules. Absent by default; malformed is a `LogLine`, never fatal. `PreToolUse`/`PostToolUse` ride the tool pipeline as `HooksPolicy`; `UserPromptSubmit`/`SessionStart` are dispatched from `chat.rs`; `SessionEnd` (with a `reason`: `idle` or `archived`) from `investigate.rs`, whether or not investigations are on. A hook that fails to spawn, times out, or writes non-JSON **abstains** — the operator's script being broken must not become a permission decision. |
 | `sica-settings/mcp/*.toml` | `agents::mcp` | One MCP server per file (`command`, `args`, `env`, `cwd`, `enabled`); the stem is the server name. Started at BE start over stdio, tools only, each bridged as a skill named `mcp__<server>__<tool>` whose JSON Schema goes into the `tools` array verbatim. A server that will not start is a `LogLine` and the agent comes up without it. |
 | `sica-settings/workspaces.json` | `backend::workspaces` | The workspace registry (v26): `{ version, order, rows }`, one row per registered directory with its title and the manual order of its sessions. Written whole through `atomic_write` on every mutation. Missing on a fresh install and bootstrapped from session headers; a corrupt one is moved aside and rebuilt, a newer `version` is refused and left alone. |
 | `sica-settings/.env` | `sica_core::creds` | Optional `KEY=value` file backing `${VAR}` references in the provider TOMLs and `web.toml`. Read on every resolution, so a rotated key needs no restart. Deliberately *not* the working directory's `.env` — that file arrives with `git clone`. `.gitignore` it. |

@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use agents::runner::{self, RunSpec};
-use agents::{EventSink, SkillRegistry, ToolSubAgent};
+use agents::{EventSink, ToolSubAgent};
 use idealist::{
     lessons, Diagnosis, IdealistConfig, Ledger, LedgerEntry, Ticket, TicketStatus, TicketStore,
     TriggerOrigin,
@@ -43,11 +43,11 @@ use llm::client::LlmClient;
 use protocol::Event;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::chat::Sessions;
+use crate::chat::ChatHub;
 
 /// The only skills an investigation may call.
 pub const READ_ONLY: [&str; 3] = [
@@ -83,6 +83,16 @@ pub enum EndReason {
 }
 
 impl EndReason {
+    /// The `reason` a `SessionEnd` hook reads.
+    fn hook_reason(self) -> &'static str {
+        match self {
+            EndReason::Idle => "idle",
+            EndReason::Archived => "archived",
+            EndReason::Manual => "requested",
+            EndReason::StartupSweep => "startup",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             EndReason::Idle => "idle",
@@ -93,62 +103,63 @@ impl EndReason {
     }
 }
 
-/// What the hub lends the investigator.
-pub struct Deps {
-    pub llm:          Arc<Mutex<Option<LlmClient>>>,
-    pub active_turns: Arc<Mutex<HashMap<u64, (u64, CancellationToken)>>>,
-    pub sessions:     Sessions,
-    pub skills:       Arc<SkillRegistry>,
-    pub events:       Arc<dyn EventSink>,
-}
-
 pub struct Investigator {
     cfg:     IdealistConfig,
-    deps:    Deps,
+    /// The hub, for the LLM, the running turns, the logs, the skills, the
+    /// event sink, the hooks, and creating fix sessions.
+    hub:     ChatHub,
     store:   TicketStore,
     ledger:  Ledger,
     tx:      mpsc::UnboundedSender<(u64, EndReason)>,
     /// One pending idle timer per session.
     idle:    std::sync::Mutex<HashMap<u64, CancellationToken>>,
+    /// Sessions whose end has been announced (`SessionEnd` hooks ran) since
+    /// their last turn, so idle-then-archive announces once.
+    ended:   std::sync::Mutex<HashSet<u64>>,
     /// The run in flight, so a starting turn can stop it.
     current: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 static INVESTIGATOR: OnceLock<Arc<Investigator>> = OnceLock::new();
 
-/// Start the worker. Called once from `main`, inside the runtime. A config
-/// with `investigate = false` installs nothing, and every hook below is then
-/// a no-op — as it is in tests and replay runs, which never call this.
-pub fn install(cfg: IdealistConfig, deps: Deps) {
-    if !cfg.investigate {
-        info!("investigator: disabled by idealist.toml");
-        return;
-    }
+/// Start session-end tracking, and the worker. Called once from `main`,
+/// inside the runtime. Tracking runs whatever `investigate` says, because
+/// `SessionEnd` hooks depend on it too; `investigate = false` only stops
+/// investigations from being queued. Tests and replay runs never call
+/// this, and every hook below is then a no-op.
+pub fn install(cfg: IdealistConfig, hub: ChatHub) {
     let store = TicketStore::open_default();
-    let reset = store.reset_stale();
-    if reset > 0 {
-        info!(reset, "investigator: tickets left `investigating` by a stopped backend reset to open");
+    if cfg.investigate {
+        let reset = store.reset_stale();
+        if reset > 0 {
+            info!(reset, "investigator: tickets left `investigating` by a stopped backend reset to open");
+        }
+    } else {
+        info!("investigator: investigations disabled by idealist.toml");
     }
     let (tx, rx) = mpsc::unbounded_channel();
     let inv = Arc::new(Investigator {
         cfg,
-        deps,
+        hub,
         store,
         ledger: Ledger::open_default(),
         tx,
         idle: std::sync::Mutex::new(HashMap::new()),
+        ended: std::sync::Mutex::new(HashSet::new()),
         current: std::sync::Mutex::new(None),
     });
     if INVESTIGATOR.set(inv.clone()).is_err() {
         return;
     }
     tokio::spawn(worker(inv.clone(), rx));
-    tokio::spawn(async move {
-        tokio::time::sleep(SWEEP_DELAY).await;
-        for id in inv.ledger.pending_sessions() {
-            let _ = inv.tx.send((id, EndReason::StartupSweep));
-        }
-    });
+    if inv.cfg.investigate {
+        tokio::spawn(async move {
+            tokio::time::sleep(SWEEP_DELAY).await;
+            for id in inv.ledger.pending_sessions() {
+                let _ = inv.tx.send((id, EndReason::StartupSweep));
+            }
+        });
+    }
 }
 
 /// A turn is starting in `session_id`: it is not ended, and nothing may
@@ -158,16 +169,18 @@ pub fn session_active(session_id: u64) {
     if let Some(t) = inv.idle.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id) {
         t.cancel();
     }
+    inv.ended.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
     if let Some(t) = inv.current.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         t.cancel();
     }
 }
 
-/// `session_id` went idle. Arms its end-of-session timer when it has
-/// something to investigate.
+/// `session_id` went idle. Arms its end-of-session timer when anything
+/// would happen at the end: tickets to investigate, or `SessionEnd` hooks.
 pub fn session_idle(session_id: u64) {
     let Some(inv) = INVESTIGATOR.get() else { return };
-    if !inv.ledger.load(session_id).has_pending() {
+    let investigate = inv.cfg.investigate && inv.ledger.load(session_id).has_pending();
+    if !investigate && !inv.has_end_hooks() {
         return;
     }
     let token = CancellationToken::new();
@@ -186,7 +199,7 @@ pub fn session_idle(session_id: u64) {
             _ = token.cancelled() => {}
             _ = tokio::time::sleep(wait) => {
                 inv.idle.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
-                let _ = inv.tx.send((session_id, EndReason::Idle));
+                inv.end(session_id, EndReason::Idle).await;
             }
         }
     });
@@ -194,19 +207,22 @@ pub fn session_idle(session_id: u64) {
 
 /// The session was archived: it has ended.
 pub fn session_archived(session_id: u64) {
-    if let Some(inv) = INVESTIGATOR.get() {
-        let _ = inv.tx.send((session_id, EndReason::Archived));
+    let Some(inv) = INVESTIGATOR.get() else { return };
+    if let Some(t) = inv.idle.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id) {
+        t.cancel();
     }
+    let inv = inv.clone();
+    tokio::spawn(async move { inv.end(session_id, EndReason::Archived).await });
 }
 
 /// `Request::InvestigateSession`. `Err` says why nothing will happen.
 pub fn request(session_id: u64) -> Result<(), String> {
-    let Some(inv) = INVESTIGATOR.get() else {
-        return Err(format!(
+    let inv = INVESTIGATOR.get().filter(|i| i.cfg.investigate).ok_or_else(|| {
+        format!(
             "the investigator is off — set `investigate = true` in {}",
             idealist::config::path().display()
-        ));
-    };
+        )
+    })?;
     if !inv.ledger.load(session_id).has_pending() {
         return Err(format!("session {session_id} has no uninvestigated tickets"));
     }
@@ -276,16 +292,39 @@ fn pick(entries: Vec<&LedgerEntry>, store: &TicketStore, cap: usize) -> Vec<(Led
 }
 
 impl Investigator {
+    fn has_end_hooks(&self) -> bool {
+        !self.hub.hooks.for_event(crate::hooks::HookEvent::SessionEnd).is_empty()
+    }
+
+    /// `session_id` has ended: announce it to `SessionEnd` hooks (once per
+    /// quiet period), then queue its investigation.
+    async fn end(&self, session_id: u64, reason: EndReason) {
+        let first = self.ended.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id);
+        if first && self.has_end_hooks() {
+            crate::hooks::run_session_end(
+                &self.hub.hooks,
+                &self.hub.sessions,
+                &self.hub.event_sink,
+                session_id,
+                reason.hook_reason(),
+            )
+            .await;
+        }
+        if self.cfg.investigate {
+            let _ = self.tx.send((session_id, reason));
+        }
+    }
+
     /// The LLM client, when one is connected and no turn is running.
     async fn quiet_client(&self) -> Option<LlmClient> {
-        if !self.deps.active_turns.lock().await.is_empty() {
+        if !self.hub.active_turns.lock().await.is_empty() {
             return None;
         }
-        self.deps.llm.lock().await.clone()
+        self.hub.llm.lock().await.clone()
     }
 
     fn emit(&self, level: &str, message: String) {
-        self.deps.events.emit(Event::LogLine { level: level.into(), message });
+        self.hub.event_sink.emit(Event::LogLine { level: level.into(), message });
     }
 
     async fn run_session(&self, client: &LlmClient, session_id: u64, reason: EndReason) {
@@ -311,7 +350,7 @@ impl Investigator {
         // Publish the token, *then* look again: a turn that started after
         // the worker's quiet check but before the token existed had nothing
         // to cancel, and would otherwise share the LLM with this run.
-        if !self.deps.active_turns.lock().await.is_empty() {
+        if !self.hub.active_turns.lock().await.is_empty() {
             cancel.cancel();
         }
         let mut interrupted = false;
@@ -322,7 +361,7 @@ impl Investigator {
             }
             let id = ticket.meta.id.clone();
             let _ = self.store.set_status(&id, TicketStatus::Investigating);
-            self.deps.events.emit(Event::IdealistStatus {
+            self.hub.event_sink.emit(Event::IdealistStatus {
                 activity:    format!("investigating {id}"),
                 severity:    protocol::Severity::Info,
                 last_ticket: None,
@@ -335,10 +374,10 @@ impl Investigator {
                 interrupted = true;
                 break;
             }
-            self.record(session_id, &id, outcome);
+            self.record(session_id, &id, outcome).await;
         }
         *self.current.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        self.deps.events.emit(Event::IdealistStatus {
+        self.hub.event_sink.emit(Event::IdealistStatus {
             activity:    "idle".into(),
             severity:    protocol::Severity::Info,
             last_ticket: None,
@@ -358,7 +397,7 @@ impl Investigator {
     }
 
     /// Write one outcome to its ticket, the lessons file and the FE.
-    fn record(&self, session_id: u64, id: &str, outcome: Outcome) {
+    async fn record(&self, session_id: u64, id: &str, outcome: Outcome) {
         let (section, diagnosis, summary) = match &outcome {
             Outcome::Found { finding, section, verified } => {
                 let confidence = if *verified { finding.confidence.clone() } else { "low".into() };
@@ -402,7 +441,11 @@ impl Investigator {
             _ => format!("idealist: ticket {id} not diagnosed — {summary}"),
         };
         self.emit(if ok { "INFO" } else { "WARN" }, line);
-        self.deps.events.emit(Event::IdealistInvestigated {
+        // A sure harness bug gets a fix session when the operator opted in.
+        // `confidence` is already `low` for an unverified run, so `high`
+        // here means the investigator read code that backs it.
+        let sure_bug = category.as_deref() == Some("harness_bug") && confidence.as_deref() == Some("high");
+        self.hub.event_sink.emit(Event::IdealistInvestigated {
             ticket_id: id.to_string(),
             session_id,
             ok,
@@ -410,6 +453,25 @@ impl Investigator {
             confidence,
             summary,
         });
+        if sure_bug && self.cfg.auto_fix_session {
+            match start_fix_session(&self.hub, id).await {
+                Ok((fix_id, draft)) => {
+                    self.emit(
+                        "INFO",
+                        format!(
+                            "idealist: opened fix session {fix_id} for ticket {id} — the fix \
+                             prompt is waiting in its composer, nothing has been sent"
+                        ),
+                    );
+                    self.hub.event_sink.emit(Event::FixSessionReady {
+                        session_id: fix_id,
+                        ticket_id:  id.to_string(),
+                        draft,
+                    });
+                }
+                Err(e) => self.emit("WARN", format!("idealist: no fix session for {id} — {e}")),
+            }
+        }
     }
 
     async fn investigate(
@@ -421,7 +483,7 @@ impl Investigator {
         cancel: &CancellationToken,
     ) -> Outcome {
         let (persona, names) = persona_and_skills();
-        let registry = Arc::new(self.deps.skills.restricted_to(&names));
+        let registry = Arc::new(self.hub.skills.restricted_to(&names));
         if registry.by_name.is_empty() {
             return Outcome::Failed {
                 why: "none of read-file / glob / grep is registered".into(),
@@ -481,7 +543,7 @@ impl Investigator {
 
     /// The log rows around `seq`, rendered as the Trajectory view reads.
     async fn window(&self, session_id: u64, seq: Option<u64>) -> String {
-        let g = self.deps.sessions.lock().await;
+        let g = self.hub.sessions.lock().await;
         let Some(log) = g.get(&session_id) else {
             return "(the session's log is not loaded — it may have been deleted)".into();
         };
@@ -633,6 +695,83 @@ fn task_text(session_id: u64, ticket: &Ticket, window: &str, prior: &[String]) -
     )
 }
 
+/// Open the session that fixes ticket `ticket_id`, or find the one already
+/// opened for it, and build the prompt a person reviews before sending.
+///
+/// The session works in the sica-rust checkout (`workspace_root`), not the
+/// user's working directory: a harness bug is in this code, whatever folder
+/// the user's own sessions are pointed at. Nothing is sent from here — the
+/// FE puts the draft in the composer.
+pub async fn start_fix_session(hub: &ChatHub, ticket_id: &str) -> Result<(u64, String), String> {
+    let store = TicketStore::open_default();
+    if !store.path(ticket_id).is_file() {
+        return Err(format!("no ticket `{ticket_id}` in {}", store.dir().display()));
+    }
+    let ticket = store.load(ticket_id).map_err(|e| format!("ticket {ticket_id}: {e}"))?;
+    let draft = fix_prompt(&ticket, &store.path(ticket_id));
+    if let Some(existing) = ticket.meta.fix_session {
+        if hub.sessions.lock().await.contains_key(&existing) {
+            return Ok((existing, draft));
+        }
+    }
+    let root = sica_core::paths::workspace_root();
+    let id = hub.create_session_in(root, None).await;
+    let title = format!("Fix {ticket_id}: {}", ticket.meta.module);
+    hub.rename_session(id, &title).await;
+    store
+        .set_fix_session(ticket_id, id)
+        .map_err(|e| format!("session {id} opened but the ticket could not record it: {e}"))?;
+    Ok((id, draft))
+}
+
+/// The fix session's opening message. Built from the ticket so it stands on
+/// its own; the investigator's latest section rides along when there is one.
+fn fix_prompt(ticket: &Ticket, path: &std::path::Path) -> String {
+    let m = &ticket.meta;
+    let diagnosed = match &m.diagnosis {
+        Some(d) => format!(
+            "The end-of-session investigator diagnosed it as `{}` with `{}` confidence.",
+            d.category, d.confidence
+        ),
+        None => "It has not been diagnosed yet — start by finding the root cause.".into(),
+    };
+    let latest = TicketStore::investigations(ticket)
+        .pop()
+        .map(|s| format!("\n\nThe latest investigation:\n\n{}", clip(s.trim(), 3_000)))
+        .unwrap_or_default();
+    let krate = crate_of(&m.module);
+    format!(
+        "Fix idealist ticket `{id}` (`{module}`, {occ} occurrence(s)). {diagnosed} \
+         The ticket is at {path}.{latest}\n\n\
+         1. Read the ticket and check the diagnosis against the code before changing anything.\n\
+         2. Make the smallest change that removes the root cause, and add or adjust a unit test \
+         that fails without it.\n\
+         3. Run the tests: `.\\run.ps1 test -p {krate}`.\n\
+         4. Summarise what you changed and why. The ticket stays open until a person marks it \
+         resolved.",
+        id = m.id,
+        module = m.module,
+        occ = m.occurrences,
+        path = path.display(),
+    )
+}
+
+/// The crate a module path lives in, for the test command.
+fn crate_of(module: &str) -> String {
+    if module.starts_with("agents::tool::") {
+        return "agents".into();
+    }
+    if let Some(file) = module.strip_prefix("backend::panic::") {
+        if let Some(rest) = file.strip_prefix("crates/") {
+            if let Some(k) = rest.split('/').next() {
+                return k.to_string();
+            }
+        }
+        return "backend".into();
+    }
+    module.split("::").next().filter(|k| !k.is_empty()).unwrap_or("backend").replace('_', "-")
+}
+
 fn render_finding(f: &Finding, verified: bool, calls: &[String]) -> String {
     let mut out = String::new();
     if !verified {
@@ -712,6 +851,7 @@ mod tests {
                 sessions: vec![1],
                 last_message: "x".into(),
                 diagnosis: None,
+                fix_session: None,
             },
             body: "# x\n".into(),
         }
@@ -739,6 +879,32 @@ mod tests {
         assert!(source_hint("backend::turn::prompt").contains("chat.rs"));
         assert!(source_hint("backend::panic::crates/agents/src/turn.rs").contains("crates/agents/src/turn.rs"));
         assert_eq!(source_hint("sica_core::event"), "`crates/sica-core/src/event.rs`");
+    }
+
+    #[test]
+    fn fix_prompt_is_self_contained() {
+        let mut t = ticket("abc123", "Error", 3, TicketStatus::Diagnosed);
+        t.meta.module = "agents::tool::run-cli".into();
+        t.meta.diagnosis = Some(Diagnosis {
+            category: "harness_bug".into(),
+            confidence: "high".into(),
+            at: "2026-09-26T00:00:00Z".into(),
+            lesson: None,
+        });
+        t.body.push_str("\n## Investigation — x (session 1)\n\nroot cause: quoting\n");
+        let p = fix_prompt(&t, std::path::Path::new("idealist_workspace/tickets/abc123.md"));
+        assert!(p.contains("`abc123`") && p.contains("harness_bug") && p.contains("root cause: quoting"));
+        assert!(p.contains("run.ps1 test -p agents"), "{p}");
+        assert!(p.contains("tickets/abc123.md"));
+    }
+
+    #[test]
+    fn crate_of_maps_modules_to_crates() {
+        assert_eq!(crate_of("agents::tool::glob"), "agents");
+        assert_eq!(crate_of("backend::turn::prompt"), "backend");
+        assert_eq!(crate_of("sica_core::event"), "sica-core");
+        assert_eq!(crate_of("backend::panic::crates/llm/src/client.rs"), "llm");
+        assert_eq!(crate_of("backend::panic::src/x.rs"), "backend");
     }
 
     #[test]
@@ -784,6 +950,7 @@ mod tests {
             recovered_turns: recovered as u32,
             unrecovered_turns: 0,
             investigated: false,
+            turns: Vec::new(),
         };
         let entries = vec![
             entry("warn1", TriggerOrigin::TurnError, false),

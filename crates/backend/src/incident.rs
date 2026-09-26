@@ -93,7 +93,7 @@ async fn file(r: &'static Reporter, mut t: Trigger) {
         g.get(&session_id).and_then(|l| l.events.last()).map(|e| e.seq)
     };
     let skill = idealist::ticket::tool_skill(&t.module);
-    if let Err(e) = r.ledger.record(session_id, &id, t.origin, skill, seq) {
+    if let Err(e) = r.ledger.record(session_id, &id, t.origin, skill, seq, t.turn_id) {
         warn!(session_id, error = %e, "incident: ledger write failed");
     }
     t.seq = seq;
