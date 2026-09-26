@@ -144,9 +144,10 @@ fn normalize_event(obj: &mut Map<String, Value>, sidecar: &mut Sidecar) {
             obj.insert("delay_ms".into(), Value::String("{{delay}}".into()));
         }
         "context_injected" => {
-            // The runtime-context snapshot is time, cwd, os and model. Only
-            // the time line is volatile; `replace_paths` handles the cwd,
-            // and the model is part of what the scenario ran against.
+            // The runtime-context snapshot is cwd, os and model, and the
+            // clock row is the time. Only the time is volatile;
+            // `replace_paths` handles the cwd, and the model is part of
+            // what the scenario ran against.
             if let Some(Value::String(c)) = obj.get("content") {
                 let replaced = mask_times(c);
                 obj.insert("content".into(), Value::String(replaced));

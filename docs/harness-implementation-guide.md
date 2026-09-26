@@ -607,7 +607,11 @@ sparse slots**, not magic numbers: `HARNESS_IDENTITY: -1000`, `HARNESS_SOURCE:
 machine. **Sections** join into the system prompt; **contexts** become a
 *user-role snapshot message* ("Current runtime context. This snapshot
 supersedes earlier runtime-context snapshots.") so volatile facts never
-invalidate the system-prompt KV prefix. Strict `{{variable}}` interpolation
+invalidate the system-prompt KV prefix. Since 2026-09-26 (long-session-plan
+B1/B2) the snapshot is re-landed only when its facts change, through
+`chat::upsert_context`, and the clock is its own appended `Clock` row, so
+the prefix ahead of the newest turn is byte-identical from one turn to the
+next. Strict `{{variable}}` interpolation
 (`/^[a-z][a-z0-9_]*$/`): unknown or valueless names *throw*. A `complete: true`
 section replaces the whole prompt. `toolOrder` config with one
 `'<unlisted-tools>'` rest marker canonicalises tool order. Convention: **tool
@@ -1289,6 +1293,10 @@ prompt is now under budget, return `true` without summarising and emit a
 
 **Shipped as** two lines of the runtime snapshot (§5.1): the local time with
 its offset, and the time since the previous message, refreshed once per turn.
+Since 2026-09-26 those two lines are `agents::prompt::clock_text`, a one-line
+`ContextInjected { source: Clock }` appended every turn and never replaced,
+so the refresh no longer moves the snapshot's position in the prefix
+(long-session-plan B1).
 
 **Mechanism.** Durable, source-attributed clock: current time, the browser
 zone attached to the open request, elapsed time since the previous

@@ -295,16 +295,18 @@ change. sica-rust: `Assembly.context(...)` renders into
 previous snapshot — one copy is ever model-visible and the system prompt is
 never touched. Refreshed once per turn.
 
-### 5.4 KV-cache stability as a design constraint — **Partial**
+### 5.4 KV-cache stability as a design constraint — **Implemented**
 
 dsh keeps `exit_plan_mode` registered when plan mode is off, canonicalises
 tool order with an explicit `toolOrder`, and builds the compaction call as a
 genuine prefix of the last routed request. sica-rust: the catalogue and
 `tools_json()` are both sorted by name (stable); the compaction summary is
-positioned where the folded span began (prefix-friendly). The compaction
-*call* itself uses a separate system prompt rather than replaying the
-conversation's own prefix, and `memory.md` is re-read every hop (an edit
-mid-session changes the prefix — intentional, so edits apply live).
+positioned where the folded span began (prefix-friendly); the compaction
+call replays the conversation's own prefix (Wave 2); and since 2026-09-26
+(long-session-plan Wave B) the runtime snapshot is re-landed only when its
+facts change while the clock is an appended row, so nothing ahead of the
+newest turn moves between turns. `memory.md` is still re-read every hop (an
+edit mid-session changes the prefix — intentional, so edits apply live).
 
 ### 5.5 Workspace instructions (`AGENTS.md`) with a byte budget — **Implemented**
 

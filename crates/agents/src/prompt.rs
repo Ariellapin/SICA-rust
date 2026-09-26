@@ -6,12 +6,15 @@
 //! Byte-stability is the point — a stable system prompt keeps the provider's
 //! KV/prompt cache hot across requests.
 //!
-//! Volatile facts (time, working directory, permission mode…) are kept out of
+//! Volatile facts (working directory, permission mode…) are kept out of
 //! the system prompt entirely: they become a **runtime-context snapshot**, a
 //! user-role message the backend derives alongside the system prompt. The
 //! caller persists it as a `ContextInjected { source: RuntimeContext }` event
-//! that shadows its predecessor, so a mode change never invalidates the
-//! system-prompt prefix.
+//! that shadows its predecessor *only when the facts changed*, so a mode
+//! change never invalidates the system-prompt prefix and an unchanged
+//! snapshot never moves it. The clock — the one fact that changes every
+//! turn — is a separate one-line [`clock_text`] the caller *appends* each
+//! turn (`ContextSource::Clock`), so the prefix ahead of it stays cached.
 //!
 //! `{{variable}}` interpolation is **strict**: a reference to an unknown or
 //! valueless variable fails the render. A malformed prompt is worse than a
@@ -256,10 +259,11 @@ pub const RUNTIME_CONTEXT_HEADER: &str =
 ///   the text-protocol invocation brief in `memory.md` is overridden by the
 ///   identity's function-calling instruction.
 ///
-/// The runtime-context snapshot carries `{{date}}`, `{{cwd}}`, `{{os}}` and
-/// (when known) the model name; volatile policy facts (permission mode,
-/// plan mode) ride it as extra lines. The plan-mode policy itself is a
-/// `PLAN_POLICY` section, present only while plan mode is active.
+/// The runtime-context snapshot carries `{{cwd}}`, `{{os}}` and (when
+/// known) the model name; volatile policy facts (permission mode, plan
+/// mode) ride it as extra lines, and the clock rides [`clock_text`]. The
+/// plan-mode policy itself is a `PLAN_POLICY` section, present only while
+/// plan mode is active.
 pub fn for_main_agent(
     memory: &str,
     registry: &SkillRegistry,
@@ -326,12 +330,6 @@ pub fn for_main_agent(
 /// the one they cannot observe any other way.
 pub fn runtime_context_text(vars: &BTreeMap<String, String>) -> String {
     let mut out = String::from(RUNTIME_CONTEXT_HEADER);
-    if let Some(date) = vars.get("date") {
-        out.push_str(&format!("\n- Local time: {date} — from the OS clock"));
-    }
-    if let Some(elapsed) = vars.get("elapsed") {
-        out.push_str(&format!("\n- Time since the previous message: {elapsed}"));
-    }
     if let Some(cwd) = vars.get("cwd") {
         out.push_str(&format!("\n- Working directory: {cwd}"));
     }
@@ -349,6 +347,21 @@ pub fn runtime_context_text(vars: &BTreeMap<String, String>) -> String {
         out.push_str(&format!("\n- Plan mode: {plan}"));
     }
     out.push_str(OUTPUT_NAMING);
+    out
+}
+
+/// The clock line (harness guide §9.3), from `{{date}}` and, when known,
+/// `{{elapsed}}`. One short user-role message per turn, appended and never
+/// replaced: the local time with its offset and its source, then the time
+/// since the previous model-visible message.
+pub fn clock_text(vars: &BTreeMap<String, String>) -> String {
+    let mut out = String::from("Clock:");
+    if let Some(date) = vars.get("date") {
+        out.push_str(&format!(" local time {date} — from the OS clock."));
+    }
+    if let Some(elapsed) = vars.get("elapsed") {
+        out.push_str(&format!(" Time since the previous message: {elapsed}."));
+    }
     out
 }
 
@@ -464,9 +477,26 @@ mod tests {
         // The snapshot is separate from the system body.
         let ctx = r.runtime_context.unwrap();
         assert!(ctx.starts_with(RUNTIME_CONTEXT_HEADER));
-        assert!(ctx.contains("Local time:"));
+        assert!(!ctx.contains("Local time"), "the clock is not in the snapshot: {ctx}");
         assert!(ctx.contains("Working directory:"));
         assert!(ctx.contains("Model: m"));
+    }
+
+    #[test]
+    fn the_clock_line_carries_the_time_and_the_gap_and_nothing_else() {
+        let mut vars = standard_vars("m");
+        vars.insert("elapsed".into(), "6 minute(s)".into());
+        let clock = clock_text(&vars);
+        assert!(clock.starts_with("Clock: local time "), "{clock}");
+        assert!(clock.contains("from the OS clock"));
+        assert!(clock.ends_with("Time since the previous message: 6 minute(s)."));
+        assert!(!clock.contains("Working directory"));
+        assert_eq!(clock.lines().count(), 1);
+        // The snapshot, by contrast, is the same text whatever the clock says.
+        let a = runtime_context_text(&vars);
+        vars.insert("date".into(), "2030-01-01 00:00 (+00:00)".into());
+        vars.insert("elapsed".into(), "2 day(s)".into());
+        assert_eq!(a, runtime_context_text(&vars));
     }
 
     #[test]

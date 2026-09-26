@@ -470,8 +470,16 @@ pub enum ContextSource {
     /// Pushed in from outside the loop (`Request::InjectContext`) — the
     /// operator handing the model a fact, not the model asking for one.
     Injected,
-    /// Volatile facts (time, permission mode) snapshotted for this step.
+    /// The stable runtime facts (cwd, OS, model, permission mode, plan
+    /// mode), replaced only when one of them changes.
     RuntimeContext,
+    /// The clock line — local time and time since the previous message —
+    /// appended at the top of every turn and never replaced. Kept apart
+    /// from [`ContextSource::RuntimeContext`] because it is the one fact
+    /// that changes every turn: replacing an early snapshot in place would
+    /// move the prompt prefix at that position and cost the provider's
+    /// cache of everything after it (long-session-plan B1).
+    Clock,
 }
 
 impl ContextSource {
@@ -487,6 +495,7 @@ impl ContextSource {
             ContextSource::GoalRound => "goal round".into(),
             ContextSource::Injected => "injected".into(),
             ContextSource::RuntimeContext => "runtime context".into(),
+            ContextSource::Clock => "clock".into(),
         }
     }
 }

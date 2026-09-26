@@ -119,7 +119,26 @@ heading. Kept rather than discarded because the alternative is the trimmer,
 which keeps nothing of the folded span at all; the warning is what makes a
 model that cannot follow the directive visible.
 
-## Wave B — a stable prefix across turns (M × 2)
+## Wave B — a stable prefix across turns (M × 2) — **shipped, recordings to re-bless**
+
+**Shipped as** (2026-09-26): `ContextSource::Clock` and
+`agents::prompt::clock_text`, appended at the top of every turn by
+`chat::append_runtime_context`, which now lands the runtime snapshot
+through `chat::upsert_context` — the shared rule for every once-visible
+context row, `refresh_instructions` included — so a snapshot is replaced
+only when its content changed. No protocol change: `MessageDump`
+carries the source as its label string, and the FE renders "clock" like
+any injected context. Decisions in
+[notes/2026-09-26-stable-prefix.md](notes/2026-09-26-stable-prefix.md).
+
+**Every replay recording must be re-blessed on the Windows machine
+before replay is green again**: each one logs one runtime-context row
+per turn and compares heuristic token counts, and both change here.
+`.\run.ps1 --% run -p frontend --bin replay -- --bless` once per
+scenario (`compaction-replace`, `empty-response-retry`, `ptc-program`,
+`spill-digest`, `write-file-effect`), then a plain replay run to confirm.
+The TTFT measurement below is still to be taken; the `/stats` table from
+Wave F is where to read it.
 
 ### B1. Split the runtime context into a stable snapshot and a clock line
 
@@ -136,8 +155,8 @@ place every turn. Split it:
   anything else, and the prefix before the newest turn never changes.
 
 The FE renders `Clock` like any injected context (collapsed by default;
-`context_source` on `MessageDump` already carries the label, so a new
-enum variant is a protocol bump).
+`context_source` on `MessageDump` carries the label as a string, so the
+new variant needed no protocol bump).
 
 Measure before and after with the number already in the log:
 `TurnUsage.ttft_ms` on turn N of a 30-turn session against a llama.cpp
@@ -146,12 +165,12 @@ length once the prefix is stable. Record the numbers in the note.
 
 ### B2. Position every other re-injection at the tail
 
-Audit the remaining `Replace { seq, seq }` sites — `refresh_instructions`,
-`@session` and `@file` snapshots, the job notices — and confirm each one
-changes only when its content changes. The instructions snapshot already
-does. Add a test in `event.rs` that a `Replace` of unchanged content is
-never appended (a helper `append_if_changed` on `SessionLog` makes this
-one place).
+Audited: the only in-place `Replace { seq, seq }` sites are the two
+snapshots (now both through `chat::upsert_context`, which appends nothing
+for unchanged content — `upsert_context_lands_nothing_for_unchanged_content`
+pins it) and the pruner, whose replacement is by construction a change.
+`@session` and `@file` snapshots, job notices, tool notices and the
+re-attached todo list are all appends.
 
 ## Wave C — durable working memory (M × 2, protocol bump)
 
@@ -335,7 +354,7 @@ the two waves are opinions.
 
 1. ~~**A1 → A2 → A3 → A4**~~ shipped, see above.
 2. ~~**F3 → F1 → F2**~~ shipped, see above.
-3. **B1 → B2** (one protocol bump).
+3. ~~**B1 → B2**~~ shipped, see above; re-bless the recordings.
 4. **C1 → C2** (one protocol bump); D1–D3 ride the same session since
    they touch the continuation point C2 also edits.
 5. **E1 → E2**, then E3 and E4 only if the numbers from F3 say so.

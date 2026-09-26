@@ -4037,13 +4037,47 @@ pub(crate) async fn session_cwd(sessions: &Sessions, session_id: u64) -> PathBuf
         .unwrap_or_else(sica_core::paths::working_dir)
 }
 
-/// Snapshot the volatile runtime facts (time, cwd, os, model, permission
-/// mode, plan mode) as a user-role message. The new snapshot shadows its
-/// predecessor at the position the first one took, so one copy is ever
-/// model-visible and the system-prompt prefix is never touched. Called once
-/// per turn — dsh's refresh throttle. When the predecessor was itself
-/// shadowed by a compaction, the new snapshot appends fresh instead of
-/// replacing a span that is no longer on the surface.
+/// Land a context snapshot that is meant to exist once on the surface:
+/// when the newest visible entry from `source` already says `content`,
+/// nothing is appended; otherwise the new copy shadows it in place, or is
+/// appended fresh when no predecessor is visible (a compaction shadowed
+/// it, or there never was one). Returns whether a row was appended.
+///
+/// This is the one rule that keeps the prompt prefix stable across turns
+/// (long-session-plan B2): a `Replace` moves the surface at the position
+/// it lands, and the provider's cache of everything after that position
+/// goes with it — so a snapshot is re-landed only when it really changed.
+fn upsert_context(
+    log: &mut SessionLog,
+    same_source: impl Fn(&ContextSource) -> bool,
+    source: ContextSource,
+    content: String,
+) -> bool {
+    let entries = log.derive_surface();
+    let prev = entries
+        .iter()
+        .rev()
+        .find(|e| e.context.as_ref().is_some_and(&same_source));
+    if prev.is_some_and(|e| e.message.content == content) {
+        return false;
+    }
+    let surface = match prev {
+        Some(e) => SurfaceOp::Replace { start_seq: e.seq, end_seq: e.seq },
+        None => SurfaceOp::Append,
+    };
+    log.append(EventKind::ContextInjected { surface, source, content });
+    true
+}
+
+/// The turn's two context rows (long-session-plan B1). First the runtime
+/// snapshot — cwd, os, model, permission mode, plan mode — as a user-role
+/// message that shadows its predecessor **only when one of those facts
+/// changed**, so on most turns it appends nothing and the prefix ahead of
+/// the conversation stays byte-identical. Then the clock line — local
+/// time and the gap since the previous message — *appended* every turn
+/// and never replaced: it is the one fact that always changes, and
+/// replacing an early row in place would move everything after it out of
+/// the provider's cache. Called once per turn — dsh's refresh throttle.
 fn append_runtime_context(
     log: &mut SessionLog,
     model: &str,
@@ -4074,20 +4108,16 @@ fn append_runtime_context(
         let secs = (chrono::Utc::now().timestamp_millis() - ts).max(0) / 1000;
         vars.insert("elapsed".into(), human_elapsed(secs));
     }
-    let content = agents::prompt::runtime_context_text(&vars);
-    let prev = entries
-        .iter()
-        .rev()
-        .find(|e| matches!(e.context, Some(ContextSource::RuntimeContext)))
-        .map(|e| e.seq);
-    let surface = match prev {
-        Some(seq) => SurfaceOp::Replace { start_seq: seq, end_seq: seq },
-        None      => SurfaceOp::Append,
-    };
+    upsert_context(
+        log,
+        |s| matches!(s, ContextSource::RuntimeContext),
+        ContextSource::RuntimeContext,
+        agents::prompt::runtime_context_text(&vars),
+    );
     log.append(EventKind::ContextInjected {
-        surface,
-        source: ContextSource::RuntimeContext,
-        content,
+        surface: SurfaceOp::Append,
+        source: ContextSource::Clock,
+        content: agents::prompt::clock_text(&vars),
     });
 }
 
@@ -4146,19 +4176,12 @@ fn refresh_instructions(log: &mut SessionLog) -> bool {
         agents::instructions::render(&baseline)
     };
 
-    if prev_content.as_deref() == Some(content.as_str()) {
-        return false;
-    }
-    let surface = match prev {
-        Some(seq) => SurfaceOp::Replace { start_seq: seq, end_seq: seq },
-        None      => SurfaceOp::Append,
-    };
-    log.append(EventKind::ContextInjected {
-        surface,
-        source: ContextSource::Instructions,
+    upsert_context(
+        log,
+        |s| matches!(s, ContextSource::Instructions),
+        ContextSource::Instructions,
         content,
-    });
-    true
+    )
 }
 
 /// After a successful filesystem-touching skill (`read-file`, `write-file`,
@@ -5502,12 +5525,15 @@ mod tests {
         });
 
         let surface = log.derive_surface();
-        assert_eq!(surface.len(), 2, "the first draft and its reply are gone");
-        assert!(matches!(
-            surface[0].context,
-            Some(ContextSource::RuntimeContext)
-        ));
-        assert_eq!(surface[1].message.content, "second draft");
+        // The snapshot, this turn's clock and the edited message; the
+        // first draft and its reply are gone. The earlier clock stays —
+        // clocks are never replaced — and the unchanged snapshot was not
+        // re-landed.
+        assert_eq!(surface.len(), 4, "{surface:?}");
+        assert!(matches!(surface[0].context, Some(ContextSource::RuntimeContext)));
+        assert!(matches!(surface[1].context, Some(ContextSource::Clock)));
+        assert!(matches!(surface[2].context, Some(ContextSource::Clock)));
+        assert_eq!(surface[3].message.content, "second draft");
     }
 
     #[test]
@@ -5634,6 +5660,7 @@ mod tests {
             content: "hi".into(),
             images: Vec::new(),
         });
+        let seq_before = log.last_seq();
         append_runtime_context(&mut log, "test-model", PermissionMode::WorkspaceWrite, false);
         let entries = log.derive_surface();
         let snaps: Vec<_> = entries
@@ -5643,8 +5670,46 @@ mod tests {
         assert_eq!(snaps.len(), 1, "one snapshot is ever model-visible");
         assert!(snaps[0].message.content.contains("Model: test-model"));
         assert!(snaps[0].message.content.starts_with(agents::prompt::RUNTIME_CONTEXT_HEADER));
-        // It landed where the first one stood — before the user message.
-        assert_eq!(entries.last().unwrap().message.content, "hi");
+        assert!(!snaps[0].message.content.contains("local time"), "the clock is its own row");
+        // Unchanged facts: the first snapshot still stands, untouched, at
+        // the front; the second turn appended only its clock.
+        assert_eq!(snaps[0].seq, 2, "the original row, not a replacement");
+        assert_eq!(log.last_seq(), seq_before + 1, "exactly one row (the clock) was appended");
+        assert!(matches!(entries.last().unwrap().context, Some(ContextSource::Clock)));
+        assert_eq!(entries[2].message.content, "hi");
+        assert_eq!(entries.iter().filter(|e| matches!(e.context, Some(ContextSource::Clock))).count(), 2);
+
+        // A changed fact replaces the snapshot in place — one copy visible,
+        // at the position the first one took.
+        append_runtime_context(&mut log, "test-model", PermissionMode::ReadOnly, false);
+        let entries = log.derive_surface();
+        let snaps: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.context, Some(ContextSource::RuntimeContext)))
+            .collect();
+        assert_eq!(snaps.len(), 1);
+        assert!(snaps[0].message.content.contains("read-only"), "{}", snaps[0].message.content);
+        assert!(matches!(entries[0].context, Some(ContextSource::RuntimeContext)), "still first");
+        assert_eq!(entries[2].message.content, "hi");
+    }
+
+    #[test]
+    fn upsert_context_lands_nothing_for_unchanged_content() {
+        let mut log = SessionLog::new(1, "t");
+        let same = |s: &ContextSource| matches!(s, ContextSource::Instructions);
+        assert!(upsert_context(&mut log, same, ContextSource::Instructions, "A".into()));
+        let first = log.last_seq();
+        assert!(!upsert_context(&mut log, same, ContextSource::Instructions, "A".into()));
+        assert_eq!(log.last_seq(), first, "no row for the same content");
+        assert!(upsert_context(&mut log, same, ContextSource::Instructions, "B".into()));
+        let surface = log.derive_surface();
+        assert_eq!(surface.len(), 1);
+        assert_eq!(surface[0].message.content, "B");
+        assert!(matches!(
+            log.events.last().unwrap().kind,
+            EventKind::ContextInjected { surface: SurfaceOp::Replace { start_seq, end_seq }, .. }
+                if start_seq == first && end_seq == first
+        ));
     }
 
     #[test]
@@ -5670,8 +5735,12 @@ mod tests {
             .filter(|e| matches!(e.context, Some(ContextSource::RuntimeContext)))
             .collect();
         assert_eq!(snaps.len(), 1);
-        // Appended fresh (newest entry), not resurrected at the dead span.
-        assert_eq!(after.last().unwrap().seq, snaps[0].seq);
+        // Appended fresh (right after the summary, ahead of this turn's
+        // clock), not resurrected at the dead span.
+        assert_eq!(after.len(), 3, "{after:?}");
+        assert!(after[0].message.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX));
+        assert_eq!(after[1].seq, snaps[0].seq);
+        assert!(matches!(after[2].context, Some(ContextSource::Clock)));
     }
 
     fn todo_write(log: &mut SessionLog, items: &[(&str, protocol::TodoStatus)]) {
