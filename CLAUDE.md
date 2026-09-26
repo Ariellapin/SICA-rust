@@ -93,8 +93,12 @@ Seven crates, dependency direction strictly downward. Details in
 - Optional integrations are opt-in files, absent by default and never fatal when
   malformed: `.sica/hooks.json` in the working directory (user hooks, §13.1),
   `sica-settings/mcp/*.toml` (one MCP server each, §13.2), `sica-settings/web.toml`
-  (the `web-search` provider key, §13.3). Each reports what it could not load as a
+  (the `web-search` provider key, §13.3), `sica-settings/idealist.toml` (the
+  end-of-session investigator's knobs). Each reports what it could not load as a
   `LogLine` rather than failing startup.
+- Report a new failure path through `backend::incident` (not only a `LogLine`),
+  so it becomes an idealist ticket the end-of-session investigator can read.
+  See [docs/notes/2026-09-26-idealist-investigator.md](docs/notes/2026-09-26-idealist-investigator.md).
 - Three skills are off until a doc turns them on: `skills/agent-team.md` registers
   `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5), and
   `skills/schedule.md` registers the three reminder tools (§12.8; seeded as

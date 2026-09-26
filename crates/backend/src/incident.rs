@@ -57,41 +57,52 @@ pub fn installed() -> bool {
 
 /// Report one failure. Never blocks and never fails: reporting a problem
 /// must not become a second problem.
-pub fn report(mut t: Trigger) {
+pub fn report(t: Trigger) {
     let Some(r) = REPORTER.get() else { return };
+    if t.session_id.is_none() {
+        r.bus.publish(t);
+        return;
+    }
+    r.handle.spawn(file(r, t));
+}
+
+/// Log, ledger, publish — in that order, so the `TicketOpened` row is in
+/// the log before the daemon hears about it.
+async fn file(r: &'static Reporter, mut t: Trigger) {
     let Some(session_id) = t.session_id else {
         r.bus.publish(t);
         return;
     };
-    r.handle.spawn(async move {
-        let _g = r.order.lock().await;
-        let id = idealist::ticket::ticket_id(&t);
-        let seq = if r.ledger.is_new(session_id, &id) {
-            append_event(&r.sessions, session_id, EventKind::TicketOpened {
-                ticket_id: id.clone(),
-                origin:    t.origin.as_str().into(),
-                module:    t.module.clone(),
-                turn_id:   t.turn_id,
-            })
-            .await
-        } else {
-            let g = r.sessions.lock().await;
-            g.get(&session_id).and_then(|l| l.events.last()).map(|e| e.seq)
-        };
-        let skill = idealist::ticket::tool_skill(&t.module);
-        if let Err(e) = r.ledger.record(session_id, &id, t.origin, skill, seq) {
-            warn!(session_id, error = %e, "incident: ledger write failed");
-        }
-        t.seq = seq;
-        r.bus.publish(t);
-    });
+    let _g = r.order.lock().await;
+    let id = idealist::ticket::ticket_id(&t);
+    let seq = if r.ledger.is_new(session_id, &id) {
+        append_event(&r.sessions, session_id, EventKind::TicketOpened {
+            ticket_id: id.clone(),
+            origin:    t.origin.as_str().into(),
+            module:    t.module.clone(),
+            turn_id:   t.turn_id,
+        })
+        .await
+    } else {
+        let g = r.sessions.lock().await;
+        g.get(&session_id).and_then(|l| l.events.last()).map(|e| e.seq)
+    };
+    let skill = idealist::ticket::tool_skill(&t.module);
+    if let Err(e) = r.ledger.record(session_id, &id, t.origin, skill, seq) {
+        warn!(session_id, error = %e, "incident: ledger write failed");
+    }
+    t.seq = seq;
+    r.bus.publish(t);
 }
 
 /// A turn ended with `finish_reason = "error"`. `reason` becomes the module
 /// suffix (`backend::turn::<reason>`), so each distinct way a turn dies is
-/// its own ticket.
-pub fn turn_error(session_id: u64, turn_id: u64, reason: &str, message: impl Into<String>) {
-    report(Trigger {
+/// its own ticket. Awaited rather than spawned so the `TicketOpened` row
+/// lands before the turn's `TurnEnd` — the investigator reads the log in
+/// order.
+pub async fn turn_error(session_id: u64, turn_id: u64, reason: &str, message: impl Into<String>) {
+    let Some(r) = REPORTER.get() else { return };
+    file(r, Trigger {
         kind:       "turn_error".into(),
         module:     format!("backend::turn::{reason}"),
         message:    message.into(),
@@ -99,7 +110,8 @@ pub fn turn_error(session_id: u64, turn_id: u64, reason: &str, message: impl Int
         session_id: Some(session_id),
         turn_id:    Some(turn_id),
         ..Default::default()
-    });
+    })
+    .await;
 }
 
 /// A failure outside any turn (a connect, a config file).

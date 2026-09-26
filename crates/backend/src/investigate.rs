@@ -308,6 +308,12 @@ impl Investigator {
 
         let cancel = CancellationToken::new();
         *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
+        // Publish the token, *then* look again: a turn that started after
+        // the worker's quiet check but before the token existed had nothing
+        // to cancel, and would otherwise share the LLM with this run.
+        if !self.deps.active_turns.lock().await.is_empty() {
+            cancel.cancel();
+        }
         let mut interrupted = false;
         for (entry, ticket) in picked {
             if cancel.is_cancelled() {

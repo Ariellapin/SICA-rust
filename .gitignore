@@ -13,7 +13,7 @@ Thumbs.db
 
 # Per-user LLM provider configs — may contain API keys.
 /sica-settings/
-idealist_workspace/*.md
+idealist_workspace/
 sessions/*.*
 
 # Oversized tool outputs the sub-agent spilled to disk (see agents::spill).

@@ -2883,7 +2883,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     crate::incident::turn_error(
                         session_id, outer_turn, "checkpoint",
                         format!("session log could not be flushed before a request: {e}"),
-                    );
+                    ).await;
                     finish = "error";
                     break;
                 }
@@ -2912,7 +2912,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         });
                         crate::incident::turn_error(
                             session_id, outer_turn, "prompt", format!("prompt assembly failed: {e}"),
-                        );
+                        ).await;
                         finish = "error";
                         break;
                     }
@@ -2975,7 +2975,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             });
                             crate::incident::turn_error(
                                 session_id, outer_turn, "prompt", format!("prompt assembly failed: {e}"),
-                            );
+                            ).await;
                             finish = "error";
                             break;
                         }
@@ -3174,7 +3174,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             one_line(failure.reason(), 200)
                         );
                         warn!(session_id, turn_id, "{msg}");
-                        crate::incident::turn_error(session_id, outer_turn, "context_overflow", msg.clone());
+                        crate::incident::turn_error(session_id, outer_turn, "context_overflow", msg.clone()).await;
                         event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg });
                         finish = "error";
                         break;
@@ -3239,7 +3239,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         format!("LLM request failed ({}) — not retryable", failure.reason())
                     };
                     warn!(session_id, turn_id, "{msg}");
-                    crate::incident::turn_error(session_id, outer_turn, "llm_request", msg.clone());
+                    crate::incident::turn_error(session_id, outer_turn, "llm_request", msg.clone()).await;
                     event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg });
                     finish = "error";
                     break;
@@ -3384,7 +3384,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         crate::incident::turn_error(
                             session_id, outer_turn, "checkpoint",
                             "session log could not be flushed before a tool call",
-                        );
+                        ).await;
                         finish = "error";
                         break;
                     }
@@ -3478,7 +3478,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 if let Err(e) = checkpoint(&sessions_map, session_id).await {
                     let msg = format!("{ABORTED_BEFORE_DISPATCH}: session log could not be flushed ({e})");
                     event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg.clone() });
-                    crate::incident::turn_error(session_id, outer_turn, "checkpoint", msg.clone());
+                    crate::incident::turn_error(session_id, outer_turn, "checkpoint", msg.clone()).await;
                     append_tool_result(&sessions_map, session_id, call_seq, &call.skill, None, false, &msg, true)
                         .await;
                     finish = "error";

@@ -14,6 +14,7 @@ mod llm;
 mod agents;
 mod integrations;
 mod skills;
+mod tickets;
 
 use egui::{Align, Align2, Layout, Rect, Rounding, Sense, Vec2};
 
