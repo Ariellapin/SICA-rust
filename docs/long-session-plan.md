@@ -1,0 +1,293 @@
+# Plan: making the agent hold up over long sessions
+
+Status on 2026-09-26, commit `f90197e`. A code survey of what happens to a
+session that runs for hours: dozens of turns, several compactions, a few
+backend restarts, and a goal or auto-continue chain driving most of the
+work. The turn loop, compaction, the meter and the overflow recovery are
+all in place ([agent-loop.md](agent-loop.md)); what follows is what still
+loses information, wastes time, or stops the agent once a session gets
+long, with a recipe per item. Sizes use the guides' scale (S / M / L).
+
+The items are grouped into six waves in the order they should ship. Wave A
+is a set of correctness fixes to the compaction chain that any long session
+hits today and that need no protocol change; do it first.
+
+## What "long session" breaks today
+
+| # | Symptom | Cause | Where |
+| --- | --- | --- | --- |
+| 1 | Facts from early in the session vanish after the second compaction | The previous `<compacted-summary>` sits inside the folded span and is cut to 2 000 chars (1 333 head + 667 tail) by the per-message excerpt guard before the summariser sees it, so the middle sections (Files and Code, Errors and Fixes, Pending Jobs) of the earlier checkpoint are dropped on every re-compaction | `compact::summarize_fold`, `MAX_EXCERPT_CHARS` |
+| 2 | When the trimmer backstop fires, the first thing it drops is the compaction summary | `trim_to_budget` removes the oldest non-system message first; on the wire the summary is a `user` message right after the system prompt | `context::trim_to_budget` |
+| 3 | In native mode a trim can orphan a `tool` result from its `tool_calls` | The trimmer drops single messages with no pairing rule, unlike `split_index` | same |
+| 4 | Every turn re-prefills the whole prompt on llama.cpp / vLLM prefix caching | The runtime-context snapshot (time, elapsed) is `Replace`d in place near the *front* of the surface each turn, so the prefix changes at an early position and the server's KV cache for everything after it is invalidated | `chat::append_runtime_context`, `derive_surface` Replace positioning |
+| 5 | The todo list is gone from the model's view after a compaction | `TodoWrite` is not a surface event; the model only ever saw its own `todo-write` call, which the fold summarises away | `EventKind::surface`, `handle_control` |
+| 6 | A human message can drive at most ~36 tool calls before the session goes idle | `MAX_TOOL_HOPS = 12` per turn × (1 + `MAX_AUTO_CONTINUES = 2`); a goal is the only way past it | `chat.rs:40`, `verdict.rs:48` |
+| 7 | After a backend restart (the FE's rebuild/restart, or a crash) the model is never told what it lost | Background jobs die with the process with no `JobFinished`; an open `TurnStart` without `TurnEnd` is left as is; in native mode a `ToolCall` whose result never landed leaves dangling `tool_calls` on the next request | `ChatHub::new_loaded`, `jobs_bridge` |
+| 8 | Each hop costs a full fold of the log, several times | `derive_surface` runs in `build_history`, again in `compact_session`, again in `prune_tool_results`' caller, in `refresh_instructions`, and once more under `--invariants`; every fold is O(events) with a `HashMap` of calls | `sica_core::event::derive_surface` |
+| 9 | `spill/<session>/` grows without bound | `spill::write` has no sweeper; a long session with many `run-cli` results leaves hundreds of files | `agents::spill` |
+| 10 | A compaction on a large window stalls the turn for minutes | The summariser replays the whole folded span (capped only per message) through the same local model; there is no smaller summarisation model and no chunking | `compact::summarize_fold`, `CompactPolicy` |
+| 11 | Nothing measures whether any of this is getting better | `TurnUsage.ttft_ms` and `TokenUsage` are logged but there is no per-session series, no replay scenario with two chained compactions, and no invariant on the summary chain | `sica_core::project`, `snapshots/` |
+
+Items 1–3 and 5 lose information; 4, 8 and 10 lose time; 6 and 7 stop the
+agent; 9 fills the disk; 11 is why the rest cannot be tuned.
+
+## Ground rules
+
+Same as [remaining-work.md](remaining-work.md#ground-rules-that-apply-to-every-item):
+build only through `.\run.ps1`, keep smoke and replay green, bump
+`PROTOCOL_VERSION` for any wire change, never remove from a log, report to
+the operator through `LogLine`, and write a `docs/notes/` entry for any
+decision the code cannot explain. Two rules specific to this plan:
+
+- **Compaction defaults are replay-priced.** Changing `threshold_pct`,
+  `retain_pct`, the excerpt cap or the directive text changes what the
+  `compaction-replace` scenario sends. Re-bless it in the same commit and
+  say so.
+- **Cache stability is a design constraint.** Anything that touches the
+  surface before the tail — a re-injected snapshot, a notice, a summary —
+  must either be stable across turns or be appended at the end. Check
+  every wave against item 4.
+
+## Wave A — compaction chain correctness (S × 4, no protocol change)
+
+### A1. The previous checkpoint is folded whole
+
+In `compact::summarize_fold`, exempt a folded message that starts with
+`SUMMARY_PREFIX` from the `MAX_EXCERPT_CHARS` cut; it is already capped at
+`MAX_SUMMARY_CHARS` (8 000) by `clean`. The directive's "consolidate an
+earlier checkpoint" rule can only work when the whole checkpoint is in
+front of the summariser. Test: a fold containing an 8 000-char summary
+reaches the request intact while a 200 KB tool result is still excerpted.
+
+### A2. The trimmer never drops the summary and never orphans a pair
+
+In `context::trim_to_budget`:
+
+1. Treat a leading run of messages that begin with
+   `protocol::CONTEXT_SUMMARY_PREFIX` as part of the protected head, like
+   the system prompt.
+2. When the message being dropped is an assistant message with
+   `tool_calls`, drop its following `tool` messages with it; when it is a
+   `tool` message, drop back to its assistant message. Reuse the pairing
+   rule from `compact::split_index` (extract it into a shared helper).
+3. The notice keeps counting dropped messages, but says "after the
+   summary" when one was kept.
+
+Tests: the summary survives a trim to a budget that only fits system +
+summary + last message; a native pair is never split.
+
+### A3. The todo list survives compaction
+
+Two changes:
+
+1. `compact_session`, after landing the summary, re-injects the latest
+   `TodoWrite` items (fold from the log with the same code
+   `dump_session` uses at `chat.rs:1420`) as a
+   `ContextInjected { source: ToolNotice }` appended after the summary,
+   rendered as the checklist the model wrote. Only when at least one item
+   is not `Completed`.
+2. The compaction directive gains one line under **Current Work**:
+   "If a todo list was in use, do not restate it; it is re-attached after
+   this checkpoint." This keeps the summary from duplicating it.
+
+Same treatment for an active goal: the round prompt already carries the
+objective, so nothing is needed there.
+
+### A4. Summary shape is validated before it lands
+
+`summarize_fold` currently accepts any non-empty text. Add a check that the
+cleaned summary contains all eight headings in order; a summary missing
+headings is treated like an empty one (retry within `policy.retries`, then
+fail closed to the trimmer). The `instruction_names_all_eight_sections`
+test already lists the headings; reuse the list. A WARN `LogLine` names the
+missing heading so a model that cannot follow the directive is visible.
+
+## Wave B — a stable prefix across turns (M × 2)
+
+### B1. Split the runtime context into a stable snapshot and a clock line
+
+Today one `ContextInjected { RuntimeContext }` carries cwd, OS, model,
+permission, plan state, local time and elapsed time, and is `Replace`d in
+place every turn. Split it:
+
+- **`RuntimeContext`** keeps the stable facts (cwd, OS, model, permission
+  mode, plan state) and is replaced *only when its content changes*, the
+  way `refresh_instructions` already works. Most turns append nothing.
+- **A new `ContextSource::Clock`** carries the two time lines and is
+  **appended** at the top of every turn, never replaced. A clock line is
+  ~25 tokens; forty turns cost 1 000 tokens, which compaction folds like
+  anything else, and the prefix before the newest turn never changes.
+
+The FE renders `Clock` like any injected context (collapsed by default;
+`context_source` on `MessageDump` already carries the label, so a new
+enum variant is a protocol bump).
+
+Measure before and after with the number already in the log:
+`TurnUsage.ttft_ms` on turn N of a 30-turn session against a llama.cpp
+server with prompt caching on. Expected: TTFT stops growing with history
+length once the prefix is stable. Record the numbers in the note.
+
+### B2. Position every other re-injection at the tail
+
+Audit the remaining `Replace { seq, seq }` sites — `refresh_instructions`,
+`@session` and `@file` snapshots, the job notices — and confirm each one
+changes only when its content changes. The instructions snapshot already
+does. Add a test in `event.rs` that a `Replace` of unchanged content is
+never appended (a helper `append_if_changed` on `SessionLog` makes this
+one place).
+
+## Wave C — durable working memory (M × 2, protocol bump)
+
+The compaction summary is the only thing that carries the agent's own
+state across a fold, and it is LLM-written and lossy (item 1 made it
+worse; A1 makes it whole but not exact). Long tasks need a small piece of
+state the harness carries verbatim.
+
+### C1. `notes-write`: a pinned working-memory block
+
+A harness control skill like `todo-write` (body runs in `chat.rs`,
+excluded from children via `control::CHILD_EXCLUDED`):
+
+- **Contract.** `notes-write '<markdown>'` replaces the session's working
+  notes. Cap 4 KiB (a `LogLine` and a failed outcome above that). The
+  catalogue line says what it is for: decisions taken, file paths in play,
+  commands that worked, open questions — "what you would want to know
+  after your memory is wiped".
+- **Durable.** `EventKind::Notes { content }`, non-surface, folded by
+  `sica_core::project::notes` (latest wins). Written to
+  `sessions/<id>/notes.md` as well so the operator can read and edit it;
+  an edit on disk is picked up at turn start like `memory.md`.
+- **Visible.** Injected as `ContextInjected { source: WorkingMemory }`
+  appended right after each compaction summary (with A3's todo block) and
+  at the start of the first turn after a backend restart. Not on every
+  turn: between compactions the model's own `notes-write` call is still in
+  the tail and the pinned copy would only churn the prefix (Wave B).
+- **Prompted.** One sentence in the compaction directive: "The working
+  notes are re-attached after this checkpoint; do not restate them." And
+  one in `memory.md`'s Rules: update the notes when a decision is made or
+  a step completes, not every hop.
+- **FE.** A dock card next to the todo checklist, editable, sending
+  `Request::WriteNotes` (protocol bump alongside the event and the
+  `SessionDump.notes` field).
+
+### C2. Restart brief
+
+At `ChatHub::new_loaded`, for each session whose log ends inside a turn
+(a `TurnStart` without its `TurnEnd`):
+
+1. Append `TurnEnd { finish_reason: "restart" }` so the outline and the
+   verdict logic see a closed turn.
+2. For every `ToolCall` without a `ToolResult`, append a failed result
+   `ABORTED_BY_RESTART` (the `answer_unrun` shape at `chat.rs:808`), so a
+   native transcript never carries dangling `tool_calls`.
+3. For every background job started in the session and not `JobFinished`,
+   append `JobFinished { status: "lost" }` and queue the same
+   `JobNotice` the bridge sends, saying the job died with the process.
+4. Queue one `ContextInjected { source: Injected }` for the next turn:
+   "The backend restarted at <time>; the turn in progress was cut short
+   after <n> tool calls; jobs <ids> were lost; your working notes and todo
+   list follow." followed by C1's block.
+
+Nothing here starts a turn — the person or the goal driver does. Smoke
+step: kill the backend mid-turn, restart, load the session, assert the
+four rows and that the next request derives cleanly in native mode.
+
+## Wave D — autonomy budget for long runs (S × 3)
+
+### D1. Hop and continue budgets become settings
+
+`MAX_TOOL_HOPS` (12) and `verdict::MAX_AUTO_CONTINUES` (2) were sized for
+a chat, not a two-hour task. Fold both into the `harness.toml` item
+(remaining-work M1) with defaults unchanged, and raise the *native-mode*
+default hop cap to 32: native batches already overlap reads, the repeat
+guard catches loops at 3/5/8, and the verdict check still audits every
+abnormal stop. Text mode keeps 12; small models that emit one call per
+message need the shorter leash. Replay recordings are unaffected (no
+scenario reaches the cap).
+
+### D2. A hop-limit stop under an active goal does not spend an auto-continue
+
+At the continuation point (`chat.rs:3674`) a `hop-limit` stop with an
+armed goal should open a goal round directly rather than an auto-continue,
+because the round prompt re-grounds the model on the workspace and the
+goal's own round cap bounds it. Keep auto-continue for `max_tokens` and
+`error`, where re-grounding is not the point. One test over `llm::mock`.
+
+### D3. Compaction's Next Step feeds the verdict
+
+`verdict::digest` lists the turn's tool calls; when the turn contained a
+compaction, include the summary's **Next Step** section so the judge sees
+what the model itself said remained. Pure function change, one test.
+
+## Wave E — cost per hop and per session (M × 2, S × 2)
+
+### E1. Cache the surface fold
+
+Give `SessionLog` a memoised `derive_surface`: recompute only when
+`last_seq` moved (an `append` invalidates). Every caller in `chat.rs`
+already goes through the log, so the change is local. Measure with a
+synthetic 20 000-event log (`sessions_store` tests have the builders):
+fold time per hop before and after. If the fold is under a millisecond at
+that size, ship the cache anyway for the invariants path and stop there;
+do not build incremental folds.
+
+### E2. Spill sweeper
+
+At backend start and once an hour, delete `spill/<session>/` files older
+than 7 days *or* beyond 256 MiB per session, oldest first, and log one
+line per sweep. A spilled file the model may still read is one the
+summary names; 7 days is well past any tail. Make both numbers
+`harness.toml` fields (M1).
+
+### E3. Lazy session bodies
+
+Remaining-work M2 as written. It matters here because a machine with
+months of long sessions pays the whole set at every restart, and Wave C2
+adds a fold per session at load.
+
+### E4. Summarisation model and chunked folds
+
+Add `CompactPolicy.model: Option<String>` (protocol bump, Models card
+row): the summariser call goes to that model on the same provider when
+set. dsh has the same knob. Then, only if measured compaction time on a
+64 k window is still over a minute: fold in chunks — summarise the oldest
+half of the span, then summarise that result plus the newer half — so
+each summariser request stays under half the window. Keep the prefix
+property for the first chunk (it is the conversation's own prefix); the
+second chunk cannot be a prefix and that is the price.
+
+## Wave F — measuring long sessions (S × 3)
+
+### F1. A chained-compaction replay scenario
+
+A new `snapshots/compaction-chain` recording with a session that compacts
+twice, where a fact stated in turn 1 (a file path and an error string) is
+asked about after the second compaction. The replay diff then catches any
+regression of A1, and the scenario is the fixture for E4's chunked fold.
+Bless once, on the model the other scenarios use.
+
+### F2. `check_summary_chain` invariant
+
+In `backend::invariants`: every `CompactionSummary` whose folded span
+contains an earlier summary must have a `summary` at least as long as the
+earlier one's **Files and Code** section, and must contain every
+backticked path the earlier one contained. Cheap, purely over the log,
+and the kind of invariant a second observer can check.
+
+### F3. A per-session series in `SessionStats`
+
+Extend `sica_core::project::stats` with, per turn: `ttft_ms`,
+`prompt_tokens`, `hops`, and whether a compaction happened. The FE's
+`stats` command prints the table. This is the instrument for B1 and E4;
+without it the two waves are opinions.
+
+## Suggested order
+
+1. **A1 → A2 → A3 → A4** in one session; re-bless `compaction-replace`
+   once at the end. Ship with a `docs/notes/` entry on the excerpt
+   exemption and the trimmer's protected head.
+2. **F3 → F1 → F2** next, so B and E are measured rather than assumed.
+3. **B1 → B2** (one protocol bump).
+4. **C1 → C2** (one protocol bump); D1–D3 ride the same session since
+   they touch the continuation point C2 also edits.
+5. **E1 → E2**, then E3 and E4 only if the numbers from F3 say so.
