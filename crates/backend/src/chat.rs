@@ -1500,24 +1500,24 @@ impl ChatHub {
         let feedback = sica_core::project::feedback(&log.events);
         let messages = log
             .derive_surface()
-            .into_iter()
+            .iter()
             .map(|e| {
                 let role = if e.context.is_some() {
                     "context"
                 } else {
                     role_to_str(e.message.role)
                 };
-                let tool = e.tool;
+                let tool = e.tool.clone();
                 let content = match &tool {
                     Some(t) => t.summary.clone(),
-                    None => e.message.content,
+                    None => e.message.content.clone(),
                 };
                 MessageDump {
                     seq: e.seq,
                     role: role.into(),
                     content,
-                    reasoning: e.message.reasoning,
-                    images: e.message.images,
+                    reasoning: e.message.reasoning.clone(),
+                    images: e.message.images.clone(),
                     tool_name: tool.as_ref().map(|t| t.name.clone()),
                     tool_ok: tool.as_ref().map(|t| t.ok),
                     tool_args_preview: tool.as_ref().map(|t| t.args_preview.clone()),
@@ -2248,7 +2248,7 @@ impl ChatHub {
         };
         let (tool_mode, opt_max_tokens, compact_policy) = {
             let opts = self.llm_opts.lock().await;
-            (opts.tool_mode, opts.max_tokens, opts.compact)
+            (opts.tool_mode, opts.max_tokens, opts.compact.clone())
         };
         let window = self.context_window.load(Ordering::Relaxed);
         let reserve = opt_max_tokens.unwrap_or(4096).saturating_add(512);
@@ -2883,7 +2883,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
             (
                 preset_mode.unwrap_or(opts.tool_mode),
                 opts.max_tokens,
-                opts.compact,
+                opts.compact.clone(),
                 opts.retry_always,
             )
         };
@@ -4008,6 +4008,15 @@ fn one_line(text: &str, cap: usize) -> String {
 /// base URL and the API key are provider configuration, not part of what
 /// the model was asked, and one of them is a secret.
 fn envelope_options_json(model: &str, opts: &protocol::LlmOptions, window: u32) -> String {
+    let mut compact = serde_json::json!({
+        "threshold_pct": opts.compact.threshold_pct,
+        "retain_pct":    opts.compact.retain_pct,
+    });
+    // Present only when set: the recordings carry this envelope, and a
+    // key that appeared on every session would change all of them.
+    if let Some(m) = &opts.compact.model {
+        compact["model"] = serde_json::Value::String(m.clone());
+    }
     serde_json::json!({
         "model":          model,
         "temperature":    opts.temperature,
@@ -4015,10 +4024,7 @@ fn envelope_options_json(model: &str, opts: &protocol::LlmOptions, window: u32) 
         "context_window": window,
         "tool_mode":      opts.tool_mode.label(),
         "thinking":       opts.thinking,
-        "compact": {
-            "threshold_pct": opts.compact.threshold_pct,
-            "retain_pct":    opts.compact.retain_pct,
-        },
+        "compact":        compact,
     })
     .to_string()
 }
@@ -4659,7 +4665,11 @@ async fn compact_session(
         level: "INFO".into(),
         message: format!(
             "context: compressed {split} message(s) into a summary — history {before_tokens} \
-             → {after_tokens} tokens"
+             → {after_tokens} tokens{}",
+            match policy.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(m) => format!(" (summarised by {m})"),
+                None => String::new(),
+            }
         ),
     });
     events.emit(Event::ContextCompacted {
@@ -5400,7 +5410,9 @@ async fn build_history(
 /// envelope facts the usage-anchored meter keys on.
 pub struct WireHistory {
     pub messages:    Vec<ChatMessage>,
-    pub entries:     Vec<SurfaceEntry>,
+    /// The fold the messages were built from, shared with the log's cache
+    /// (E1) — the same allocation until the log grows.
+    pub entries:     Arc<Vec<SurfaceEntry>>,
     /// The composed system-prompt body (empty when nothing was composed).
     pub system_body: String,
     /// The `tools` array as it goes on the wire, pretty-printed. Empty in
@@ -5476,7 +5488,7 @@ fn build_wire_history(
         .unwrap_or_default();
     Ok(WireHistory {
         messages: out,
-        entries: Vec::new(), // filled by build_history
+        entries: Arc::new(Vec::new()), // filled by build_history
         system_body: rendered.system,
         tools_body,
         envelope,
@@ -6131,7 +6143,7 @@ mod tests {
         let id = 9_101;
         let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(id, SessionLog::new(id, "chain"))])));
         let sink: Arc<dyn EventSink> = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
-        let policy = protocol::CompactPolicy { threshold_pct: 80, retain_pct: 16, max_tokens: 2048, retries: 1 };
+        let policy = protocol::CompactPolicy { threshold_pct: 80, retain_pct: 16, max_tokens: 2048, retries: 1, model: None };
         let cancel = CancellationToken::new();
         let (budget, window) = (600, 100_000);
 

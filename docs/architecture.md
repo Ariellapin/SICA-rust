@@ -250,6 +250,15 @@ A restart repairs each log at load by appending: `TurnEnd { finish_reason:
 dangling calls, `JobFinished { status: "lost" }` for background jobs the
 process took with it (`backend::restart`).
 
+v31 (long-session-plan Wave E) adds `CompactPolicy.model: Option<String>`
+(`#[serde(default)]`, absent on the wire when `None`): the model the
+compaction summary is written by, on the same provider as the connected
+one. The provider TOML's `compact_model` and the Models card's *Sum model*
+row set it; `compact::summarize_fold` swaps only the model name on its
+clone of the client. `CompactPolicy` is no longer `Copy`. The request
+envelope names it under `compact.model` only when set, so existing
+recordings are unchanged.
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
@@ -263,7 +272,7 @@ process took with it (`backend::restart`).
 | `skills/*.md` | `agents::md_skill` | Scanned at BE startup only — adding a skill needs a BE restart. `plan-mode.md` is the plan-policy config, excluded from the scan by name. |
 | `sessions/<id>.jsonl` | `backend::sessions_store` | One append-only event log per chat session (`sica_core::event::SessionEvent`, one JSON object per line). Line 1 is the `SessionCreated` **header**: id, title, created_at, `format` and the session's `cwd` (v26). A torn final line or a bad line mid-file is skipped, never fatal; a future `format` is skipped whole. Loaded eagerly at startup by `ChatHub::new_loaded`; `list_headers` answers from line 1 plus a scan for the rows that can change a listing, without deriving anything. A fresh session is not written until its first user message. Legacy `<id>.toml` files are migrated once into `LegacyMessage` events and renamed `<id>.toml.bak` (never deleted). |
 | `sessions/<id>/attachments/<sha256>.<ext>` | `sica_core::attachments` | Every image a message carried (v28), named by the SHA-256 of its bytes. Written once, never rewritten, deduplicated by content; removed only with the session. |
-| `spill/<session>/*.txt` | `agents::spill` | Full text of tool outputs too large to feed back into context; the model holds only a digest + this path. `.gitignore`d churn. |
+| `spill/<session>/*.txt` | `agents::spill` | Full text of tool outputs too large to feed back into context; the model holds only a digest + this path. `.gitignore`d churn, swept by `spill::sweep` at BE start and hourly (long-session-plan E2): files older than `spill_max_age_days` go, then per session the oldest past `spill_max_mib_per_session`, both `harness.toml` keys, `0` = rule off. Nothing here is read back by the harness. |
 | `sica-settings.json` | `frontend::settings_store` | FE settings, read at startup. Settings › General applies live (theme mode, content font size 12–17, Normal/Compact transcript, busy-Enter, reduce-motion) and writes through on every change; the other sections still have their own Apply / Connect buttons. |
 | `sica-settings/llm-providers/*.toml` | `frontend::llm_providers` | One panel per provider; filename stem is the id. `.gitignore`d — may hold API keys. In the UI, `0` means "auto" for `max_tokens`/`context_window`. Each card shows a per-model recommendation (`llm::preset`, matched from the model string: temperature / thinking / tool mode per family) with a one-click Apply that persists to the TOML. |
 | `idealist_workspace/Improvement-{BE,FE}-*.md` | `idealist` | Generated tickets. Append-only churn; don't treat as source. |
@@ -274,7 +283,7 @@ process took with it (`backend::restart`).
 | `sica-settings/workspaces.json` | `backend::workspaces` | The workspace registry (v26): `{ version, order, rows }`, one row per registered directory with its title and the manual order of its sessions. Written whole through `atomic_write` on every mutation. Missing on a fresh install and bootstrapped from session headers; a corrupt one is moved aside and rebuilt, a newer `version` is refused and left alone. |
 | `sica-settings/.env` | `sica_core::creds` | Optional `KEY=value` file backing `${VAR}` references in the provider TOMLs and `web.toml`. Read on every resolution, so a rotated key needs no restart. Deliberately *not* the working directory's `.env` — that file arrives with `git clone`. `.gitignore` it. |
 | `sica-settings/web.toml` | `agents::web` | `provider` (`brave` \| `exa` \| `tavily`) + `api_key` for `web-search` (a literal, or `"${BRAVE_API_KEY}"` to name an environment variable). Absent by default; the tool still registers and its failure text says exactly which file to write, because a tool that disappears when unconfigured teaches the model the capability does not exist. `.gitignore` it — it holds a key. |
-| `sica-settings/harness.toml` | `agents::harness` | The turn budgets (long-session-plan D1): `tool_hops_text` (12), `tool_hops_native` (32, also PTC) and `auto_continues` (2), every key optional. Read once at BE start into `ChatHub::harness`; absent means the defaults, a malformed file or a `0` is a `LogLine` and the default applies for that field. The Settings › Skills › Harness tab lists the defaults and names the file; the rest of that tab's numbers are still constants (remaining-work M1). |
+| `sica-settings/harness.toml` | `agents::harness` | The turn budgets (long-session-plan D1): `tool_hops_text` (12), `tool_hops_native` (32, also PTC) and `auto_continues` (2), plus the spill sweeper's `spill_max_age_days` (7) and `spill_max_mib_per_session` (256, E2), every key optional. Read once at BE start into `ChatHub::harness`; absent means the defaults, a malformed file or a `0` is a `LogLine` and the default applies for that field. The Settings › Skills › Harness tab lists the defaults and names the file; the rest of that tab's numbers are still constants (remaining-work M1). |
 | `snapshots/<scenario>/` | `frontend::bin::replay` | Recorded-session evals (guide §14.1): `session.jsonl` (the recording, which is *also* the replay script), optional `scenario.toml`, `replay.override.json`, `workspace/` and `workspace.expected/`. Source, not churn. |
 
 ## Adding a new request (the common task)

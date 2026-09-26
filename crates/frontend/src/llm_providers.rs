@@ -57,6 +57,10 @@ pub struct ProviderConfig {
     /// Summariser attempts when compaction fails. 0 = default (1).
     #[serde(default)]
     pub compact_retries: u32,
+    /// The model the compaction summary is written by, on this provider
+    /// (long-session-plan E4). Empty = the connected model.
+    #[serde(default)]
+    pub compact_model: String,
     /// Retry every request failure, fatal ones included (dsh's
     /// `retry: { mode: always }`, harness §4.2) — for unattended runs.
     #[serde(default)]
@@ -156,6 +160,10 @@ impl ProviderConfig {
                 } else {
                     d.retries
                 },
+                model: {
+                    let m = self.compact_model.trim();
+                    (!m.is_empty()).then(|| m.to_string())
+                },
             },
             retry_always: self.retry_always,
         }
@@ -233,6 +241,7 @@ pub(crate) fn defaults() -> Vec<ProviderConfig> {
         api_key: String::new(),
         temperature: default_temperature(),
         compact_retries: 0,
+        compact_model: String::new(),
         retry_always: false,
         max_tokens: 0,
         context_window: 0,

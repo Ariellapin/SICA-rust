@@ -177,7 +177,8 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
         kit::txt(
             "The numbers behind a stalled or truncated call. The two turn budgets \
              are read from sica-settings/harness.toml at backend start \
-             (tool_hops_text, tool_hops_native, auto_continues — every key \
+             (tool_hops_text, tool_hops_native, auto_continues, and the spill \
+             sweep's spill_max_age_days / spill_max_mib_per_session — every key \
              optional, shown here at their defaults; the backend's log says \
              which values it loaded). The rest are compile-time constants.",
             12.0,
@@ -192,6 +193,7 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
         ("Shell foreground cap", "30 s · 32 KiB per stream"),
         ("Background jobs", "10 per session · 256 KiB retained"),
         ("Spill threshold", "48 KB → spill/<session>/"),
+        ("Spill sweep", "7 days · 256 MiB per session · hourly"),
         ("Tool-result pruner", "8 KiB → 4 KiB head + 1 KiB tail"),
         ("Sub-agent depth", "4"),
         ("Parallel tool pool", "4 (native mode)"),

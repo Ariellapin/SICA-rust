@@ -1231,7 +1231,9 @@ again"). Writes to new paths pass.
 
 **Shipped as** the prefix-preserving `compact::summarize_fold` with dsh's eight
 headings and the 80/16 `CompactPolicy`; every knob including `retries` is on
-the provider TOML and the Models card since Wave 10. Hardened for long
+the provider TOML and the Models card since Wave 10, and `model` (the
+summariser model on the same provider, dsh's own knob) since
+long-session-plan E4 (v31). Hardened for long
 sessions on 2026-09-26 ([long-session-plan.md](long-session-plan.md) Wave A):
 an earlier checkpoint in the fold is never excerpted, the reply is checked
 for the eight headings in order (retried, then kept with a WARN), the trimmer
@@ -1276,7 +1278,7 @@ headings; 95 % trigger; 35 % tail. The `Replace` event is in place.
    the preamble + `<compacted-summary>` tags; `SUMMARY_PREFIX` stays as the
    first line so the FE marker still matches.
 3. **Policy knobs:** `CompactPolicy { threshold_pct: 80, retain_pct: 16,
-   max_tokens: 8192, retries: 1 }` on `LlmOptions` (bump) with UI in the LLM
+   max_tokens: 8192, retries: 1, model: None }` on `LlmOptions` (bump) with UI in the LLM
    settings tab. Today's 95 % is late — dsh's 80 % leaves room for the reply.
 4. **Pairing:** `split_index` already refuses to open the tail on a `Tool`
    message; also refuse to *close* the fold on an assistant message whose

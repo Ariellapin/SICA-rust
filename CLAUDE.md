@@ -64,7 +64,7 @@ Seven crates, dependency direction strictly downward. Details in
 ## Reference docs
 
 - **[docs/architecture.md](docs/architecture.md)** — the crate graph, the wire
-  protocol (framing, `PROTOCOL_VERSION` history v17–v30), every on-disk surface,
+  protocol (framing, `PROTOCOL_VERSION` history v17–v31), every on-disk surface,
   how to add a new request, and the conventions to respect when editing.
 - **[docs/agent-loop.md](docs/agent-loop.md)** — one turn end to end: history
   derivation, prune/compact/trim, retry classification, the two tool-calling
@@ -97,7 +97,8 @@ Seven crates, dependency direction strictly downward. Details in
   malformed: `.sica/hooks.json` in the working directory (user hooks, §13.1),
   `sica-settings/mcp/*.toml` (one MCP server each, §13.2), `sica-settings/web.toml`
   (the `web-search` provider key, §13.3), `sica-settings/harness.toml` (the
-  tool-hop and auto-continue budgets, `agents::harness`). Each reports what it
+  tool-hop and auto-continue budgets and the spill sweeper's age and size
+  limits, `agents::harness`). Each reports what it
   could not load as a `LogLine` rather than failing startup.
 - Three skills are off until a doc turns them on: `skills/agent-team.md` registers
   `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5), and

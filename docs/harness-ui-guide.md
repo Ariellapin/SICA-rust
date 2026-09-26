@@ -1995,7 +1995,7 @@ different unit.
 
 ---
 
-## 11. Protocol impact (v17 … v30)
+## 11. Protocol impact (v17 … v31)
 
 Additive only; `#[serde(default)]` on every new field so old logs load.
 
@@ -2023,6 +2023,7 @@ Additive only; `#[serde(default)]` on every new field so old logs load.
 | `Request::SetWorkingDir { path }` · `Request::RateMessage { session_id, seq, rating, note }` · `Event::SchedulesChanged { session_id, rows }` (`ScheduleDump`) · `SessionDump.schedules` · `SessionMeta.scheduled` · `MessageDump.feedback` · `JobDump.started_at` · `TurnUsage.last_seq` · `LlmOptions.retry_always` | live default folder §7.2, thumbs §3.5, the schedule catalogue and alarm §6.10, job durations §6.9, the Models card's retry toggle | ✅ (v29) |
 
 | `Request::WriteNotes { session_id, content }` · `Event::NotesChanged { session_id, content }` · `SessionDump.notes` | the notes card §6.6a (long-session-plan C1) | ✅ (v30) |
+| `CompactPolicy.model: Option<String>` (`LlmOptions.compact`) | the Models card's *Sum model* row — the summariser model on the same provider (long-session-plan E4) | ✅ (v31) |
 
 `forward_event` keeps `LogLine.level` (no wire change). `PROTOCOL_VERSION`
 is **22** (v17 batch → v18 prompt editing → v19 queue verbs → v20 trajectory

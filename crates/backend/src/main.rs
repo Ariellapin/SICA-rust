@@ -501,10 +501,18 @@ async fn run(args: Args) -> Result<()> {
     )
     .with_jobs(jobs.clone())
     .with_hooks(hook_config.clone())
-    .with_harness(harness_config);
+    .with_harness(harness_config.clone());
     // What the restart owes each session it cut (C2): queued as context for
     // the session's next turn, never a turn of its own.
     chat.deliver_restart_briefs().await;
+
+    // The spill sweeper (long-session-plan E2): once now and then hourly,
+    // under the two `harness.toml` spill keys. Nothing under `spill/` is
+    // ever read back by the harness, so a sweep can only cost the model a
+    // `read-file` on a path a week-old checkpoint still names. The first
+    // pass always reports, so the operator can see the sweeper is on; a
+    // later pass reports only when it removed something.
+    spawn_spill_sweeper(out_tx.clone(), harness_config.clone());
 
     // Replay mode (guide §14.1): the recording is the provider. Installed
     // here rather than through `ConnectLlm` because there is nothing to
@@ -652,4 +660,44 @@ impl agents::ToolFailureSink for ToolFailureBridge {
             traceback,
         });
     }
+}
+
+/// See the call site in `main`: the E2 sweeper, one pass at start and one
+/// every hour after, blocking file work on the blocking pool.
+fn spawn_spill_sweeper(
+    out_tx: mpsc::UnboundedSender<Frame>,
+    harness: std::sync::Arc<agents::harness::HarnessConfig>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        let mut first = true;
+        loop {
+            tick.tick().await;
+            let (age, cap) = (harness.spill_max_age(), harness.spill_max_bytes());
+            let sweep = tokio::task::spawn_blocking(move || {
+                agents::spill::sweep(&sica_core::paths::spill_dir(), age, cap)
+            })
+            .await
+            .unwrap_or_default();
+            for e in &sweep.errors {
+                warn!(error = %e, "spill sweep");
+                let _ = out_tx.send(Frame::event(Event::LogLine {
+                    level:   "WARN".into(),
+                    message: format!("spill sweep: {e}"),
+                }));
+            }
+            info!(removed = sweep.removed, freed = sweep.freed_bytes, "spill sweep");
+            if first || sweep.removed > 0 {
+                let _ = out_tx.send(Frame::event(Event::LogLine {
+                    level:   "INFO".into(),
+                    message: if first {
+                        format!("{} — next sweep in 1 h", sweep.summary())
+                    } else {
+                        sweep.summary()
+                    },
+                }));
+            }
+            first = false;
+        }
+    });
 }

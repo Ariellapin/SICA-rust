@@ -296,6 +296,13 @@ pub async fn summarize_fold(
     if summarizer.max_tokens.is_none() || summarizer.max_tokens.unwrap_or(0) < policy.max_tokens {
         summarizer.max_tokens = Some(policy.max_tokens);
     }
+    // E4: the fold may go to a different model on the same provider. The
+    // request is otherwise identical — same endpoint, key and sampling —
+    // so a provider that does not serve the name fails the call and the
+    // retry budget reports it like any other summariser failure.
+    if let Some(model) = policy.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        summarizer.model = model.to_string();
+    }
 
     // The best malformed attempt so far — kept only if no attempt has the
     // full eight-section shape.
@@ -461,6 +468,7 @@ mod tests {
     }
 
     const POLICY: protocol::CompactPolicy = protocol::CompactPolicy {
+        model: None,
         threshold_pct: 80,
         retain_pct:    16,
         max_tokens:    8192,

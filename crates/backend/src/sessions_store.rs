@@ -19,6 +19,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sica_core::atomic::atomic_write;
 use sica_core::event::{
@@ -41,6 +42,14 @@ pub struct SessionLog {
     /// leave a log that is neither. Until then nothing is written, so
     /// merely *opening* an old session does not touch the disk.
     rewrite: bool,
+    /// The memoised fold (long-session-plan E1): the surface as of the
+    /// event count it was computed at. The log only grows, and only
+    /// through [`Self::append`], so the count is the whole cache key — a
+    /// fold is recomputed exactly when something was appended since. A
+    /// hop asks for the surface several times (history, compaction, the
+    /// pruner, the instructions refresh, the invariants) and at twenty
+    /// thousand events each fold cost ~40 ms in a debug build.
+    surface: std::sync::Mutex<Option<(usize, Arc<Vec<SurfaceEntry>>)>>,
 }
 
 impl SessionLog {
@@ -59,8 +68,14 @@ impl SessionLog {
     /// workspace registry reads exactly this field to decide membership.
     pub fn new_in(id: u64, title: impl Into<String>, cwd: Option<PathBuf>) -> Self {
         let created_at = chrono::Utc::now().timestamp();
-        let mut log =
-            Self { id, events: Vec::new(), next_seq: 1, flushed: 0, rewrite: false };
+        let mut log = Self {
+            id,
+            events: Vec::new(),
+            next_seq: 1,
+            flushed: 0,
+            rewrite: false,
+            surface: std::sync::Mutex::new(None),
+        };
         log.append(EventKind::SessionCreated {
             id,
             title: title.into(),
@@ -123,14 +138,14 @@ impl SessionLog {
                 .cloned(),
         );
         let next_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
-        Self { id, events, next_seq, flushed: 0, rewrite: false }
+        Self { id, events, next_seq, flushed: 0, rewrite: false, surface: std::sync::Mutex::new(None) }
     }
 
     /// A session restored from disk — every event is already persisted.
     fn from_events(id: u64, events: Vec<SessionEvent>, rewrite: bool) -> Self {
         let next_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
         let flushed = events.len();
-        Self { id, events, next_seq, flushed, rewrite }
+        Self { id, events, next_seq, flushed, rewrite, surface: std::sync::Mutex::new(None) }
     }
 
     /// Append one event and return its seq.
@@ -209,8 +224,21 @@ impl SessionLog {
             .unwrap_or_else(|| self.created_at())
     }
 
-    pub fn derive_surface(&self) -> Vec<SurfaceEntry> {
-        derive_surface(&self.events)
+    /// The model-visible history, folded once per change to the log and
+    /// shared from then on: two calls between appends return the same
+    /// allocation. Callers that need to hold it across an append clone
+    /// the `Arc`, not the entries.
+    pub fn derive_surface(&self) -> Arc<Vec<SurfaceEntry>> {
+        let key = self.events.len();
+        let mut cache = self.surface.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, surface)) = cache.as_ref() {
+            if *at == key {
+                return surface.clone();
+            }
+        }
+        let surface = Arc::new(derive_surface(&self.events));
+        *cache = Some((key, surface.clone()));
+        surface
     }
 
     /// The derived history as plain messages. Currently only tests call
@@ -218,7 +246,7 @@ impl SessionLog {
     /// seqs — but it is the store's public replay API.
     #[allow(dead_code)]
     pub fn derive_messages(&self) -> Vec<Message> {
-        self.derive_surface().into_iter().map(|e| e.message).collect()
+        self.derive_surface().iter().map(|e| e.message.clone()).collect()
     }
 
     /// Messages the user typed, counting migrated ones.
@@ -582,6 +610,7 @@ fn migrate_toml(dir: &Path, toml_path: &Path) {
             next_seq: 1,
             flushed: 0,
             rewrite: false,
+            surface: std::sync::Mutex::new(None),
         };
         log.append(EventKind::SessionCreated {
             id,
@@ -620,6 +649,74 @@ pub fn delete_in(dir: &Path, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Long-session-plan E1's measurement: how long one fold of a 20 000
+    /// event log takes. Ignored by default — it prints, it does not
+    /// assert. `cargo test -p backend fold_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fold_time_at_twenty_thousand_events() {
+        let mut log = SessionLog::new(1, "bench");
+        let mut last_call = 0;
+        for i in 0..5000 {
+            log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: format!("ask {i} {}", "w ".repeat(40)), images: Vec::new() });
+            last_call = log.append(EventKind::ToolCall { name: "grep".into(), args_preview: "grep 'x'".into(), expectation: "e".into(), call_id: None, args_json: None });
+            log.append(EventKind::ToolResult { surface: SurfaceOp::Append, call_seq: last_call, skill: "grep".into(), tool_call_id: None, ok: true, summary: "r ".repeat(60), trusted: false, pruned: false });
+            log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: format!("reply {i} {}", "w ".repeat(40)), reasoning: None, tool_calls: None });
+            if i % 500 == 499 {
+                let end = log.last_seq();
+                log.append(EventKind::CompactionSummary { surface: SurfaceOp::Replace { start_seq: end.saturating_sub(1500), end_seq: end }, content: "summary".into(), summary: "summary".into(), folded: 1500, before_tokens: 0, after_tokens: 0 });
+            }
+        }
+        let _ = last_call;
+        assert!(log.events.len() >= 20_000);
+        let n = 20;
+        let t = std::time::Instant::now();
+        let mut len = 0;
+        for _ in 0..n {
+            len = derive_surface(&log.events).len();
+        }
+        let raw = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            len = log.derive_surface().len();
+        }
+        let cached = t.elapsed() / n;
+        println!(
+            "fold of {} events -> {len} entries: {raw:?} per uncached fold, {cached:?} through the log",
+            log.events.len()
+        );
+    }
+
+    /// E1's contract: the fold is shared until the log grows, and an
+    /// append is exactly what invalidates it.
+    #[test]
+    fn the_surface_is_folded_once_per_append() {
+        let mut log = SessionLog::new(1, "cache");
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "a".into(), images: Vec::new() });
+        let first = log.derive_surface();
+        let again = log.derive_surface();
+        assert!(Arc::ptr_eq(&first, &again), "no append, no second fold");
+        assert_eq!(first.len(), 1);
+
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "b".into(), reasoning: None, tool_calls: None });
+        let after = log.derive_surface();
+        assert!(!Arc::ptr_eq(&first, &after), "an append invalidates");
+        assert_eq!(after.len(), 2);
+        assert_eq!(first.len(), 1, "a held fold is a snapshot, not a view");
+
+        // A non-surface append still invalidates — the key is the log's
+        // length, not the surface's, so the cache never has to know which
+        // kinds fold to nothing.
+        log.append(EventKind::TurnEnd { turn_id: 1, finish_reason: "done".into(), hops: 0 });
+        let after_bookkeeping = log.derive_surface();
+        assert!(!Arc::ptr_eq(&after, &after_bookkeeping));
+        assert_eq!(after_bookkeeping.len(), 2);
+
+        // A log built from rows (load, fork) starts cold and folds the same.
+        let rebuilt = SessionLog::from_events(1, log.events.clone(), false);
+        assert_eq!(rebuilt.derive_surface().len(), 2);
+    }
 
     #[test]
     fn the_latest_envelope_is_the_newest_one_written() {
@@ -703,8 +800,8 @@ mod tests {
         // from its `ToolCall`, not the fallback.
         let tool = fork
             .derive_surface()
-            .into_iter()
-            .find_map(|e| e.tool)
+            .iter()
+            .find_map(|e| e.tool.clone())
             .expect("tool entry");
         assert_eq!(tool.args_preview, "read-file 'a.rs'");
         assert_eq!(tool.args_json.as_deref(), Some(r#"{"path":"a.rs"}"#));

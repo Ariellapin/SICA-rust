@@ -21,7 +21,13 @@
 //! tool_hops_text   = 12   # text tool-calling: one call per model reply
 //! tool_hops_native = 32   # native / PTC: a reply may carry a whole batch
 //! auto_continues   = 2    # continuation turns per human message
+//! spill_max_age_days       = 7     # spill sweeper (E2): 0 turns the rule off
+//! spill_max_mib_per_session = 256  # oldest first past this; 0 turns it off
 //! ```
+//!
+//! The two spill keys drive `agents::spill::sweep`, which the backend runs
+//! at start and once an hour over `spill/<session>/`. Unlike the turn
+//! budgets, `0` is meaningful there: it switches that rule off.
 //!
 //! The native cap is higher on purpose: a native batch already overlaps
 //! its reads, the repeat guard (`agents::guard`) catches loops at 3/5/8,
@@ -39,6 +45,13 @@ pub const DEFAULT_TOOL_HOPS_TEXT: u8 = 12;
 pub const DEFAULT_TOOL_HOPS_NATIVE: u8 = 32;
 /// Continuation turns the completion check may open per human message.
 pub const DEFAULT_AUTO_CONTINUES: u8 = 2;
+/// Spilled tool outputs older than this are swept. Well past any tail a
+/// session could still be reading: a spilled file the model may still
+/// need is one the current checkpoint names, and no checkpoint reaches
+/// back a week.
+pub const DEFAULT_SPILL_MAX_AGE_DAYS: u32 = 7;
+/// Per-session cap on spilled bytes; past it the oldest files go first.
+pub const DEFAULT_SPILL_MAX_MIB_PER_SESSION: u32 = 256;
 
 /// The loaded budgets. `Default` is the pre-D1 constants, so a test that
 /// never reads the file sees exactly the behaviour it always did.
@@ -51,6 +64,12 @@ pub struct HarnessConfig {
     pub tool_hops_native: u8,
     #[serde(default = "default_auto_continues")]
     pub auto_continues:   u8,
+    /// `0` = no age rule.
+    #[serde(default = "default_spill_age")]
+    pub spill_max_age_days: u32,
+    /// `0` = no size rule.
+    #[serde(default = "default_spill_mib")]
+    pub spill_max_mib_per_session: u32,
 }
 
 fn default_hops_text() -> u8 {
@@ -62,6 +81,12 @@ fn default_hops_native() -> u8 {
 fn default_auto_continues() -> u8 {
     DEFAULT_AUTO_CONTINUES
 }
+fn default_spill_age() -> u32 {
+    DEFAULT_SPILL_MAX_AGE_DAYS
+}
+fn default_spill_mib() -> u32 {
+    DEFAULT_SPILL_MAX_MIB_PER_SESSION
+}
 
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -69,6 +94,8 @@ impl Default for HarnessConfig {
             tool_hops_text:   DEFAULT_TOOL_HOPS_TEXT,
             tool_hops_native: DEFAULT_TOOL_HOPS_NATIVE,
             auto_continues:   DEFAULT_AUTO_CONTINUES,
+            spill_max_age_days: DEFAULT_SPILL_MAX_AGE_DAYS,
+            spill_max_mib_per_session: DEFAULT_SPILL_MAX_MIB_PER_SESSION,
         }
     }
 }
@@ -84,9 +111,32 @@ impl HarnessConfig {
     /// budgets a session is running under without opening the file.
     pub fn summary(&self) -> String {
         format!(
-            "tool hops {} text / {} native, {} auto-continue(s) per message",
-            self.tool_hops_text, self.tool_hops_native, self.auto_continues
+            "tool hops {} text / {} native, {} auto-continue(s) per message, \
+             spill sweep {} / {}",
+            self.tool_hops_text,
+            self.tool_hops_native,
+            self.auto_continues,
+            match self.spill_max_age_days {
+                0 => "no age limit".to_string(),
+                d => format!("{d} day(s)"),
+            },
+            match self.spill_max_mib_per_session {
+                0 => "no size limit".to_string(),
+                m => format!("{m} MiB per session"),
+            },
         )
+    }
+
+    /// The age rule for [`crate::spill::sweep`], `None` when switched off.
+    pub fn spill_max_age(&self) -> Option<std::time::Duration> {
+        (self.spill_max_age_days > 0)
+            .then(|| std::time::Duration::from_secs(u64::from(self.spill_max_age_days) * 86_400))
+    }
+
+    /// The size rule for [`crate::spill::sweep`], `None` when switched off.
+    pub fn spill_max_bytes(&self) -> Option<u64> {
+        (self.spill_max_mib_per_session > 0)
+            .then(|| u64::from(self.spill_max_mib_per_session) << 20)
     }
 
     /// Replace every zero with its default, naming each in `warnings`. A
@@ -193,6 +243,20 @@ mod tests {
         assert_eq!(loaded.config.tool_hops_native, 64);
         assert_eq!(loaded.config.tool_hops_text, DEFAULT_TOOL_HOPS_TEXT);
         assert_eq!(loaded.config.auto_continues, DEFAULT_AUTO_CONTINUES);
+        assert_eq!(loaded.config.spill_max_age_days, DEFAULT_SPILL_MAX_AGE_DAYS);
+    }
+
+    /// The spill keys are the one place a zero means something: off.
+    #[test]
+    fn a_zero_spill_rule_is_off_not_a_typo() {
+        let loaded = load_from(&tmp("spill", Some("spill_max_age_days = 0\nspill_max_mib_per_session = 1\n")));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.config.spill_max_age(), None);
+        assert_eq!(loaded.config.spill_max_bytes(), Some(1 << 20));
+        let d = HarnessConfig::default();
+        assert_eq!(d.spill_max_age(), Some(std::time::Duration::from_secs(7 * 86_400)));
+        assert_eq!(d.spill_max_bytes(), Some(256 << 20));
+        assert!(d.summary().contains("7 day(s)") && d.summary().contains("256 MiB"), "{}", d.summary());
     }
 
     #[test]
@@ -222,7 +286,7 @@ mod tests {
 
     #[test]
     fn summary_names_every_budget() {
-        let s = HarnessConfig { tool_hops_text: 7, tool_hops_native: 40, auto_continues: 3 }.summary();
+        let s = HarnessConfig { tool_hops_text: 7, tool_hops_native: 40, auto_continues: 3, ..Default::default() }.summary();
         assert!(s.contains("7 text") && s.contains("40 native") && s.contains("3 auto-continue"), "{s}");
     }
 }

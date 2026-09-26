@@ -316,6 +316,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                              (harness §9.1). 0 = default (1).",
                         );
                     });
+                    field_row(ui, &t, "Sum model", &mut cfg.compact_model, false);
                     ui.horizontal(|ui| {
                         label_cell(ui, &t, "Retry always");
                         ui.checkbox(&mut cfg.retry_always, "").on_hover_text(

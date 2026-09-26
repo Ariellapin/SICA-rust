@@ -23,9 +23,9 @@ hits today and that need no protocol change; do it first.
 | 5 | The todo list is gone from the model's view after a compaction | `TodoWrite` is not a surface event; the model only ever saw its own `todo-write` call, which the fold summarises away | `EventKind::surface`, `handle_control` |
 | 6 | A human message can drive at most ~36 tool calls before the session goes idle | `MAX_TOOL_HOPS = 12` per turn × (1 + `MAX_AUTO_CONTINUES = 2`); a goal is the only way past it — *fixed by Wave D: both are `harness.toml` settings, native turns get 32 hops, and a hop-limit stop under an armed goal opens a round instead of spending a continue* | `chat.rs:40`, `verdict.rs:48` |
 | 7 | After a backend restart (the FE's rebuild/restart, or a crash) the model is never told what it lost | Background jobs die with the process with no `JobFinished`; an open `TurnStart` without `TurnEnd` is left as is; in native mode a `ToolCall` whose result never landed leaves dangling `tool_calls` on the next request | `ChatHub::new_loaded`, `jobs_bridge` |
-| 8 | Each hop costs a full fold of the log, several times | `derive_surface` runs in `build_history`, again in `compact_session`, again in `prune_tool_results`' caller, in `refresh_instructions`, and once more under `--invariants`; every fold is O(events) with a `HashMap` of calls | `sica_core::event::derive_surface` |
-| 9 | `spill/<session>/` grows without bound | `spill::write` has no sweeper; a long session with many `run-cli` results leaves hundreds of files | `agents::spill` |
-| 10 | A compaction on a large window stalls the turn for minutes | The summariser replays the whole folded span (capped only per message) through the same local model; there is no smaller summarisation model and no chunking | `compact::summarize_fold`, `CompactPolicy` |
+| 8 | Each hop costs a full fold of the log, several times | `derive_surface` runs in `build_history`, again in `compact_session`, again in `prune_tool_results`' caller, in `refresh_instructions`, and once more under `--invariants`; every fold is O(events) with a `HashMap` of calls — *fixed by Wave E1: `SessionLog::derive_surface` is memoised per append* | `sica_core::event::derive_surface` |
+| 9 | `spill/<session>/` grows without bound | `spill::write` has no sweeper; a long session with many `run-cli` results leaves hundreds of files — *fixed by Wave E2: `spill::sweep`, hourly* | `agents::spill` |
+| 10 | A compaction on a large window stalls the turn for minutes | The summariser replays the whole folded span (capped only per message) through the same local model; there is no smaller summarisation model and no chunking — *Wave E4 adds the model knob (`CompactPolicy.model`); chunking waits on a measurement* | `compact::summarize_fold`, `CompactPolicy` |
 | 11 | Nothing measures whether any of this is getting better | `TurnUsage.ttft_ms` and `TokenUsage` are logged but there is no per-session series, no replay scenario with two chained compactions, and no invariant on the summary chain | `sica_core::project`, `snapshots/` |
 
 Items 1–3 and 5 lose information; 4, 8 and 10 lose time; 6 and 7 stop the
@@ -291,7 +291,30 @@ goal's own round cap bounds it. Keep auto-continue for `max_tokens` and
 compaction, include the summary's **Next Step** section so the judge sees
 what the model itself said remained. Pure function change, one test.
 
-## Wave E — cost per hop and per session (M × 2, S × 2)
+## Wave E — cost per hop and per session (M × 2, S × 2) — **shipped E1, E2, E4a**
+
+**Shipped as** (2026-09-26, protocol v31): the memoised fold on
+`sessions_store::SessionLog` (`derive_surface` returns an
+`Arc<Vec<SurfaceEntry>>` shared until the next `append`; `WireHistory.entries`
+holds the same allocation) — measured by the ignored
+`fold_time_at_twenty_thousand_events` test at 20 011 events / 3 750 entries:
+**45 ms per uncached fold, 2 ms through the log**, debug build (E1);
+`agents::spill::sweep` under the `harness.toml` keys `spill_max_age_days`
+(7) and `spill_max_mib_per_session` (256), run by `main::spawn_spill_sweeper`
+at start and hourly, one `LogLine` on the first pass and on any pass that
+removed something (E2); and `CompactPolicy.model` — the provider TOML's
+`compact_model`, the Models card's *Sum model* row, `summarize_fold` sending
+the fold to that model on the same provider, present in the request
+envelope only when set (E4, first half). Two items are deliberately **not**
+shipped: E3 (lazy session bodies, remaining-work M2 as written) and E4's
+chunked folds, both of which the suggested order makes conditional on
+numbers from F3 that only a real machine with real sessions can produce
+— the restart time with months of sessions, and the compaction time on a
+64k window with the model knob set. Decisions in
+[notes/2026-09-26-cost-per-hop.md](notes/2026-09-26-cost-per-hop.md).
+The replay recordings are unaffected: the fold's output is unchanged, the
+sweeper never touches a file a replay writes during its own run, and the
+envelope gains a key only when a summariser model is set.
 
 ### E1. Cache the surface fold
 
@@ -393,4 +416,5 @@ the two waves are opinions.
 3. ~~**B1 → B2**~~ shipped, see above; re-bless the recordings.
 4. ~~**C1 → C2**~~ shipped (v30), see above.
 5. ~~**D1 → D2 → D3**~~ shipped, see above.
-6. **E1 → E2**, then E3 and E4 only if the numbers from F3 say so.
+6. ~~**E1 → E2**~~ and E4's model knob shipped, see above; E3 and E4's
+   chunked folds only if the numbers from F3 say so.

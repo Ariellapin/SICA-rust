@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -31,7 +31,7 @@ pub const CONTEXT_CEILING_PCT: u32 = 95;
 /// Compaction policy knobs sent with `ConnectLlm`. Mirrors dsh's per-routed-
 /// model compaction config: trigger early enough to leave room for the reply,
 /// keep a verbatim tail, cap the summary, and retry once on a bad summary.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactPolicy {
     /// Fold when the prompt reaches this percent of the budget.
     pub threshold_pct: u32,
@@ -42,11 +42,17 @@ pub struct CompactPolicy {
     /// Extra attempts when the summariser returns nothing usable or is cut
     /// off by `max_tokens` (a truncated summary is discarded, never kept).
     pub retries: u32,
+    /// The model the summarisation call goes to, on the same provider
+    /// (long-session-plan E4; dsh has the same knob). `None` = the
+    /// connected model. A smaller model folds a 64k window in a fraction
+    /// of the time and the checkpoint format is a directive, not a skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Default for CompactPolicy {
     fn default() -> Self {
-        Self { threshold_pct: COMPACT_TRIGGER_PCT, retain_pct: 16, max_tokens: 8192, retries: 1 }
+        Self { threshold_pct: COMPACT_TRIGGER_PCT, retain_pct: 16, max_tokens: 8192, retries: 1, model: None }
     }
 }
 
