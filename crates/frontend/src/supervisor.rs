@@ -430,7 +430,7 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }
         }
-        Event::IdealistTicketWritten { path, kind } => {
+        Event::IdealistTicketWritten { path, kind, .. } => {
             UiEvent::IdealistTicketWritten { path, kind }
         }
     };

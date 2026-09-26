@@ -89,6 +89,9 @@ pub async fn handle(
         },
         Request::ArchiveSession { session_id } => {
             chat.archive_session(session_id).await;
+            // Archived is ended: investigate what went wrong in it now
+            // rather than waiting out the idle timer.
+            crate::investigate::session_archived(session_id);
             Response::Ok
         }
         Request::SearchSessions { query } => Response::SessionSearch {
@@ -262,15 +265,55 @@ pub async fn handle(
             }
         }
         Request::ReportFrontendError { module, message, traceback } => {
+            // Straight to the bus: the FE has no session context to give,
+            // and `incident` is for failures the backend itself observed.
             idealist_bus.publish(idealist::Trigger {
                 kind: "fe_panic".into(),
                 module,
                 message,
                 traceback,
+                origin: idealist::TriggerOrigin::Frontend,
+                ..Default::default()
             });
             Response::Ok
         }
+        Request::InvestigateSession { session_id } => match crate::investigate::request(session_id) {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error { message },
+        },
+        Request::ListTickets => tickets_response(),
+        Request::SetTicketStatus { ticket_id, status } => {
+            // Only the states a person decides. `investigating` and
+            // `diagnosed` belong to the investigator.
+            let parsed = idealist::TicketStatus::parse(&status).filter(|s| {
+                matches!(
+                    s,
+                    idealist::TicketStatus::Open
+                        | idealist::TicketStatus::Resolved
+                        | idealist::TicketStatus::Wontfix
+                        | idealist::TicketStatus::Noise
+                )
+            });
+            let Some(parsed) = parsed else {
+                return Response::Error {
+                    message: format!(
+                        "`{status}` is not a status you can set — use open, resolved, wontfix or noise"
+                    ),
+                };
+            };
+            match idealist::TicketStore::open_default().set_status(&ticket_id, parsed) {
+                Ok(_) => tickets_response(),
+                Err(e) => Response::Error { message: format!("ticket {ticket_id}: {e}") },
+            }
+        }
     }
+}
+
+/// Every ticket, newest first (`Response::Tickets`).
+fn tickets_response() -> Response {
+    let store = idealist::TicketStore::open_default();
+    let tickets = store.list().iter().map(|t| idealist::summary(t, &store)).collect();
+    Response::Tickets { tickets }
 }
 
 

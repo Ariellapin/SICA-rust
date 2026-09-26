@@ -55,6 +55,8 @@ pub struct ToolFailureReport {
     pub depth:        u8,
     pub host_os:      &'static str,
     pub host_family:  &'static str,
+    /// Session the call ran in, when it ran in one.
+    pub session_id:   Option<u64>,
 }
 
 /// Receiver for sub-agent tool failures. The backend forwards into the
@@ -787,6 +789,7 @@ impl ToolSubAgent {
                     depth:        self.depth,
                     host_os:      std::env::consts::OS,
                     host_family:  std::env::consts::FAMILY,
+                    session_id:   self.session_id,
                 });
             }
         }

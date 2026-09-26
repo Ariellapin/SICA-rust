@@ -176,15 +176,49 @@ Report findings most-severe first. Say plainly when you found nothing \
 worth reporting.
 ";
 
-/// Write `agents/reviewer.md` if it is absent. Same contract as the skill
-/// and plan-mode seeds: create once, never clobber.
+/// The idealist investigator's persona (`backend::investigate`). Public so
+/// the backend can fall back to it when `agents/investigator.md` is gone;
+/// the backend appends the category definitions and the report schema, so
+/// an edit of this file cannot break the contract.
+pub const INVESTIGATOR_PERSONA: &str = "\
+You investigate one failure from a sica-rust session. The harness filed it \
+as an improvement ticket; you are shown the ticket, the session-log rows \
+around the failure, and any earlier investigations of the same failure. \
+The source is in {{cwd}}.
+
+Decide what actually went wrong. Read the code the ticket points at before \
+concluding, and base every claim on something you read or a log row you \
+were shown. You can only read and search — never propose that you apply a \
+fix yourself; describe it for a developer instead.
+
+Be decisive: one root cause, the smallest fix that removes it, and your \
+honest confidence. When the evidence does not settle it, say `low`.
+";
+
+const INVESTIGATOR_MD_HEAD: &str = "\
+---
+name: investigator
+description: Diagnoses an idealist ticket from the session log and the source; never edits or runs anything.
+skills: [read-file, glob, grep]
+---
+";
+
+/// Write `agents/reviewer.md` and `agents/investigator.md` if they are
+/// absent. Same contract as the skill and plan-mode seeds: create once,
+/// never clobber.
 pub fn seed_defaults(agents_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(agents_dir)?;
-    let path = agents_dir.join("reviewer.md");
-    if path.exists() {
-        return Ok(());
+    let seeds = [
+        ("reviewer.md", REVIEWER_MD.to_string()),
+        ("investigator.md", format!("{INVESTIGATOR_MD_HEAD}{INVESTIGATOR_PERSONA}")),
+    ];
+    for (name, body) in seeds {
+        let path = agents_dir.join(name);
+        if !path.exists() {
+            std::fs::write(path, body)?;
+        }
     }
-    std::fs::write(path, REVIEWER_MD)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,6 +352,16 @@ mod tests {
     }
 
     #[test]
+    fn investigator_seed_loads_read_only() {
+        let dir = tmp("seed-investigator");
+        seed_defaults(&dir).unwrap();
+        let p = load(&dir, "investigator").unwrap();
+        assert_eq!(p.skills, vec!["read-file", "glob", "grep"]);
+        assert!(p.persona.contains("{{cwd}}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_seeded_preset_parses_and_names_real_skills() {
         let dir = tmp("seed-parse");
         seed_defaults(&dir).unwrap();
@@ -326,7 +370,8 @@ mod tests {
         assert!(p.persona.contains("{{cwd}}"), "personas interpolate");
         let (all, errors) = load_dir(&dir);
         assert!(errors.is_empty());
-        assert_eq!(all.len(), 1);
+        let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["investigator", "reviewer"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1717,6 +1717,11 @@ impl ChatHub {
                     level: "ERROR".into(),
                     message: format!("LLM: connect failed — {msg}"),
                 });
+                crate::incident::outside_turn(
+                    idealist::TriggerOrigin::LlmConnect,
+                    "llm::connect",
+                    format!("LLM connect failed — {msg}"),
+                );
             }
         }
     }
@@ -1988,6 +1993,11 @@ impl ChatHub {
                     level:   "ERROR".into(),
                     message: format!("agent `{name}` could not be loaded ({e}) — running without it"),
                 });
+                crate::incident::outside_turn(
+                    idealist::TriggerOrigin::Config,
+                    "agents::preset",
+                    format!("agent `{name}` could not be loaded: {e}"),
+                );
                 (self.skills.clone(), None, None)
             }
         }
@@ -2504,6 +2514,9 @@ available: {}  (`/agent off` clears)", names.join(", "))
         source: TurnSource,
         rewind: Option<u64>,
     ) {
+        // The session is working, not ended, and a running investigation
+        // must give the LLM back.
+        crate::investigate::session_active(session_id);
         let Some(client) = self.llm.lock().await.clone() else {
             // A followup handed this call a *reserved* slot. Nothing is
             // going to run now, so release it — otherwise the session reads
@@ -2867,6 +2880,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         level:   "ERROR".into(),
                         message: format!("session log could not be flushed — turn ended: {e}"),
                     });
+                    crate::incident::turn_error(
+                        session_id, outer_turn, "checkpoint",
+                        format!("session log could not be flushed before a request: {e}"),
+                    );
                     finish = "error";
                     break;
                 }
@@ -2893,6 +2910,9 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             level: "ERROR".into(),
                             message: format!("prompt assembly failed: {e}"),
                         });
+                        crate::incident::turn_error(
+                            session_id, outer_turn, "prompt", format!("prompt assembly failed: {e}"),
+                        );
                         finish = "error";
                         break;
                     }
@@ -2953,6 +2973,9 @@ available: {}  (`/agent off` clears)", names.join(", "))
                                 level: "ERROR".into(),
                                 message: format!("prompt assembly failed: {e}"),
                             });
+                            crate::incident::turn_error(
+                                session_id, outer_turn, "prompt", format!("prompt assembly failed: {e}"),
+                            );
                             finish = "error";
                             break;
                         }
@@ -3151,6 +3174,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             one_line(failure.reason(), 200)
                         );
                         warn!(session_id, turn_id, "{msg}");
+                        crate::incident::turn_error(session_id, outer_turn, "context_overflow", msg.clone());
                         event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg });
                         finish = "error";
                         break;
@@ -3215,6 +3239,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         format!("LLM request failed ({}) — not retryable", failure.reason())
                     };
                     warn!(session_id, turn_id, "{msg}");
+                    crate::incident::turn_error(session_id, outer_turn, "llm_request", msg.clone());
                     event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg });
                     finish = "error";
                     break;
@@ -3356,6 +3381,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             level:   "ERROR".into(),
                             message: "session log could not be flushed before a tool call — turn ended".into(),
                         });
+                        crate::incident::turn_error(
+                            session_id, outer_turn, "checkpoint",
+                            "session log could not be flushed before a tool call",
+                        );
                         finish = "error";
                         break;
                     }
@@ -3449,6 +3478,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 if let Err(e) = checkpoint(&sessions_map, session_id).await {
                     let msg = format!("{ABORTED_BEFORE_DISPATCH}: session log could not be flushed ({e})");
                     event_sink.emit(Event::LogLine { level: "ERROR".into(), message: msg.clone() });
+                    crate::incident::turn_error(session_id, outer_turn, "checkpoint", msg.clone());
                     append_tool_result(&sessions_map, session_id, call_seq, &call.skill, None, false, &msg, true)
                         .await;
                     finish = "error";
@@ -3563,6 +3593,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 hops,
             })
             .await;
+            crate::incident::turn_ended(session_id, outer_turn).await;
             event_sink.emit(Event::TurnUsage {
                 session_id,
                 turn_id:     outer_turn,
@@ -3707,6 +3738,8 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 };
                 if mine && matches!(next, Next::Idle) {
                     guard.remove(&session_id);
+                    // Starts the end-of-session clock (idealist tickets).
+                    crate::investigate::session_idle(session_id);
                 }
                 next
             };
@@ -5097,7 +5130,13 @@ fn build_wire_history(
     persona: Option<&str>,
     cwd: &Path,
 ) -> Result<WireHistory, agents::prompt::PromptError> {
-    let mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
+    let mut mem = agents::memory::load(&sica_core::paths::memory_file()).unwrap_or_default();
+    // Opt-in (`lessons_in_prompt` in idealist.toml): what investigations of
+    // earlier failures taught, riding along with the memory brief.
+    if let Some(lessons) = crate::investigate::lessons_section() {
+        mem.push_str("\n\n");
+        mem.push_str(&lessons);
+    }
     let vars = agents::prompt::standard_vars_in(model, cwd);
     let rendered =
         agents::prompt::for_main_agent(&mem, skills, mode, &vars, plan_policy, persona)?;

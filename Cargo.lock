@@ -1638,11 +1638,15 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossbeam-channel",
+ "once_cell",
  "protocol",
+ "regex",
  "serde",
  "serde_json",
+ "sha2",
  "sica-core",
  "tokio",
+ "toml",
  "tracing",
 ]
 

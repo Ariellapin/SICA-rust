@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -468,6 +468,17 @@ pub enum Request {
 
     // Frontend telemetry — feeds the idealist's classifier.
     ReportFrontendError { module: String, message: String, traceback: Option<String> },
+
+    // Idealist tickets (v30).
+    /// Run the end-of-session investigator for this session now, instead
+    /// of waiting for it to go idle. Answers `Ok`; the outcome arrives as
+    /// `IdealistInvestigated` events.
+    InvestigateSession { session_id: u64 },
+    /// Answers `Tickets`.
+    ListTickets,
+    /// `status` is one of `open`, `resolved`, `wontfix`, `noise`. Answers
+    /// `Tickets` with the updated list.
+    SetTicketStatus { ticket_id: String, status: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +526,33 @@ pub enum Response {
         outline:     Vec<TurnRowDump>,
         through_seq: u64,
     },
+    /// Every improvement ticket, newest `last_seen` first.
+    Tickets { tickets: Vec<TicketSummary> },
+}
+
+/// One improvement ticket as the FE lists it (`idealist_workspace/tickets`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TicketSummary {
+    pub id:           String,
+    /// `open` · `investigating` · `diagnosed` · `investigation_failed` ·
+    /// `resolved` · `wontfix` · `noise`.
+    pub status:       String,
+    /// `tool_call` · `turn_error` · `llm_connect` · `panic` · … .
+    pub origin:       String,
+    pub module:       String,
+    pub severity:     String,
+    pub occurrences:  u32,
+    pub regressions:  u32,
+    pub first_seen:   String,
+    pub last_seen:    String,
+    pub sessions:     Vec<u64>,
+    pub last_message: String,
+    /// The investigator's verdict, once there is one.
+    pub category:     Option<String>,
+    pub confidence:   Option<String>,
+    pub lesson:       Option<String>,
+    /// The ticket file, for "open in editor".
+    pub path:         String,
 }
 
 /// Which family an [`EventDump`] belongs to — the ledger's tinted kind tag
@@ -1118,6 +1156,21 @@ pub enum Event {
     IdealistTicketWritten {
         path: String,
         kind: TicketKind,
+        /// Fingerprint-derived id; the same failure always files here.
+        ticket_id:   String,
+        occurrences: u32,
+        /// A `resolved` ticket fired again.
+        reopened:    bool,
+    },
+    /// The end-of-session investigator finished one ticket. `ok = false`
+    /// means it ran but produced nothing usable (see the ticket body).
+    IdealistInvestigated {
+        ticket_id:  String,
+        session_id: u64,
+        ok:         bool,
+        category:   Option<String>,
+        confidence: Option<String>,
+        summary:    String,
     },
 
     // Wave 3 control plane (guide §10–§11).
