@@ -257,7 +257,14 @@ fn describe(kind: &EventKind) -> Described {
         }
         EventKind::ToolCall { name, args_preview, expectation, args_json, .. } => row(
             EventTag::Tool,
-            format!("{name} {}", one_line(args_preview)),
+            // Every producer's preview already leads with the skill name
+            // (`parse_tool_call::render`, `"{name} {json}"`); prefix it only
+            // when one does not.
+            if args_preview.starts_with(name.as_str()) {
+                one_line(args_preview)
+            } else {
+                format!("{name} {}", one_line(args_preview))
+            },
         )
         .payload(args_json.clone().unwrap_or_else(|| args_preview.clone()))
         .result(expectation.clone()),
@@ -536,7 +543,7 @@ mod tests {
         let log = log_with(vec![
             EventKind::ToolCall {
                 name: "read-file".into(),
-                args_preview: "'README.md'".into(),
+                args_preview: "read-file 'README.md'".into(),
                 expectation: "the file".into(),
                 call_id: None,
                 args_json: Some(r#"{"path":"README.md"}"#.into()),
@@ -557,6 +564,7 @@ mod tests {
         let result = rows.iter().find(|r| r.seq == 3).unwrap();
         assert_eq!(call.tag, EventTag::Tool);
         assert_eq!(call.payload, r#"{"path":"README.md"}"#);
+        assert_eq!(call.text, "read-file 'README.md'", "the skill name appears once");
         assert!(!call.shadowed, "a ToolCall never reaches the surface");
         assert_eq!(result.call_seq, Some(2));
         assert_eq!(result.ok, Some(true));

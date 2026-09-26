@@ -51,6 +51,33 @@ pub fn analyze(t: &Trigger) -> Analysis {
     }
 }
 
+/// A tool failure the model caused with its own input — a missing file, an
+/// `edit-file` anchor that does not match, a missing argument — and that the
+/// tool's error already tells it how to recover from. These are not defects
+/// in the harness, so no improvement ticket is written for them; a model
+/// probing error paths on purpose would otherwise file one per probe.
+pub fn is_caller_error(t: &Trigger) -> bool {
+    let Some(skill) = t.module.strip_prefix("agents::tool::") else {
+        return false;
+    };
+    let lower = t.message.to_lowercase();
+    if lower.starts_with("missing or empty `") || lower.starts_with("missing `") {
+        return true;
+    }
+    let not_found = lower.starts_with("no such file")
+        || lower.contains("(os error 2)")
+        || lower.contains("cannot find the file");
+    match skill {
+        "read-file" => not_found,
+        "edit-file" => {
+            not_found
+                || lower.starts_with("old text not found")
+                || lower.starts_with("old text matches")
+        }
+        _ => false,
+    }
+}
+
 /// Returns `(human-readable fix, optional replacement skill name)`.
 ///
 /// The replacement-skill suggestion is the actionable bit: when present, the
@@ -263,5 +290,31 @@ mod tests {
         let a = analyze(&trig);
         assert!(a.suggested_skill.is_none());
         assert!(a.proposed_fix.contains("Investigate"));
+    }
+
+    #[test]
+    fn caller_input_errors_are_not_tickets() {
+        let tb = Some("host_os=windows");
+        for (skill, msg) in [
+            ("read-file", "no such file: C:\\w\\x.txt — check the path"),
+            ("read-file", "stat C:\\w\\x.txt: The system cannot find the file specified. (os error 2)"),
+            ("edit-file", "old text not found — the file may have changed since you read it"),
+            ("edit-file", "old text matches 3 times — include more surrounding lines"),
+            ("edit-file", "no such file: x.txt — edit-file only edits existing files"),
+            ("run-cli", "missing or empty `command` arg"),
+        ] {
+            let m = format!("agents::tool::{skill}");
+            assert!(is_caller_error(&t(&m, msg, tb)), "{skill}: {msg}");
+        }
+    }
+
+    #[test]
+    fn real_tool_failures_still_ticket() {
+        let tb = Some("host_os=windows");
+        assert!(!is_caller_error(&t("agents::tool::run-pwsh", "timeout after 30s", tb)));
+        assert!(!is_caller_error(&t("agents::tool::write-file", "write x: Access is denied. (os error 5)", tb)));
+        assert!(!is_caller_error(&t("agents::tool::read-file", "x too large (2000000 bytes, max 1048576)", tb)));
+        // Not a tool trigger at all.
+        assert!(!is_caller_error(&t("backend::dispatcher", "old text not found", tb)));
     }
 }
