@@ -80,6 +80,9 @@ Seven crates, dependency direction strictly downward. Details in
   ideas catalogue, and the ones deliberately left for later.
 - [docs/remaining-work.md](docs/remaining-work.md) — what is still open after
   Wave 10 / UI-9, with a recipe per item. Start there for the next wave.
+- [docs/long-session-plan.md](docs/long-session-plan.md) — what breaks over a
+  session that runs for hours (compaction chain, prefix churn, restarts, hop
+  budgets) and the six waves that fix it, with a recipe per item.
 
 ## Before you edit
 
