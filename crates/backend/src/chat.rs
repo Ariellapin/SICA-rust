@@ -24,7 +24,7 @@ use agents::{
     BrokerSet, EventSink, SkillRegistry, ToolFailureSink, ToolSubAgent,
 };
 use llm::client::{ChatContent, ChatMessage, ContentPart, ImageUrl, LlmClient};
-use sica_core::event::{ContextSource, EventKind, SurfaceEntry, SurfaceOp, TurnSource};
+use sica_core::event::{ContextSource, EventKind, SessionEvent, SurfaceEntry, SurfaceOp, TurnSource};
 use sica_core::message::{Message, Role};
 
 use crate::hooks;
@@ -1417,15 +1417,7 @@ impl ChatHub {
             self.permissions.lock().await.get(&id).copied().unwrap_or_default();
         let plan_active = self.plans.lock().await.get(&id).copied().unwrap_or(false);
         let agent = self.presets.lock().await.get(&id).cloned();
-        let todos = log
-            .events
-            .iter()
-            .filter_map(|ev| match &ev.kind {
-                EventKind::TodoWrite { items } => Some(items.clone()),
-                _ => None,
-            })
-            .last()
-            .unwrap_or_default();
+        let todos = latest_todos(&log.events);
         let runs = sica_core::project::workflow_runs(&log.events)
             .into_iter()
             .map(run_dump)
@@ -4441,6 +4433,22 @@ async fn compact_session(
         failed(events);
         return false;
     };
+    if let Some(heading) = summary.missing_heading {
+        // Kept anyway: a checkpoint without one of its sections still
+        // carries more than the trimmer would leave. The operator is told,
+        // because a model that cannot follow the directive is a model to
+        // change the summariser for.
+        events.emit(Event::LogLine {
+            level: "WARN".into(),
+            message: format!(
+                "context: the compaction summary lacks its `{heading}` section \
+                 after {} attempt(s) — kept as is; the summariser model is not \
+                 following the checkpoint format",
+                policy.retries + 1
+            ),
+        });
+    }
+    let summary = summary.text;
 
     let content = agents::compact::summary_message(&summary);
     let after_tokens = {
@@ -4459,17 +4467,18 @@ async fn compact_session(
             failed(events);
             return false;
         }
-        log.append(EventKind::CompactionSummary {
-            surface: SurfaceOp::Replace {
+        land_compaction(
+            log,
+            SurfaceOp::Replace {
                 start_seq: entries[0].seq,
                 end_seq: entries[split - 1].seq,
             },
             content,
-            summary: summary.clone(),
-            folded: split as u32,
+            summary.clone(),
+            split as u32,
             before_tokens,
             after_tokens,
-        });
+        );
         if let Err(e) = sessions_store::flush(log) {
             warn!(error = %e, session_id, "flush session (after compaction) failed");
         }
@@ -4492,6 +4501,52 @@ async fn compact_session(
         pruned: pruned as u32,
     });
     true
+}
+
+/// Record a compaction: the summary that shadows the folded span, then the
+/// todo list re-attached as a tool notice when the list still has open
+/// items. `TodoWrite` is not a surface event — the model only ever saw its
+/// own `todo-write` call, and that call is what the fold just summarised
+/// away — so without this the checklist the UI still shows would be one the
+/// model no longer knows about. Appended, not positioned after the summary:
+/// an append leaves the prefix before it untouched.
+fn land_compaction(
+    log: &mut SessionLog,
+    surface: SurfaceOp,
+    content: String,
+    summary: String,
+    folded: u32,
+    before_tokens: u32,
+    after_tokens: u32,
+) {
+    log.append(EventKind::CompactionSummary {
+        surface,
+        content,
+        summary,
+        folded,
+        before_tokens,
+        after_tokens,
+    });
+    if let Some(checklist) = agents::control::render_todo_checklist(&latest_todos(&log.events)) {
+        log.append(EventKind::ContextInjected {
+            surface: SurfaceOp::Append,
+            source: ContextSource::ToolNotice,
+            content: checklist,
+        });
+    }
+}
+
+/// The session's current todo list: the items of the newest `TodoWrite`,
+/// or nothing.
+fn latest_todos(events: &[SessionEvent]) -> Vec<protocol::TodoItem> {
+    events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::TodoWrite { items } => Some(items.clone()),
+            _ => None,
+        })
+        .last()
+        .unwrap_or_default()
 }
 
 /// Replace every oversized tool result older than the tail with its pruned
@@ -5305,7 +5360,7 @@ impl idealist::IdealistEventSink for OutSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sica_core::event::{derive_messages, SessionEvent};
+    use sica_core::event::derive_messages;
 
     fn registry() -> SkillRegistry {
         SkillRegistry::new()
@@ -5576,6 +5631,59 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         // Appended fresh (newest entry), not resurrected at the dead span.
         assert_eq!(after.last().unwrap().seq, snaps[0].seq);
+    }
+
+    fn todo_write(log: &mut SessionLog, items: &[(&str, protocol::TodoStatus)]) {
+        log.append(EventKind::TodoWrite {
+            items: items
+                .iter()
+                .map(|(c, s)| protocol::TodoItem { content: (*c).into(), status: *s })
+                .collect(),
+        });
+    }
+
+    fn fold_all(log: &mut SessionLog) {
+        let entries = log.derive_surface();
+        land_compaction(
+            log,
+            SurfaceOp::Replace { start_seq: entries[0].seq, end_seq: entries.last().unwrap().seq },
+            agents::compact::summary_message("S"),
+            "S".into(),
+            entries.len() as u32,
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    fn compaction_reattaches_an_open_todo_list() {
+        let mut log = SessionLog::new(1, "t");
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u1".into(), images: Vec::new() });
+        todo_write(&mut log, &[("read it", protocol::TodoStatus::Completed), ("fix it", protocol::TodoStatus::InProgress)]);
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a1".into(), reasoning: None, tool_calls: None });
+        fold_all(&mut log);
+        let after = log.derive_surface();
+        assert_eq!(after.len(), 2, "summary, then the re-attached checklist");
+        assert!(after[0].message.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX));
+        assert!(matches!(after[1].context, Some(ContextSource::ToolNotice)));
+        assert!(after[1].message.content.contains("- [~] fix it"));
+        assert!(after[1].message.content.contains("- [x] read it"));
+        // The UI's copy is the same list.
+        assert_eq!(latest_todos(&log.events).len(), 2);
+    }
+
+    #[test]
+    fn compaction_reattaches_nothing_when_the_list_is_done_or_absent() {
+        let mut log = SessionLog::new(1, "t");
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u1".into(), images: Vec::new() });
+        log.append(EventKind::AssistantMessage { surface: SurfaceOp::Append, content: "a1".into(), reasoning: None, tool_calls: None });
+        fold_all(&mut log);
+        assert_eq!(log.derive_surface().len(), 1, "no list, no notice");
+
+        todo_write(&mut log, &[("read it", protocol::TodoStatus::Completed)]);
+        log.append(EventKind::UserMessage { surface: SurfaceOp::Append, content: "u2".into(), images: Vec::new() });
+        fold_all(&mut log);
+        assert_eq!(log.derive_surface().len(), 1, "a finished list is not re-attached");
     }
 
     /// The Replace fold must produce exactly what the old in-place splice

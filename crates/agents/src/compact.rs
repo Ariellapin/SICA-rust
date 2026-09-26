@@ -119,9 +119,47 @@ error strings, URLs. Never paraphrase them.
 - Capture corrections the user made and decisions taken, with their reasons.
 - If an earlier checkpoint summary appears in the conversation, consolidate \
 it into this one rather than mentioning it.
+- If a todo list was maintained with `todo-write`, do not restate it under \
+Current Work; it is re-attached after this checkpoint.
 - Do not mention that the conversation is being summarized or compressed.
 - Do not call any tools. Do not address the user. Output only the eight \
 sections.";
+
+/// The eight headings [`COMPACTION_INSTRUCTION`] demands, in order. A
+/// summary is judged against this list before it lands.
+pub const REQUIRED_HEADINGS: [&str; 8] = [
+    "## Primary Request and Intent",
+    "## Key Technical Concepts",
+    "## Files and Code",
+    "## Errors and Fixes",
+    "## Pending Jobs",
+    "## Current Work",
+    "## Next Step",
+    "## Critical Context",
+];
+
+/// The first required heading `summary` lacks, or has out of order — `None`
+/// when the checkpoint has the shape the directive asked for.
+pub fn missing_heading(summary: &str) -> Option<&'static str> {
+    let mut from = 0;
+    for heading in REQUIRED_HEADINGS {
+        match summary[from..].find(heading) {
+            Some(at) => from += at + heading.len(),
+            None => return Some(heading),
+        }
+    }
+    None
+}
+
+/// What one successful summarisation produced. `missing_heading` is set when
+/// the model never managed the eight-section shape within the retry budget
+/// and the last attempt was kept anyway: a partial checkpoint still carries
+/// more than the trimmer's amputation would, but the operator is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldSummary {
+    pub text:            String,
+    pub missing_heading: Option<&'static str>,
+}
 
 /// Approximate token cost of one persisted message, matching the accounting
 /// [`crate::context::trim_to_budget`] uses (+4 for per-message role/framing
@@ -209,15 +247,24 @@ pub fn split_index(messages: &[Message], budget_tokens: u32, retain_pct: u32) ->
 /// `None` when every attempt produced nothing usable — the caller leaves the
 /// history untouched and the trimmer takes over. A summary cut off by
 /// `max_tokens` (`finish_reason == "length"`) fails closed and is retried
-/// rather than kept. The caller frames the result with [`summary_message`]
-/// and records it as a `CompactionSummary` event that shadows the folded span.
+/// rather than kept. A summary missing one of the [`REQUIRED_HEADINGS`] is
+/// retried too, but the last such attempt is *kept* once the budget is
+/// spent, flagged on [`FoldSummary::missing_heading`]. The caller frames the
+/// result with [`summary_message`] and records it as a `CompactionSummary`
+/// event that shadows the folded span.
+///
+/// An earlier checkpoint inside the fold (a message opening with
+/// [`SUMMARY_PREFIX`]) is passed whole: the directive tells the model to
+/// consolidate it, which it cannot do from a head/tail excerpt — that is how
+/// the middle sections of a checkpoint used to vanish on every second
+/// compaction. It is already bounded by [`MAX_SUMMARY_CHARS`].
 pub async fn summarize_fold(
     client: &LlmClient,
     policy: &protocol::CompactPolicy,
     system_wire: &[ChatMessage],
     folded: Vec<ChatMessage>,
     cancel: Option<CancellationToken>,
-) -> Option<String> {
+) -> Option<FoldSummary> {
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(system_wire.len() + folded.len() + 1);
     messages.extend_from_slice(system_wire);
     messages.extend(folded);
@@ -228,7 +275,7 @@ pub async fn summarize_fold(
     let folded_count = messages.len().saturating_sub(system_wire.len() + 1);
     for m in messages.iter_mut().skip(system_wire.len()).take(folded_count) {
         let text = m.content.text();
-        if text.len() > MAX_EXCERPT_CHARS {
+        if text.len() > MAX_EXCERPT_CHARS && !is_checkpoint(&text) {
             m.content = llm::client::ChatContent::Text(excerpt(&text, MAX_EXCERPT_CHARS));
         }
     }
@@ -238,6 +285,9 @@ pub async fn summarize_fold(
         summarizer.max_tokens = Some(policy.max_tokens);
     }
 
+    // The best malformed attempt so far — kept only if no attempt has the
+    // full eight-section shape.
+    let mut degraded: Option<FoldSummary> = None;
     for attempt in 0..=policy.retries {
         let Some((raw, finish_reason)) = stream_summary(&summarizer, messages.clone(), &cancel).await
         else {
@@ -251,12 +301,26 @@ pub async fn summarize_fold(
             continue;
         }
         let summary = clean(&raw);
-        if !summary.is_empty() {
-            return Some(summary);
+        if summary.is_empty() {
+            warn!(attempt, "compaction summarizer returned nothing");
+            continue;
         }
-        warn!(attempt, "compaction summarizer returned nothing");
+        match missing_heading(&summary) {
+            None => return Some(FoldSummary { text: summary, missing_heading: None }),
+            Some(heading) => {
+                warn!(attempt, heading, "compaction summary is missing a section");
+                if degraded.as_ref().is_none_or(|d| d.text.len() < summary.len()) {
+                    degraded = Some(FoldSummary { text: summary, missing_heading: Some(heading) });
+                }
+            }
+        }
     }
-    None
+    degraded
+}
+
+/// Whether a wire message is an earlier compaction checkpoint.
+fn is_checkpoint(text: &str) -> bool {
+    text.starts_with(SUMMARY_PREFIX)
 }
 
 /// The system-message text a compaction summary is stored and sent as: the
@@ -499,6 +563,41 @@ mod tests {
         }
         assert!(COMPACTION_INSTRUCTION.contains("(none)"));
         assert!(COMPACTION_INSTRUCTION.contains("Do not call any tools"));
+    }
+
+    #[test]
+    fn missing_heading_names_the_first_gap_in_order() {
+        let full = REQUIRED_HEADINGS.map(|h| format!("{h}\n(none)\n")).concat();
+        assert_eq!(missing_heading(&full), None);
+        assert_eq!(missing_heading("prose only"), Some("## Primary Request and Intent"));
+        let no_files = full.replace("## Files and Code\n", "");
+        assert_eq!(missing_heading(&no_files), Some("## Files and Code"));
+        // Present but out of order counts as missing: the reader expects
+        // the fixed layout, and the scan names the heading it could not
+        // find *after* the ones before it.
+        let swapped = full
+            .replace("## Next Step\n(none)\n## Critical Context\n", "## Critical Context\n(none)\n## Next Step\n");
+        assert_eq!(missing_heading(&swapped), Some("## Critical Context"));
+    }
+
+    #[test]
+    fn required_headings_match_the_directive() {
+        for h in REQUIRED_HEADINGS {
+            assert!(COMPACTION_INSTRUCTION.contains(h), "directive lacks {h}");
+        }
+        assert!(COMPACTION_INSTRUCTION.contains("todo-write"));
+    }
+
+    #[test]
+    fn an_earlier_checkpoint_is_never_excerpted() {
+        // The guard `summarize_fold` applies, exercised on its own inputs:
+        // a checkpoint over the cap stays whole, a tool dump does not.
+        let checkpoint = summary_message(&"## Primary Request and Intent\n- keep me\n".repeat(200));
+        assert!(checkpoint.len() > MAX_EXCERPT_CHARS);
+        assert!(is_checkpoint(&checkpoint));
+        let dump = "x".repeat(MAX_EXCERPT_CHARS * 4);
+        assert!(!is_checkpoint(&dump));
+        assert!(excerpt(&dump, MAX_EXCERPT_CHARS).len() < dump.len());
     }
 
     #[test]

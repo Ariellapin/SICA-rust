@@ -190,6 +190,28 @@ fn unreachable(name: &str) -> SkillOutcome {
     }
 }
 
+/// The checklist as the model reads it when the harness re-attaches it —
+/// after a compaction folded the `todo-write` call that last set it. Empty
+/// when nothing is left to do, so the caller can skip the notice.
+pub fn render_todo_checklist(items: &[protocol::TodoItem]) -> Option<String> {
+    if items.is_empty() || items.iter().all(|t| t.status == protocol::TodoStatus::Completed) {
+        return None;
+    }
+    let mut out = String::from(
+        "Your todo list, carried over unchanged from before the context checkpoint \
+         (update it with todo-write as you go):\n",
+    );
+    for t in items {
+        let mark = match t.status {
+            protocol::TodoStatus::Pending => "[ ]",
+            protocol::TodoStatus::InProgress => "[~]",
+            protocol::TodoStatus::Completed => "[x]",
+        };
+        out.push_str(&format!("- {mark} {}\n", t.content));
+    }
+    Some(out.trim_end().to_string())
+}
+
 /// Full-replacement todo list. Validated and persisted by the harness (see
 /// module docs); this stub only carries the catalogue entry + guidance.
 pub struct TodoWrite;
@@ -252,6 +274,25 @@ mod tests {
         .unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].status, protocol::TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn checklist_renders_open_items_and_skips_a_finished_list() {
+        let items = parse_todo_items(&Value::String(
+            r#"[{"content":"read it","status":"completed"},{"content":"fix it","status":"in_progress"},{"content":"test it","status":"pending"}]"#.into(),
+        ))
+        .unwrap();
+        let text = render_todo_checklist(&items).expect("open items remain");
+        assert!(text.contains("- [x] read it"));
+        assert!(text.contains("- [~] fix it"));
+        assert!(text.contains("- [ ] test it"));
+        assert!(text.contains("todo-write"));
+        let done = parse_todo_items(&Value::String(
+            r#"[{"content":"read it","status":"completed"}]"#.into(),
+        ))
+        .unwrap();
+        assert_eq!(render_todo_checklist(&done), None);
+        assert_eq!(render_todo_checklist(&[]), None);
     }
 
     #[test]

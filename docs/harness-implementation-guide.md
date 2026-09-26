@@ -1209,7 +1209,12 @@ again"). Writes to new paths pass.
 
 **Shipped as** the prefix-preserving `compact::summarize_fold` with dsh's eight
 headings and the 80/16 `CompactPolicy`; every knob including `retries` is on
-the provider TOML and the Models card since Wave 10.
+the provider TOML and the Models card since Wave 10. Hardened for long
+sessions on 2026-09-26 ([long-session-plan.md](long-session-plan.md) Wave A):
+an earlier checkpoint in the fold is never excerpted, the reply is checked
+for the eight headings in order (retried, then kept with a WARN), the trimmer
+protects the checkpoint(s) and native call/result pairs, and the open todo
+list is re-attached after every summary.
 
 **Mechanism.** Policy per routed model: `thresholdRatio 0.8` of the context
 window, `retainRatio 0.16` kept verbatim as a tail (or absolute

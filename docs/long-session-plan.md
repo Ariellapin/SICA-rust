@@ -48,7 +48,23 @@ decision the code cannot explain. Two rules specific to this plan:
   must either be stable across turns or be appended at the end. Check
   every wave against item 4.
 
-## Wave A — compaction chain correctness (S × 4, no protocol change)
+## Wave A — compaction chain correctness (S × 4, no protocol change) — **shipped**
+
+**Shipped as** (2026-09-26): `compact::summarize_fold` passes an earlier
+checkpoint whole and judges every attempt against
+`compact::REQUIRED_HEADINGS`, returning a `FoldSummary` whose
+`missing_heading` the loop reports; `context::trim_to_budget` keeps a
+protected head (system prompt plus the checkpoints after it) and drops
+native call/result pairs together; `chat::land_compaction` appends the
+open todo list as a `ToolNotice` after every summary, rendered by
+`control::render_todo_checklist`. Decisions in
+[notes/2026-09-26-compaction-chain.md](notes/2026-09-26-compaction-chain.md).
+A4 shipped softer than planned below: a summary that never reaches the
+eight-section shape is *kept* after the retries, with a WARN naming the
+missing section, rather than failing closed to the trimmer — the note says
+why. No recording needed re-blessing: the replay serves replies in call
+order, the directive is not logged, and the `compaction-replace` scenario
+has no todo list.
 
 ### A1. The previous checkpoint is folded whole
 
@@ -95,12 +111,13 @@ objective, so nothing is needed there.
 
 ### A4. Summary shape is validated before it lands
 
-`summarize_fold` currently accepts any non-empty text. Add a check that the
-cleaned summary contains all eight headings in order; a summary missing
-headings is treated like an empty one (retry within `policy.retries`, then
-fail closed to the trimmer). The `instruction_names_all_eight_sections`
-test already lists the headings; reuse the list. A WARN `LogLine` names the
-missing heading so a model that cannot follow the directive is visible.
+`summarize_fold` used to accept any non-empty text. It now checks that the
+cleaned summary contains all eight headings in order; a summary missing one
+is retried within `policy.retries`, and if no attempt has the shape the
+longest malformed one is kept and a WARN `LogLine` names the missing
+heading. Kept rather than discarded because the alternative is the trimmer,
+which keeps nothing of the folded span at all; the warning is what makes a
+model that cannot follow the directive visible.
 
 ## Wave B — a stable prefix across turns (M × 2)
 
@@ -283,9 +300,7 @@ without it the two waves are opinions.
 
 ## Suggested order
 
-1. **A1 → A2 → A3 → A4** in one session; re-bless `compaction-replace`
-   once at the end. Ship with a `docs/notes/` entry on the excerpt
-   exemption and the trimmer's protected head.
+1. ~~**A1 → A2 → A3 → A4**~~ shipped, see above.
 2. **F3 → F1 → F2** next, so B and E are measured rather than assumed.
 3. **B1 → B2** (one protocol bump).
 4. **C1 → C2** (one protocol bump); D1–D3 ride the same session since
