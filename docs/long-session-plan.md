@@ -21,7 +21,7 @@ hits today and that need no protocol change; do it first.
 | 3 | In native mode a trim can orphan a `tool` result from its `tool_calls` | The trimmer drops single messages with no pairing rule, unlike `split_index` | same |
 | 4 | Every turn re-prefills the whole prompt on llama.cpp / vLLM prefix caching | The runtime-context snapshot (time, elapsed) is `Replace`d in place near the *front* of the surface each turn, so the prefix changes at an early position and the server's KV cache for everything after it is invalidated | `chat::append_runtime_context`, `derive_surface` Replace positioning |
 | 5 | The todo list is gone from the model's view after a compaction | `TodoWrite` is not a surface event; the model only ever saw its own `todo-write` call, which the fold summarises away | `EventKind::surface`, `handle_control` |
-| 6 | A human message can drive at most ~36 tool calls before the session goes idle | `MAX_TOOL_HOPS = 12` per turn × (1 + `MAX_AUTO_CONTINUES = 2`); a goal is the only way past it | `chat.rs:40`, `verdict.rs:48` |
+| 6 | A human message can drive at most ~36 tool calls before the session goes idle | `MAX_TOOL_HOPS = 12` per turn × (1 + `MAX_AUTO_CONTINUES = 2`); a goal is the only way past it — *fixed by Wave D: both are `harness.toml` settings, native turns get 32 hops, and a hop-limit stop under an armed goal opens a round instead of spending a continue* | `chat.rs:40`, `verdict.rs:48` |
 | 7 | After a backend restart (the FE's rebuild/restart, or a crash) the model is never told what it lost | Background jobs die with the process with no `JobFinished`; an open `TurnStart` without `TurnEnd` is left as is; in native mode a `ToolCall` whose result never landed leaves dangling `tool_calls` on the next request | `ChatHub::new_loaded`, `jobs_bridge` |
 | 8 | Each hop costs a full fold of the log, several times | `derive_surface` runs in `build_history`, again in `compact_session`, again in `prune_tool_results`' caller, in `refresh_instructions`, and once more under `--invariants`; every fold is O(events) with a `HashMap` of calls | `sica_core::event::derive_surface` |
 | 9 | `spill/<session>/` grows without bound | `spill::write` has no sweeper; a long session with many `run-cli` results leaves hundreds of files | `agents::spill` |
@@ -244,7 +244,27 @@ Nothing here starts a turn — the person or the goal driver does. Smoke
 step: kill the backend mid-turn, restart, load the session, assert the
 four rows and that the next request derives cleanly in native mode.
 
-## Wave D — autonomy budget for long runs (S × 3)
+## Wave D — autonomy budget for long runs (S × 3) — **shipped**
+
+**Shipped as** (2026-09-26, no protocol change): `agents::harness`
+(`HarnessConfig { tool_hops_text 12, tool_hops_native 32, auto_continues 2 }`
+read once at backend start from `sica-settings/harness.toml`, malformed or
+zero values reported as `LogLine`s and the defaults kept; `ChatHub::harness`
+/ `with_harness`, the turn loop's `max_hops = harness.hop_cap(native)`, and
+`verdict::continue_prompt`'s `of` argument); `verdict::after_stop` (the
+four-way choice at the continuation point, with `AfterStop::GoalRound` for a
+`hop-limit` stop under an armed goal with rounds left, proved end to end by
+`chat::tests::a_hop_limit_under_an_armed_goal_opens_a_round_not_a_continuation`
+over a replay script); and `agents::compact::section` feeding the latest
+checkpoint's **Next Step** into `verdict::digest`. The Settings › Skills ›
+Harness tab lists the two budgets at their defaults and names the file.
+One departure from D1's recipe: only the two budgets moved into the file,
+not the whole of remaining-work M1's list — the rest of that item (shell
+timeout, caps, compaction thresholds, the editable tab) is untouched and
+still open, and the loader is written so those keys can join it. Decisions
+in [notes/2026-09-26-autonomy-budget.md](notes/2026-09-26-autonomy-budget.md).
+The replay recordings are unaffected: no scenario reaches a cap or runs a
+verdict, and the recordings do not carry requests.
 
 ### D1. Hop and continue budgets become settings
 
@@ -371,5 +391,6 @@ the two waves are opinions.
 1. ~~**A1 → A2 → A3 → A4**~~ shipped, see above.
 2. ~~**F3 → F1 → F2**~~ shipped, see above.
 3. ~~**B1 → B2**~~ shipped, see above; re-bless the recordings.
-4. ~~**C1 → C2**~~ shipped (v30), see above. D1–D3 next.
-5. **E1 → E2**, then E3 and E4 only if the numbers from F3 say so.
+4. ~~**C1 → C2**~~ shipped (v30), see above.
+5. ~~**D1 → D2 → D3**~~ shipped, see above.
+6. **E1 → E2**, then E3 and E4 only if the numbers from F3 say so.

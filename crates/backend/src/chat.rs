@@ -34,12 +34,6 @@ use crate::sessions_store::{self, SessionLog};
 use crate::title_gen;
 use crate::verdict;
 
-/// Hard cap on tool hops within one user message. Stops a model from
-/// ping-ponging skill calls forever when it cannot decide a final answer.
-/// Generous because the documented workflow spends hops on `read-file`ing
-/// `skills/*.md` contracts before the real calls.
-const MAX_TOOL_HOPS: u8 = 12;
-
 /// Largest resolved-argument blob recorded on a durable `ToolCall`. Past it
 /// the field is omitted and a rebuilt row falls back to `args_preview`; the
 /// whole log is parsed at every backend start, so a megabyte of `write-file`
@@ -145,6 +139,11 @@ pub struct ChatHub {
     /// is refused deterministically instead of reaching the broker.
     /// Restored from the log's `Command { name: "approval" }` rows.
     pub approval_never: Arc<Mutex<HashSet<u64>>>,
+    /// The turn budgets (`agents::harness`, long-session-plan D1): the
+    /// tool-hop cap per transport and the auto-continue budget. Read once
+    /// at startup from `sica-settings/harness.toml`; the defaults are the
+    /// constants the loop always ran under.
+    pub harness:       Arc<agents::harness::HarnessConfig>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -178,6 +177,9 @@ struct ControlState {
     schedules:    Arc<Mutex<HashMap<u64, Vec<sica_core::project::ScheduleRecord>>>>,
     /// See [`ChatHub::approval_never`].
     approval_never: Arc<Mutex<HashSet<u64>>>,
+    /// See [`ChatHub::harness`]. A native call refused over the cap names
+    /// the cap it hit.
+    harness:      Arc<agents::harness::HarnessConfig>,
 }
 
 impl ControlState {
@@ -703,7 +705,10 @@ impl ControlState {
             return BatchEnd::Aborted;
         }
         if over_limit {
-            let msg = format!("tool-hop limit ({MAX_TOOL_HOPS}) reached — call not executed");
+            let msg = format!(
+                "tool-hop limit ({}) reached — call not executed",
+                self.harness.tool_hops_native
+            );
             append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), false, &msg, true)
                 .await;
             let args = serde_json::from_str(&call.arguments)
@@ -1116,6 +1121,7 @@ impl ChatHub {
             schedules:    Arc::new(Mutex::new(HashMap::new())),
             approval_never: Arc::new(Mutex::new(HashSet::new())),
             pending_briefs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            harness:      Arc::new(agents::harness::HarnessConfig::default()),
         }
     }
 
@@ -1334,6 +1340,7 @@ impl ChatHub {
             )),
             schedules:    self.schedules.clone(),
             approval_never: self.approval_never.clone(),
+            harness:      self.harness.clone(),
             // Harness commands are the user acting directly; a turn task
             // overrides this with its own source.
             turn_source:  TurnSource::Human,
@@ -1351,6 +1358,12 @@ impl ChatHub {
 
     pub fn with_jobs(mut self, jobs: Arc<agents::JobRegistry>) -> Self {
         self.jobs = jobs;
+        self
+    }
+
+    /// Adopt the turn budgets `main.rs` loaded and reported.
+    pub fn with_harness(mut self, harness: Arc<agents::harness::HarnessConfig>) -> Self {
+        self.harness = harness;
         self
     }
 
@@ -2878,6 +2891,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
         // rides the native transport, it is not a third one — so the mode
         // itself only reaches the two places that narrow the catalogue.
         let native_tools = tool_mode.native();
+        // The turn's budgets (D1). Snapshotted with the rest so every hop
+        // of this turn answers to the same cap.
+        let harness = self.harness.clone();
+        let max_hops = harness.hop_cap(native_tools);
         let model_name = client.model.clone();
         let mut window = self.context_window.load(Ordering::Relaxed);
         // The options half of the request envelope. Snapshotted per turn
@@ -3449,7 +3466,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 // Consecutive read-only calls overlap (§6.2); the batch
                 // runner preserves model order for every append.
                 if native_tools && !out.tool_calls.is_empty() {
-                    let over_limit = hops >= MAX_TOOL_HOPS;
+                    let over_limit = hops >= max_hops;
                     if !over_limit {
                         hops += 1;
                     }
@@ -3478,7 +3495,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         event_sink.emit(Event::LogLine {
                             level: "WARN".into(),
                             message: format!(
-                                "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
+                                "tool-hop limit ({max_hops}) reached — aborting further skill calls"
                             ),
                         });
                         finish = "hop-limit";
@@ -3508,7 +3525,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         &out.content,
                         |name| skills.by_name.contains_key(name),
                     ) {
-                        let retrying = !syntax_nudged && hops < MAX_TOOL_HOPS;
+                        let retrying = !syntax_nudged && hops < max_hops;
                         let msg = format!(
                             "assistant emitted {reason} — no skill ran; {}",
                             if retrying {
@@ -3568,9 +3585,9 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     finish = "error";
                     break;
                 }
-                if hops >= MAX_TOOL_HOPS {
+                if hops >= max_hops {
                     let msg = format!(
-                        "tool-hop limit ({MAX_TOOL_HOPS}) reached — aborting further skill calls"
+                        "tool-hop limit ({max_hops}) reached — aborting further skill calls"
                     );
                     event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg.clone() });
                     append_tool_result(&sessions_map, session_id, call_seq, &call.skill, None, false, &msg, true)
@@ -3740,35 +3757,52 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     })
                     .await;
                     let spent = control.auto_continues(session_id).await;
-                    let budget_left = spent < verdict::MAX_AUTO_CONTINUES;
-                    let (level, message) = if v.reached {
-                        ("INFO", format!(
-                            "turn {outer_turn} stopped ({finish}) but the request was met — {}",
-                            v.reason
-                        ))
-                    } else if budget_left {
-                        ("WARN", format!(
-                            "turn {outer_turn} stopped ({finish}) with the request \
-                             unfinished — {} · continuing automatically",
-                            v.reason
-                        ))
-                    } else {
-                        ("WARN", format!(
-                            "turn {outer_turn} stopped ({finish}) with the request \
-                             unfinished — {} · {spent} of {} auto-continues spent, \
-                             say `continue` to resume",
-                            v.reason,
-                            verdict::MAX_AUTO_CONTINUES
-                        ))
-                    };
+                    let budget_left = spent < harness.auto_continues;
+                    // A hop-limit stop with an armed goal that has rounds
+                    // left is the round driver's to pick up (D2): the round
+                    // prompt re-grounds the model where an auto-continue
+                    // would only say "carry on", and it spends a round the
+                    // goal budgeted rather than one of the two continues.
+                    // Read under the same facts the dispatch below reads,
+                    // so the two cannot disagree — a Stop between here and
+                    // there disarms the goal and the dispatch goes idle.
+                    let goal_round_ready = finish == "hop-limit"
+                        && control.goal(session_id).await.is_some_and(|g| g.rounds_left())
+                        && control.armed(session_id).await;
+                    let (level, message) =
+                        match verdict::after_stop(v.reached, finish, budget_left, goal_round_ready) {
+                            verdict::AfterStop::Met => ("INFO", format!(
+                                "turn {outer_turn} stopped ({finish}) but the request was met — {}",
+                                v.reason
+                            )),
+                            verdict::AfterStop::GoalRound => ("WARN", format!(
+                                "turn {outer_turn} stopped ({finish}) with the request \
+                                 unfinished — {} · the armed goal's next round takes it up",
+                                v.reason
+                            )),
+                            verdict::AfterStop::AutoContinue => {
+                                // Counted before the turn runs: a
+                                // continuation that crashes must still cost
+                                // an attempt, or a request that crashes
+                                // every time would loop.
+                                let attempt = control.bump_auto_continue(session_id).await;
+                                auto_continue = Some(verdict::continue_prompt(
+                                    &v, finish, attempt, harness.auto_continues,
+                                ));
+                                ("WARN", format!(
+                                    "turn {outer_turn} stopped ({finish}) with the request \
+                                     unfinished — {} · continuing automatically ({attempt} of {})",
+                                    v.reason, harness.auto_continues
+                                ))
+                            }
+                            verdict::AfterStop::Exhausted => ("WARN", format!(
+                                "turn {outer_turn} stopped ({finish}) with the request \
+                                 unfinished — {} · {spent} of {} auto-continues spent, \
+                                 say `continue` to resume",
+                                v.reason, harness.auto_continues
+                            )),
+                        };
                     event_sink.emit(Event::LogLine { level: level.into(), message });
-                    if !v.reached && budget_left {
-                        // Counted before the turn runs: a continuation that
-                        // crashes must still cost an attempt, or a request
-                        // that crashes every time would loop.
-                        let attempt = control.bump_auto_continue(session_id).await;
-                        auto_continue = Some(verdict::continue_prompt(&v, finish, attempt));
-                    }
                 }
             }
 
@@ -6318,6 +6352,7 @@ mod tests {
             runs: Arc::new(NoRuns),
             schedules: Arc::new(Mutex::new(HashMap::new())),
             approval_never: Arc::new(Mutex::new(HashSet::new())),
+            harness: Arc::new(agents::harness::HarnessConfig::default()),
         };
         (cs, Arc::new(Mutex::new(HashMap::new())), cap)
     }
@@ -6695,6 +6730,100 @@ BE A REVIEWER
         let hub = ChatHub::new(tx, Arc::new(SkillRegistry::new()), None);
         (hub, rx)
     }
+    /// Long-session-plan D2, end to end through the real turn loop with
+    /// the model served from a script: a turn that stops at the hop cap
+    /// while a goal is armed with rounds left is audited as usual, but
+    /// the continuation it earns is a goal round — no auto-continue is
+    /// opened and none is spent.
+    ///
+    /// The cap comes from `HarnessConfig` (D1) rather than a constant, so
+    /// one hop is enough to reach it; `notes-write` is a harness control
+    /// that runs in the hub, so no summariser call competes for the
+    /// script. The first turn is a human message, which also triggers
+    /// the LLM titler after the round is spawned; the two prose replies
+    /// at the end serve whichever of the two asks first.
+    #[tokio::test]
+    async fn a_hop_limit_under_an_armed_goal_opens_a_round_not_a_continuation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(agents::control::NotesWrite));
+        let hub = ChatHub::new(tx, Arc::new(reg), None).with_harness(Arc::new(
+            agents::harness::HarnessConfig { tool_hops_text: 1, ..Default::default() },
+        ));
+        let id = hub.create_session(None).await;
+        hub.goals.lock().await.insert(id, Goal::new(1, "finish the notes".into(), 1));
+        hub.goal_armed.lock().await.insert(id);
+
+        let replies = [
+            // Hop 1: runs in the hub. Hop 2: the cap — call recorded, not run.
+            "notes-write 'step one done' > confirm saved",
+            "notes-write 'step two done' > confirm saved",
+            // The completion check's verdict on the hop-limit stop.
+            r#"{"reached": false, "reason": "the second note never landed", "next_step": "write it"}"#,
+            // The goal round's reply, and one for the titler.
+            "The objective is met.",
+            "Notes session",
+        ];
+        let calls = replies
+            .iter()
+            .map(|r| llm::replay::ReplayCall::Message { content: r.to_string(), reasoning: None, tool_calls: None })
+            .collect();
+        hub.connect_replay(Arc::new(llm::replay::ReplayScript::new(calls)), 100_000, LlmOptions::default())
+            .await;
+        hub.send_user_message(id, "keep the notes current until both steps are in".into(), Vec::new())
+            .await;
+
+        // Two turns end — the human one at the cap, the round normally —
+        // and the slot is released.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let ended = {
+                let g = hub.sessions.lock().await;
+                g[&id].events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnd { .. })).count()
+            };
+            if ended >= 2 && hub.active_turns.lock().await.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the session never went idle");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let g = hub.sessions.lock().await;
+        let events = &g[&id].events;
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::TurnEnd { finish_reason, .. } => Some(finish_reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, ["hop-limit", "done"], "{ends:?}");
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::TurnVerdict { reached: false, .. })),
+            "the stop is still audited"
+        );
+        let sources: Vec<TurnSource> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::TurnStart { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, [TurnSource::Human, TurnSource::GoalRound], "{sources:?}");
+        drop(g);
+        assert_eq!(hub.auto_cont.lock().await.get(&id).copied().unwrap_or(0), 0, "no continue spent");
+        let goal = hub.goals.lock().await.get(&id).cloned().expect("goal kept");
+        assert_eq!(goal.rounds_started, 1, "the round was recorded before it ran");
+
+        let mut said_so = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let protocol::Payload::Event(Event::LogLine { message, .. }) = frame.payload {
+                said_so |= message.contains("the armed goal's next round takes it up");
+            }
+        }
+        assert!(said_so, "the operator is told which path the stop took");
+    }
+
 
     /// Search reads the derived surface, so it finds what was said and
     /// skips the fenced tool blocks and injected snapshots around it.

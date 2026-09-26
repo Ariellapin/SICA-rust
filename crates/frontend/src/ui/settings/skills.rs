@@ -3,8 +3,10 @@
 //! Tab **Catalogue**: what the `/` palette lists, grouped Commands / Skills /
 //! Agents, with the source path of each entry and a filter. Tab **Folders**:
 //! the three directories those entries come from, plus the skill-creator
-//! template. The harness constants (hop limit, timeouts, spill caps) are
-//! read-only here until they become settings.
+//! template. Tab **Harness**: the loop's numbers. The two turn budgets (the
+//! tool-hop cap per transport and the auto-continue budget) are settings in
+//! `sica-settings/harness.toml` (long-session-plan D1), listed here at
+//! their defaults; the rest are constants and read-only until they follow.
 
 use egui::{Layout, Sense, Vec2};
 
@@ -173,15 +175,19 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
     kit::label(
         ui,
         kit::txt(
-            "These are compile-time constants today; the section lists them so \
-             the numbers behind a stalled or truncated call are visible.",
+            "The numbers behind a stalled or truncated call. The two turn budgets \
+             are read from sica-settings/harness.toml at backend start \
+             (tool_hops_text, tool_hops_native, auto_continues — every key \
+             optional, shown here at their defaults; the backend's log says \
+             which values it loaded). The rest are compile-time constants.",
             12.0,
             Weight::Regular,
             kit::col(t.alias.label[2]),
         ),
     );
     for (name, value) in [
-        ("Tool hops per turn", "12"),
+        ("Tool hops per turn", "12 text · 32 native / PTC"),
+        ("Auto-continues per message", "2"),
         ("Default tool timeout", "120 s"),
         ("Shell foreground cap", "30 s · 32 KiB per stream"),
         ("Background jobs", "10 per session · 256 KiB retained"),

@@ -2,7 +2,7 @@
 //! whether the user actually got what they asked for.
 //!
 //! A turn can end for reasons that have nothing to do with the work being
-//! finished — `MAX_TOOL_HOPS`, the completion cap, a retry budget running
+//! finished — the tool-hop cap, the completion cap, a retry budget running
 //! out. Before this check those stops were silent: the session simply went
 //! idle mid-task and the person had to notice, guess why, and type
 //! "continue". Twelve `read-file` hops covering lines 29-100 of a 214-line
@@ -12,9 +12,10 @@
 //! answers three things: was the request satisfied, why not, and what the
 //! single next step is. The answer is recorded as `EventKind::TurnVerdict`
 //! and, when the request was *not* satisfied, opens one more turn carrying
-//! that next step — at most [`MAX_AUTO_CONTINUES`] times per human message.
+//! that next step — at most `auto_continues` times per human message
+//! (`agents::harness`, default 2).
 //!
-//! Three deliberate limits, each answering a way this goes wrong:
+//! Four deliberate limits, each answering a way this goes wrong:
 //!
 //! - **Abnormal stops only.** A turn the model ended itself (`done`) is not
 //!   checked, so a normal conversation costs exactly what it did before.
@@ -27,6 +28,13 @@
 //!   have. A broken judge must not be able to hold a session, and a broken
 //!   judge must not be invisible either: session 85 stopped at the hop
 //!   limit and went idle with no verdict and no line saying why.
+//! - **A hop-limit stop under an armed goal is the goal driver's.** The
+//!   verdict is still taken and recorded, but the continuation it would
+//!   open is a goal round instead ([`after_stop`]): the round prompt
+//!   re-grounds the model on the objective and the workspace, and the
+//!   goal's own round cap bounds it, where an auto-continue would just say
+//!   "carry on" and spend one of two. `max_tokens` and `error` stops keep
+//!   the auto-continue — re-grounding is not what those need.
 //!
 //! The judge runs with thinking **off**. It is a tool-less classification
 //! with a small completion cap, and a reasoning model (Qwen 3.x) given that
@@ -41,12 +49,6 @@ use sica_core::event::{EventKind, SessionEvent};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-/// Continuation turns the check may open for one human message. Two is
-/// enough to finish work that stopped a hop short without turning a
-/// mis-scoped request into an unbounded loop; the count resets on the next
-/// human turn, never on a continuation.
-pub const MAX_AUTO_CONTINUES: u8 = 2;
-
 /// Bytes of the objective and of the turn digest the judge is shown.
 const MAX_INPUT_BYTES: usize = 3072;
 /// Completion cap on the verdict request. Thinking is disabled for the
@@ -60,9 +62,13 @@ const MAX_REPLY_BYTES: usize = 8192;
 /// Longest `reason` / `next_step` kept. Both are read by a human in the
 /// GUI and, for `next_step`, pasted into the continuation prompt.
 const MAX_FIELD_LEN: usize = 400;
-/// Tool calls listed in the digest, newest last. A hop-limited turn has 12;
-/// showing all of them is what makes "it only reached line 100" visible.
+/// Tool calls listed in the digest, newest last. A hop-limited text turn
+/// has 12; showing all of them is what makes "it only reached line 100"
+/// visible. A native turn may have more, and its newest calls are the ones
+/// that say where it got to.
 const MAX_DIGEST_CALLS: usize = 16;
+/// Longest checkpoint **Next Step** quoted in the digest.
+const MAX_NEXT_STEP_LEN: usize = 600;
 
 const SYSTEM_PROMPT: &str = "\
 You audit whether an AI agent's turn actually completed the user's request. \
@@ -138,6 +144,12 @@ pub fn objective(events: &[SessionEvent], turn_id: u64) -> String {
 /// agent's own last words. Tool *results* are omitted — the judge needs to
 /// know that lines 65-70 were read, not what was on them, and a hop-limited
 /// turn's results would swamp the budget.
+///
+/// When the turn compacted its context, the latest checkpoint's **Next
+/// Step** section is quoted too (long-session-plan D3): the calls before
+/// the fold are still listed, but what the model itself said remained is
+/// the better evidence of where the work stood, and the judge would
+/// otherwise see only the calls after it.
 pub fn digest(events: &[SessionEvent], turn_id: u64) -> String {
     let start = events
         .iter()
@@ -154,8 +166,16 @@ pub fn digest(events: &[SessionEvent], turn_id: u64) -> String {
 
     let mut calls: Vec<String> = Vec::new();
     let mut last_said = String::new();
+    let mut next_step: Option<String> = None;
     for ev in tail {
         match &ev.kind {
+            EventKind::CompactionSummary { summary, .. } => {
+                // Latest wins; a chained compaction consolidates the earlier
+                // one's sections into its own.
+                next_step = agents::compact::section(summary, "## Next Step")
+                    .filter(|s| !s.is_empty())
+                    .map(|s| one_line(s, MAX_NEXT_STEP_LEN));
+            }
             EventKind::ToolCall { args_preview, .. } => {
                 let mark = match ok_by_call.get(&ev.seq) {
                     Some(true) => "ok",
@@ -186,12 +206,57 @@ pub fn digest(events: &[SessionEvent], turn_id: u64) -> String {
             out.push('\n');
         }
     }
+    if let Some(step) = next_step {
+        out.push_str(
+            "\nThe agent's context was compacted during this turn; its own checkpoint \
+             named the next step as:\n",
+        );
+        out.push_str(&step);
+        out.push('\n');
+    }
     if !last_said.trim().is_empty() {
         out.push_str("\nThe agent's last message:\n");
         out.push_str(&one_line(&last_said, 600));
         out.push('\n');
     }
     sica_core::retain::utf8_head(&out, MAX_INPUT_BYTES).to_string()
+}
+
+/// What follows an abnormal stop once the verdict is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterStop {
+    /// The judge says the request was met: the turn simply ends.
+    Met,
+    /// A `hop-limit` stop with an armed goal that has rounds left: the
+    /// round driver opens the next round, and no auto-continue is spent.
+    GoalRound,
+    /// Open a continuation turn carrying the verdict's next step.
+    AutoContinue,
+    /// The request is unfinished and the continue budget is spent: the
+    /// session goes idle and the log line says so.
+    Exhausted,
+}
+
+/// Decide what an abnormal stop leads to (long-session-plan D2). Pure, so
+/// the four-way choice is tested without a turn behind it; the caller
+/// supplies the facts it already holds.
+///
+/// A goal round is preferred only for `hop-limit`. That stop means the
+/// model was still working and ran out of leash, which is exactly what a
+/// round prompt — the objective, the workspace, a fresh round budget — is
+/// for. `max_tokens` cut a reply mid-sentence and `error` is a transport or
+/// provider failure; neither is helped by re-grounding, and both keep the
+/// narrower "carry on from here" continuation.
+pub fn after_stop(reached: bool, finish_reason: &str, budget_left: bool, goal_round_ready: bool) -> AfterStop {
+    if reached {
+        AfterStop::Met
+    } else if finish_reason == "hop-limit" && goal_round_ready {
+        AfterStop::GoalRound
+    } else if budget_left {
+        AfterStop::AutoContinue
+    } else {
+        AfterStop::Exhausted
+    }
 }
 
 /// Ask the connected model whether `objective` was met. `Err` carries a
@@ -305,10 +370,11 @@ pub fn parse(raw: &str) -> Option<Verdict> {
 /// away thinking the person asked again. It also names the limit that was
 /// hit, because "you were cut off at the hop limit" is what makes a model
 /// widen its next `read-file` window instead of repeating six-line reads.
-pub fn continue_prompt(v: &Verdict, finish_reason: &str, attempt: u8) -> String {
+/// `of` is the session's continue budget (`agents::harness`).
+pub fn continue_prompt(v: &Verdict, finish_reason: &str, attempt: u8, of: u8) -> String {
     let step = v.next_step.as_deref().unwrap_or(v.reason.as_str());
     format!(
-        "<auto_continue attempt=\"{attempt}\" of=\"{MAX_AUTO_CONTINUES}\">\n\
+        "<auto_continue attempt=\"{attempt}\" of=\"{of}\">\n\
          Your previous turn was cut short by the harness ({finish_reason}) before the \
          user's request was finished. This is the harness continuing it — the user has \
          not sent a new message.\n\n\
@@ -571,19 +637,68 @@ mod tests {
             reason:    "only lines 29-100 of 214 were read".into(),
             next_step: Some("read from line 101 in one call".into()),
         };
-        let p = continue_prompt(&v, "hop-limit", 1);
+        let p = continue_prompt(&v, "hop-limit", 1, 2);
         assert!(p.contains("hop-limit"));
         assert!(p.contains("read from line 101 in one call"));
         assert!(p.contains("only lines 29-100 of 214 were read"));
         assert!(p.contains("not sent a new message"));
-        assert!(p.contains("attempt=\"1\""));
+        assert!(p.contains("attempt=\"1\" of=\"2\""));
     }
 
     #[test]
     fn continue_prompt_falls_back_to_the_reason() {
         let v =
             Verdict { reached: false, reason: "half the files are unread".into(), next_step: None };
-        let p = continue_prompt(&v, "max_tokens", 2);
+        let p = continue_prompt(&v, "max_tokens", 2, 3);
         assert!(p.contains("Do this next: half the files are unread"));
+        assert!(p.contains("of=\"3\""), "the configured budget, not a constant: {p}");
+    }
+
+    /// The checkpoint's own account of what remained is quoted, newest
+    /// fold wins, and an empty or `(none)` section adds nothing.
+    #[test]
+    fn digest_quotes_the_latest_checkpoints_next_step() {
+        let checkpoint = |step: &str| EventKind::CompactionSummary {
+            surface:       SurfaceOp::Replace { start_seq: 1, end_seq: 2 },
+            content:       String::new(),
+            summary:       format!("## Current Work\nstuff\n## Next Step\n{step}\n## Critical Context\n(none)\n"),
+            folded:        2,
+            before_tokens: 100,
+            after_tokens:  10,
+        };
+        let events = vec![
+            ev(1, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
+            call(2, "grep 'before'"),
+            ev(3, checkpoint("finish the parser first")),
+            call(4, "grep 'after'"),
+            ev(5, checkpoint("run cargo test -p agents\nthen commit")),
+        ];
+        let d = digest(&events, 1);
+        assert!(d.contains("compacted during this turn"), "{d}");
+        assert!(d.contains("run cargo test -p agents then commit"), "one line, newest fold: {d}");
+        assert!(!d.contains("finish the parser first"), "the earlier fold is consolidated: {d}");
+        assert!(d.contains("'before'") && d.contains("'after'"), "calls on both sides stay: {d}");
+
+        let events = vec![
+            ev(1, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
+            ev(2, checkpoint("(none)")),
+        ];
+        assert!(!digest(&events, 1).contains("compacted"), "nothing to quote, nothing said");
+        let events = vec![ev(1, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human })];
+        assert!(!digest(&events, 1).contains("compacted"));
+    }
+
+    /// The four-way choice at the continuation point.
+    #[test]
+    fn after_stop_prefers_a_goal_round_only_for_hop_limits() {
+        use AfterStop::*;
+        assert_eq!(after_stop(true, "hop-limit", true, true), Met, "met is met, whatever is armed");
+        assert_eq!(after_stop(false, "hop-limit", true, true), GoalRound);
+        assert_eq!(after_stop(false, "hop-limit", false, true), GoalRound, "a round costs no continue");
+        assert_eq!(after_stop(false, "hop-limit", true, false), AutoContinue, "no goal, the old path");
+        assert_eq!(after_stop(false, "max_tokens", true, true), AutoContinue, "re-grounding is not the point");
+        assert_eq!(after_stop(false, "error", true, true), AutoContinue);
+        assert_eq!(after_stop(false, "max_tokens", false, true), Exhausted);
+        assert_eq!(after_stop(false, "hop-limit", false, false), Exhausted);
     }
 }

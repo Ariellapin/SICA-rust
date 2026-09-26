@@ -96,8 +96,9 @@ Seven crates, dependency direction strictly downward. Details in
 - Optional integrations are opt-in files, absent by default and never fatal when
   malformed: `.sica/hooks.json` in the working directory (user hooks, §13.1),
   `sica-settings/mcp/*.toml` (one MCP server each, §13.2), `sica-settings/web.toml`
-  (the `web-search` provider key, §13.3). Each reports what it could not load as a
-  `LogLine` rather than failing startup.
+  (the `web-search` provider key, §13.3), `sica-settings/harness.toml` (the
+  tool-hop and auto-continue budgets, `agents::harness`). Each reports what it
+  could not load as a `LogLine` rather than failing startup.
 - Three skills are off until a doc turns them on: `skills/agent-team.md` registers
   `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5), and
   `skills/schedule.md` registers the three reminder tools (§12.8; seeded as

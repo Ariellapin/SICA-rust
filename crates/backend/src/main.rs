@@ -466,13 +466,42 @@ async fn run(args: Args) -> Result<()> {
         }));
     }
 
+    // Turn budgets (`agents::harness`, long-session-plan D1). Read once,
+    // like the hooks: a cap that changed under a running turn would make
+    // two hops of one turn answer to different budgets. A file that will
+    // not parse is reported and the defaults apply; a file that did load
+    // is announced, since a budget that fell back silently is exactly what
+    // someone editing it would go looking for.
+    let harness = agents::harness::load();
+    for w in &harness.warnings {
+        warn!(warning = %w, "harness");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level:   "WARN".into(),
+            message: w.clone(),
+        }));
+    }
+    if harness.present {
+        let msg = format!(
+            "harness: {} — from {}",
+            harness.config.summary(),
+            agents::harness::config_path().display()
+        );
+        info!(%msg, "harness budgets loaded");
+        let _ = out_tx.send(Frame::event(Event::LogLine {
+            level:   "INFO".into(),
+            message: msg,
+        }));
+    }
+    let harness_config = std::sync::Arc::new(harness.config);
+
     let chat = ChatHub::new_loaded(
         out_tx.clone(),
         skill_registry.clone(),
         Some(tool_failure_sink.clone()),
     )
     .with_jobs(jobs.clone())
-    .with_hooks(hook_config.clone());
+    .with_hooks(hook_config.clone())
+    .with_harness(harness_config);
     // What the restart owes each session it cut (C2): queued as context for
     // the session's next turn, never a turn of its own.
     chat.deliver_restart_briefs().await;

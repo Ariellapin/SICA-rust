@@ -224,8 +224,8 @@ arguments; a new user message clears the chain. sica-rust:
 one per session on `ChatHub::repeat`, fed by `chat::observe_repeat` after
 every dispatch on both tool paths — failed and unknown-skill calls too. The
 notice lands as `ContextInjected { source: ToolNotice }` (a user-role message
-after the tool result) plus a WARN `LogLine`; `MAX_TOOL_HOPS` remains the hard
-stop. Wording says "has produced the same result" rather than "cannot", since
+after the tool result) plus a WARN `LogLine`; the tool-hop cap
+(`agents::harness`, 12 text / 32 native) remains the hard stop. Wording says "has produced the same result" rather than "cannot", since
 `run-cli` is not idempotent. Wave 3 moved it onto the pipeline: the
 [`RepeatReminder`](../crates/agents/src/pipeline.rs) policy counts in
 `post_execute` (denied calls included) and returns the notice as
@@ -426,7 +426,8 @@ records `done | interrupted | error | hop-limit`.
 
 ### 8.4 No built-in turn budget → plugin on `agent/turn-stopping` — n/a
 
-sica-rust's `MAX_TOOL_HOPS` is the equivalent hard cap.
+sica-rust's tool-hop cap (`agents::harness::HarnessConfig::hop_cap`, set in
+`sica-settings/harness.toml`) is the equivalent hard cap.
 
 ## 9. Structured hand-offs between agent contexts
 

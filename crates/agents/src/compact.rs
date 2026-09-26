@@ -151,6 +151,31 @@ pub fn missing_heading(summary: &str) -> Option<&'static str> {
     None
 }
 
+/// The body under `heading` in a checkpoint `summary`: the text from the
+/// end of the heading line to the next `## ` heading (or the end), trimmed.
+/// `None` when the heading is absent; `Some("")` when it is there and
+/// empty or `(none)`, so a caller can tell "the model said nothing" from
+/// "the model wrote no such section".
+pub fn section<'a>(summary: &'a str, heading: &str) -> Option<&'a str> {
+    let at = summary
+        .lines()
+        .scan(0usize, |off, line| {
+            let start = *off;
+            *off += line.len() + 1;
+            Some((start, line))
+        })
+        .find(|(_, line)| line.trim_end() == heading)
+        .map(|(start, line)| start + line.len())?;
+    let rest = &summary[at..];
+    let end = rest
+        .match_indices("\n## ")
+        .map(|(i, _)| i)
+        .next()
+        .unwrap_or(rest.len());
+    let body = rest[..end].trim();
+    Some(if body == "(none)" { "" } else { body })
+}
+
 /// What one successful summarisation produced. `missing_heading` is set when
 /// the model never managed the eight-section shape within the retry budget
 /// and the last attempt was kept anyway: a partial checkpoint still carries
@@ -649,6 +674,19 @@ mod tests {
         assert!(pruned.contains("pruned to free context"));
         assert!(pruned.len() <= PRUNE_THRESHOLD, "{}", pruned.len());
         assert!(prune_summary(&pruned).is_none(), "a pruned result must not prune again");
+    }
+
+    #[test]
+    fn section_returns_the_body_under_a_heading() {
+        let text = "## Current Work\nediting foo.rs\n\n## Next Step\nrun `cargo test -p agents`\nthen commit\n## Critical Context\n(none)\n";
+        assert_eq!(section(text, "## Next Step"), Some("run `cargo test -p agents`\nthen commit"));
+        assert_eq!(section(text, "## Current Work"), Some("editing foo.rs"));
+        assert_eq!(section(text, "## Critical Context"), Some(""), "(none) reads as empty");
+        assert_eq!(section(text, "## Pending Jobs"), None, "absent is not empty");
+        // A heading at the very end, and a heading that is only a prefix of
+        // a longer line, do not match.
+        assert_eq!(section("## Next Step", "## Next Step"), Some(""));
+        assert_eq!(section("## Next Steps\nx", "## Next Step"), None);
     }
 
     #[test]

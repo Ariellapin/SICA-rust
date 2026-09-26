@@ -93,6 +93,13 @@ newest-first and does not accept the drag. The backend's
 The Harness tab (`crates/frontend/src/ui/settings/skills.rs`) lists
 constants read-only. Make them settings:
 
+> **Partly done** (long-session-plan D1, 2026-09-26): `agents::harness`
+> already reads `sica-settings/harness.toml` for the two turn budgets
+> (`tool_hops_text`, `tool_hops_native`, `auto_continues`), with the
+> `LogLine`-and-defaults stance below, and `ChatHub::with_harness` carries
+> it. The steps here extend that file and loader rather than adding a
+> second one; `MAX_TOOL_HOPS` in step 1 is gone.
+
 1. Define `HarnessConfig` in `agents` with `serde` defaults equal to today's
    constants: shell timeout (`Skill::timeout`), stdout/stderr cap,
    `spill::SPILL_THRESHOLD`, `compact::PRUNE_THRESHOLD` and the 80/16

@@ -10,6 +10,7 @@ pub mod control;
 pub mod delegate;
 pub mod goal;
 pub mod guard;
+pub mod harness;
 pub mod instructions;
 pub mod invoke;
 pub mod jobs;

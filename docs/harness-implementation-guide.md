@@ -57,8 +57,8 @@ seams exist *statically*:
 | `ctx.session` + persistence + JSONL | `sica_core::event` + `backend::sessions_store::SessionLog` | Event-sourced since the dsh port; `sessions/<id>.jsonl`. |
 | `ctx.tools` (registry + pipeline) | `agents::SkillRegistry` + `agents::ToolSubAgent` | Registry is name → `Arc<dyn Skill>`; pipeline is `ToolSubAgent::run`. |
 | `ctx.systemPrompt` | `chat::build_wire_history` (+ copies in `team.rs`, `model_eval.rs`) | Hard-coded concat today. §5 replaces it. |
-| agent loop | `chat::ChatHub::send_user_message` | One spawned task per user message, hop loop, `MAX_TOOL_HOPS = 12`. |
-| completion check | `backend::verdict` | An abnormal stop (`hop-limit`, `max_tokens`, `error`) is audited against the human objective; `EventKind::TurnVerdict` plus up to `MAX_AUTO_CONTINUES = 2` continuation turns. |
+| agent loop | `chat::ChatHub::send_user_message` | One spawned task per user message, hop loop capped by `agents::harness::HarnessConfig::hop_cap` (12 text / 32 native, `sica-settings/harness.toml`). |
+| completion check | `backend::verdict` | An abnormal stop (`hop-limit`, `max_tokens`, `error`) is audited against the human objective; `EventKind::TurnVerdict` plus up to `auto_continues` (`harness.toml`, default 2) continuation turns; a `hop-limit` stop under an armed goal opens a goal round instead (`verdict::after_stop`). |
 | `ctx.skills` | `agents::md_skill` + `skills/*.md` | Scanned at BE start. |
 | `ctx.compaction` | `agents::compact` + `chat::compact_session` | Summary lands as a `CompactionSummary` event with `SurfaceOp::Replace`. |
 | `ctx.tokenMeter` | `agents::turn` live `TokenUsage` events + `llm::tokenize` | Heuristic `chars/4`, exact via llama.cpp `/tokenize`. |
