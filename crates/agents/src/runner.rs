@@ -14,8 +14,9 @@
 //!   successful tool calls is reported as unverified ([`Report::verified`]);
 //!   callers label it so the reader never sees a guess presented as fact.
 //! - **A botched tool call read as a final answer.** A reply that looks
-//!   like a tool call but does not parse buys one `SYNTAX_CORRECTION`
-//!   retry (`parse_tool_call::rejected_attempt`) before it is accepted.
+//!   like a tool call but does not parse buys one [`syntax_correction`]
+//!   retry naming the defect (`parse_tool_call::rejected_attempt`) before
+//!   it is accepted.
 //!
 //! **Structured output** (§12.2) closes a third: with a schema, the run's
 //! result is only what arrives through the child-scoped
@@ -40,19 +41,34 @@ use crate::subagent::{ToolInvocation, ToolSubAgent};
 /// protocol's parser accepts it unchanged.
 pub const STRUCTURED_OUTPUT_NAME: &str = "structured-output";
 
-/// Sent to a child that emitted something tool-call-shaped the parser could
-/// not read. Restates the contract and — the part that matters — forbids
-/// the fallback the model would otherwise take: writing up the output it
-/// *expected* the tool to produce.
-pub const SYNTAX_CORRECTION: &str = "\
-That was not a valid tool call, so NOTHING ran and you received no output. \
-To call a tool, reply with exactly one line and nothing else:\n\n\
-    <skill-name> '<arg1>' '<arg2>' > <what you want to learn>\n\n\
-Every argument must be quoted and the ` > <expectation>` part is required. \
-Retry the call now if you still need it. If you do not, reply with your \
-report — but do NOT describe file contents, command output, or whether a \
-path exists unless a tool result above actually shows it; say plainly that \
-you could not verify it instead.";
+/// Sent to a model that emitted something tool-call-shaped the parser could
+/// not read. `reason` is [`parse_tool_call::rejected_attempt`]'s account of
+/// the defect: a bare restatement of the contract sent the model guessing
+/// at what it got wrong — `sessions/3` spent 37k tokens of reasoning on a
+/// JSON call one `}` short and still did not find it. The fence form is
+/// offered because a one-line argument is the hard way to pass a script
+/// full of quotes. The last part forbids the fallback the model would
+/// otherwise take: writing up the output it *expected* the tool to produce.
+pub fn syntax_correction(reason: &str) -> String {
+    format!(
+        "That was not a valid tool call, so NOTHING ran and you received no \
+         output. The parser found {reason}.\n\n\
+         To call a tool, reply with exactly one call and nothing else: \
+         either one line,\n\n    \
+         <skill-name> '<arg1>' '<arg2>' > <what you want to learn>\n\n\
+         or, when an argument is long or full of quotes (a script, a file \
+         body), one JSON object in a fence:\n\n    \
+         ```tool_call\n    \
+         {{\"skill\": \"<skill-name>\", \"args\": {{\"<arg-name>\": \"<value>\"}}, \
+         \"expectation\": \"<what you want to learn>\"}}\n    \
+         ```\n\n\
+         Every argument must be quoted and the expectation is required. \
+         Retry the call now if you still need it. If you do not, reply with \
+         your report — but do NOT describe file contents, command output, or \
+         whether a path exists unless a tool result above actually shows it; \
+         say plainly that you could not verify it instead."
+    )
+}
 
 /// Sent once to a run that owes structured output but replied in prose.
 pub const STRUCTURED_REMINDER: &str = "\
@@ -282,7 +298,7 @@ pub async fn run_conversation(
                 });
                 if retrying {
                     nudged = true;
-                    transcript.push(ChatMessage::text("user", SYNTAX_CORRECTION));
+                    transcript.push(ChatMessage::text("user", syntax_correction(&reason)));
                     continue;
                 }
             }
@@ -577,6 +593,20 @@ mod tests {
                 "evidence": {"type": "array", "items": {"type": "string"}},
             }
         })
+    }
+
+    #[test]
+    fn syntax_correction_names_the_defect_and_offers_the_fence() {
+        let reason = crate::parse_tool_call::rejected_attempt(
+            "```tool_call\n{\"skill\": \"run-pwsh\", \"args\": {\"command\": \"dir\"}, }\n```",
+            |_| true,
+        )
+        .unwrap();
+        let text = syntax_correction(&reason);
+        assert!(text.starts_with("That was not a valid tool call, so NOTHING ran"), "{text}");
+        assert!(text.contains(&format!("The parser found {reason}.")), "{text}");
+        assert!(text.contains("```tool_call\n"), "the fence form is offered: {text}");
+        assert!(text.contains("could not verify it"), "{text}");
     }
 
     #[test]

@@ -114,6 +114,19 @@ async fn main() -> Result<()> {
         entries.iter().any(|e| e.name == "read-file"),
         "catalog missing the built-in read-file skill: {entries:?}"
     );
+    // The memory tools are seeded on (`skills/memory.md`), unlike the
+    // reminders — unless someone switched them off in this workspace.
+    let memory_doc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("skills")
+        .join("memory.md");
+    if memory_doc.exists() {
+        assert!(
+            entries.iter().any(|e| e.name == "remember"),
+            "skills/memory.md is on but `remember` is not in the catalog"
+        );
+    }
 
     // Session round-trip through the event-log store. A fresh session lives
     // in memory only (nothing is written until its first user message), so
@@ -165,6 +178,7 @@ async fn main() -> Result<()> {
     println!("smoke: load session -> id={} title={:?} messages={}", session.id, session.title, session.messages.len());
     assert_eq!(session.id, new_id);
     assert!(session.messages.is_empty(), "fresh session should have no messages");
+    assert!(session.memory.is_none(), "a fresh session has no memory yet");
 
     // The Trajectory view's ledger (guide §10). A fresh session derives no
     // messages but its log already holds the `SessionCreated` line, which is
@@ -361,6 +375,65 @@ async fn main() -> Result<()> {
             _ => anyhow::bail!("idealist request {id}: unexpected {resp:?}"),
         }
     }
+
+    // Memory (v32). Long-term memory round-trips — add, refuse the repeat,
+    // delete — and the smoke leaves the store as it found it, since it runs
+    // against the real workspace. The session-memory requests have nothing
+    // real to act on here (no model, no such session) and must say so.
+    let fact = format!("smoke test fact {}", std::process::id());
+    let mut before = 0usize;
+    let mut added: Option<String> = None;
+    let memory_steps: Vec<(u64, Request)> = vec![
+        (18, Request::ListMemories),
+        (19, Request::SaveMemory { id: None, text: fact.clone(), project: None }),
+        (20, Request::SaveMemory { id: None, text: fact.to_uppercase(), project: None }),
+        (22, Request::SetSessionMemory { session_id: 999_999_999, summary: "x".into(), facts: Vec::new() }),
+        (23, Request::RefreshSessionMemory { session_id: new_id }),
+    ];
+    for (id, req) in memory_steps {
+        writer.send(Frame::request(id, req).encode()?.into()).await?;
+        let resp = loop {
+            let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+            let frame = Frame::decode(&bytes)?;
+            match frame.payload {
+                Payload::Response(r) if frame.id == id => break r,
+                _ => {}
+            }
+        };
+        match (id, &resp) {
+            (18, Response::Memories { memories }) => {
+                before = memories.len();
+                println!("smoke: memories -> {before} on disk");
+            }
+            (19, Response::Memories { memories }) => {
+                let m = memories.iter().find(|m| m.text == fact).expect("the new memory is listed");
+                assert!(m.project.is_none() && m.source == "user", "{m:?}");
+                assert_eq!(memories.len(), before + 1);
+                added = Some(m.id.clone());
+                println!("smoke: memory added -> {}", m.id);
+            }
+            (20 | 22 | 23, Response::Error { message }) => {
+                println!("smoke: memory request {id} refused -> {message}");
+            }
+            _ => anyhow::bail!("memory request {id}: unexpected {resp:?}"),
+        }
+    }
+    let added = added.expect("step 19 added a memory");
+    writer.send(Frame::request(21, Request::DeleteMemory { id: added.clone() }).encode()?.into()).await?;
+    let resp = loop {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        match frame.payload {
+            Payload::Response(r) if frame.id == 21 => break r,
+            _ => {}
+        }
+    };
+    let Response::Memories { memories } = resp else {
+        anyhow::bail!("expected Memories, got {resp:?}");
+    };
+    assert!(!memories.iter().any(|m| m.id == added), "the deleted memory is gone");
+    assert_eq!(memories.len(), before);
+    println!("smoke: memory deleted -> {added}");
 
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;

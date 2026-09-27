@@ -2141,6 +2141,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | **8 — workflows** — **done** | model-written orchestration scripts (§12.5, `agents::workflow` on the shared `agents::script` sandbox + `prompt::order::WORKFLOW_SDK`, opt-in on `skills/workflow.md`) | L×1 | no |
 | **9 — workspaces & durability** — **done** (protocol v26) | per-session `cwd` + the format header and its migration chain (§3.8, `event::migrate` + `sessions_store::list_headers`) · workspace registry `backend::workspaces` + `NewSession { workspace_id }` (§3.9) · `sica_core::atomic::atomic_write` · credential references + `sica-settings/.env` (§14.6, `sica_core::creds`) | M×3 + S×2 | yes (v26) — `ListWorkspaces` … `MoveSession`, `Event::WorkspacesChanged`, `SessionMeta.cwd`; log-only `SessionCreated.format` / `.cwd` |
 | **10 — durability, reminders, leftovers** — **done** (protocol v29) | fail-closed checkpoints (§3.2, `chat::checkpoint` + `ABORTED_BEFORE_DISPATCH`) · reminders (§12.8, `agents::schedule` + the hub's timer, opt-in on `skills/schedule.md`) · message feedback (§3.7, `RateMessage` + `MessageFeedback`) · approval policy `never` (§10.2) · `Retry-After` + `retry_always` (§4.2) · per-agent `tool_mode:` (§2.3) · `@path` expansion (§9.5) · `timeout_secs` (§6.3) · shell and grep overflow through `spill::write` (§6.6, §6.9) · spill-backed job output (§12.4) · description cap + `disable-model-invocation` / `user-invocable` (§8.1) · `stats` / `approval` / `job-output` commands (§8.4) · `PreToolUse` context (§13.1) · ralph rounds as run rows (§12.6) · `SetWorkingDir` on a live backend (§3.9, UI §7.2) · `docs/notes/` (§14.4) | S×14 + M×3 | yes (v29) — `SetWorkingDir`, `RateMessage`; `Event::SchedulesChanged`, `SessionDump.schedules`, `SessionMeta.scheduled`, `MessageDump.feedback`, `JobDump.started_at`, `TurnUsage.last_seq`, `LlmOptions.retry_always`. Log-only: `EventKind::Schedule`, `EventKind::MessageFeedback`, `TurnSource::Schedule` |
+| **11 — memory** — **done** (protocol v32) | session memory (a running summary + key facts in the log, `backend::memory_keeper` writing it while the model is idle, re-attached after compactions) · long-term memory (`agents::long_term`, `memories/long-term.json`, injected at turn start) · `remember` / `recall` / `forget` (`agents::remember`, seeded on) · the header's Memory panel and Settings › Memory. See `docs/notes/2026-09-27-session-and-long-term-memory.md` | M×3 | yes (v32) |
 | **later** | Windows sandbox (§10.4) · persistent PTY (§6.7) · LSP (§13.4) · lazy session bodies (§3.8) · continuable children + `send_message` / `interrupt_agent` (§12.1, §12.7) · `harness.toml` for the constants the Skills › Harness tab lists (UI §7.2) · Model Experience blocks in the skill seeds (§14.4) · the output split (§6.1) | L/XL | — |
 
 ---
@@ -2149,7 +2150,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 
 | Variant | Surface | Introduced by |
 | --- | --- | --- |
-| `ContextInjected { surface, source: ContextSource, content }` — `source ∈ {Instructions, SkillInvocation { name }, FileReference { path }, SessionReference { id }, ToolNotice, JobNotice, GoalRound, Injected, RuntimeContext}` — **done** | user-role | §2.1, §5.1, §5.3, §6.4, §8.2, §9.5, §12.4 |
+| `ContextInjected { surface, source: ContextSource, content }` — `source ∈ {Instructions, SkillInvocation { name }, FileReference { path }, SessionReference { id }, ToolNotice, JobNotice, GoalRound, Injected, RuntimeContext, SessionMemory, LongTermMemory}` — **done** (the last two with v32) | user-role | §2.1, §5.1, §5.3, §6.4, §8.2, §9.5, §12.4, Wave 11 |
 | `ToolResult.pruned: bool` + `ToolResult.trusted: bool` — **done**; `parent_seq` is reserved on paper only and **not declared** (the run rows of §12.5 cover what it was for) | (existing) | §9.2, §7/§12.6, §9.4 |
 | `TurnStart.source: TurnSource { Human, GoalRound, Followup, AutoContinue, Schedule }` — **done** (Wave 4; `AutoContinue` with `backend::verdict`, `Schedule` with Wave 10) | (existing) | §12.3 |
 | `Command { name, input, ok }` | no | §8.4 |
@@ -2165,6 +2166,7 @@ Each wave builds and ships on its own; protocol bumps are marked.
 | `MessageFeedback { seq_ref, rating, note }` — **done** (Wave 10) | no | §3.7 |
 | `WorkflowRun { run_id, call_seq, phase, member, member_id, state }` — **done** (v27) | no | §12.5, UI §6.11 |
 | `Schedule { id, op, prompt, rule, fire_at, after_seconds, every_seconds, accepted_at }` — **done** (Wave 10) | no | §12.8 |
+| `SessionMemory { summary, facts, through_seq, author }` — **done** (v32) | no | Wave 11 (memory) |
 
 All are additive; `derive_surface` ignores unknown non-surface kinds. Give
 `EventKind` a `#[serde(other)] Unknown` variant before Wave 2 so a log written
@@ -2185,6 +2187,7 @@ by a newer backend still loads on an older one.
 | 10 — shipped as v27 | — | `Event::WorkflowRunChanged` (`WorkflowRunDump`, `RunPhaseDump`, `RunMemberDump`); `SessionDump.runs`. Log-only: `EventKind::WorkflowRun`, `RunState` |
 | 11 — shipped as v28 | — | `UserImage += sha, bytes`, `data_base64` now empty in every dump. Log-only: the same shape, plus `sessions/<id>/attachments/` beside the log |
 | 12 — shipped as v29 | `SetWorkingDir { path }`, `RateMessage { session_id, seq, rating, note }` | `Event::SchedulesChanged` (`ScheduleDump`); `SessionDump.schedules`; `SessionMeta.scheduled`; `MessageDump.feedback`; `JobDump.started_at`; `TurnUsage.last_seq`; `LlmOptions.retry_always`. Log-only: `EventKind::Schedule`, `EventKind::MessageFeedback`, `TurnSource::Schedule` |
+| memory — shipped as v32 | `ListMemories`, `SaveMemory { id, text, project }`, `DeleteMemory { id }`, `SetSessionMemory { session_id, summary, facts }`, `RefreshSessionMemory { session_id }` | `Response::Memories` (`MemoryDump`); `Event::SessionMemoryChanged` (`SessionMemoryDump`), `Event::SessionMemoryUpdate`, `Event::MemoriesChanged`; `SessionDump.memory`. Log-only: `EventKind::SessionMemory`, `ContextSource::SessionMemory`, `ContextSource::LongTermMemory` |
 
 Every bump: `.\run.ps1 build --workspace`, restart the GUI, run
 `.\run.ps1 run -p frontend --bin smoke`, and update CLAUDE.md's version note.

@@ -288,6 +288,31 @@ pub async fn handle(
                 Err(message) => Response::Error { message },
             }
         }
+        // Memory (v32). Long-term mutations answer with the whole store and
+        // push it too, so Settings and any other open surface agree.
+        Request::ListMemories => Response::Memories { memories: chat.memory_dumps() },
+        Request::SaveMemory { id, text, project } => {
+            match chat.save_memory(id.as_deref(), &text, project.as_deref()) {
+                Ok(()) => Response::Memories { memories: chat.memory_dumps() },
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::DeleteMemory { id } => match chat.delete_memory(&id) {
+            Ok(()) => Response::Memories { memories: chat.memory_dumps() },
+            Err(message) => Response::Error { message },
+        },
+        Request::SetSessionMemory { session_id, summary, facts } => {
+            match chat.set_session_memory(session_id, &summary, &facts).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::RefreshSessionMemory { session_id } => {
+            match crate::memory_keeper::request(session_id).await {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
         Request::SetTicketStatus { ticket_id, status } => {
             // Only the states a person decides. `investigating` and
             // `diagnosed` belong to the investigator.

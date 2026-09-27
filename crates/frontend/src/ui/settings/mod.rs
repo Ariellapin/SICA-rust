@@ -13,6 +13,7 @@ mod general;
 mod llm;
 mod agents;
 mod integrations;
+mod memory;
 mod skills;
 mod tickets;
 
@@ -27,11 +28,12 @@ use crate::ui::kit::{self, Elevation, Level, Weight};
 const NAV_W: f32 = 188.0;
 const PANEL_W: f32 = 800.0;
 
-const SECTIONS: [(SettingsTab, &str, Icon); 6] = [
+const SECTIONS: [(SettingsTab, &str, Icon); 7] = [
     (SettingsTab::General, "General", Icon::Gear),
     (SettingsTab::Models, "Models", Icon::Model),
     (SettingsTab::Skills, "Skills", Icon::Sparkle),
     (SettingsTab::Agents, "Agents", Icon::Think),
+    (SettingsTab::Memory, "Memory", Icon::Memory),
     (SettingsTab::Integrations, "Integrations", Icon::Shield),
     (SettingsTab::Diagnostics, "Diagnostics", Icon::Job),
 ];
@@ -118,6 +120,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                                             SettingsTab::Models => llm::draw(app, ui),
                                             SettingsTab::Skills => skills::draw(app, ui),
                                             SettingsTab::Agents => agents::draw(app, ui),
+                                            SettingsTab::Memory => memory::draw(app, ui),
                                             SettingsTab::Integrations => integrations::draw(app, ui),
                                             SettingsTab::Diagnostics => diagnostics::draw(app, ui),
                                         });

@@ -104,6 +104,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     }
 
     settings::draw(app, ctx);
+    // The session-memory panel is a modal of its own; it opens from the
+    // header, never at the same time as Settings.
+    if !app.settings_open {
+        chat::memory_panel(app, ctx);
+    }
     // Over the transcript, under the first-run dialog.
     chat::lightbox(app, ctx);
     // Last, so it sits over everything the first run has no use for yet.

@@ -22,9 +22,9 @@ Seven crates, dependency direction strictly downward:
 | `protocol` | Wire types only (`Frame`, `Request`, `Response`, `Event`) + `PROTOCOL_VERSION`. No I/O, no dep on `sica-core`. Shared by both binaries — changes here force rebuilding both. |
 | `sica-core` | Shared utilities: `paths` (every on-disk surface), `event` (the append-only session log + `derive_surface` fold), `project` (pure folds over that log — session stats, the turn outline, the last token reading), `snapshot` (tokenising a log so two runs of it can be diffed), `retain` (UTF-8-safe head/tail windows + the one omission sentence every cut uses), `message`/`session` (chat message types; `Session` survives only for legacy TOML migration), `build_id`, `theme`. |
 | `llm` | HTTP client for OpenAI-compatible `/v1/chat/completions` (llama.cpp, vLLM, OpenAI, Anthropic-compat), SSE streaming + `<think>` splitting, connection state machine, token counting, `replay` (serve completions from a recorded log instead of a socket) and `mock` (a scripted fault server, test-only). |
-| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds), `web` (`web-fetch`/`web-search`), `mcp` (MCP servers bridged as skills), `script` (the shared Rhai sandbox: limits, output capture, abort wording, Rhai↔JSON), `ptc` (the `run-code` runtime behind programmatic tool calling), `workflow` (model-written orchestration scripts, opt-in on `skills/workflow.md`). |
+| `agents` | Agent runtime: `turn` (one streaming request), `ToolSubAgent` (one tool call), `SkillRegistry`, built-in skills, markdown skills, `memory.md`, `prompt` (composed ordered system prompt + runtime-context snapshot + strict `{{var}}` interpolation), `instructions` (`AGENTS.md`/`CLAUDE.md` loader with a 64 KiB budget), `meter` (usage-anchored token meter), context `trim`/`compact` (prefix-preserving 8-section compaction + the tool-result pruner), tool-call parser, `guard` (repeat-tool reminder), `invoke` (`/name` expansion), `proc` (Windows Job Objects for shells), `spill`, `runner` (one delegated LLM conversation + structured output), `delegate` (`subagent`/`subagent-fork`), `ralph` (fresh-agent rounds), `web` (`web-fetch`/`web-search`), `mcp` (MCP servers bridged as skills), `script` (the shared Rhai sandbox: limits, output capture, abort wording, Rhai↔JSON), `ptc` (the `run-code` runtime behind programmatic tool calling), `workflow` (model-written orchestration scripts, opt-in on `skills/workflow.md`), `long_term` (the long-term memory store and `memory.toml`), `session_memory` (the session memory's caps, snapshot, and the keeper's prompt and parser), `remember` (the `remember` / `recall` / `forget` tools). |
 | `idealist` | Files every reported failure as an improvement ticket in `idealist_workspace/tickets/` — one ticket per fingerprint (origin, module, normalised message), so repeats bump a count and a resolved ticket that fires again reopens. Keeps the per-session ledger the end-of-session investigator reads, and `lessons.md`. Never calls an LLM and never edits source. |
-| `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `hooks.rs` runs the user's own shell hooks around it; `incident.rs` is the one path every failure takes to the idealist (session log `TicketOpened`, ledger, bus) plus the panic hook; `investigate.rs` is the end-of-session investigator; `invariants.rs` holds the runtime invariant companions (`--invariants`); `be_core/` holds the legacy demo state. |
+| `backend` | Long-lived binary. `main.rs` parses `--ipc/--parent-pid/--log-level` and wires registry → idealist → `ChatHub`; `dispatcher.rs` routes requests; `chat.rs` owns the agent loop; `hooks.rs` runs the user's own shell hooks around it; `incident.rs` is the one path every failure takes to the idealist (session log `TicketOpened`, ledger, bus) plus the panic hook; `investigate.rs` is the end-of-session investigator; `memory_keeper.rs` keeps each session's memory up to date while the model is idle; `invariants.rs` holds the runtime invariant companions (`--invariants`); `be_core/` holds the legacy demo state. |
 | `frontend` | egui GUI. `supervisor.rs` owns the BE child + IPC + watcher + cargo build; `app.rs` holds all UI state and drains `UiEvent`s; `ui/` holds the surfaces — `kit` (the design-system primitives), `icons`, `sidebar`, `chat/` (transcript, tool rows, composer, dock, control takeovers, `trajectory` (the event-log ledger), `details` (the tool / event inspector)), `settings/` (a modal). Styling is the dsh port described in [docs/harness-ui-guide.md](harness-ui-guide.md); waves UI-1…UI-5 are in. |
 
 ## Wire protocol
@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 31) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 32) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -252,6 +252,30 @@ sica-rust checkout whose fix prompt the FE puts in the composer, unsent.
 by itself, and `TicketSummary.fix_session` names it. See
 [notes/2026-09-26-idealist-followups.md](notes/2026-09-26-idealist-followups.md).
 
+v32 (memory) adds the agent's two memories. **Session memory** is a running
+summary plus up to 15 key facts, stored in the session's own log as the
+non-surface `EventKind::SessionMemory` (latest row wins,
+`sica_core::project::session_memory`). `backend::memory_keeper` writes it
+while the model is idle: a short timer after a session goes idle, one
+completion over the conversation since the memory's `through_seq`, never
+while any turn runs, and a compare-and-set against the row it started from.
+After a compaction folds history, `ContextSource::SessionMemory` puts it
+back at the tail. **Long-term memory** is a store of single facts, global
+or tied to one project folder (`agents::long_term`,
+`memories/long-term.json`). It reaches a session at turn start as a
+`ContextSource::LongTermMemory` snapshot, reconciled like the `AGENTS.md`
+one: a new row only when the store changed. Three harness-control tools
+serve both: `remember '<fact>' [project|global|session]`, `recall '<query>'`
+(the store plus every other session's memory, framed untrusted) and
+`forget '<id>'` (`agents::remember`, seeded on as `skills/memory.md`). The
+wire gains `ListMemories`, `SaveMemory`, `DeleteMemory` (all answered by
+`Response::Memories`), `SetSessionMemory`, `RefreshSessionMemory`,
+`Event::SessionMemoryChanged`, `Event::SessionMemoryUpdate`,
+`Event::MemoriesChanged`, and `SessionDump.memory`. The frontend draws the
+session memory in the header's Memory panel and the store in
+Settings › Memory. See
+[notes/2026-09-27-session-and-long-term-memory.md](notes/2026-09-27-session-and-long-term-memory.md).
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
@@ -271,6 +295,9 @@ by itself, and `TicketSummary.fix_session` names it. See
 | `idealist_workspace/tickets/<id>.md` | `idealist::ticket` | One improvement ticket per kind of failure: TOML front-matter between `+++` fences (status, origin, occurrences, sessions, diagnosis), then markdown — the message, the heuristic analysis, and one `## Investigation` section per investigator run. The id is the fingerprint's first 12 hex characters. `.gitignore`d churn. Older `Improvement-*.md` files are left as they are. |
 | `idealist_workspace/sessions/<id>.toml` | `idealist::ledger` | Which tickets a session raised, where (`seq` of the `TicketOpened` row), how often, whether each tool failure was recovered from in its turn, and whether the investigator has looked. The startup sweep queues every ledger with uninvestigated entries. |
 | `idealist_workspace/lessons.md` | `idealist::lessons` | One line per diagnosed `model_mistake` / `environment` ticket. Added to the system prompt only with `lessons_in_prompt = true`; delete a line to retire it. |
+| `memories/long-term.json` | `agents::long_term` | Long-term memory (v32): `{ version, memories }`, one fact per entry (≤ 400 chars), `project` absent for a global one. Written whole through `atomic_write` under one process-wide lock; a document that will not parse is moved aside as `long-term.json.corrupt-<ts>`, one from a newer build is read but never rewritten. At most 500 entries — past that the oldest `auto` entry goes, never one a person or the model wrote. `.gitignore`d. Not to be confused with `memory.md`, which is the person's instruction brief. |
+| `sica-settings/memory.toml` | `agents::long_term::MemoryConfig` | Optional: `session_summary` (true), `idle_seconds` (45), `min_new_chars` (400), `auto_remember` (true), `inject` (true), `prompt_items` (40), `prompt_chars` (4000), `timeout_secs` (180). Re-read per use, so Settings › Memory applies without a restart; a malformed file is a `LogLine` at startup and the defaults. |
+| `skills/memory.md` | `agents::remember` | Seeded **on** (unlike `schedule.md.off`): its presence registers `remember` / `recall` / `forget` at BE start. Renaming it to `.md.off` removes the tools; remembered facts still reach the prompt unless `inject = false`. |
 | `idealist_workspace/crash-<ts>.md` | `backend::incident` | Written synchronously by the panic hook, before anything else can fail. |
 | `sica-settings/idealist.toml` | `idealist::config` | Optional: `investigate`, `idle_minutes` (10), `max_per_session` (5), `max_hops` (12), `timeout_secs` (300), `lessons_in_prompt` (false), `auto_fix_session` (false). Absent means those defaults; malformed is a `LogLine` and the defaults. Read at BE start. |
 | `evals/*.toml` | `agents::model_eval` | One prompt suite per file; `default.toml` seeded once at BE start, user-owned after. Read per run, so edits need no restart. |

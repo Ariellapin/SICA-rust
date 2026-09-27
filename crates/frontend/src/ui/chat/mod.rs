@@ -14,6 +14,7 @@ mod control;
 pub mod details;
 mod dock;
 mod md_blocks;
+mod memory;
 mod messages;
 mod meter;
 mod slash_menu;
@@ -21,6 +22,7 @@ mod tool_row;
 pub mod trajectory;
 mod user_text;
 
+pub use memory::panel as memory_panel;
 pub use messages::lightbox;
 
 use egui::{Align, Align2, Layout, Rect, Sense, Vec2};
@@ -156,6 +158,9 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Rightmost and always there, so the actions that come
+                    // and go (jobs, reminders) never shift it.
+                    memory::action(app, ui);
                     jobs_action(app, ui);
                     schedule_action(app, ui);
                 });

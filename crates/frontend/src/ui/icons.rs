@@ -66,6 +66,9 @@ pub enum Icon {
     /// Message feedback (harness §3.7).
     ThumbUp,
     ThumbDown,
+    /// Memory (v32): the header's session-memory panel, Settings › Memory
+    /// and the memory tools' rows.
+    Memory,
 }
 
 impl Icon {
@@ -80,6 +83,7 @@ impl Icon {
             "skill-creator" | "model-eval" => Icon::Code,
             "todo-write" => Icon::Todo,
             "create-goal" | "get-goal" | "update-goal" => Icon::Goal,
+            "remember" | "recall" | "forget" => Icon::Memory,
             _ => Icon::Sparkle,
         }
     }
@@ -273,6 +277,12 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 (0.30, 0.50), (0.48, 0.84), (0.56, 0.80), (0.52, 0.58), (0.80, 0.58),
                 (0.86, 0.50), (0.78, 0.18), (0.30, 0.18),
             ]);
+        }
+        Icon::Memory => {
+            // A bookmark over two lines of text: something kept to return to.
+            poly(&[(0.26, 0.12), (0.74, 0.12), (0.74, 0.88), (0.50, 0.70), (0.26, 0.88), (0.26, 0.12)]);
+            line((0.38, 0.32), (0.62, 0.32));
+            line((0.38, 0.46), (0.56, 0.46));
         }
         Icon::Inject => {
             line((0.50, 0.14), (0.50, 0.58));

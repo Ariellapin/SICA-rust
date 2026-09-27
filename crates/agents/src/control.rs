@@ -47,6 +47,11 @@ pub const CHILD_EXCLUDED: &[&str] = &[
     crate::schedule::SCHEDULE_CREATE_NAME,
     crate::schedule::SCHEDULE_LIST_NAME,
     crate::schedule::SCHEDULE_DELETE_NAME,
+    // A child's memory is its parent's business: what it learned reaches
+    // the parent in its report, and the parent decides what to keep.
+    crate::remember::REMEMBER_NAME,
+    crate::remember::RECALL_NAME,
+    crate::remember::FORGET_NAME,
 ];
 
 /// User-editable plan-mode policy, seeded once into `skills/` (never
@@ -98,6 +103,16 @@ pub fn is_control_skill(name: &str) -> bool {
         || name == EXIT_PLAN_MODE_NAME
         || crate::goal::is_goal_skill(name)
         || is_schedule_skill(name)
+        || crate::remember::is_memory_skill(name)
+}
+
+/// Whether a harness control's outcome is instructions (`true`) or data
+/// the model should not take orders from (`false`). Every control answers
+/// in the harness's own words except `recall`, which hands back text that
+/// earlier sessions produced — summaries of conversations that read files
+/// and web pages — so it is framed like any other fetched data.
+pub fn control_trusted(name: &str) -> bool {
+    name != crate::remember::RECALL_NAME
 }
 
 /// The reminder tools (guide §12.8) are harness controls too: they mutate

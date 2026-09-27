@@ -13,6 +13,7 @@ pub mod guard;
 pub mod instructions;
 pub mod invoke;
 pub mod jobs;
+pub mod long_term;
 pub mod mcp;
 pub mod md_skill;
 pub mod memory;
@@ -26,9 +27,11 @@ pub mod preset;
 pub mod prompt;
 pub mod ralph;
 pub mod registry;
+pub mod remember;
 pub mod runner;
 pub mod schedule;
 pub mod script;
+pub mod session_memory;
 pub mod skill;
 pub mod skill_creator;
 pub mod spill;
@@ -54,6 +57,7 @@ pub use parse_tool_call::{
     extract as extract_tool_call, extract_known as extract_tool_call_known, ToolCall,
 };
 pub use registry::SkillRegistry;
+pub use remember::{Forget, Recall, Remember};
 pub use schedule::{ScheduleCreate, ScheduleDelete, ScheduleList};
 pub use skill::{Concurrency, Skill, SkillContext, SkillOutcome};
 pub use skill_creator::SkillCreator;

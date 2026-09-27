@@ -140,11 +140,16 @@ pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<S
     let text = unwrap_xml_call(text);
     let text = text.as_ref();
     if text.contains("```tool_call") {
-        return Some(
-            "a ```tool_call fence whose body the parser could not read \
-             (malformed JSON, or missing `skill`/`args` keys)"
-                .into(),
-        );
+        // The reason reaches the model in the syntax correction, so it names
+        // the defect precisely enough to fix rather than restating the
+        // contract the model already tried to follow.
+        let why = match json_fence_body(text) {
+            Some(body) => parse_json_body(body)
+                .err()
+                .unwrap_or_else(|| "whose body could not be read".into()),
+            None => "with no closing ``` line after its JSON".into(),
+        };
+        return Some(format!("a ```tool_call block {why}"));
     }
     for line in text.lines() {
         let trimmed = strip_fence_indent(line);
@@ -157,14 +162,19 @@ pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<S
         if !rest.contains('\'') && !rest.contains('"') && !rest.contains('>') {
             continue;
         }
-        if split_on_expectation(rest.trim_start()).is_none() {
-            // Either there is genuinely no ` > ` clause, or an unclosed quote
-            // swallowed it — indistinguishable from here, and the fix the
-            // model needs is the same either way.
-            return Some(format!(
-                "a `{name}` line with no ` > <expectation>` part \
-                 (or an unclosed quote before it)"
-            ));
+        let rest = rest.trim_start();
+        if split_on_expectation(rest).is_none() {
+            // A quote still open at the end of the line swallowed any ` > `
+            // after it. Shell commands hit this constantly — a PowerShell
+            // `' '` inside a '…' argument closes it early.
+            if quote_open_at_eol(rest) {
+                return Some(format!(
+                    "a `{name}` line whose quoted argument is never closed \
+                     (a quote of the same kind inside an argument must be \
+                     escaped, as `\\'` inside '…')"
+                ));
+            }
+            return Some(format!("a `{name}` line with no ` > <expectation>` part"));
         }
         return Some(format!(
             "a `{name}` line whose arguments are not correctly quoted"
@@ -191,6 +201,12 @@ pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<S
 /// as JSON. Returns `None` if no such fence exists, the JSON is malformed,
 /// or the required `skill` / `args` keys are missing.
 fn extract_json_fence(text: &str) -> Option<ToolCall> {
+    parse_json_body(json_fence_body(text)?).ok()
+}
+
+/// The body of the first ```tool_call``` fence in `text`, or `None` when
+/// there is no such fence or it is never closed.
+fn json_fence_body(text: &str) -> Option<&str> {
     let mut rest = text;
     while let Some(open_idx) = rest.find("```") {
         let after_ticks = &rest[open_idx + 3..];
@@ -206,39 +222,50 @@ fn extract_json_fence(text: &str) -> Option<ToolCall> {
             continue;
         }
         let close_idx = after_lang.find("```")?;
-        let body = &after_lang[..close_idx];
-        return parse_json_body(body);
+        return Some(&after_lang[..close_idx]);
     }
     None
 }
 
-fn parse_json_body(body: &str) -> Option<ToolCall> {
-    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    let obj = value.as_object()?;
+/// Read a tool-call JSON body. The error completes the sentence
+/// "a ```tool_call block …" in [`rejected_attempt`].
+fn parse_json_body(body: &str) -> Result<ToolCall, String> {
+    let value = parse_json_lenient(body.trim())?;
+    let obj = value.as_object().ok_or("whose JSON is not an object")?;
     // `name` / `arguments` are the OpenAI and Hermes spellings of the same
     // pair; a model that wraps the call in `<tool_call>` uses those.
     let skill = obj
         .get("skill")
-        .or_else(|| obj.get("name"))?
-        .as_str()?
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+        .ok_or("whose JSON has no `skill` name")?
         .to_string();
     if !is_valid_skill_name(&skill) {
-        return None;
+        return Err(format!("whose `skill` ({skill:?}) is not a skill name"));
     }
-    let args = obj
+    let mut args = obj
         .get("args")
         .or_else(|| obj.get("arguments"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let expectation = obj
+    let mut expectation = obj
         .get("expectation")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    // Populate `raw_args` from the args object's *values* (in insertion
-    // order — serde_json's Map preserves it) so the UI's `args_preview`
-    // chip still shows something useful even though the dispatcher will
-    // route via `args_json` instead.
+    // The model that loses count of its braces (see `parse_json_lenient`)
+    // has written the expectation inside `args`. The contract reserves that
+    // key for the call itself, so it goes back to the top level.
+    if expectation.is_empty() {
+        if let Some(serde_json::Value::String(inner)) =
+            args.as_object_mut().and_then(|m| m.remove("expectation"))
+        {
+            expectation = inner;
+        }
+    }
+    // Populate `raw_args` from the args object's *values* so the UI's
+    // `args_preview` chip still shows something useful even though the
+    // dispatcher will route via `args_json` instead.
     let raw_args = args
         .as_object()
         .map(|m| {
@@ -250,12 +277,116 @@ fn parse_json_body(body: &str) -> Option<ToolCall> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(ToolCall {
+    Ok(ToolCall {
         skill,
         raw_args,
         expectation,
         args_json: Some(args),
     })
+}
+
+/// Parse tool-call JSON, forgiving the two slips a model makes writing it
+/// around a script: a raw line break inside a string value, and stopping
+/// short of the closing brackets. A command full of `{ … }` blocks makes
+/// the model lose count of its own braces — `sessions/3` holds five
+/// `run-pwsh` calls in a row that were each exactly one `}` short, and the
+/// turn died on them. Both repairs are unambiguous; a string that is never
+/// closed is left open, since where it should end is anyone's guess.
+///
+/// The error is the reason sentence for [`rejected_attempt`], and names the
+/// first defect the repairs leave — not a slip they would have forgiven,
+/// which would spend the model's one retry on the wrong fix.
+fn parse_json_lenient(body: &str) -> Result<serde_json::Value, String> {
+    let strict = match serde_json::from_str(body) {
+        Ok(value) => return Ok(value),
+        Err(e) => e,
+    };
+    let fixed = repair_json(body);
+    if fixed == body {
+        return Err(json_error_reason(body, &strict));
+    }
+    serde_json::from_str(&fixed).map_err(|e| json_error_reason(&fixed, &e))
+}
+
+/// `body` with raw control characters inside strings escaped and, when
+/// every string is closed and every closing bracket matches its opener, the
+/// brackets still open at its end closed. A mismatched closer means the
+/// structure is wrong rather than short, so nothing is appended to it.
+fn repair_json(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut open: Vec<char> = Vec::new();
+    let mut mismatched = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in body.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            } else if c < ' ' {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    other => out.push_str(&format!("\\u{:04x}", other as u32)),
+                }
+                continue;
+            }
+        } else {
+            match c {
+                '"' => in_string = true,
+                '{' => open.push('}'),
+                '[' => open.push(']'),
+                '}' | ']' => mismatched |= open.pop() != Some(c),
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    if !in_string && !mismatched {
+        out.extend(open.into_iter().rev());
+    }
+    out
+}
+
+/// Name a JSON syntax error the way a model can act on: serde's message and
+/// position, the text just before it (a column number alone is useless in a
+/// one-line body of a thousand characters), and the escaping rule that the
+/// shell commands and Windows paths inside tool calls break most often.
+fn json_error_reason(body: &str, e: &serde_json::Error) -> String {
+    let before = text_before(body, e.line(), e.column());
+    let at = if before.is_empty() {
+        String::new()
+    } else {
+        format!(", right after `{before}`")
+    };
+    format!(
+        "whose JSON does not parse: {e}{at} (inside a JSON string write every \
+         `\"` as `\\\"` and every `\\` as `\\\\`)"
+    )
+}
+
+/// Up to 40 bytes of `body`'s line `line` (1-based) ending at byte column
+/// `column` — where serde found the error.
+fn text_before(body: &str, line: usize, column: usize) -> String {
+    let line_start: usize = body
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum();
+    let mut end = (line_start + column).min(body.len());
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut start = end.saturating_sub(40).max(line_start).min(end);
+    while !body.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = if start > line_start { "…" } else { "" };
+    format!("{cut}{}", &body[start..end])
 }
 
 fn is_valid_skill_name(s: &str) -> bool {
@@ -378,7 +509,7 @@ fn extract_json_envelope(text: &str) -> Option<ToolCall> {
     if end <= start {
         return None;
     }
-    parse_json_body(&text[start..=end])
+    parse_json_body(&text[start..=end]).ok()
 }
 
 fn parse_line(line: &str) -> Option<ToolCall> {
@@ -864,12 +995,23 @@ mod tests {
     #[test]
     fn rejected_attempt_flags_unbalanced_quotes() {
         let known = |n: &str| n == "run-cli";
-        // The unclosed quote swallows the ` > ` separator, so this lands in
-        // the same bucket as a missing expectation — deliberately, since the
-        // correction the model needs is identical.
+        // The unclosed quote swallows the ` > ` separator; the reason names
+        // the quote, since adding an expectation would not fix the call.
         let reason = rejected_attempt("run-cli 'cargo test > report the failures", known).unwrap();
         assert!(reason.contains("run-cli"), "{reason}");
-        assert!(reason.contains("quote"), "{reason}");
+        assert!(reason.contains("never closed"), "{reason}");
+    }
+
+    /// `sessions/85`: a PowerShell `-join " '` closed the '…' argument early,
+    /// and the quote after it ran to the end of the line.
+    #[test]
+    fn rejected_attempt_flags_a_quote_a_shell_command_left_open() {
+        let known = |n: &str| n == "run-pwsh";
+        let s = "run-pwsh '$h = ($b | % { $_.ToString(\"x2\") }) -join \" '; $h' > the hex header";
+        assert!(extract_known(s, known).is_none());
+        let reason = rejected_attempt(s, known).unwrap();
+        assert!(reason.contains("never closed"), "{reason}");
+        assert!(reason.contains(r"\'"), "{reason}");
     }
 
     #[test]
@@ -877,6 +1019,96 @@ mod tests {
         assert!(looks_like_attempt("```tool_call\n{}\n```"));
         assert!(looks_like_attempt(r#"{ "skill": "run-cli", "args": {} }"#));
         assert!(!looks_like_attempt("no tools here"));
+    }
+
+    /// `sessions/3`: five `run-pwsh` calls in a row whose PowerShell script
+    /// blocks made the model lose count of its braces. Each fence is exactly
+    /// one `}` short, with the expectation left inside `args`; every one was
+    /// rejected, and the turn ended on the second.
+    #[test]
+    fn json_fence_one_brace_short_is_repaired() {
+        let body = r#"{"skill": "run-pwsh", "args": {"command": "$lines = Get-Content \"wk.txt\"; for ($i = 0; $i -lt [Math]::Min(124, $lines.Count); $i++) { $l = $lines[$i]; $f = 0; if ($l -match \"<random: (.*?)>\") { $p = $Matches[1] -split \"\\|\\|\"; $f = @($p | Where-Object { $_ -match \"front\" }).Count }; Write-Output (\"{0}|{1}\" -f ($i+1), $f) }", "expectation": "front-pose count for each line"}"#;
+        let tc = extract(&format!("Let me check.\n\n```tool_call\n{body}\n```")).unwrap();
+        assert_eq!(tc.skill, "run-pwsh");
+        assert_eq!(tc.expectation, "front-pose count for each line");
+        let args = tc.args_json.unwrap();
+        assert_eq!(args.as_object().unwrap().len(), 1, "only the command stays in args: {args}");
+        let command = args["command"].as_str().unwrap();
+        assert!(command.starts_with(r#"$lines = Get-Content "wk.txt";"#), "{command}");
+        assert!(command.contains(r#"-split "\|\|""#), "{command}");
+        assert!(command.ends_with("$f) }"), "{command}");
+    }
+
+    /// The same slip inside a Hermes envelope is read the same way.
+    #[test]
+    fn json_envelope_one_brace_short_is_repaired() {
+        let s = "<tool_call>\n{\"name\": \"read-file\", \"arguments\": {\"path\": \"a.md\"}\n</tool_call>";
+        let tc = extract_known(s, |n| n == "read-file").unwrap();
+        assert_eq!(tc.args_json.unwrap()["path"], "a.md");
+    }
+
+    /// Balanced braces, expectation still inside `args`: it goes back to the
+    /// top level instead of reaching the skill as an argument nobody declared.
+    #[test]
+    fn json_fence_hoists_expectation_out_of_args() {
+        let s = "```tool_call\n{\"skill\": \"read-file\", \"args\": {\"path\": \"a.md\", \"expectation\": \"the title\"}}\n```";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.expectation, "the title");
+        assert_eq!(tc.args_json.unwrap(), serde_json::json!({ "path": "a.md" }));
+        assert_eq!(tc.raw_args, vec!["a.md".to_string()]);
+    }
+
+    #[test]
+    fn json_fence_accepts_raw_line_breaks_in_a_string() {
+        let s = "```tool_call\n{\"skill\": \"run-pwsh\", \"args\": {\"command\": \"$a = 1\n$b = 2\n\t$a + $b\"}, \"expectation\": \"the sum\"}\n```";
+        let tc = extract(s).unwrap();
+        assert_eq!(tc.args_json.unwrap()["command"], "$a = 1\n$b = 2\n\t$a + $b");
+    }
+
+    /// Where an unterminated string should end is a guess, and a closer that
+    /// does not match its opener is a wrong structure rather than a short
+    /// one — neither is repaired into a call that runs something made up.
+    #[test]
+    fn json_fence_repair_does_not_guess() {
+        let open_string = "```tool_call\n{\"skill\": \"run-pwsh\", \"args\": {\"command\": \"Get-ChildItem\n```";
+        assert!(extract(open_string).is_none());
+        let why = rejected_attempt(open_string, |_| true).unwrap();
+        assert!(why.contains("EOF while parsing a string"), "{why}");
+
+        let mismatched = "```tool_call\n{\"skill\": \"run-cli\", \"args\": {\"command\": \"dir\"]\n```";
+        assert!(extract(mismatched).is_none());
+    }
+
+    /// The reason quotes serde's error and the text just before it, so the
+    /// model sees which backslash broke the JSON — a Windows path, usually.
+    #[test]
+    fn rejected_fence_names_the_json_error_and_where() {
+        let s = "```tool_call\n{\"skill\": \"read-file\", \"args\": {\"path\": \"C:\\Users\\me\\a.txt\"}}\n```";
+        assert!(extract(s).is_none());
+        let why = rejected_attempt(s, |_| true).unwrap();
+        assert!(why.starts_with("a ```tool_call block whose JSON does not parse"), "{why}");
+        assert!(why.contains("invalid escape"), "{why}");
+        assert!(why.contains(r#""C:\U`"#), "the excerpt ends at the bad escape: {why}");
+        assert!(why.contains(r"every `\` as `\\`"), "{why}");
+    }
+
+    /// A body the repairs cannot finish is reported by the defect they
+    /// leave, not by a slip they forgave: the raw line break is fine, the
+    /// unescaped quote is what the model must fix on its one retry.
+    #[test]
+    fn rejected_fence_reports_the_defect_the_repair_leaves() {
+        let s = "```tool_call\n{\"skill\": \"run-pwsh\", \"args\": {\"command\": \"$a = 1\nGet-Content \"x.txt\"\"}}\n```";
+        assert!(extract(s).is_none());
+        let why = rejected_attempt(s, |_| true).unwrap();
+        assert!(!why.contains("control character"), "{why}");
+        assert!(why.contains("expected `,` or `}`"), "{why}");
+        assert!(why.contains(r#"Get-Content "x`"#), "{why}");
+    }
+
+    #[test]
+    fn rejected_fence_without_a_closing_line_says_so() {
+        let why = rejected_attempt("```tool_call\n{\"skill\": \"glob\", \"args\": {}}", |_| true).unwrap();
+        assert!(why.contains("no closing ```"), "{why}");
     }
 
     #[test]

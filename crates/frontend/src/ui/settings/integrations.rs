@@ -363,11 +363,12 @@ fn web_search(app: &mut App, ui: &mut egui::Ui) {
 // Opt-in skills
 // ---------------------------------------------------------------------------
 
-/// The two skills that are off until a doc turns them on. Both spend many
-/// LLM conversations per call, and `workflow` also adds its scripting
-/// reference to every system prompt while it is on — so the switch is the
-/// presence of the file, and turning it off renames rather than deletes.
-const OPTIONAL: [(&str, &str); 3] = [
+/// The skills a doc switches on. The first three are off until one does:
+/// they spend many LLM conversations per call, or catalogue tokens on every
+/// request. `memory` is the other way round — seeded on, because remembering
+/// is the point — but the switch is the same: the presence of the file, and
+/// turning it off renames rather than deletes.
+const OPTIONAL: [(&str, &str); 4] = [
     (
         "workflow",
         "Model-written orchestration scripts (harness §12.5). One call can \
@@ -385,6 +386,12 @@ const OPTIONAL: [(&str, &str); 3] = [
          schedule-create / -list / -delete. Three catalogue entries cost \
          every request ~250 tokens while on; reminders already in a log \
          are delivered either way.",
+    ),
+    (
+        "memory",
+        "The model's memory tools: remember / recall / forget. On by \
+         default. Turning them off keeps what is already remembered in the \
+         prompt — Settings › Memory has that switch.",
     ),
 ];
 
