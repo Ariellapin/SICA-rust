@@ -18,6 +18,10 @@ use crate::trigger_bus::TriggerOrigin;
 
 static WRITE: Mutex<()> = Mutex::new(());
 
+/// Turn ids one entry remembers. Enough for the invariant, which only ever
+/// asks about the turn that just ended.
+pub const TURNS_KEPT: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub ticket_id: String,
@@ -40,6 +44,10 @@ pub struct LedgerEntry {
     pub unrecovered_turns: u32,
     #[serde(default)]
     pub investigated:      bool,
+    /// Turns it fired in, newest last, capped at [`TURNS_KEPT`]. What the
+    /// `error-turn-ticketed` invariant checks a `TurnEnd { error }` against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns:             Vec<u64>,
 }
 
 impl LedgerEntry {
@@ -144,7 +152,17 @@ impl Ledger {
         origin: TriggerOrigin,
         skill: Option<&str>,
         seq: Option<u64>,
+        turn_id: Option<u64>,
     ) -> Result<Recorded> {
+        let note_turn = |turns: &mut Vec<u64>| {
+            if let Some(t) = turn_id {
+                if !turns.contains(&t) {
+                    turns.push(t);
+                    let over = turns.len().saturating_sub(TURNS_KEPT);
+                    turns.drain(..over);
+                }
+            }
+        };
         self.update(session_id, |l| {
             if let Some(e) = l.entries.iter_mut().find(|e| e.ticket_id == ticket_id) {
                 e.count = e.count.saturating_add(1);
@@ -152,8 +170,11 @@ impl Ledger {
                     e.last_seq = seq;
                 }
                 e.investigated = false;
+                note_turn(&mut e.turns);
                 return Recorded::Repeat;
             }
+            let mut turns = Vec::new();
+            note_turn(&mut turns);
             l.entries.push(LedgerEntry {
                 ticket_id: ticket_id.to_string(),
                 origin,
@@ -164,6 +185,7 @@ impl Ledger {
                 recovered_turns: 0,
                 unrecovered_turns: 0,
                 investigated: false,
+                turns,
             });
             Recorded::First
         })
@@ -262,8 +284,8 @@ mod tests {
     fn first_then_repeat() {
         let l = ledger("ledger-first");
         assert!(l.is_new(4, "abc"));
-        let r1 = l.record(4, "abc", TriggerOrigin::ToolCall, Some("glob"), Some(10)).unwrap();
-        let r2 = l.record(4, "abc", TriggerOrigin::ToolCall, Some("glob"), Some(15)).unwrap();
+        let r1 = l.record(4, "abc", TriggerOrigin::ToolCall, Some("glob"), Some(10), None).unwrap();
+        let r2 = l.record(4, "abc", TriggerOrigin::ToolCall, Some("glob"), Some(15), None).unwrap();
         assert_eq!((r1, r2), (Recorded::First, Recorded::Repeat));
         let s = l.load(4);
         assert_eq!(s.entries.len(), 1);
@@ -271,6 +293,21 @@ mod tests {
         assert_eq!(s.entries[0].seq, Some(10));
         assert_eq!(s.entries[0].last_seq, Some(15));
         assert!(!l.is_new(4, "abc"));
+    }
+
+    #[test]
+    fn turns_are_remembered_once_and_capped() {
+        let l = ledger("ledger-turns");
+        for t in [3, 3, 4] {
+            l.record(2, "e", TriggerOrigin::TurnError, None, None, Some(t)).unwrap();
+        }
+        assert_eq!(l.load(2).entries[0].turns, vec![3, 4]);
+        for t in 10..(10 + TURNS_KEPT as u64 + 5) {
+            l.record(2, "e", TriggerOrigin::TurnError, None, None, Some(t)).unwrap();
+        }
+        let turns = l.load(2).entries[0].turns.clone();
+        assert_eq!(turns.len(), TURNS_KEPT);
+        assert_eq!(turns.last(), Some(&(10 + TURNS_KEPT as u64 + 4)));
     }
 
     #[test]
@@ -286,9 +323,9 @@ mod tests {
     #[test]
     fn apply_turn_marks_recovered_entries() {
         let l = ledger("ledger-recover");
-        l.record(1, "t1", TriggerOrigin::ToolCall, Some("read-file"), Some(5)).unwrap();
-        l.record(1, "t2", TriggerOrigin::ToolCall, Some("glob"), Some(6)).unwrap();
-        l.record(1, "t3", TriggerOrigin::TurnError, None, Some(7)).unwrap();
+        l.record(1, "t1", TriggerOrigin::ToolCall, Some("read-file"), Some(5), None).unwrap();
+        l.record(1, "t2", TriggerOrigin::ToolCall, Some("glob"), Some(6), None).unwrap();
+        l.record(1, "t3", TriggerOrigin::TurnError, None, Some(7), None).unwrap();
         let outcome = turn_recovery([("read-file", false), ("read-file", true), ("glob", false)]);
         l.apply_turn(1, 3, &outcome).unwrap();
         let s = l.load(1);
@@ -304,13 +341,13 @@ mod tests {
     #[test]
     fn investigated_sessions_leave_the_queue_until_a_repeat() {
         let l = ledger("ledger-pending");
-        l.record(9, "a", TriggerOrigin::TurnError, None, None).unwrap();
-        l.record(11, "b", TriggerOrigin::TurnError, None, None).unwrap();
+        l.record(9, "a", TriggerOrigin::TurnError, None, None, None).unwrap();
+        l.record(11, "b", TriggerOrigin::TurnError, None, None, None).unwrap();
         assert_eq!(l.pending_sessions(), vec![9, 11]);
         l.mark_investigated(9).unwrap();
         assert_eq!(l.pending_sessions(), vec![11]);
         assert!(l.load(9).investigated_at.is_some());
-        l.record(9, "a", TriggerOrigin::TurnError, None, None).unwrap();
+        l.record(9, "a", TriggerOrigin::TurnError, None, None, None).unwrap();
         assert_eq!(l.pending_sessions(), vec![9, 11]);
     }
 }

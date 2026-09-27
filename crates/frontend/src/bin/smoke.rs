@@ -332,6 +332,36 @@ async fn main() -> Result<()> {
     println!("smoke: workspace delete -> session {ws_session} still loads");
     let _ = std::fs::remove_dir_all(&ws_dir);
 
+    // Idealist tickets (v30/v31). The list answers whatever is on disk; the
+    // two requests about things that do not exist must be refused with a
+    // reason, not crash the dispatcher or hang.
+    let mut idealist_steps = vec![
+        (15, Request::ListTickets),
+        (16, Request::StartFixSession { ticket_id: "000000000000".into() }),
+        (17, Request::InvestigateSession { session_id: ws_session }),
+    ]
+    .into_iter();
+    while let Some((id, req)) = idealist_steps.next() {
+        writer.send(Frame::request(id, req).encode()?.into()).await?;
+        let resp = loop {
+            let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+            let frame = Frame::decode(&bytes)?;
+            match frame.payload {
+                Payload::Response(r) if frame.id == id => break r,
+                _ => {}
+            }
+        };
+        match (id, &resp) {
+            (15, Response::Tickets { tickets }) => {
+                println!("smoke: tickets -> {} on disk", tickets.len());
+            }
+            (16 | 17, Response::Error { message }) => {
+                println!("smoke: idealist request {id} refused -> {message}");
+            }
+            _ => anyhow::bail!("idealist request {id}: unexpected {resp:?}"),
+        }
+    }
+
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;
     let _ = writer.get_mut().shutdown().await;

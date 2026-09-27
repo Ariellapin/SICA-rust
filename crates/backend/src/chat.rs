@@ -1453,7 +1453,6 @@ impl ChatHub {
     /// the header is the proof of membership and a failed attach can only
     /// lose an ordering entry, never misfile a session.
     pub async fn create_session(&self, workspace_id: Option<u64>) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // A session always records where it works, workspace or not:
         // that is what stops it from reopening somewhere else after the
         // user points the app at another folder. Without a workspace the
@@ -1462,6 +1461,14 @@ impl ChatHub {
         let cwd = workspace_id
             .and_then(|w| self.workspaces.path_of(w))
             .unwrap_or_else(sica_core::paths::working_dir);
+        self.create_session_in(cwd, workspace_id).await
+    }
+
+    /// [`Self::create_session`] in a given directory — a fix session for an
+    /// idealist ticket works in the sica-rust checkout, whatever folder the
+    /// user's own sessions point at.
+    pub async fn create_session_in(&self, cwd: PathBuf, workspace_id: Option<u64>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let s = SessionLog::new_in(id, default_title(id), Some(cwd));
         self.sessions.lock().await.insert(id, s);
         if let Some(w) = workspace_id {
@@ -3594,6 +3601,15 @@ available: {}  (`/agent off` clears)", names.join(", "))
             })
             .await;
             crate::incident::turn_ended(session_id, outer_turn).await;
+            if crate::invariants::enabled() && crate::incident::installed() {
+                let ledger = idealist::Ledger::open_default();
+                let has_file = ledger.dir().join(format!("{session_id}.toml")).is_file();
+                let loaded = has_file.then(|| ledger.load(session_id));
+                crate::invariants::report(
+                    event_sink.as_ref(),
+                    crate::invariants::check_error_turn_ticketed(finish, outer_turn, loaded.as_ref()),
+                );
+            }
             event_sink.emit(Event::TurnUsage {
                 session_id,
                 turn_id:     outer_turn,

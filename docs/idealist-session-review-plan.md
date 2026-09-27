@@ -9,8 +9,9 @@ This builds on the existing `idealist` crate. It does not replace it.
 
 ## Status (2026-09-26)
 
-**Implemented** (protocol v30). The design decisions are recorded in
-[notes/2026-09-26-idealist-investigator.md](notes/2026-09-26-idealist-investigator.md).
+**Implemented** (protocol v31). The design decisions are recorded in
+[notes/2026-09-26-idealist-investigator.md](notes/2026-09-26-idealist-investigator.md)
+and [notes/2026-09-26-idealist-followups.md](notes/2026-09-26-idealist-followups.md).
 
 | Phase | State |
 | --- | --- |
@@ -20,10 +21,11 @@ This builds on the existing `idealist` crate. It does not replace it.
 | 4.1 — FE ticket panel | done — Settings › Diagnostics › Improvement tickets |
 | 4.2 — lessons (opt-in `lessons_in_prompt`) | done — `idealist::lessons` |
 | 4.4 — regression reopen | done |
-| 4.3 — auto-fix session | **deferred**: the protocol has no draft message a person could review before it is sent |
-| `HookEvent::SessionEnd` | **deferred** |
+| 4.3 — fix session | done (v31) — `StartFixSession` + opt-in `auto_fix_session`; the prompt waits in the composer, never sent |
+| `HookEvent::SessionEnd` | done — `reason` = `idle` / `archived` |
 | 5 — unit tests | done (idealist, investigate, preset) |
-| 5 — replay scenario, runtime invariant | **not done**: the replay needs the Windows `backend.exe`; the invariant was dropped (see the note) |
+| 5 — runtime invariant | done — `error-turn-ticketed` |
+| 5 — replay scenario | **not committed**: recordings are platform-bound; the flow was verified with temporary scenarios (see the follow-up note) |
 
 Changes from the plan below: the ticket id *is* the fingerprint's head, so
 the failing site writes the ledger and `TicketOpened` itself. Tickets live

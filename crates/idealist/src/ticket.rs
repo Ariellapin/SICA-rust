@@ -125,6 +125,10 @@ pub struct TicketMeta {
     pub last_message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnosis:    Option<Diagnosis>,
+    /// The session opened to fix this ticket (`StartFixSession`), so a
+    /// second request reopens it instead of starting another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_session:  Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -381,11 +385,21 @@ impl TicketStore {
                 sessions:     t.session_id.into_iter().collect(),
                 last_message: one_line(&t.message, 200),
                 diagnosis:    None,
+                fix_session:  None,
             },
             body: initial_body(t, a, src),
         };
         let path = self.save(&ticket)?;
         Ok(Upsert { id, path, created: true, reopened: false, occurrences: 1 })
+    }
+
+    /// Record the session opened to fix a ticket.
+    pub fn set_fix_session(&self, id: &str, session_id: u64) -> Result<Ticket> {
+        let _g = WRITE.lock().unwrap_or_else(|p| p.into_inner());
+        let mut t = self.load(id)?;
+        t.meta.fix_session = Some(session_id);
+        self.save(&t)?;
+        Ok(t)
     }
 
     /// Set a ticket's status. `Err` when the ticket does not exist.

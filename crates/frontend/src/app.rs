@@ -1027,6 +1027,9 @@ pub struct IdealistUiState {
     pub tickets:     Option<Vec<protocol::TicketSummary>>,
     /// Show resolved / wontfix / noise tickets too.
     pub show_closed: bool,
+    /// Fix prompts for sessions `auto_fix_session` opened, keyed by session.
+    /// Put in the composer when the person opens that session — never sent.
+    pub pending_drafts: std::collections::HashMap<u64, String>,
 }
 
 #[allow(dead_code)]
@@ -1802,6 +1805,21 @@ impl App {
         ctx.set_style(style);
     }
 
+    /// Make sure the sidebar lists `id` before the backend's own list
+    /// arrives, the way `SessionCreated` does.
+    fn adopt_session(&mut self, id: u64) {
+        if !self.chat.sessions.iter().any(|s| s.id == id) {
+            self.chat.sessions.insert(0, SessionMeta {
+                id,
+                title: format!("Session {id}"),
+                created_at: 0,
+                updated_at: 0,
+                cwd: None,
+                scheduled: false,
+            });
+        }
+    }
+
     /// Ask for the ticket list again — only once the Diagnostics panel has
     /// loaded it, so a session nobody is looking at costs no requests.
     pub fn refresh_tickets(&mut self) {
@@ -1826,6 +1844,13 @@ impl App {
     /// `UiEvent::SessionLoaded` and is rebuilt into `Vec<Turn>`.
     pub fn switch_session(&mut self, id: u64) {
         self.chat.pending_delete = None;
+        // A fix prompt `auto_fix_session` left for this session goes into
+        // the composer — unless the person is already typing something.
+        if let Some(draft) = self.chat.idealist.pending_drafts.remove(&id) {
+            if self.chat.draft.trim().is_empty() {
+                self.chat.draft = draft;
+            }
+        }
         if self.chat.session_id == id {
             return;
         }
@@ -2467,6 +2492,30 @@ impl App {
             }
             UiEvent::Tickets { tickets } => {
                 self.chat.idealist.tickets = Some(tickets);
+            }
+            UiEvent::FixSession { session_id, ticket_id, draft } => {
+                self.push_log(
+                    LogKind::Event,
+                    format!("fix session {session_id} for ticket {ticket_id} — review the prompt, then send"),
+                );
+                self.adopt_session(session_id);
+                self.switch_session(session_id);
+                self.chat.draft = draft;
+                self.send(UiCommand::SendRequest(Request::ListSessions));
+                self.refresh_tickets();
+            }
+            UiEvent::FixSessionReady { session_id, ticket_id, draft } => {
+                self.push_log(
+                    LogKind::Event,
+                    format!(
+                        "fix session {session_id} opened for ticket {ticket_id} — its prompt \
+                         waits in the composer when you open it"
+                    ),
+                );
+                self.chat.idealist.pending_drafts.insert(session_id, draft);
+                self.adopt_session(session_id);
+                self.send(UiCommand::SendRequest(Request::ListSessions));
+                self.refresh_tickets();
             }
             UiEvent::SessionList { mut sessions } => {
                 // Newest on top — the list reads most-recent-first.

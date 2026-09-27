@@ -282,6 +282,12 @@ pub async fn handle(
             Err(message) => Response::Error { message },
         },
         Request::ListTickets => tickets_response(),
+        Request::StartFixSession { ticket_id } => {
+            match crate::investigate::start_fix_session(chat, &ticket_id).await {
+                Ok((session_id, draft)) => Response::FixSession { session_id, ticket_id, draft },
+                Err(message) => Response::Error { message },
+            }
+        }
         Request::SetTicketStatus { ticket_id, status } => {
             // Only the states a person decides. `investigating` and
             // `diagnosed` belong to the investigator.

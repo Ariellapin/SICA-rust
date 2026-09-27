@@ -154,6 +154,16 @@ fn ticket_card(app: &App, ui: &mut egui::Ui, tk: &TicketSummary) -> Option<Reque
             if kit::button(ui, "Open ticket", kit::Variant::Ghost, kit::Size::Sm).clicked() {
                 let _ = super::open_path(std::path::Path::new(&tk.path));
             }
+            // A harness bug is fixed in code: open a session in the
+            // sica-rust checkout with the fix prompt in the composer. It is
+            // never sent from here.
+            let is_bug = tk.category.as_deref() == Some("harness_bug");
+            if (is_bug || tk.fix_session.is_some()) && !closed(&tk.status) {
+                let label = if tk.fix_session.is_some() { "Open fix session" } else { "Start fix session" };
+                if kit::button(ui, label, kit::Variant::Primary, kit::Size::Sm).clicked() {
+                    out = Some(Request::StartFixSession { ticket_id: tk.id.clone() });
+                }
+            }
             let set = |status: &str| Request::SetTicketStatus {
                 ticket_id: tk.id.clone(),
                 status:    status.into(),
