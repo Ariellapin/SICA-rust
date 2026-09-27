@@ -23,8 +23,13 @@ Behaviour:
 - Relative paths resolve against the workspace root.
 - Relative paths may not escape the workspace via `..`.
 - Files larger than **1 MiB** are rejected.
-- `start` / `end` are named args — use the JSON-fenced tool_call form to
-  pass them. Out-of-range bounds clamp; the output carries a
-  `[lines a-b of N]` header when a range was requested.
+- `start` / `end` are named args. In the one-line form put them after the
+  path: `read-file 'wk.txt' 'start=40' 'end=80' > lines 40-80`. Out-of-range
+  bounds clamp; the output carries a `[lines a-b of N]` header when a range
+  was requested.
+- One call returns at most **48 KB** of numbered lines. A longer read stops
+  at the last whole line that fits and ends with a
+  `[read-file: output capped …]` line naming the `start` / `end` to read on.
+- The path is taken exactly as written — backslashes included.
 - The raw contents are summarised by the sub-agent against the expectation
   text after `>` before being returned to the main agent.

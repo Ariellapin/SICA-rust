@@ -16,6 +16,15 @@ Args (JSON):
 }
 ```
 
+One-line form:
+
+    run-pwsh '<command>' > <what you want to know>
+
+The command reaches PowerShell exactly as written between the outer quotes:
+backslashes are literal (`C:\new\raw` stays a path, `\s+` stays a regex),
+and quotes inside it are fine (`-ne ' '`, `"it's"`). Put the
+` > <expectation>` straight after the closing quote.
+
 Behaviour:
 - Windows: invokes `powershell -NoLogo -NoProfile -NonInteractive -Command <command>`.
   Falls back to `pwsh` (PowerShell Core) if `powershell.exe` is missing.

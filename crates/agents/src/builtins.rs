@@ -54,7 +54,9 @@ pub const READ_FILE_DESCRIPTION: &str =
 
 pub const WRITE_FILE_DESCRIPTION: &str =
     "Write UTF-8 content to a file. Positional args: <path> <content>. \
-     Creates parent dirs; refuses `..` traversal in relative paths.";
+     Optional named args: append (`true` adds to the end of the file — \
+     write a large file in parts). Creates parent dirs; refuses `..` \
+     traversal in relative paths.";
 
 pub const EDIT_FILE_DESCRIPTION: &str =
     "Replace exact text in a file. Positional args: <path> <old> <new>. \
@@ -186,18 +188,17 @@ Invocation (single line):
 Examples:
 
     read-file 'skills/run-cli.md' > what positional args does run-cli accept
-    read-file 'src/main.rs' '1' '80' > the first 80 lines (named start/end args)
+    read-file 'src/main.rs' 'start=1' 'end=80' > the first 80 lines
 
 Behaviour:
 - Relative paths resolve against the working directory.
 - Relative paths may not escape the workspace via `..`.
 - Files larger than **1 MiB** are rejected.
 - Optional named args `start` / `end` (1-based, inclusive) select a line
-  range; they are named args, so use the JSON-fenced tool_call form:
-
-      ```tool_call
-      { "skill": "read-file", "args": { "path": "src/main.rs", "start": "1", "end": "80" }, "expectation": "the first 80 lines" }
-      ```
+  range, as `'start=N'` / `'end=M'` after the path.
+- One call returns at most **48 KB** of numbered lines. A longer read stops
+  at the last whole line that fits and ends with a
+  `[read-file: output capped …]` line naming the `start` / `end` to read on.
 
 - The raw contents are summarised by the sub-agent against the expectation
   text after `>` before being returned to the main agent.
@@ -222,6 +223,13 @@ Behaviour:
 - Relative paths may not escape the workspace via `..`.
 - Use `\n`, `\t`, `\\`, `\'`, `\"` escapes inside the quoted content to
   embed newlines or quote characters.
+- Optional named arg `append`: `'append=true'` adds the content to the end
+  of the file instead of replacing it. Write a large file in parts — one
+  reply can only hold so much, and a call cut off mid-body never runs:
+
+      write-file 'out.txt' '<first 20 lines>' > confirm the first part
+      write-file 'out.txt' '<next 20 lines>' 'append=true' > confirm the second part
+
 - Returns the number of bytes written in the outcome summary.
 "#;
 
@@ -590,8 +598,81 @@ impl Skill for ReadFile {
         // numeric strings (the text protocol only carries strings).
         let start = parse_line_arg(args.get("start"));
         let end = parse_line_arg(args.get("end"));
-        SkillOutcome { ok: true, summary: numbered_range(&text, start, end) }
+        SkillOutcome {
+            ok:      true,
+            summary: numbered_page(&text, start, end, path, READ_FILE_MAX_BYTES),
+        }
     }
+}
+
+/// Most numbered text one `read-file` returns, in bytes. `read-file` is
+/// exempt from spilling (a spill file is read back with it), so without a
+/// cap a 325 KB wildcard file reached the model whole — 80 K tokens in a
+/// 64 K window — the summariser could not fit it either, and the turn died
+/// on the overflow (`sessions/95`). Over the cap the result stops at the
+/// last whole line that fits and says how to read on.
+pub const READ_FILE_MAX_BYTES: usize = 48 * 1024;
+
+/// How the line that ends a capped read begins. The sub-agent keeps that
+/// line when it summarises the result: the way to the rest of the file has
+/// to survive the paraphrase.
+pub const READ_FILE_CAP_MARK: &str = "[read-file: output capped";
+
+/// [`numbered_range`], cut to `cap` bytes at a line boundary. A cut read
+/// opens with the range it shows and ends with a [`READ_FILE_CAP_MARK`]
+/// line naming the next call to make; a single line longer than the cap is
+/// shown up to the cap and says so.
+fn numbered_page(text: &str, start: Option<usize>, end: Option<usize>, path: &str, cap: usize) -> String {
+    let full = numbered_range(text, start, end);
+    if full.len() <= cap {
+        return full;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    // `numbered_range` returns early (and short) past the end, so the
+    // range here is never empty.
+    let from = start.unwrap_or(1).max(1);
+    let to = end.unwrap_or(total).min(total);
+    let quoted = path.replace('\'', "\\'");
+    let mut body = String::new();
+    let mut last = from - 1;
+    for n in from..=to {
+        let row = format!("{n:>5}\t{}\n", lines[n - 1]);
+        if body.len() + row.len() > cap {
+            break;
+        }
+        body.push_str(&row);
+        last = n;
+    }
+    if last < from {
+        // One line alone is over the cap: its head is all there is room for.
+        let row = format!("{from:>5}\t{}", lines[from - 1]);
+        let head = sica_core::retain::utf8_head(&row, cap);
+        let mut out = format!("[line {from} of {total}]\n{head}\n");
+        out.push_str(&format!(
+            "{READ_FILE_CAP_MARK} at {} KB — line {from} is {} bytes long and only its \
+             first {} are shown; search it with grep or run-pwsh instead",
+            cap / 1024,
+            lines[from - 1].len(),
+            head.len(),
+        ));
+        if from < to {
+            out.push_str(&format!(
+                "; the next lines start with read-file '{quoted}' 'start={}'",
+                from + 1
+            ));
+        }
+        out.push(']');
+        return out;
+    }
+    let next = last + 1;
+    let next_end = (next + (last - from)).min(to);
+    format!(
+        "[lines {from}-{last} of {total}]\n{body}{READ_FILE_CAP_MARK} at {} KB — lines \
+         {next}-{to} are not shown; read on with read-file '{quoted}' 'start={next}' \
+         'end={next_end}']",
+        cap / 1024,
+    )
 }
 
 fn parse_line_arg(v: Option<&Value>) -> Option<usize> {
@@ -626,6 +707,10 @@ fn numbered_range(text: &str, start: Option<usize>, end: Option<usize>) -> Strin
         out.push_str(&format!("[line {from} is past the end of the file ({total} lines)]"));
         return out;
     }
+    if from > to {
+        out.push_str(&format!("[the range is empty: start {from} is after end {to}]"));
+        return out;
+    }
     for (i, line) in lines[(from - 1)..to].iter().enumerate() {
         out.push_str(&format!("{:>5}\t{}\n", from + i, line));
     }
@@ -646,6 +731,7 @@ impl Skill for WriteFile {
     fn name(&self) -> &str { WRITE_FILE_NAME }
     fn description(&self) -> &str { WRITE_FILE_DESCRIPTION }
     fn positional_args(&self) -> Vec<String> { vec!["path".into(), "content".into()] }
+    fn optional_args(&self) -> Vec<String> { vec!["append".into()] }
 
     async fn run(&self, args: Value, ctx: SkillContext) -> SkillOutcome {
         let root = call_root(Some(&self.root), &ctx);
@@ -657,7 +743,11 @@ impl Skill for WriteFile {
             Some(c) => c.to_string(),
             None    => return err("missing `content` arg"),
         };
-        let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(false);
+        // A bool from a JSON call, `'append=true'` from the text protocol.
+        // Appending is how a file too big for one reply gets written: a
+        // single 300 KB `write-file` runs past the completion cap, and the
+        // truncated call never runs at all (`sessions/92`, `sessions/93`).
+        let append = crate::control::flag_arg(args.get("append"));
         let resolved = match resolve(&root, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
@@ -680,7 +770,12 @@ impl Skill for WriteFile {
         match result {
             Ok(()) => SkillOutcome {
                 ok: true,
-                summary: format!("wrote {} bytes to {}", content.len(), resolved.display()),
+                summary: format!(
+                    "{} {} bytes to {}",
+                    if append { "appended" } else { "wrote" },
+                    content.len(),
+                    resolved.display()
+                ),
             },
             Err(e) => err(&format!("write {}: {e}", resolved.display())),
         }
@@ -1251,6 +1346,58 @@ mod tests {
         w.run(json!({ "path": "log.txt", "content": "b", "append": true }), ctx()).await;
         let text = std::fs::read_to_string(dir.join("log.txt")).unwrap();
         assert_eq!(text, "ab");
+    }
+
+    /// `'append=true'` from the text protocol arrives as a string.
+    #[tokio::test]
+    async fn write_appends_on_a_text_protocol_flag() {
+        let dir = tempdir();
+        let w = WriteFile::new(dir.clone());
+        w.run(json!({ "path": "log.txt", "content": "a" }), ctx()).await;
+        let out = w.run(json!({ "path": "log.txt", "content": "b", "append": "true" }), ctx()).await;
+        assert!(out.summary.starts_with("appended 1 bytes"), "{}", out.summary);
+        assert_eq!(std::fs::read_to_string(dir.join("log.txt")).unwrap(), "ab");
+        assert_eq!(WriteFile::new(dir).optional_args(), vec!["append".to_string()]);
+    }
+
+    /// `sessions/95`: a 325 KB file came back whole and overflowed the
+    /// window. A read over the cap stops at a line boundary and names the
+    /// call that reads on.
+    #[tokio::test]
+    async fn a_long_read_stops_at_the_cap_and_says_how_to_read_on() {
+        let dir = tempdir();
+        let line = "x".repeat(2_600);
+        let body: String = (0..124).map(|_| format!("{line}\n")).collect();
+        std::fs::write(dir.join("wk.txt"), &body).unwrap();
+        let r = ReadFile::new(dir.clone());
+        let out = r.run(json!({ "path": "wk.txt" }), ctx()).await;
+        assert!(out.ok);
+        assert!(out.summary.len() <= READ_FILE_MAX_BYTES + 512, "{}", out.summary.len());
+        // Each numbered row is 2 607 bytes: 18 fit in 48 KB.
+        assert!(out.summary.starts_with("[lines 1-18 of 124]\n    1\t"), "{}", &out.summary[..40]);
+        let last = out.summary.lines().last().unwrap();
+        assert!(last.starts_with(READ_FILE_CAP_MARK), "{last}");
+        assert!(last.contains("read-file 'wk.txt' 'start=19' 'end=36'"), "{last}");
+        // Reading on picks up exactly where it stopped.
+        let out = r.run(json!({ "path": "wk.txt", "start": "19", "end": "36" }), ctx()).await;
+        assert!(out.summary.starts_with("[lines 19-36 of 124]"), "{}", &out.summary[..40]);
+        assert!(out.summary.lines().last().unwrap().starts_with("   36\t"));
+        // One line longer than the cap is shown up to the cap, and says so.
+        std::fs::write(dir.join("one.json"), "y".repeat(100_000)).unwrap();
+        let out = r.run(json!({ "path": "one.json" }), ctx()).await;
+        assert!(out.summary.len() <= READ_FILE_MAX_BYTES + 512, "{}", out.summary.len());
+        assert!(out.summary.contains("line 1 is 100000 bytes long"), "{}", out.summary.lines().last().unwrap());
+    }
+
+    /// An inverted range used to slice `lines[start..end]` backwards and
+    /// panic the turn.
+    #[tokio::test]
+    async fn an_inverted_range_is_reported_not_a_panic() {
+        let dir = tempdir();
+        std::fs::write(dir.join("f.txt"), "a\nb\nc\nd\ne").unwrap();
+        let r = ReadFile::new(dir);
+        let out = r.run(json!({ "path": "f.txt", "start": 5, "end": 2 }), ctx()).await;
+        assert!(out.summary.contains("range is empty"), "{}", out.summary);
     }
 
     #[tokio::test]

@@ -14,6 +14,15 @@ Args (JSON):
 }
 ```
 
+One-line form — the command is taken exactly as written between the outer
+quotes, backslashes and inner quotes included:
+
+    run-cli 'git status' > what changed
+
+On Windows this is `cmd.exe`: PowerShell cmdlets (`Get-Content`, …) are not
+found there — call `run-pwsh` for those instead of wrapping them in
+`powershell -Command "…"`.
+
 Behaviour:
 - Windows: invokes `cmd /C <command>`. Other OSes: `/bin/sh -c <command>`.
 - Stdout and stderr are each capped to **32 KiB** before being returned.

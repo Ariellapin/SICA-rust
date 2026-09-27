@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
-use sica_core::event::{EventKind, SessionEvent};
+use sica_core::event::{EventKind, SessionEvent, SurfaceOp};
 
 use crate::streaming::{StreamChunk, ToolCallDelta, Usage};
 
@@ -99,6 +99,9 @@ impl ReplayScript {
             .lines()
             .filter_map(|l| serde_json::from_str::<SessionEvent>(l).ok())
             .filter_map(|ev| match ev.kind {
+                // A `Replace` row is the harness shadowing a reply it cut
+                // down (`compact::truncated_reply`), not a completion.
+                EventKind::AssistantMessage { surface: SurfaceOp::Replace { .. }, .. } => None,
                 EventKind::AssistantMessage { content, reasoning, tool_calls, .. } => {
                     Some(ReplayCall::Message { content, reasoning, tool_calls })
                 }

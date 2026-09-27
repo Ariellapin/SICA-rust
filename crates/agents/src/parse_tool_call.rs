@@ -37,10 +37,17 @@
 //! its training data around this contract's line. [`unwrap_xml_call`]
 //! strips the wrapper before the scan, and a `{"name": …, "arguments": …}`
 //! body inside the envelope is read like the JSON fence (`sessions/84`).
+//!
+//! The live loops call [`extract_for`], which also knows each skill's
+//! arity and so can take a one-argument skill's argument verbatim, read
+//! Qwen's `<parameter=…>` form, and accept a wrapped or trailing call that
+//! left out its expectation. [`extract_known`] stays strict: `model-eval`
+//! grades the model on this contract and must not be told a sloppy call was
+//! fine.
 
 // `Eq` is not derived because `serde_json::Value` only implements `PartialEq`
 // (`f64` inside `Value::Number` rules out total equality).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ToolCall {
     pub skill:       String,
     pub raw_args:    Vec<String>,
@@ -51,6 +58,12 @@ pub struct ToolCall {
     /// for the natural-language form, which still relies on the skill's
     /// declared `positional_args()` to map values to names.
     pub args_json:   Option<serde_json::Value>,
+    /// Arguments the model named itself, in the order it wrote them — the
+    /// `<parameter=key>` form Qwen's chat template trains. The registry
+    /// binds a name the skill declares to that argument and hands the rest
+    /// to the positionals still missing, in order, so `name` / `file_path`
+    /// reach `path`. Empty for every other shape.
+    pub named:       Vec<(String, String)>,
 }
 
 /// Return the first plausible tool call in `text`, if any.
@@ -110,6 +123,490 @@ pub fn extract_known(text: &str, is_known: impl Fn(&str) -> bool) -> Option<Tool
         offset += line.len() + 1;
     }
     None
+}
+
+/// Like [`extract_known`], but told how many positional arguments each
+/// registered skill takes (`arity` is `None` for a name nobody registered),
+/// which buys the live loops three recoveries a model eval must not grant:
+///
+/// - **One argument, verbatim.** For a skill with a single positional
+///   (`run-pwsh`, `read-file`, `subagent`, …) everything between the outer
+///   quotes is the argument as written. Only an escaped outer quote is
+///   unescaped, so a Windows path keeps its `\n`, `\t` and `\r` and a regex
+///   keeps its `\\` (`sessions/85` ran `…\Output\local\raw` as a carriage
+///   return), and a quote *inside* the argument — PowerShell's `-ne ' '`,
+///   an apostrophe — no longer cuts the command short (`sessions/92` ran
+///   half a command and dropped the rest). Trailing `'key=value'` tokens
+///   stay separate, so optional args still bind.
+/// - **Qwen's own parameters.** `<function=name>` followed by
+///   `<parameter=key>value</parameter>` blocks is read as named arguments
+///   (`sessions/93` wrote a file that way twice, and was refused twice).
+/// - **No expectation.** A call inside a closed `<function=name>` block —
+///   on the tag's line or below it, quoted or, for a one-argument skill,
+///   not — or on the reply's last line, is dispatched without its
+///   ` > <expectation>` (`sessions/94` ended its turn on two
+///   `read-file 'wk.txt'` calls).
+pub fn extract_for(text: &str, arity: impl Fn(&str) -> Option<usize>) -> Option<ToolCall> {
+    if let Some(tc) = extract_xml_params(text) {
+        return Some(tc);
+    }
+    let raw = text;
+    let wrapped = has_xml_wrapper(text);
+    let functions = wrapper_functions(text);
+    let unwrapped = unwrap_xml_call(text);
+    let text = unwrapped.as_ref();
+    if let Some(tc) = extract_json_fence(text) {
+        return Some(tc);
+    }
+    if wrapped {
+        if let Some(tc) = extract_json_envelope(text) {
+            return Some(tc);
+        }
+    }
+    let mut offset = 0usize;
+    for line in text.split('\n') {
+        let trimmed = strip_fence_indent(line);
+        if let Some(tc) = parse_line_for(trimmed, &arity) {
+            if arity(&tc.skill).is_some() {
+                return Some(tc);
+            }
+        } else if !trimmed.is_empty() {
+            let indent = line.len() - line.trim_start().len();
+            if let Some(tc) = parse_multiline_for(&text[offset + indent..], &arity) {
+                if arity(&tc.skill).is_some() {
+                    return Some(tc);
+                }
+            }
+        }
+        offset += line.len() + 1;
+    }
+    if let Some(tc) = extract_function_body(raw, &arity) {
+        return Some(tc);
+    }
+    bare_call(text, &functions, &arity)
+}
+
+/// A closed `<function=name>` … `</function>` block whose body is the
+/// call's arguments rather than `<parameter=…>` tags — most often on the
+/// line *below* the tag, where the line scan cannot pair them:
+///
+/// ```text
+/// <function=read-file>
+/// wk.txt
+/// </function>
+/// ```
+///
+/// (a Qwen 3.6 session of 2026-09-27 was refused on exactly that twice,
+/// and its turn ended). The body is read as the rest of a call line — quoted
+/// args with or without an expectation — and, for a one-argument skill, an
+/// unquoted body is the argument itself, as written.
+fn extract_function_body(text: &str, arity: &impl Fn(&str) -> Option<usize>) -> Option<ToolCall> {
+    for (i, _) in text.match_indices('<') {
+        let Some((XmlTag::FunctionOpen(name), end)) = xml_tag_at(text, i) else { continue };
+        let skill = skill_spelling(name);
+        let Some(n) = arity(&skill) else { continue };
+        let rest = &text[end..];
+        // Only a block the model closed: a tag named in passing is prose.
+        let Some(close) = ["</function>", "</tool_call>"]
+            .iter()
+            .filter_map(|tag| rest.find(tag))
+            .min()
+        else {
+            continue;
+        };
+        let body = rest[..close].trim();
+        if body.is_empty() || body.contains("<function=") || body.starts_with("<parameter=") {
+            continue;
+        }
+        let line = format!("{skill} {body}");
+        let parsed = if body.contains('\n') {
+            parse_multiline_for(&line, arity)
+        } else {
+            parse_line_for(&line, arity)
+        };
+        if let Some(tc) = parsed {
+            return Some(tc);
+        }
+        if let Some(raw_args) = bare_args(body, n) {
+            return Some(ToolCall { skill, raw_args, ..ToolCall::default() });
+        }
+        if n == 1 && !body.starts_with(['\'', '"']) {
+            return Some(ToolCall { skill, raw_args: vec![body.to_string()], ..ToolCall::default() });
+        }
+    }
+    None
+}
+
+/// The arguments of a call written without an expectation: all quoted —
+/// one verbatim argument for a one-argument skill, escapes processed for
+/// the rest. `None` when any of it is bare.
+fn bare_args(rest: &str, arity: usize) -> Option<Vec<String>> {
+    if arity == 1 {
+        one_arg(rest)
+    } else {
+        verbatim_tokens(rest).and_then(|_| tokenize_args(rest))
+    }
+}
+
+/// [`parse_line`], except that a one-argument skill takes its argument
+/// verbatim (see [`extract_for`]).
+fn parse_line_for(line: &str, arity: &impl Fn(&str) -> Option<usize>) -> Option<ToolCall> {
+    let line = line.trim();
+    let (skill, rest) = take_skill_name(line)?;
+    if arity(&skill) != Some(1) {
+        return parse_line(line);
+    }
+    let rest = rest.trim_start();
+    let (expectation, raw_args) = split_one_arg(rest).or_else(|| {
+        let (args_part, expectation) = split_on_expectation(rest)?;
+        Some((expectation, tokenize_args(args_part)?))
+    })?;
+    Some(ToolCall {
+        skill,
+        raw_args,
+        expectation: expectation.trim().to_string(),
+        ..ToolCall::default()
+    })
+}
+
+/// [`parse_multiline`], with a one-argument skill's body taken verbatim.
+fn parse_multiline_for(text: &str, arity: &impl Fn(&str) -> Option<usize>) -> Option<ToolCall> {
+    let (skill, rest) = take_skill_name(text)?;
+    if arity(&skill) != Some(1) {
+        return parse_multiline(text);
+    }
+    let rest = rest.trim_start();
+    if !quote_open_at_eol(rest) {
+        return None;
+    }
+    let (args_part, expectation) = split_on_expectation(rest)?;
+    let raw_args = one_arg(args_part).or_else(|| tokenize_args(args_part))?;
+    Some(ToolCall {
+        skill,
+        raw_args,
+        expectation: expectation.lines().next().unwrap_or("").trim().to_string(),
+        ..ToolCall::default()
+    })
+}
+
+/// Split a one-argument call's `rest` so the left side reads as that one
+/// argument: at the first ` > ` outside quotes when that works, else at the
+/// last ` > ` straight after a closing quote — an odd quote *inside* the
+/// argument (an apostrophe) throws the first reading out of phase, and
+/// the second is what the line meant. Returns (expectation, args).
+fn split_one_arg(rest: &str) -> Option<(&str, Vec<String>)> {
+    if let Some((args_part, expectation)) = split_on_expectation(rest) {
+        if let Some(args) = one_arg(args_part) {
+            return Some((expectation, args));
+        }
+    }
+    let (args_part, expectation) = split_after_last_quote(rest)?;
+    Some((expectation, one_arg(args_part)?))
+}
+
+/// The args of a one-argument skill: the argument itself, then any extras
+/// the model appended as separate simple tokens (`'background=true'`,
+/// `'80'`). A second token that is not simple — ` }).Count"` — means the
+/// quotes belong to the argument, so the whole span is the argument.
+fn one_arg(args_part: &str) -> Option<Vec<String>> {
+    let s = args_part.trim();
+    if let Some(tokens) = verbatim_tokens(s) {
+        if tokens.len() <= 1 || tokens[1..].iter().all(|t| simple_extra(t)) {
+            return Some(tokens);
+        }
+    }
+    single_span(s)
+}
+
+/// Every token of `s`, each quoted, taken as written: only an escaped
+/// quote of the token's own kind is unescaped. `None` when a token is bare
+/// or never closed.
+fn verbatim_tokens(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(q) = chars.next() else { break };
+        if q != '\'' && q != '"' {
+            return None;
+        }
+        let mut buf = String::new();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek() == Some(&q) {
+                chars.next();
+                buf.push(q);
+            } else if c == q {
+                closed = true;
+                break;
+            } else {
+                buf.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        out.push(buf);
+    }
+    Some(out)
+}
+
+/// `s` as one quoted span whose inside may hold quotes of its own, with
+/// trailing `'key=value'` tokens peeled off as extras. `None` unless `s`
+/// (after the peel) opens and closes with the same quote.
+fn single_span(s: &str) -> Option<Vec<String>> {
+    let mut s = s.trim();
+    let mut extras: Vec<String> = Vec::new();
+    while let Some((rest, kv)) = peel_kv_token(s) {
+        extras.insert(0, kv);
+        s = rest;
+    }
+    let q = s.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    if s.len() < 2 || !s.ends_with(q) {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut out = vec![inner.replace(&format!("\\{q}"), &q.to_string())];
+    out.extend(extras);
+    Some(out)
+}
+
+/// Peel one trailing `'key=value'` token off `s`: it has to stand alone —
+/// whitespace before it, and before that the quote that closed the
+/// argument it follows. Returns (what is left, the token's text).
+fn peel_kv_token(s: &str) -> Option<(&str, String)> {
+    let q = s.chars().last().filter(|c| *c == '\'' || *c == '"')?;
+    let body = &s[..s.len() - 1];
+    let open = body.rfind(q)?;
+    let inner = &body[open + 1..];
+    let before = &body[..open];
+    let rest = before.trim_end();
+    if rest.len() == before.len() || !(rest.ends_with('\'') || rest.ends_with('"')) {
+        return None;
+    }
+    let (key, _) = inner.split_once('=')?;
+    if !is_arg_name(key.trim()) {
+        return None;
+    }
+    Some((rest, inner.to_string()))
+}
+
+/// A token worth keeping apart from a one-argument skill's argument: a
+/// `key=value` pair, or one short word with no quotes or spaces in it.
+fn simple_extra(t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || t.len() > 200 {
+        return false;
+    }
+    if let Some((key, _)) = t.split_once('=') {
+        if is_arg_name(key.trim()) {
+            return true;
+        }
+    }
+    !t.contains(char::is_whitespace) && !t.contains(['\'', '"'])
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*` — what an optional argument's name looks like.
+fn is_arg_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The last ` > ` that directly follows a quote of the kind `rest` opens
+/// with. Returns (args part, expectation), the args part ending on that
+/// quote.
+fn split_after_last_quote(rest: &str) -> Option<(&str, &str)> {
+    let q = rest.chars().next().filter(|c| *c == '\'' || *c == '"')? as u8;
+    let bytes = rest.as_bytes();
+    let mut i = bytes.len();
+    while i > 1 {
+        i -= 1;
+        if bytes[i] != q {
+            continue;
+        }
+        let after = &rest[i + 1..];
+        let spaced = after.trim_start();
+        if spaced.len() == after.len() {
+            continue;
+        }
+        if let Some(expectation) = spaced.strip_prefix('>') {
+            if expectation.starts_with(char::is_whitespace) {
+                return Some((&rest[..=i], expectation.trim_start()));
+            }
+        }
+    }
+    None
+}
+
+/// A call written with no ` > <expectation>` at all, accepted only where
+/// the intent is not in doubt: a line opened by one of the reply's
+/// `<function=name>` tags (`functions`), or, with no such tag, the reply's
+/// last line. Every argument must be quoted — a bare word after a skill
+/// name is prose ("read-file is the tool"), not an argument.
+fn bare_call(
+    text: &str,
+    functions: &[String],
+    arity: &impl Fn(&str) -> Option<usize>,
+) -> Option<ToolCall> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| strip_fence_indent(l).trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let candidates: Vec<&str> = if functions.is_empty() {
+        lines.last().copied().into_iter().collect()
+    } else {
+        lines
+            .into_iter()
+            .filter(|l| {
+                functions.iter().any(|f| {
+                    l.strip_prefix(f.as_str())
+                        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+                })
+            })
+            .collect()
+    };
+    for line in candidates {
+        let (skill, rest) = match take_skill_name(line) {
+            Some(split) => split,
+            None if is_valid_skill_name(line) => (line.to_string(), ""),
+            None => continue,
+        };
+        let Some(n) = arity(&skill) else { continue };
+        let rest = rest.trim();
+        let raw_args = if rest.is_empty() {
+            Vec::new()
+        } else {
+            match bare_args(rest, n) {
+                Some(args) => args,
+                None => continue,
+            }
+        };
+        return Some(ToolCall { skill, raw_args, ..ToolCall::default() });
+    }
+    None
+}
+
+/// The skill names of every `<function=name>` tag in `text`, spelled the
+/// way the line scan will see them.
+fn wrapper_functions(text: &str) -> Vec<String> {
+    text.match_indices('<')
+        .filter_map(|(i, _)| match xml_tag_at(text, i)? {
+            (XmlTag::FunctionOpen(name), _) => Some(skill_spelling(name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A tool name as this contract spells skills: `read_file` → `read-file`.
+/// Models trained on snake_case tool names write them that way inside
+/// their native wrappers.
+fn skill_spelling(name: &str) -> String {
+    name.trim().replace('_', "-")
+}
+
+/// Read Qwen's native parameter form:
+///
+/// ```text
+/// <function=write-file>
+/// <parameter=path>
+/// notes.txt
+/// </parameter>
+/// <parameter=content>
+/// …
+/// </parameter>
+/// </function>
+/// ```
+///
+/// A value is everything between its tags less the one line break on each
+/// side the template puts there, so a file body arrives exactly as written
+/// — no quoting, no escapes. A missing `</parameter>` ends the value at the
+/// next tag. A `<parameter=expectation>` becomes the call's expectation.
+fn extract_xml_params(text: &str) -> Option<ToolCall> {
+    for (i, _) in text.match_indices('<') {
+        let Some((XmlTag::FunctionOpen(name), end)) = xml_tag_at(text, i) else { continue };
+        let params = xml_params(&text[end..]);
+        if params.is_empty() {
+            continue;
+        }
+        let skill = skill_spelling(name);
+        if !is_valid_skill_name(&skill) {
+            return None;
+        }
+        let mut expectation = String::new();
+        let mut named = Vec::with_capacity(params.len());
+        for (key, value) in params {
+            if key == "expectation" {
+                expectation = value.trim().to_string();
+            } else {
+                named.push((key, value));
+            }
+        }
+        let raw_args = named.iter().map(|(_, v)| v.clone()).collect();
+        return Some(ToolCall { skill, raw_args, expectation, args_json: None, named });
+    }
+    None
+}
+
+/// The `<parameter=key>value</parameter>` blocks at the start of `body`.
+fn xml_params(body: &str) -> Vec<(String, String)> {
+    const OPEN: &str = "<parameter=";
+    const CLOSE: &str = "</parameter>";
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let Some(after) = rest.trim_start().strip_prefix(OPEN) else { break };
+        let Some(gt) = after.find('>') else { break };
+        let key = after[..gt].trim().to_string();
+        let value_on = &after[gt + 1..];
+        let (value, next) = match value_on.find(CLOSE) {
+            Some(end) => (&value_on[..end], &value_on[end + CLOSE.len()..]),
+            None => {
+                let end = [OPEN, "</function>", "</tool_call>"]
+                    .iter()
+                    .filter_map(|tag| value_on.find(tag))
+                    .min()
+                    .unwrap_or(value_on.len());
+                (&value_on[..end], &value_on[end..])
+            }
+        };
+        if key.is_empty() {
+            break;
+        }
+        out.push((key, strip_template_breaks(value)));
+        rest = next;
+    }
+    out
+}
+
+/// `value` less one line break at each end — the ones the template writes
+/// around every value, which are no part of it.
+fn strip_template_breaks(value: &str) -> String {
+    let v = value
+        .strip_prefix("\r\n")
+        .or_else(|| value.strip_prefix('\n'))
+        .unwrap_or(value);
+    let v = v.strip_suffix("\r\n").or_else(|| v.strip_suffix('\n')).unwrap_or(v);
+    v.to_string()
+}
+
+/// The newest complete tool call drafted in `reasoning`, as the line the
+/// model wrote. A reasoning model that stops mid-thought (`sessions/95`
+/// ended 24 K tokens of reasoning mid-sentence, the call it had settled on
+/// a few lines up) never sends that call, and its reasoning is not part of
+/// the next request — handing the line back spares it re-deriving the
+/// plan. Lines are read newest first; a line over 8 KiB is not offered.
+pub fn last_drafted_call(reasoning: &str, is_known: impl Fn(&str) -> bool) -> Option<String> {
+    reasoning
+        .lines()
+        .rev()
+        .map(|l| l.trim().trim_matches('`').trim())
+        .filter(|l| !l.is_empty() && l.len() <= 8 * 1024)
+        .find(|l| parse_line(l).is_some_and(|tc| is_known(&tc.skill)))
+        .map(str::to_string)
 }
 
 /// True when `text` contains a shape the model commonly *thinks* is a tool
@@ -238,8 +735,8 @@ fn parse_json_body(body: &str) -> Result<ToolCall, String> {
         .get("skill")
         .or_else(|| obj.get("name"))
         .and_then(|v| v.as_str())
-        .ok_or("whose JSON has no `skill` name")?
-        .to_string();
+        .map(skill_spelling)
+        .ok_or("whose JSON has no `skill` name")?;
     if !is_valid_skill_name(&skill) {
         return Err(format!("whose `skill` ({skill:?}) is not a skill name"));
     }
@@ -282,6 +779,7 @@ fn parse_json_body(body: &str) -> Result<ToolCall, String> {
         raw_args,
         expectation,
         args_json: Some(args),
+        named: Vec::new(),
     })
 }
 
@@ -485,7 +983,7 @@ pub fn unwrap_xml_call(text: &str) -> std::borrow::Cow<'_, str> {
                 match tag {
                     XmlTag::Envelope | XmlTag::FunctionClose => out.push('\n'),
                     XmlTag::FunctionOpen(name) => {
-                        out.push_str(name);
+                        out.push_str(&skill_spelling(name));
                         out.push(' ');
                     }
                 }
@@ -531,7 +1029,7 @@ fn parse_line(line: &str) -> Option<ToolCall> {
         skill,
         raw_args,
         expectation: expectation.trim().to_string(),
-        args_json: None,
+        ..ToolCall::default()
     })
 }
 
@@ -558,7 +1056,7 @@ fn parse_multiline(text: &str) -> Option<ToolCall> {
         skill,
         raw_args,
         expectation: expectation.lines().next().unwrap_or("").trim().to_string(),
-        args_json: None,
+        ..ToolCall::default()
     })
 }
 
@@ -1116,5 +1614,171 @@ mod tests {
         // A plain ```json block is NOT a tool call.
         let s = "```json\n{ \"skill\": \"run-cli\", \"args\": {} }\n```";
         assert!(extract(s).is_none());
+    }
+
+    /// The registry's arities for the skills these tests name.
+    fn arity(name: &str) -> Option<usize> {
+        match name {
+            "run-cli" | "run-pwsh" | "read-file" | "subagent" => Some(1),
+            "write-file" => Some(2),
+            "edit-file" => Some(3),
+            "job-list" => Some(0),
+            _ => None,
+        }
+    }
+
+    /// `sessions/92`: PowerShell's `-ne ' '` inside the '…' argument. The
+    /// strict tokenizer ended the command at the inner quote, dropped the
+    /// rest, and cmd.exe reported a missing terminator.
+    #[test]
+    fn a_quote_inside_a_command_stays_in_the_command() {
+        let s = r#"run-cli 'powershell -Command "(Get-Content wk.txt | Where-Object { $_.Trim() -ne ' ' }).Count"' > count the non-blank lines"#;
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(
+            tc.raw_args,
+            vec![r#"powershell -Command "(Get-Content wk.txt | Where-Object { $_.Trim() -ne ' ' }).Count""#.to_string()]
+        );
+        assert_eq!(tc.expectation, "count the non-blank lines");
+    }
+
+    /// `sessions/85`: `…\Output\local\raw\…` reached PowerShell with a
+    /// carriage return where `\r` was. A command is taken as written.
+    #[test]
+    fn a_windows_path_keeps_its_backslashes() {
+        let s = r#"<function=run-pwsh> 'Get-ChildItem -Path "C:\Pograms\Output\local\raw\2026-09-05" -Filter "*.ldb"' > the metadata files"#;
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(
+            tc.raw_args,
+            vec![r#"Get-ChildItem -Path "C:\Pograms\Output\local\raw\2026-09-05" -Filter "*.ldb""#.to_string()]
+        );
+        let tc = extract_for(r#"read-file '\\server\share\new\a.txt' > the file"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec![r"\\server\share\new\a.txt".to_string()]);
+        let tc = extract_for(r#"run-pwsh '$a -split "\\|"' > the parts"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec![r#"$a -split "\\|""#.to_string()], "a regex keeps `\\`");
+    }
+
+    #[test]
+    fn apostrophes_inside_a_one_argument_call() {
+        let tc = extract_for(r#"run-pwsh 'Write-Output "it's Ann's"' > the text"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec![r#"Write-Output "it's Ann's""#.to_string()]);
+        // An odd quote throws the first ` > ` reading out of phase; the call
+        // still ends at the last ` > ` after a closing quote.
+        let tc = extract_for(r#"run-pwsh '"don't" > out.txt' > write it"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec![r#""don't" > out.txt"#.to_string()]);
+        assert_eq!(tc.expectation, "write it");
+        // A trailing backslash does not escape the closing quote.
+        let tc = extract_for(r#"read-file 'C:\Users\me\' > list it"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec![r"C:\Users\me\".to_string()]);
+        // The documented escape still works.
+        let tc = extract_for(r#"run-pwsh 'Write-Output \'hi\'' > greet"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["Write-Output 'hi'".to_string()]);
+    }
+
+    #[test]
+    fn extras_after_a_one_argument_call_stay_separate() {
+        let tc = extract_for("run-cli 'cargo build' 'background=true' > start it", arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["cargo build".to_string(), "background=true".to_string()]);
+        let tc = extract_for("read-file 'wk.txt' 'start=1 end=2' > two lines", arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["wk.txt".to_string(), "start=1 end=2".to_string()]);
+        let tc = extract_for("read-file 'src/main.rs' '1' '80' > the top", arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["src/main.rs".to_string(), "1".into(), "80".into()]);
+        // Peeled even when the argument has quotes of its own.
+        let tc = extract_for(r#"run-pwsh 'Get-Item 'a b'' 'cwd=C:\x' > the item"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["Get-Item 'a b'".to_string(), r"cwd=C:\x".to_string()]);
+    }
+
+    #[test]
+    fn a_multi_argument_call_keeps_its_escapes() {
+        let tc = extract_for(r#"write-file 'a.txt' 'x\ny' > confirm"#, arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["a.txt".to_string(), "x\ny".to_string()]);
+    }
+
+    /// `sessions/93`: Qwen's native form, refused twice before the turn hit
+    /// max_tokens rewriting the same file.
+    #[test]
+    fn reads_qwen_parameter_tags() {
+        let s = "I'll build it in chunks.\n\n<tool_call>\n<function=write-file>\n<parameter=name>\nwc_part1.txt\n</parameter>\n<parameter=content>\nline one\nline two\n</parameter>\n</function>\n</tool_call>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.skill, "write-file");
+        assert_eq!(
+            tc.named,
+            vec![
+                ("name".to_string(), "wc_part1.txt".to_string()),
+                ("content".to_string(), "line one\nline two".to_string()),
+            ]
+        );
+        assert_eq!(tc.raw_args, vec!["wc_part1.txt".to_string(), "line one\nline two".into()]);
+        assert_eq!(tc.expectation, "");
+
+        let s = "<function=read_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=expectation>\nthe title\n</parameter>\n</function>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.skill, "read-file", "snake_case is this contract's kebab-case");
+        assert_eq!(tc.named, vec![("path".to_string(), "a.md".to_string())]);
+        assert_eq!(tc.expectation, "the title");
+
+        // An unclosed value ends at the next tag.
+        let s = "<function=read-file>\n<parameter=path>\na.md\n</function>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.named, vec![("path".to_string(), "a.md".to_string())]);
+    }
+
+    /// `sessions/94`: the wrapped call with no expectation, twice — the
+    /// second refusal ended the turn.
+    #[test]
+    fn a_wrapped_call_needs_no_expectation() {
+        let s = "I'll start by reading the file.\n\n<tool_call>\n<function=read-file> 'wk.txt'\n</function>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.skill, "read-file");
+        assert_eq!(tc.raw_args, vec!["wk.txt".to_string()]);
+        assert_eq!(tc.expectation, "");
+        // No arguments at all.
+        let tc = extract_for("<tool_call>\n<function=job-list>\n</function>\n</tool_call>", arity).unwrap();
+        assert_eq!(tc.skill, "job-list");
+        assert!(tc.raw_args.is_empty());
+        // The strict entry point still refuses it.
+        assert!(extract_known(s, |n| arity(n).is_some()).is_none());
+    }
+
+    /// Qwen 3.6, 2026-09-27: the argument on the line below the tag,
+    /// unquoted, no expectation — refused twice, and the turn ended.
+    #[test]
+    fn a_function_block_body_is_the_call() {
+        let s = "I'll start by reading the `wk.txt` file.\n\n<tool_call>\n<function=read-file>\nwk.txt\n</function>\n</tool_call>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.skill, "read-file");
+        assert_eq!(tc.raw_args, vec!["wk.txt".to_string()]);
+        // Quoted, with an expectation, on the next line.
+        let s = "<tool_call>\n<function=read-file>\n'wk.txt' > the structure\n</function>\n</tool_call>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["wk.txt".to_string()]);
+        assert_eq!(tc.expectation, "the structure");
+        // A script over several lines is one command.
+        let s = "<function=run-pwsh>\n$a = Get-Content wk.txt\n$a.Count\n</function>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["$a = Get-Content wk.txt\n$a.Count".to_string()]);
+        // A tag named in passing, never closed, is prose.
+        assert!(extract_for("I would use <function=read-file> for that", arity).is_none());
+    }
+
+    #[test]
+    fn a_trailing_call_needs_no_expectation_but_prose_is_not_a_call() {
+        let tc = extract_for("Let me look.\n\nread-file 'wk.txt'", arity).unwrap();
+        assert_eq!(tc.raw_args, vec!["wk.txt".to_string()]);
+        // Mid-reply, followed by prose: the model may be quoting it.
+        let s = "read-file 'wk.txt'\nThen I will edit it.";
+        assert!(extract_for(s, arity).is_none());
+        assert!(rejected_attempt(s, |n| arity(n).is_some()).unwrap().contains("expectation"));
+        assert!(extract_for("The tool you want:\nread-file is the skill", arity).is_none());
+        assert!(extract_for("read-file 'a' is the call", arity).is_none(), "a bare word is prose");
+        assert!(extract_for("frobnicate 'a.md'", arity).is_none(), "unknown skill");
+    }
+
+    #[test]
+    fn the_last_drafted_call_is_found_in_reasoning() {
+        let known = |n: &str| arity(n).is_some();
+        let r = "Plan: read it first.\nread-file 'a.txt' > first look\nNo wait, the whole thing.\n`run-pwsh 'Get-Content a.txt' > all of it`\nOK let me send that. Hmm, and";
+        assert_eq!(last_drafted_call(r, known).as_deref(), Some("run-pwsh 'Get-Content a.txt' > all of it"));
+        assert_eq!(last_drafted_call("just thinking, no calls", known), None);
+        assert_eq!(last_drafted_call("frobnicate 'x' > y", known), None);
     }
 }

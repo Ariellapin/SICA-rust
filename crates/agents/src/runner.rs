@@ -70,6 +70,39 @@ pub fn syntax_correction(reason: &str) -> String {
     )
 }
 
+/// Sent to a model whose reply ended inside its reasoning: nothing said,
+/// nothing called. `sessions/92`, `93` and `95` each ended a turn that way,
+/// on 10-24 K tokens of thinking cut off mid-sentence, and the loop took the
+/// silence for a finished answer. The reasoning is not part of the next
+/// request, so the call the model drafted there — or, failing that, the
+/// last of its thinking — is handed back: told only to try again, a model
+/// that lost its way in a long plan tends to lose it again.
+pub fn empty_reply_correction(drafted: Option<&str>, reasoning_tail: &str) -> String {
+    let mut out = String::from(
+        "Your last reply ended while you were still thinking: it had no visible text \
+         and no tool call, so NOTHING ran. Your reasoning is not shown back to you, so \
+         do not start the analysis over — act on the plan you already made.",
+    );
+    match drafted {
+        Some(call) => {
+            out.push_str("\n\nThe last tool call you drafted was:\n\n    ");
+            out.push_str(call);
+            out.push_str("\n\nIf that is still the right step, send exactly that line now.");
+        }
+        None if !reasoning_tail.trim().is_empty() => {
+            out.push_str("\n\nYour reasoning ended with:\n\n«…");
+            out.push_str(reasoning_tail.trim());
+            out.push('»');
+        }
+        None => {}
+    }
+    out.push_str(
+        "\n\nReply now with one tool call, and keep any thinking short — or, if the \
+         work is done, give your final answer.",
+    );
+    out
+}
+
 /// Sent once to a run that owes structured output but replied in prose.
 pub const STRUCTURED_REMINDER: &str = "\
 That reply does not count as your result. Report your final answer by \
@@ -267,9 +300,7 @@ pub async fn run_conversation(
         let reply = llm_call(client, cancel, transcript.clone()).await?;
         transcript.push(ChatMessage::text("assistant", reply.clone()));
 
-        let call = reg.and_then(|r| {
-            parse_tool_call::extract_known(&reply, |n| r.by_name.contains_key(n))
-        });
+        let call = reg.and_then(|r| parse_tool_call::extract_for(&reply, |n| r.arity(n)));
 
         let Some(call) = call else {
             // A reply that *looks* like a tool call but does not parse is a
@@ -380,9 +411,7 @@ pub async fn run_conversation(
             transcript.push(ChatMessage::text("assistant", last.clone()));
             // One final chance to settle a structured run properly.
             if spec.schema.is_some() {
-                if let Some(c) = reg.and_then(|r| {
-                    parse_tool_call::extract_known(&last, |n| r.by_name.contains_key(n))
-                }) {
+                if let Some(c) = reg.and_then(|r| parse_tool_call::extract_for(&last, |n| r.arity(n))) {
                     if c.skill == STRUCTURED_OUTPUT_NAME {
                         let raw = c.raw_args.first().cloned().unwrap_or_default();
                         if let Ok(value) = parse_structured(&raw, spec.schema.as_ref()) {
@@ -593,6 +622,17 @@ mod tests {
                 "evidence": {"type": "array", "items": {"type": "string"}},
             }
         })
+    }
+
+    #[test]
+    fn empty_reply_correction_hands_back_the_draft_or_the_tail() {
+        let with = empty_reply_correction(Some("read-file 'a.txt' > the top"), "ignored");
+        assert!(with.contains("NOTHING ran"), "{with}");
+        assert!(with.contains("\n    read-file 'a.txt' > the top\n"), "{with}");
+        assert!(!with.contains("ignored"), "{with}");
+        let without = empty_reply_correction(None, "  so I will edit line 2 next  ");
+        assert!(without.contains("«…so I will edit line 2 next»"), "{without}");
+        assert!(!empty_reply_correction(None, "").contains('«'));
     }
 
     #[test]

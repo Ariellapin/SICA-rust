@@ -17,7 +17,11 @@
 //! Three deliberate limits, each answering a way this goes wrong:
 //!
 //! - **Abnormal stops only.** A turn the model ended itself (`done`) is not
-//!   checked, so a normal conversation costs exactly what it did before.
+//!   checked, so a normal conversation costs exactly what it did before —
+//!   with one exception: a *continuation* that ends `done` is checked too.
+//!   Work big enough to be cut short once is where a model most often
+//!   announces the next step and stops, and the chain it belongs to has
+//!   already paid for checks.
 //! - **Never after an interrupt.** Stop means stop; auto-continuing work a
 //!   person just cancelled would make the Stop button a lie — the same
 //!   reasoning that disarms the goal driver there.
@@ -41,11 +45,47 @@ use sica_core::event::{EventKind, SessionEvent};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-/// Continuation turns the check may open for one human message. Two is
-/// enough to finish work that stopped a hop short without turning a
-/// mis-scoped request into an unbounded loop; the count resets on the next
-/// human turn, never on a continuation.
-pub const MAX_AUTO_CONTINUES: u8 = 2;
+/// Continuation turns the check may open for one human message, progress
+/// or not. The count resets on the next human turn, never on a
+/// continuation.
+pub const MAX_AUTO_CONTINUES: u8 = 12;
+
+/// Continuations in a row that may pass without one successful tool call.
+/// A continuation that got something done is refunded, so a long job — a
+/// 124-line file edited a dozen hops per turn — keeps going as long as each
+/// turn moves it, while a request the model cannot make progress on still
+/// stops after two tries, as it always did.
+pub const MAX_STALLED_CONTINUES: u8 = 2;
+
+/// What the completion check has spent on one human message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Spent {
+    /// Continuations opened since the message.
+    pub opened:  u8,
+    /// Those still counted as stalled — opened, and not refunded by a
+    /// successful tool call.
+    pub stalled: u8,
+}
+
+impl Spent {
+    /// Whether one more continuation may be opened.
+    pub fn budget_left(&self) -> bool {
+        self.stalled < MAX_STALLED_CONTINUES && self.opened < MAX_AUTO_CONTINUES
+    }
+
+    /// Count a continuation about to open. Counted *before* it runs, so a
+    /// continuation that crashes still costs one.
+    pub fn open(&mut self) -> u8 {
+        self.opened = self.opened.saturating_add(1);
+        self.stalled = self.stalled.saturating_add(1);
+        self.opened
+    }
+
+    /// The continuation that just ended made progress.
+    pub fn refund(&mut self) {
+        self.stalled = self.stalled.saturating_sub(1);
+    }
+}
 
 /// Bytes of the objective and of the turn digest the judge is shown.
 const MAX_INPUT_BYTES: usize = 3072;
@@ -66,14 +106,15 @@ const MAX_DIGEST_CALLS: usize = 16;
 
 const SYSTEM_PROMPT: &str = "\
 You audit whether an AI agent's turn actually completed the user's request. \
-The turn was cut short by a harness limit, not by the agent deciding it was \
-done, so assume nothing was finished unless the transcript shows it.
+Assume nothing was finished unless the transcript shows it.
 
 Reply with one JSON object and nothing else:
 {\"reached\": true|false, \"reason\": \"<one sentence>\", \"next_step\": \"<one imperative sentence>\"}
 
 - \"reached\" is true only if the user's request is fully satisfied by work \
-visible in the transcript. Partial progress is false.
+visible in the transcript. Partial progress is false. It is also true when \
+the agent's last message asks the user a question it cannot go on without — \
+the next move is then the user's.
 - \"reason\" says concretely what was and was not done. Name the specific \
 thing left — a line number, a file, an unanswered question.
 - \"next_step\" is the single most useful next action, addressed to the \
@@ -92,12 +133,36 @@ pub struct Verdict {
 }
 
 /// Whether a `TurnEnd.finish_reason` describes a turn cut short by the
-/// harness rather than one the model chose to end.
+/// harness rather than one the model chose to end. `empty` is a turn whose
+/// replies kept ending inside the model's reasoning with nothing said and
+/// nothing called; `bad-call` one whose tool call still did not parse after
+/// the correction.
 ///
 /// `interrupted` is excluded on purpose, and is not merely absent: a person
 /// pressing Stop has already answered the question this module asks.
 pub fn abnormal(finish_reason: &str) -> bool {
-    matches!(finish_reason, "hop-limit" | "max_tokens" | "error")
+    matches!(finish_reason, "hop-limit" | "max_tokens" | "error" | "empty" | "bad-call")
+}
+
+/// Whether a turn that ended with `finish_reason` gets the check:
+/// every abnormal stop, and a continuation that the model ended itself.
+pub fn needs_check(finish_reason: &str, continuation: bool) -> bool {
+    abnormal(finish_reason) || (continuation && finish_reason == "done")
+}
+
+/// Whether the turn `turn_id` ran at least one tool call successfully —
+/// what refunds a continuation (see [`Spent`]). Pruned re-writes of old
+/// results are not new work.
+pub fn made_progress(events: &[SessionEvent], turn_id: u64) -> bool {
+    let Some(start) = events
+        .iter()
+        .rposition(|e| matches!(&e.kind, EventKind::TurnStart { turn_id: t, .. } if *t == turn_id))
+    else {
+        return false;
+    };
+    events[start..]
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::ToolResult { ok: true, pruned: false, .. }))
 }
 
 /// The human request a turn is ultimately serving.
@@ -205,9 +270,8 @@ pub async fn check(
 ) -> Result<Verdict, String> {
     let objective = sica_core::retain::utf8_head(objective, MAX_INPUT_BYTES);
     let prompt = format!(
-        "The user asked for:\n{objective}\n\n\
-         The turn was cut short by the harness: {finish_reason}.\n\n\
-         {digest}\n\nVerdict JSON:"
+        "The user asked for:\n{objective}\n\n{}\n\n{digest}\n\nVerdict JSON:",
+        how_it_ended(finish_reason)
     );
     let messages = vec![
         ChatMessage::text("system", SYSTEM_PROMPT),
@@ -307,19 +371,67 @@ pub fn parse(raw: &str) -> Option<Verdict> {
 /// widen its next `read-file` window instead of repeating six-line reads.
 pub fn continue_prompt(v: &Verdict, finish_reason: &str, attempt: u8) -> String {
     let step = v.next_step.as_deref().unwrap_or(v.reason.as_str());
+    let why = if finish_reason == "done" {
+        "Your previous turn ended before the user's request was finished.".to_string()
+    } else {
+        format!(
+            "Your previous turn was cut short by the harness ({finish_reason}) before the \
+             user's request was finished."
+        )
+    };
     format!(
         "<auto_continue attempt=\"{attempt}\" of=\"{MAX_AUTO_CONTINUES}\">\n\
-         Your previous turn was cut short by the harness ({finish_reason}) before the \
-         user's request was finished. This is the harness continuing it — the user has \
-         not sent a new message.\n\n\
+         {why} This is the harness continuing it — the user has not sent a new \
+         message.\n\n\
          What is still missing: {}\n\
          Do this next: {step}\n\n\
-         Work in larger steps than the previous turn did: you have a fresh but equally \
-         limited tool budget, so prefer one wide call over several narrow ones. If the \
-         request is in fact already satisfied, say so and stop.\n\
+         {} If the request is in fact already satisfied, say so and stop.\n\
          </auto_continue>",
-        v.reason
+        v.reason,
+        advice(finish_reason),
     )
+}
+
+/// What to do differently next time, by how the previous turn ended. The
+/// hop-limit advice — wider calls — is the wrong one for a reply that ran
+/// out of room: `sessions/92` was told to "work in larger steps" after a
+/// 60 K-token `write-file` hit the cap, and wrote a bigger one.
+fn advice(finish_reason: &str) -> &'static str {
+    match finish_reason {
+        "max_tokens" => {
+            "Your last reply ran into the output limit, so a tool call in it was cut off \
+             and did NOT run. Say less per reply: keep your reasoning short, and write a \
+             large file in parts — write-file the first part, then add each further part \
+             with write-file '<path>' '<text>' 'append=true'."
+        }
+        "empty" => {
+            "Your last replies ended inside your reasoning with nothing said and no tool \
+             call, so nothing ran. Keep the thinking short and reply with the tool call \
+             itself."
+        }
+        "bad-call" => {
+            "Your last tool call could not be read, so it did not run. Use the one-line \
+             form <skill> '<arg>' > <expectation>, or a ```tool_call JSON fence for \
+             arguments full of quotes."
+        }
+        "error" => "The last request failed; carry on from the last step that succeeded.",
+        _ => {
+            "Work in larger steps than the previous turn did: you have a fresh but equally \
+             limited tool budget, so prefer one wide call over several narrow ones."
+        }
+    }
+}
+
+/// The sentence that tells the judge how the turn ended.
+fn how_it_ended(finish_reason: &str) -> String {
+    if finish_reason == "done" {
+        "The agent ended this turn itself, part-way through work the harness had \
+         already resumed at least once — judge the whole request, not the turn's last \
+         step."
+            .into()
+    } else {
+        format!("The turn was cut short by the harness: {finish_reason}.")
+    }
 }
 
 /// Collapse to one line and cut on a char boundary.
@@ -400,10 +512,74 @@ mod tests {
         assert!(abnormal("hop-limit"));
         assert!(abnormal("max_tokens"));
         assert!(abnormal("error"));
+        assert!(abnormal("empty"));
+        assert!(abnormal("bad-call"));
         // The two that must never trigger a check.
         assert!(!abnormal("done"), "a model that finished is not cut short");
         assert!(!abnormal("interrupted"), "Stop means stop");
         assert!(!abnormal(""));
+    }
+
+    #[test]
+    fn a_continuation_that_ends_itself_is_checked_a_human_turn_is_not() {
+        assert!(needs_check("done", true));
+        assert!(!needs_check("done", false), "ordinary conversation costs nothing extra");
+        assert!(!needs_check("interrupted", true), "Stop means stop, continuation or not");
+        assert!(needs_check("hop-limit", false));
+    }
+
+    /// The budget that let `sessions/92` stop after two continuations of a
+    /// 124-line job: a continuation that got work done is refunded.
+    #[test]
+    fn continuations_that_make_progress_are_refunded() {
+        let mut spent = Spent::default();
+        for _ in 0..5 {
+            assert!(spent.budget_left());
+            spent.open();
+            spent.refund();
+        }
+        assert_eq!(spent, Spent { opened: 5, stalled: 0 });
+        // Two in a row with nothing done and the chain stops.
+        spent.open();
+        assert!(spent.budget_left());
+        spent.open();
+        assert!(!spent.budget_left());
+        // And however well it goes, the total is bounded.
+        let mut busy = Spent::default();
+        while busy.budget_left() {
+            busy.open();
+            busy.refund();
+        }
+        assert_eq!(busy.opened, MAX_AUTO_CONTINUES);
+    }
+
+    #[test]
+    fn progress_is_a_successful_tool_call_in_the_turn() {
+        let events = vec![
+            ev(1, EventKind::TurnStart { turn_id: 1, source: TurnSource::Human }),
+            call(2, "read-file 'a'"),
+            result(3, 2, true, "ok"),
+            ev(4, EventKind::TurnStart { turn_id: 2, source: TurnSource::AutoContinue }),
+            call(5, "read-file 'b'"),
+            result(6, 5, false, "no such file"),
+        ];
+        assert!(made_progress(&events, 1));
+        assert!(!made_progress(&events, 2), "a failed call is not progress");
+        assert!(!made_progress(&events, 9));
+    }
+
+    #[test]
+    fn the_advice_fits_how_the_turn_ended() {
+        let v = Verdict { reached: false, reason: "file half written".into(), next_step: None };
+        let p = continue_prompt(&v, "max_tokens", 1);
+        assert!(p.contains("append=true"), "{p}");
+        assert!(!p.contains("larger steps"), "wider calls are the wrong cure here: {p}");
+        assert!(continue_prompt(&v, "hop-limit", 1).contains("larger steps"));
+        assert!(continue_prompt(&v, "empty", 1).contains("inside your reasoning"));
+        let done = continue_prompt(&v, "done", 3);
+        assert!(done.contains("ended before the user's request was finished"), "{done}");
+        assert!(!done.contains("cut short"), "{done}");
+        assert!(done.contains(&format!("of=\"{MAX_AUTO_CONTINUES}\"")), "{done}");
     }
 
     #[test]

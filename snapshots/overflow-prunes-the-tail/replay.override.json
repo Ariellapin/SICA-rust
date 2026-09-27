@@ -1,0 +1,10 @@
+{
+  "_comment": "The second request is refused as too long, the way llama.cpp words it. The retry must not resend the same prompt: the 21 KB read-file result in the tail is pruned first.",
+  "calls": [
+    {
+      "before_call": 1,
+      "kind": "error",
+      "message": "HTTP 400: {\"error\":{\"code\":400,\"message\":\"the request exceeds the available context size\",\"type\":\"exceed_context_size_error\"}}"
+    }
+  ]
+}

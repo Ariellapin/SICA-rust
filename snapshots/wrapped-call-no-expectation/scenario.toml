@@ -1,0 +1,1 @@
+description = "a Qwen-style wrapped call with its argument on the line below the tag and no expectation still runs, instead of being refused until the turn ends"

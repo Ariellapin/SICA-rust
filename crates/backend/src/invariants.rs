@@ -150,10 +150,20 @@ pub fn check_compaction_span_balanced(events: &[SessionEvent]) -> Vec<Violation>
             continue;
         };
         let (start, end) = (*start_seq, *end_seq);
+        // A result replaced in place — the pruner's head/tail window — is
+        // answered by the replacing row itself, which carries the same
+        // call: the pair survives.
+        let answers = match &ev.kind {
+            EventKind::ToolResult { call_seq, .. } => Some(*call_seq),
+            _ => None,
+        };
         // A summary replaces a *prefix*: the pairing rule only has to hold
         // for results whose call is in the log at all.
         for inner in events.iter().filter(|e| e.seq >= start && e.seq <= end) {
             if let EventKind::ToolResult { call_seq, skill, .. } = &inner.kind {
+                if answers == Some(*call_seq) {
+                    continue;
+                }
                 if *call_seq != 0 && (*call_seq < start || *call_seq > end) {
                     out.push(Violation::new(
                         "compaction-span-balanced",
@@ -411,6 +421,29 @@ mod tests {
         let v = check_compaction_span_balanced(&events);
         assert_eq!(v.len(), 1, "{v:?}");
         assert!(v[0].detail.contains("but not its call"), "{}", v[0].detail);
+    }
+
+    /// The pruner shadows a result with a smaller one for the same call.
+    /// The overflow path prunes the newest results too, and
+    /// `overflow-prunes-the-tail` was the first replay to run it with this
+    /// invariant on.
+    #[test]
+    fn a_result_pruned_in_place_keeps_its_pair() {
+        let events = vec![
+            call(1, "read-file"),
+            result(2, 1, "read-file"),
+            ev(3, EventKind::ToolResult {
+                surface:      SurfaceOp::Replace { start_seq: 2, end_seq: 2 },
+                call_seq:     1,
+                skill:        "read-file".into(),
+                tool_call_id: None,
+                ok:           true,
+                summary:      "[… pruned …]".into(),
+                trusted:      true,
+                pruned:       true,
+            }),
+        ];
+        assert!(check_compaction_span_balanced(&events).is_empty());
     }
 
     #[test]

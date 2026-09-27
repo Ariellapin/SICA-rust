@@ -27,8 +27,11 @@ Emit a single line:
 
 - The first token is the skill name (always dashed, lowercase).
 - Then come the positional args in the order declared by the skill's
-  `skills/<name>.md`. Quote every arg with single or double quotes (escape
-  newlines as `\n`, single-quotes as `\'`, etc.).
+  `skills/<name>.md`. Quote every arg with single or double quotes. A
+  single-argument call (a command, a path) is taken exactly as written
+  between its outer quotes, backslashes and inner quotes included; in a
+  call with several args (`write-file`) escape newlines as `\n` and
+  single-quotes as `\'`.
 - The `>` token (whitespace on both sides) separates the call from your
   **expectation** — a short phrase saying what you want to know from the
   result.

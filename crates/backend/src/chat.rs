@@ -39,6 +39,15 @@ use crate::verdict;
 /// `skills/*.md` contracts before the real calls.
 const MAX_TOOL_HOPS: u8 = 12;
 
+/// Replies per turn that may carry nothing but reasoning before the turn
+/// ends as `empty` (and goes to the completion check). Each one is answered
+/// with `runner::empty_reply_correction` and a retry with thinking off.
+const MAX_EMPTY_NUDGES: u8 = 2;
+
+/// Bytes of a reasoning-only reply's thinking handed back with the nudge
+/// when no drafted call was found in it.
+const REASONING_TAIL_BYTES: usize = 1200;
+
 /// Largest resolved-argument blob recorded on a durable `ToolCall`. Past it
 /// the field is omitted and a rebuilt row falls back to `args_preview`; the
 /// whole log is parsed at every backend start, so a megabyte of `write-file`
@@ -123,7 +132,7 @@ pub struct ChatHub {
     /// since that session's last human message (`backend::verdict`).
     /// Process-local for the same reason `goal_armed` is: a restart must
     /// not resume a continuation the person never saw.
-    pub auto_cont:     Arc<Mutex<HashMap<u64, u8>>>,
+    pub auto_cont:     Arc<Mutex<HashMap<u64, verdict::Spent>>>,
     pub next_goal_id:  Arc<AtomicU64>,
     /// User hooks from `.sica/hooks.json` (guide §13.1). Read once at
     /// startup: a hooks file that could change under a running turn
@@ -169,7 +178,7 @@ struct ControlState {
     /// see `ControlState::armed`.
     arm_set:      Arc<Mutex<HashSet<u64>>>,
     /// See [`ChatHub::auto_cont`].
-    auto_cont:    Arc<Mutex<HashMap<u64, u8>>>,
+    auto_cont:    Arc<Mutex<HashMap<u64, verdict::Spent>>>,
     next_goal:    Arc<AtomicU64>,
     /// User hooks, so a dispatch can put `HooksPolicy` in the pipeline.
     hooks:        Arc<hooks::HookConfig>,
@@ -331,20 +340,25 @@ impl ControlState {
         self.arm_set.lock().await.contains(&session_id)
     }
 
-    /// Continuation turns already opened for the human message the current
-    /// turn descends from.
-    async fn auto_continues(&self, session_id: u64) -> u8 {
-        self.auto_cont.lock().await.get(&session_id).copied().unwrap_or(0)
+    /// What the completion check has spent on the human message the
+    /// current turn descends from.
+    async fn auto_continues(&self, session_id: u64) -> verdict::Spent {
+        self.auto_cont.lock().await.get(&session_id).copied().unwrap_or_default()
     }
 
     /// Count one continuation, returning its 1-based attempt number. Bumped
     /// *before* the turn runs, so a continuation that crashes still costs an
     /// attempt — the same reasoning that records a goal round up front.
     async fn bump_auto_continue(&self, session_id: u64) -> u8 {
-        let mut g = self.auto_cont.lock().await;
-        let n = g.entry(session_id).or_insert(0);
-        *n = n.saturating_add(1);
-        *n
+        self.auto_cont.lock().await.entry(session_id).or_default().open()
+    }
+
+    /// The continuation that just ended got work done: it does not count
+    /// against the stalled allowance (`verdict::Spent`).
+    async fn refund_auto_continue(&self, session_id: u64) {
+        if let Some(spent) = self.auto_cont.lock().await.get_mut(&session_id) {
+            spent.refund();
+        }
     }
 
     async fn set_armed(&self, session_id: u64, on: bool) {
@@ -2903,8 +2917,14 @@ available: {}  (`/agent off` clears)", names.join(", "))
             let mut hops: u8 = 0;
             // A reply shaped like a tool call that the parser rejects buys one
             // `syntax_correction` round per turn, as in the subagent runner;
-            // a second miscall is accepted as the (unverified) answer.
+            // a second miscall ends the turn as `bad-call`, which the
+            // completion check then reads.
             let mut syntax_nudged = false;
+            // Reasoning-only replies answered so far this turn, and whether
+            // the next request goes out with thinking off (the retry after
+            // one — see `MAX_EMPTY_NUDGES`).
+            let mut empty_nudges: u8 = 0;
+            let mut think_off = false;
             // Retry budget for the *current* step; reset once a step lands.
             let mut retries: u32 = 0;
             // Overflow recoveries for the current step (see
@@ -3166,8 +3186,20 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 };
 
                 let turn_id = next_turn.fetch_add(1, Ordering::Relaxed);
+                // The step after a reasoning-only reply goes out with
+                // thinking off: the plan exists, what was missing is the
+                // action — and a model that thought itself out of a reply
+                // once will, left to think again, often do it again. The
+                // completion check turns thinking off the same way.
+                let step_client = if think_off {
+                    let mut c = client.clone();
+                    c.thinking = false;
+                    c
+                } else {
+                    client.clone()
+                };
                 let out = agents::turn::run_turn(
-                    client.clone(),
+                    step_client,
                     events.clone(),
                     agents::turn::TurnInput {
                         session_id,
@@ -3248,6 +3280,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             }
                         };
                         let budget = prompt_budget(window, reserve, budget_shrink_pct);
+                        // The newest results sit in the tail compaction keeps
+                        // verbatim, so an oversized one there survives every
+                        // fold: `sessions/95` sent the same 80 K-token request
+                        // three times over one 325 KB `read-file`, and the
+                        // turn died. Cut every oversized result down, newest
+                        // included, before folding.
+                        let pruned = prune_oversized_results(&sessions_map, session_id).await;
                         let compacted = compact_session(
                             &sessions_map, session_id, &client, &event_sink, budget, window,
                             &compact_policy, &wh, native_tools, &cancel,
@@ -3258,8 +3297,13 @@ available: {}  (`/agent off` clears)", names.join(", "))
                                 .await;
                         }
                         let msg = format!(
-                            "context: the server rejected the prompt as too long — {how}; {} \
+                            "context: the server rejected the prompt as too long — {how}; {}{} \
                              and retrying ({overflow_retries}/{MAX_OVERFLOW_RETRIES})",
+                            if pruned > 0 {
+                                format!("{pruned} oversized tool result(s) pruned, ")
+                            } else {
+                                String::new()
+                            },
                             if compacted { "history compacted" } else { "nothing left to fold, trimming" },
                         );
                         warn!(session_id, turn_id, "{msg}");
@@ -3360,6 +3404,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 }
                 retries = 0;
                 overflow_retries = 0;
+                think_off = false;
 
                 // Anchor the usage meter on the provider's own count for
                 // this exact envelope — the next request prices only what
@@ -3463,7 +3508,76 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 // End the turn under a reason the FE renders as its own row
                 // (§3.5); the partial output is already persisted.
                 if out.finish_reason == "max_tokens" {
+                    // The cut reply stays in the log, but not at full size in
+                    // the model's view (`compact::truncated_reply`): the
+                    // shadowing row keeps its head, so the model still sees
+                    // where it was when the continuation picks it up.
+                    if let Some(stub) = agents::compact::truncated_reply(&out.content) {
+                        append_event(&sessions_map, session_id, EventKind::AssistantMessage {
+                            surface: SurfaceOp::Replace {
+                                start_seq: last_assistant_seq,
+                                end_seq:   last_assistant_seq,
+                            },
+                            content: stub,
+                            reasoning: None,
+                            tool_calls: None,
+                        })
+                        .await;
+                    }
                     finish = "max_tokens";
+                    break;
+                }
+
+                // A reply with nothing in it but reasoning is not an answer:
+                // the model stopped mid-thought. Sessions 92, 93 and 95 each
+                // ended a turn on 10-24 K tokens of thinking cut off
+                // mid-sentence, and the loop read the silence as `done`, so
+                // the session went idle with the work undone. Its reasoning
+                // never reaches the next request, so hand back the call it
+                // drafted (or the end of its thinking) and take the next
+                // step with thinking off; past `MAX_EMPTY_NUDGES` the turn
+                // ends as `empty` and the completion check decides.
+                if out.content.trim().is_empty() && out.tool_calls.is_empty() {
+                    if empty_nudges < MAX_EMPTY_NUDGES {
+                        empty_nudges += 1;
+                        think_off = true;
+                        let drafted = agents::parse_tool_call::last_drafted_call(
+                            &out.reasoning,
+                            |name| skills.by_name.contains_key(name),
+                        );
+                        let tail = if drafted.is_some() {
+                            ""
+                        } else {
+                            sica_core::retain::utf8_tail(&out.reasoning, REASONING_TAIL_BYTES)
+                        };
+                        let msg = format!(
+                            "assistant replied with reasoning only ({} bytes, no text, no tool \
+                             call) — {}, next step with thinking off ({empty_nudges}/{MAX_EMPTY_NUDGES})",
+                            out.reasoning.len(),
+                            if drafted.is_some() {
+                                "handing back the call it drafted"
+                            } else {
+                                "asking it to act on its plan"
+                            },
+                        );
+                        warn!(session_id, "{msg}");
+                        event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg });
+                        append_event(&sessions_map, session_id, EventKind::ContextInjected {
+                            surface: SurfaceOp::Append,
+                            source:  ContextSource::ToolNotice,
+                            content: agents::runner::empty_reply_correction(drafted.as_deref(), tail),
+                        })
+                        .await;
+                        continue;
+                    }
+                    let msg = format!(
+                        "the model still replied with reasoning only after {MAX_EMPTY_NUDGES} \
+                         request(s) to act — turn ended"
+                    );
+                    warn!(session_id, "{msg}");
+                    event_sink.emit(Event::LogLine { level: "WARN".into(), message: msg.clone() });
+                    crate::incident::turn_error(session_id, outer_turn, "empty_reply", msg).await;
+                    finish = "empty";
                     break;
                 }
 
@@ -3529,9 +3643,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 // to call a tool" in the FE; surface it as a WARN so the
                 // miscall is visible.
                 let Some(call) =
-                    agents::extract_tool_call_known(&out.content, |name| {
-                        skills.by_name.contains_key(name)
-                    })
+                    agents::parse_tool_call::extract_for(&out.content, |name| skills.arity(name))
                 else {
                     if let Some(reason) = agents::parse_tool_call::rejected_attempt(
                         &out.content,
@@ -3564,6 +3676,19 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             .await;
                             continue;
                         }
+                        // A second miscall is not an answer either — the
+                        // reply was the model trying to act. Ending it as
+                        // `done` left `sessions/94` idle after two
+                        // unparsed reads; `bad-call` lets the completion
+                        // check reopen the request.
+                        finish = "bad-call";
+                        crate::incident::turn_error(
+                            session_id, outer_turn, "bad_call",
+                            format!(
+                                "the tool call still could not be read after the syntax \
+                                 correction — {reason}"
+                            ),
+                        ).await;
                     }
                     break;
                 };
@@ -3734,18 +3859,32 @@ available: {}  (`/agent off` clears)", names.join(", "))
             // "interrupted" when the user pressed Stop, and that is not an
             // abnormal stop — Stop has answered the question. A `done` turn
             // is not checked either, so ordinary conversation costs what it
-            // always did.
+            // always did — unless it is a continuation, which is where a
+            // model most often announces its next step and stops.
             let mut auto_continue: Option<String> = None;
-            if verdict::abnormal(finish) {
-                let (objective, digest) = {
+            let continuation = matches!(control.turn_source, TurnSource::AutoContinue);
+            if verdict::needs_check(finish, continuation) {
+                let (objective, digest, progressed) = {
                     let g = sessions_map.lock().await;
                     match g.get(&session_id) {
                         Some(log) => (
                             verdict::objective(&log.events, outer_turn),
                             verdict::digest(&log.events, outer_turn),
+                            verdict::made_progress(&log.events, outer_turn),
                         ),
-                        None => (String::new(), String::new()),
+                        None => (String::new(), String::new(), false),
                     }
+                };
+                // A continuation that got work done is not a stalled one
+                // (`verdict::Spent`): long jobs keep going while each turn
+                // moves them, and still stop when two in a row do not.
+                if continuation && progressed {
+                    control.refund_auto_continue(session_id).await;
+                }
+                let ended = if finish == "done" {
+                    "ended".to_string()
+                } else {
+                    format!("stopped ({finish})")
                 };
                 // No human turn behind this one means nothing to check
                 // against; the verdict would be auditing the machine's own
@@ -3763,8 +3902,8 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             event_sink.emit(Event::LogLine {
                                 level:   "WARN".into(),
                                 message: format!(
-                                    "turn {outer_turn} stopped ({finish}) and the completion \
-                                     check failed: {why} · say `continue` to resume"
+                                    "turn {outer_turn} {ended} and the completion check \
+                                     failed: {why} · say `continue` to resume"
                                 ),
                             });
                             None
@@ -3780,25 +3919,28 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     })
                     .await;
                     let spent = control.auto_continues(session_id).await;
-                    let budget_left = spent < verdict::MAX_AUTO_CONTINUES;
+                    let budget_left = spent.budget_left();
                     let (level, message) = if v.reached {
                         ("INFO", format!(
-                            "turn {outer_turn} stopped ({finish}) but the request was met — {}",
+                            "turn {outer_turn} {ended} and the request was met — {}",
                             v.reason
                         ))
                     } else if budget_left {
                         ("WARN", format!(
-                            "turn {outer_turn} stopped ({finish}) with the request \
-                             unfinished — {} · continuing automatically",
+                            "turn {outer_turn} {ended} with the request unfinished — {} · \
+                             continuing automatically",
                             v.reason
                         ))
                     } else {
+                        let why = if spent.opened >= verdict::MAX_AUTO_CONTINUES {
+                            format!("all {} auto-continues spent", verdict::MAX_AUTO_CONTINUES)
+                        } else {
+                            format!("{} continuation(s) in a row got nothing done", spent.stalled)
+                        };
                         ("WARN", format!(
-                            "turn {outer_turn} stopped ({finish}) with the request \
-                             unfinished — {} · {spent} of {} auto-continues spent, \
-                             say `continue` to resume",
-                            v.reason,
-                            verdict::MAX_AUTO_CONTINUES
+                            "turn {outer_turn} {ended} with the request unfinished — {} · \
+                             {why}, say `continue` to resume",
+                            v.reason
                         ))
                     };
                     event_sink.emit(Event::LogLine { level: level.into(), message });
@@ -4700,6 +4842,19 @@ async fn prune_tool_results(
         warn!(error = %e, session_id, "flush session (after pruning) failed");
     }
     n
+}
+
+/// Prune every oversized tool result to its head/tail window, the newest
+/// included — the overflow path's form of [`prune_tool_results`], which
+/// otherwise spares the tail a compaction keeps verbatim. Returns how many
+/// were pruned.
+async fn prune_oversized_results(sessions: &Sessions, session_id: u64) -> usize {
+    let (entries, last_seq) = {
+        let g = sessions.lock().await;
+        let Some(log) = g.get(&session_id) else { return 0 };
+        (log.derive_surface(), log.last_seq())
+    };
+    prune_tool_results(sessions, session_id, &entries, Some(entries.len()), last_seq).await
 }
 
 /// Whether a native batch ended the turn, and how.

@@ -38,6 +38,13 @@ impl SkillRegistry {
         self.by_name.get(name).cloned()
     }
 
+    /// How many positional arguments `name` takes, or `None` when no skill
+    /// by that name is registered — what `parse_tool_call::extract_for`
+    /// needs to read a one-argument call verbatim.
+    pub fn arity(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).map(|s| s.positional_args().len())
+    }
+
     /// A cheap dispatch view: this registry minus the named skills. Used
     /// for teammates, which must never reach harness controls (`ask-user`,
     /// `todo-write`, `exit-plan-mode`) or spawn their own team — anything
@@ -198,6 +205,11 @@ impl SkillRegistry {
             return Some((skill, json.clone()));
         }
         let names = skill.positional_args();
+        let optional = skill.optional_args();
+        if !call.named.is_empty() {
+            let args = bind_named(&names, &optional, &call.named);
+            return Some((skill, args));
+        }
         let mut obj = Map::new();
         for (name, val) in names.iter().zip(call.raw_args.iter()) {
             obj.insert(name.clone(), Value::String(val.clone()));
@@ -208,18 +220,66 @@ impl SkillRegistry {
         // extra value was silently dropped and the call did something other
         // than what it said. Only names the skill declares are accepted, so
         // a command that merely contains `=` cannot become an argument.
-        let optional = skill.optional_args();
         if !optional.is_empty() {
             for raw in call.raw_args.iter().skip(names.len()) {
-                let Some((key, value)) = raw.split_once('=') else { continue };
-                let key = key.trim();
-                if optional.iter().any(|o| o == key) {
-                    obj.insert(key.to_string(), Value::String(value.trim().to_string()));
+                for (key, value) in kv_pairs(raw, &optional) {
+                    obj.insert(key, Value::String(value));
                 }
             }
         }
         Some((skill, Value::Object(obj)))
     }
+}
+
+/// The declared optional args one surplus token carries. Usually one
+/// `key=value`; a model also packs several into one token
+/// (`'start=1 end=2'`, `sessions/92`), which binds each when every word of
+/// the token is a pair with a declared key — otherwise the token is one
+/// pair whose value runs to its end (`'cwd=C:\Program Files\x'`).
+fn kv_pairs(raw: &str, optional: &[String]) -> Vec<(String, String)> {
+    let declared = |key: &str| optional.iter().any(|o| o == key);
+    let words: Vec<(&str, &str)> = raw
+        .split_whitespace()
+        .filter_map(|w| w.split_once('='))
+        .collect();
+    if words.len() > 1
+        && words.len() == raw.split_whitespace().count()
+        && words.iter().all(|(k, _)| declared(k))
+    {
+        return words.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    }
+    match raw.split_once('=') {
+        Some((key, value)) if declared(key.trim()) => {
+            vec![(key.trim().to_string(), value.trim().to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Bind arguments the model named itself (`ToolCall::named`). A name the
+/// skill declares binds as written; any other name is an alias the model
+/// brought from its training (`name`, `file_path`, `command_line`), and its
+/// value goes to the first positional still unbound, in the order written.
+/// A value with nowhere to go is dropped, as a surplus positional is.
+fn bind_named(positional: &[String], optional: &[String], named: &[(String, String)]) -> Value {
+    let mut obj = Map::new();
+    let mut aliased: Vec<&str> = Vec::new();
+    for (key, value) in named {
+        if positional.iter().chain(optional).any(|n| n == key) {
+            obj.insert(key.clone(), Value::String(value.clone()));
+        } else {
+            aliased.push(value);
+        }
+    }
+    let mut aliased = aliased.into_iter();
+    for name in positional {
+        if obj.contains_key(name) {
+            continue;
+        }
+        let Some(value) = aliased.next() else { break };
+        obj.insert(name.clone(), Value::String(value.to_string()));
+    }
+    Value::Object(obj)
 }
 
 /// Longest description the model is shown, in characters (guide §8.1,
@@ -266,6 +326,7 @@ mod tests {
             raw_args: vec!["a.md".into(), "hi".into()],
             expectation: "ok".into(),
             args_json: None,
+            ..ToolCall::default()
         };
         let (_, args) = reg.resolve(&call).unwrap();
         assert_eq!(args["path"], "a.md");
@@ -280,6 +341,7 @@ mod tests {
             raw_args: vec![],
             expectation: "".into(),
             args_json: None,
+            ..ToolCall::default()
         };
         assert!(reg.resolve(&call).is_none());
     }
@@ -424,6 +486,7 @@ mod tests {
             raw_args: args.iter().map(|s| s.to_string()).collect(),
             expectation: "ok".into(),
             args_json: None,
+            ..ToolCall::default()
         }
     }
 
@@ -463,8 +526,43 @@ mod tests {
             raw_args: vec!["a.md".into(), "hi".into(), "x=1".into()],
             expectation: String::new(),
             args_json: None,
+            ..ToolCall::default()
         };
         let (_, args) = reg.resolve(&c).unwrap();
         assert_eq!(args.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn several_pairs_in_one_token_bind_when_every_key_is_declared() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(ShellLike));
+        let (_, args) = reg.resolve(&call(&["ls", "cwd=/tmp background=true"])).unwrap();
+        assert_eq!(args["cwd"], "/tmp");
+        assert_eq!(args["background"], "true");
+        // A value with a space in it is one pair, not two.
+        let (_, args) = reg.resolve(&call(&["ls", r"cwd=C:\Program Files\x"])).unwrap();
+        assert_eq!(args["cwd"], r"C:\Program Files\x");
+        assert!(args.get("background").is_none());
+    }
+
+    /// Qwen's `<parameter=key>` form: declared names bind as written, the
+    /// rest fill the missing positionals in the order the model wrote them.
+    #[test]
+    fn named_args_bind_by_name_then_by_position() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(Tk));
+        let named = |pairs: &[(&str, &str)]| ToolCall {
+            skill: "tk".into(),
+            named: pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..ToolCall::default()
+        };
+        let (_, args) = reg.resolve(&named(&[("name", "a.md"), ("content", "hi")])).unwrap();
+        assert_eq!(args, serde_json::json!({ "path": "a.md", "content": "hi" }));
+        let (_, args) = reg.resolve(&named(&[("content", "hi"), ("path", "a.md")])).unwrap();
+        assert_eq!(args, serde_json::json!({ "path": "a.md", "content": "hi" }));
+        let (_, args) = reg
+            .resolve(&named(&[("file_path", "a.md"), ("text", "hi"), ("extra", "x")]))
+            .unwrap();
+        assert_eq!(args, serde_json::json!({ "path": "a.md", "content": "hi" }));
     }
 }

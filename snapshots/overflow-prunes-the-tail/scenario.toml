@@ -1,0 +1,1 @@
+description = "a prompt the server refuses as too long is retried with its oversized newest tool result pruned, not re-sent unchanged until the turn dies"

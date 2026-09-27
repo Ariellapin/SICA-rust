@@ -547,6 +547,14 @@ impl ToolSubAgent {
             && !expectation.trim().is_empty()
             && outcome.summary.len() > SUMMARIZE_THRESHOLD
         {
+            // A capped `read-file` ends by naming the call that reads on;
+            // like the spill path below, that must outlive the paraphrase.
+            let read_on = outcome
+                .summary
+                .lines()
+                .rev()
+                .find(|l| l.starts_with(crate::builtins::READ_FILE_CAP_MARK))
+                .map(str::to_string);
             if let Some(client) = &self.summarizer {
                 let focused = match &self.cancel {
                     Some(token) => tokio::select! {
@@ -571,6 +579,10 @@ impl ToolSubAgent {
                         if let Some(path) = &spilled {
                             focused.push('\n');
                             focused.push_str(&crate::spill::pointer(path));
+                        }
+                        if let Some(line) = read_on.filter(|l| !focused.contains(l.as_str())) {
+                            focused.push('\n');
+                            focused.push_str(&line);
                         }
                         outcome.summary = focused;
                     }
@@ -859,6 +871,9 @@ fn short(s: &str) -> String {
     out
 }
 
+/// Most raw output one summariser request carries, in bytes (~8 K tokens).
+const SUMMARIZE_INPUT_MAX: usize = 32 * 1024;
+
 /// Best-effort LLM summary. Returns `None` on any transport / network error
 /// — the caller falls back to the raw skill summary so a flaky LLM never
 /// breaks the tool-call chain.
@@ -877,6 +892,23 @@ async fn summarize(
          substitute a plausible answer. Do not include any preamble or fenced \
          blocks; output only the answer."
     );
+    // The summariser's request has to fit the same window as everything
+    // else: handed a 325 KB `read-file` it was refused as too long, and the
+    // raw text it was meant to shrink went into the conversation instead
+    // (`sessions/95`). Past the cap it reads the head and the tail.
+    let window;
+    let raw = if raw.len() > SUMMARIZE_INPUT_MAX {
+        window = {
+            let w = sica_core::retain::head_tail(raw, SUMMARIZE_INPUT_MAX * 3 / 4, SUMMARIZE_INPUT_MAX / 4);
+            w.render(&sica_core::retain::notice(
+                w.omitted,
+                "the middle of the raw output is not shown to the summariser",
+            ))
+        };
+        window.as_str()
+    } else {
+        raw
+    };
     let user = format!("Expectation: {expectation}\n\nRaw output:\n{raw}");
     let messages = vec![
         ChatMessage::text("system", system),

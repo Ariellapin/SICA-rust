@@ -68,6 +68,27 @@ pub fn prune_summary(summary: &str) -> Option<String> {
     )))
 }
 
+/// The model's view of a reply the provider cut off at the completion cap,
+/// when it is big enough to matter: its head and tail around a note saying
+/// it was cut and that no call in it ran. `None` under [`PRUNE_THRESHOLD`].
+///
+/// A cut reply is almost always a tool call whose body did not fit — a
+/// whole file in one `write-file` — and left at full size in the tail of
+/// the history it starves the very continuation meant to finish it:
+/// `sessions/93` re-sent a 50 K-token half-written file and had 14 K
+/// tokens left to answer in, and was cut off again.
+pub fn truncated_reply(content: &str) -> Option<String> {
+    if content.len() <= PRUNE_THRESHOLD {
+        return None;
+    }
+    let window = head_tail(content, PRUNE_HEAD, PRUNE_TAIL);
+    Some(window.render(&notice(
+        window.omitted,
+        "this reply was cut off at the output limit, so any tool call in it was \
+         incomplete and did NOT run; its middle was removed from context",
+    )))
+}
+
 /// Per-message cap on what goes into the summarizer prompt. One pathological
 /// tool result (a 200 KB file dump) must not crowd out the rest of the
 /// history. Applied per message in the folded wire form.
@@ -521,6 +542,16 @@ mod tests {
         assert!(pruned.contains("pruned to free context"));
         assert!(pruned.len() <= PRUNE_THRESHOLD, "{}", pruned.len());
         assert!(prune_summary(&pruned).is_none(), "a pruned result must not prune again");
+    }
+
+    #[test]
+    fn a_cut_off_reply_keeps_its_head_and_says_nothing_ran() {
+        assert_eq!(truncated_reply("short"), None);
+        let body = format!("write-file 'wk.txt' '{}", "a".repeat(60_000));
+        let stub = truncated_reply(&body).expect("over threshold");
+        assert!(stub.starts_with("write-file 'wk.txt' 'aaa"), "{}", &stub[..40]);
+        assert!(stub.contains("did NOT run"), "{stub}");
+        assert!(stub.len() < PRUNE_THRESHOLD, "{}", stub.len());
     }
 
     #[test]
