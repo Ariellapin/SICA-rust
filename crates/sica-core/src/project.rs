@@ -449,6 +449,51 @@ pub fn schedules(events: &[SessionEvent]) -> Vec<ScheduleRecord> {
     out
 }
 
+/// The session's short-term memory as its newest `SessionMemory` row left
+/// it. `seq` is that row's own seq — the handle a writer compares against
+/// to find out whether someone else wrote in the meantime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMemory {
+    pub seq:         u64,
+    /// Unix milliseconds of the row.
+    pub ts:          i64,
+    pub summary:     String,
+    pub facts:       Vec<String>,
+    pub through_seq: u64,
+    pub author:      String,
+}
+
+impl SessionMemory {
+    /// Nothing worth showing or re-attaching: a person may clear the memory,
+    /// and an empty row is how that is written down.
+    pub fn is_empty(&self) -> bool {
+        self.summary.trim().is_empty() && self.facts.iter().all(|f| f.trim().is_empty())
+    }
+}
+
+/// What a reader sees: latest wins, and a cleared memory folds to `None` —
+/// the same answer as a session that never had one.
+pub fn session_memory(events: &[SessionEvent]) -> Option<SessionMemory> {
+    latest_session_memory(events).filter(|m| !m.is_empty())
+}
+
+/// The newest `SessionMemory` row as written, empty or not. A writer needs
+/// this rather than [`session_memory`]: a cleared memory still says how far
+/// the log had been read, and its seq is still the one to compare against.
+pub fn latest_session_memory(events: &[SessionEvent]) -> Option<SessionMemory> {
+    events.iter().rev().find_map(|ev| match &ev.kind {
+        EventKind::SessionMemory { summary, facts, through_seq, author } => Some(SessionMemory {
+            seq:         ev.seq,
+            ts:          ev.ts,
+            summary:     summary.clone(),
+            facts:       facts.clone(),
+            through_seq: *through_seq,
+            author:      author.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// The latest rating per assistant message (guide §3.7): `seq_ref` →
 /// `(rating, note)`, with a `0` rating clearing the entry.
 pub fn feedback(events: &[SessionEvent]) -> std::collections::HashMap<u64, (i8, Option<String>)> {
@@ -783,5 +828,35 @@ mod tests {
             SessionStats::apply(&mut state, e);
         }
         assert_eq!(state, SessionStats::fold(&events));
+    }
+
+    fn memory_row(summary: &str, facts: &[&str], through_seq: u64, author: &str) -> EventKind {
+        EventKind::SessionMemory {
+            summary: summary.into(),
+            facts: facts.iter().map(|f| f.to_string()).collect(),
+            through_seq,
+            author: author.into(),
+        }
+    }
+
+    #[test]
+    fn session_memory_is_the_newest_row_and_a_cleared_one_reads_as_none() {
+        assert!(session_memory(&log()).is_none(), "a log without a row has no memory");
+        let mut events = log();
+        events.push(ev(20, 2_000, memory_row("first", &["a"], 9, "auto")));
+        events.push(ev(21, 2_100, memory_row("second", &["a", "b"], 19, "user")));
+        let m = session_memory(&events).expect("the newest row");
+        assert_eq!((m.seq, m.summary.as_str(), m.through_seq), (21, "second", 19));
+        assert_eq!(m.facts, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(m.author, "user");
+
+        // A person cleared it: readers see nothing, a writer still learns
+        // how far the log had been read and which row to compare against.
+        events.push(ev(22, 2_200, memory_row("  ", &[], 21, "user")));
+        assert!(session_memory(&events).is_none());
+        let raw = latest_session_memory(&events).expect("the cleared row");
+        assert_eq!((raw.seq, raw.through_seq), (22, 21));
+        // Not a surface event: it never reaches the model through the fold.
+        assert!(events.last().unwrap().kind.surface().is_none());
     }
 }

@@ -450,6 +450,19 @@ fn describe(kind: &EventKind) -> Described {
             row(EventTag::Other, format!("ticket {ticket_id} opened · {origin} · {module}"))
                 .ok(false)
         }
+        EventKind::SessionMemory { summary, facts, through_seq, author } => {
+            let text = if summary.trim().is_empty() && facts.is_empty() {
+                format!("session memory cleared · {author}")
+            } else {
+                format!(
+                    "session memory · {author} · {} fact(s) · through #{through_seq}",
+                    facts.len()
+                )
+            };
+            row(EventTag::Command, text)
+                .payload(summary.clone())
+                .result(facts.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
+        }
         EventKind::Unknown => row(
             EventTag::Other,
             "unknown event (written by a newer backend)".into(),

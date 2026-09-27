@@ -1643,6 +1643,51 @@ rather than a refused turn. dsh ends the turn, but here that would cost the
 user their whole message over a typo in one token — and the turn without
 the reference is still the turn they meant to send.
 
+### 6.13 Memory — the header panel and Settings › Memory — **done** (protocol v32)
+
+No dsh counterpart; this is sica-rust's own (harness Wave 11, decision note
+`docs/notes/2026-09-27-session-and-long-term-memory.md`).
+
+**Header action** (`ui::chat::memory::action`). It is the rightmost header
+action and is always present on a session with content, so the jobs and
+reminder actions that come and go never move it. It reads `Memory`, or
+`Memory · N` once there are N key facts, over the `Memory` glyph (a
+bookmark over two text lines). While the keeper works on the open session
+(`SessionMemoryUpdate { running: true }`) the glyph becomes the Ongoing
+pixel-chase dot.
+
+**Panel** (`ui::chat::memory::panel`). It is `kit::modal`, 620 px, drawn
+from `ui::draw` and never while Settings is open. It holds a status line
+(who last wrote it — *kept up to date in the background*, *last changed by
+the model*, *last edited by you* — and how long ago, or *Updating…*, or why
+the last pass produced nothing), then the **Summary** and the **Key facts**.
+Each fact has a Ghost **Keep** button that sends `SaveMemory` with the
+session's folder, making it a long-term memory about this project. Actions:
+**Update now** (`RefreshSessionMemory`, disabled with no model or while
+updating), **Edit** (two text areas — the summary, and the facts one per
+line — saved whole with `SetSessionMemory`), **Clear** (Danger; an empty
+`SetSessionMemory`), and **Long-term memory…**, which opens Settings ›
+Memory. Nothing is optimistic: the panel redraws from `SessionMemoryChanged`.
+
+**Settings › Memory** (`ui::settings::memory`, between Agents and
+Integrations). It has three parts:
+
+- A short explanation.
+- **Behaviour**: three switches written into `sica-settings/memory.toml`
+  line by line, keeping comments and other keys — *Keep session memories*
+  (`session_summary`), *Learn from sessions* (`auto_remember`) and *Use
+  long-term memory* (`inject`). The backend re-reads the file per use, so
+  there is no restart note.
+- **Long-term memories**: an add row (text, *This project* / *Global* pills,
+  **Add**), then cards grouped Global-first and then one group per folder,
+  with the open session's folder marked. Each card shows the fact, then
+  `id · source · date · session N`, with **Edit** (in place) and **Delete**
+  (Danger).
+
+Settings › Integrations › Optional skills gained a `memory` row. Its doc
+is seeded on, so the checkbox starts ticked; unticking it renames the file
+to `memory.md.off`.
+
 ---
 
 ## 7. Settings

@@ -23,6 +23,7 @@ mod investigate;
 mod inbox;
 mod jobs_bridge;
 mod ipc;
+mod memory_keeper;
 mod parent_watch;
 mod sessions_store;
 mod title_gen;
@@ -292,6 +293,20 @@ async fn run(args: Args) -> Result<()> {
         skill_registry.register(Arc::new(agents::ScheduleList));
         skill_registry.register(Arc::new(agents::ScheduleDelete));
     }
+    // Memory (`agents::remember`): harness controls whose bodies run in the
+    // hub — `remember … session` writes the session log and `recall` reads
+    // every session's. The reverse of the reminders: seeded *on*, because
+    // memory is the point, and `skills/memory.md.off` takes the three tools
+    // away. What is already remembered reaches the prompt either way.
+    if let Err(e) = agents::remember::seed_default(&skills_path) {
+        warn!(error = %e, dir = %skills_path.display(), "seed memory.md failed");
+    }
+    let memory_doc = skills_path.join(format!("{}.md", agents::remember::MEMORY_DOC_STEM));
+    if memory_doc.exists() {
+        skill_registry.register(Arc::new(agents::Remember));
+        skill_registry.register(Arc::new(agents::Recall));
+        skill_registry.register(Arc::new(agents::Forget));
+    }
     // `model-eval` benchmarks the connected model against a prompt suite. It
     // needs the finished registry (for the live catalogue and the known-skill
     // predicate its tool-call checks use), so it is attached below alongside
@@ -538,6 +553,18 @@ async fn run(args: Args) -> Result<()> {
     investigate::configure(idealist_cfg.clone());
     if args.replay.is_none() {
         investigate::install(idealist_cfg, chat.clone());
+    }
+
+    // The memory keeper (`memory_keeper`): session memories kept up to date
+    // while the model is idle. Not in replay, for the investigator's reason.
+    // `memory.toml` is re-read per use so Settings › Memory applies without
+    // a restart; only this first read reports a malformed file.
+    if let (_, Some(w)) = agents::long_term::MemoryConfig::load() {
+        warn!(warning = %w, "memory config");
+        let _ = out_tx.send(Frame::event(Event::LogLine { level: "WARN".into(), message: w }));
+    }
+    if args.replay.is_none() {
+        memory_keeper::install(chat.clone());
     }
 
     // The reminder owner (guide §12.8): delivers due reminders to idle

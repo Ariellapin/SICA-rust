@@ -117,6 +117,15 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                         tickets.len()
                                     )));
                                 }
+                                // Memories are personal; the log panel gets a
+                                // count, not the facts.
+                                Response::Memories { memories } => {
+                                    bridge.send(UiEvent::Log(format!(
+                                        "RSP#{} Memories {{ {} }}",
+                                        frame.id,
+                                        memories.len()
+                                    )));
+                                }
                                 other => {
                                     bridge.send(UiEvent::Log(format!("RSP#{} {other:?}", frame.id)))
                                 }
@@ -181,6 +190,9 @@ async fn read_loop(r: tokio::io::ReadHalf<IpcStream>, bridge: Arc<UiBridge>) {
                                 }
                                 Response::FixSession { session_id, ticket_id, draft } => {
                                     bridge.send(UiEvent::FixSession { session_id, ticket_id, draft });
+                                }
+                                Response::Memories { memories } => {
+                                    bridge.send(UiEvent::MemoriesChanged { memories });
                                 }
                                 Response::Error { message } => {
                                     bridge.send(UiEvent::RequestFailed { message });

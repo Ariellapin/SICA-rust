@@ -138,6 +138,16 @@ one place).
 
 ## Wave C — durable working memory (M × 2, protocol bump)
 
+**Status (2026-09-27, protocol v32): C1 is covered by session memory**, in
+a different shape from the one sketched below. The memory is kept up to date by
+the harness in the background (`backend::memory_keeper`), not only by the
+model. The model can still add a key fact with `remember '<fact>' session`,
+and a person can edit it in the header's Memory panel. It is re-attached
+after every compaction. See
+[notes/2026-09-27-session-and-long-term-memory.md](notes/2026-09-27-session-and-long-term-memory.md).
+C2 (the restart brief) is still open; when it lands, the session memory is
+the block it should attach.
+
 The compaction summary is the only thing that carries the agent's own
 state across a fold, and it is LLM-written and lossy (item 1 made it
 worse; A1 makes it whole but not exact). Long tasks need a small piece of

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -483,6 +483,27 @@ pub enum Request {
     /// ticket (v31). Answers `FixSession`; the draft is *not* sent — the
     /// FE puts it in the composer for a person to review.
     StartFixSession { ticket_id: String },
+
+    // Memory (v32). Two memories: a session's own (a running summary and
+    // the important things, in its log) and long-term memory (facts that
+    // outlive a session, in `memories/long-term.json`).
+    /// Every long-term memory, all scopes. Answers `Memories`.
+    ListMemories,
+    /// Add a long-term memory (`id: None`) or rewrite one. `project` is the
+    /// folder it belongs to; `None` makes it global, so every session sees
+    /// it. Answers `Memories`, or `Error` for empty text or an unknown id.
+    SaveMemory { id: Option<String>, text: String, project: Option<PathBuf> },
+    /// Answers `Memories`, or `Error` for an unknown id.
+    DeleteMemory { id: String },
+    /// Replace a session's memory with what a person wrote; an empty
+    /// summary with no facts clears it. Answers `Ok`, and
+    /// `SessionMemoryChanged` follows.
+    SetSessionMemory { session_id: u64, summary: String, facts: Vec<String> },
+    /// Bring a session's memory up to date now rather than when it next
+    /// goes idle. Answers `Ok` — the work waits for any running turn and
+    /// reports through `SessionMemoryUpdate` — or `Error` saying why
+    /// nothing will run.
+    RefreshSessionMemory { session_id: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +556,41 @@ pub enum Response {
     /// `StartFixSession`: the session to switch to and the prompt to put in
     /// its composer.
     FixSession { session_id: u64, ticket_id: String, draft: String },
+    /// Every long-term memory (v32), global ones first, then by folder,
+    /// oldest first within each.
+    Memories { memories: Vec<MemoryDump> },
+}
+
+/// One long-term memory (v32): a single fact that outlives the session it
+/// was learned in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryDump {
+    pub id:         String,
+    pub text:       String,
+    /// The folder it belongs to. `None` is global: every session sees it.
+    pub project:    Option<PathBuf>,
+    /// Unix seconds.
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// `model` (the `remember` tool), `user` (Settings › Memory) or `auto`
+    /// (promoted from a session's memory by the background keeper).
+    pub source:     String,
+    /// The session it came from, when one did.
+    pub session:    Option<u64>,
+}
+
+/// A session's short-term memory (v32): what it is about, what has been
+/// done, and the important things worth keeping verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionMemoryDump {
+    pub summary:     String,
+    pub facts:       Vec<String>,
+    /// `auto` (the background keeper), `model` or `user`.
+    pub author:      String,
+    /// Unix milliseconds of the write.
+    pub updated_at:  i64,
+    /// The newest log seq the writer had read.
+    pub through_seq: u64,
 }
 
 /// One improvement ticket as the FE lists it (`idealist_workspace/tickets`).
@@ -876,6 +932,9 @@ pub struct SessionDump {
     /// Active reminders (harness §12.8), the header popover's rows.
     #[serde(default)]
     pub schedules: Vec<ScheduleDump>,
+    /// The session's own memory (v32), when it has one.
+    #[serde(default)]
+    pub memory: Option<SessionMemoryDump>,
 }
 
 /// One active reminder as the frontend draws it (UI guide §6.10). Only
@@ -1278,6 +1337,27 @@ pub enum Event {
     SchedulesChanged {
         session_id: u64,
         rows: Vec<ScheduleDump>,
+    },
+    /// A session's memory changed (v32) — the keeper updated it, the model
+    /// remembered something for this session, or a person edited it — or
+    /// was pushed on session load. `None` means it has none.
+    SessionMemoryChanged {
+        session_id: u64,
+        memory: Option<SessionMemoryDump>,
+    },
+    /// The background keeper started (`running: true`) or stopped working
+    /// on a session's memory. `error` says why a pass produced nothing;
+    /// `None` with `running: false` is a pass that finished, whether or not
+    /// it found anything to change.
+    SessionMemoryUpdate {
+        session_id: u64,
+        running: bool,
+        error: Option<String>,
+    },
+    /// The long-term store changed (v32): the whole list, like every other
+    /// pushed projection, so the frontend never reconciles deltas.
+    MemoriesChanged {
+        memories: Vec<MemoryDump>,
     },
 }
 

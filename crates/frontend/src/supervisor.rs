@@ -197,6 +197,12 @@ pub enum UiEvent {
     GoalChanged { session_id: u64, goal: Option<protocol::GoalDump> },
     /// The session's active reminders (harness §12.8), whole list.
     SchedulesChanged { session_id: u64, rows: Vec<protocol::ScheduleDump> },
+    /// A session's memory changed (v32); `None` is no memory.
+    SessionMemoryChanged { session_id: u64, memory: Option<protocol::SessionMemoryDump> },
+    /// The background keeper started or stopped a pass on a session.
+    SessionMemoryUpdate { session_id: u64, running: bool, error: Option<String> },
+    /// The whole long-term store — `Response::Memories` or the push.
+    MemoriesChanged { memories: Vec<protocol::MemoryDump> },
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
@@ -435,6 +441,13 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::SchedulesChanged { session_id, rows } => {
             UiEvent::SchedulesChanged { session_id, rows }
         }
+        Event::SessionMemoryChanged { session_id, memory } => {
+            UiEvent::SessionMemoryChanged { session_id, memory }
+        }
+        Event::SessionMemoryUpdate { session_id, running, error } => {
+            UiEvent::SessionMemoryUpdate { session_id, running, error }
+        }
+        Event::MemoriesChanged { memories } => UiEvent::MemoriesChanged { memories },
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }
         }

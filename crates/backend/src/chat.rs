@@ -141,6 +141,11 @@ pub struct ChatHub {
     /// is refused deterministically instead of reaching the broker.
     /// Restored from the log's `Command { name: "approval" }` rows.
     pub approval_never: Arc<Mutex<HashSet<u64>>>,
+    /// Long-term memory (`memories/long-term.json`). One instance for the
+    /// whole process — the tools, the background keeper and Settings all
+    /// write through it — so its lock really does serialise every
+    /// read-modify-write of the document.
+    pub memory:        Arc<agents::long_term::Store>,
 }
 
 /// Wave-3 per-session control plane, shared with the turn task: the pieces
@@ -174,6 +179,8 @@ struct ControlState {
     schedules:    Arc<Mutex<HashMap<u64, Vec<sica_core::project::ScheduleRecord>>>>,
     /// See [`ChatHub::approval_never`].
     approval_never: Arc<Mutex<HashSet<u64>>>,
+    /// See [`ChatHub::memory`].
+    memory:       Arc<agents::long_term::Store>,
 }
 
 impl ControlState {
@@ -519,6 +526,8 @@ impl ControlState {
             }
         } else if agents::control::is_schedule_skill(name) {
             (self.schedule_control(sessions, name, args, session_id).await, false)
+        } else if agents::remember::is_memory_skill(name) {
+            (self.memory_control(sessions, name, args, session_id).await, false)
         } else if name == agents::goal::CREATE_GOAL_NAME {
             let objective = args
                 .get("objective")
@@ -710,7 +719,8 @@ impl ControlState {
             let (outcome, conclude) = self
                 .handle_control(sessions, &call.name, &args, &preview, "", session_id, call_seq, cancel)
                 .await;
-            append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), outcome.ok, &outcome.summary, true)
+            let trusted = agents::control::control_trusted(&call.name);
+            append_tool_result(sessions, session_id, call_seq, &call.name, Some(&call.id), outcome.ok, &outcome.summary, trusted)
                 .await;
             return if conclude { BatchEnd::Concluded } else { BatchEnd::Continue };
         }
@@ -1090,7 +1100,16 @@ impl ChatHub {
             )),
             schedules:    Arc::new(Mutex::new(HashMap::new())),
             approval_never: Arc::new(Mutex::new(HashSet::new())),
+            memory:       Arc::new(agents::long_term::Store::open_default()),
         }
+    }
+
+    /// Point long-term memory at another document — tests, so a run never
+    /// touches the real store.
+    #[cfg(test)]
+    pub fn with_memory_store(mut self, store: Arc<agents::long_term::Store>) -> Self {
+        self.memory = store;
+        self
     }
 
     /// Sessions as the workspace registry sees them (guide §3.9): id,
@@ -1226,6 +1245,7 @@ impl ChatHub {
             )),
             schedules:    self.schedules.clone(),
             approval_never: self.approval_never.clone(),
+            memory:       self.memory.clone(),
             // Harness commands are the user acting directly; a turn task
             // overrides this with its own source.
             turn_source:  TurnSource::Human,
@@ -1430,6 +1450,7 @@ impl ChatHub {
             .into_iter()
             .map(run_dump)
             .collect();
+        let memory = sica_core::project::session_memory(&log.events).map(|m| session_memory_dump(&m));
         Some(SessionDump {
             id: log.id,
             title: log.title(),
@@ -1441,7 +1462,68 @@ impl ChatHub {
             agent,
             runs,
             schedules,
+            memory,
         })
+    }
+
+    /// Every long-term memory, as Settings › Memory lists them.
+    pub fn memory_dumps(&self) -> Vec<protocol::MemoryDump> {
+        self.memory.list().iter().map(|m| m.to_dump()).collect()
+    }
+
+    /// Push the whole long-term store (`Event::MemoriesChanged`).
+    pub fn publish_memories(&self) {
+        self.event_sink.emit(Event::MemoriesChanged { memories: self.memory_dumps() });
+    }
+
+    /// `SaveMemory`: a person adding a memory (`id: None`) or rewriting one.
+    pub fn save_memory(
+        &self,
+        id: Option<&str>,
+        text: &str,
+        project: Option<&Path>,
+    ) -> Result<(), String> {
+        match id {
+            Some(id) => self.memory.update(id, text, project).map(|_| ()),
+            None => self.memory.add(text, project, "user", None).and_then(|added| match added {
+                agents::long_term::Added::New(_) => Ok(()),
+                agents::long_term::Added::Duplicate(m) => {
+                    Err(format!("already remembered as [{}]: {}", m.id, m.text))
+                }
+            }),
+        }?;
+        self.publish_memories();
+        Ok(())
+    }
+
+    /// `DeleteMemory`.
+    pub fn delete_memory(&self, id: &str) -> Result<(), String> {
+        self.memory.delete(id)?;
+        self.publish_memories();
+        Ok(())
+    }
+
+    /// `SetSessionMemory`: a person's own version of the session's memory
+    /// replaces whatever was there. It counts as having read the whole log
+    /// so far — they wrote it looking at the session — so the keeper's next
+    /// pass starts after it rather than re-reading everything behind it.
+    pub async fn set_session_memory(
+        &self,
+        session_id: u64,
+        summary: &str,
+        facts: &[String],
+    ) -> Result<(), String> {
+        let (summary, facts) = agents::session_memory::clean(summary, facts);
+        let memory = {
+            let mut g = self.sessions.lock().await;
+            let log = g.get_mut(&session_id).ok_or_else(|| format!("session {session_id} not found"))?;
+            let through_seq = log.last_seq();
+            log.append(EventKind::SessionMemory { summary, facts, through_seq, author: "user".into() });
+            sessions_store::flush(log).map_err(|e| format!("session log could not be written: {e}"))?;
+            sica_core::project::session_memory(&log.events).map(|m| session_memory_dump(&m))
+        };
+        self.event_sink.emit(Event::SessionMemoryChanged { session_id, memory });
+        Ok(())
     }
 
     /// Mint a session in memory only. It reaches disk with its first user
@@ -2183,6 +2265,9 @@ impl ChatHub {
             &CancellationToken::new(),
         )
         .await;
+        if ok {
+            reattach_after_compaction(&self.sessions, session_id, &self.memory, &self.event_sink).await;
+        }
         (
             ok,
             if ok {
@@ -2522,8 +2607,9 @@ available: {}  (`/agent off` clears)", names.join(", "))
         rewind: Option<u64>,
     ) {
         // The session is working, not ended, and a running investigation
-        // must give the LLM back.
+        // must give the LLM back — as must a memory pass.
         crate::investigate::session_active(session_id);
+        crate::memory_keeper::session_active(session_id);
         let Some(client) = self.llm.lock().await.clone() else {
             // A followup handed this call a *reserved* slot. Nothing is
             // going to run now, so release it — otherwise the session reads
@@ -2626,6 +2712,12 @@ available: {}  (`/agent off` clears)", names.join(", "))
         // Live policy facts for the runtime-context snapshot.
         let perm_mode = self.permissions.lock().await.get(&session_id).copied().unwrap_or_default();
         let turn_plan_active = self.plans.lock().await.get(&session_id).copied().unwrap_or(false);
+        // The long-term memories for this session's folder, read before the
+        // log lock is taken: the store is a file.
+        let long_term = {
+            let cwd = session_cwd(&self.sessions, session_id).await;
+            long_term_block(&self.memory, &cwd)
+        };
         // The placeholder-or-fallback title this send leaves behind, so the
         // LLM titler later knows the title is still automatic.
         let provisional_title;
@@ -2650,6 +2742,14 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 self.event_sink.emit(Event::LogLine {
                     level: "INFO".into(),
                     message: "workspace instructions snapshot updated".into(),
+                });
+            }
+            // Then what the agent remembers from earlier sessions, on the
+            // same terms: a new snapshot only when the store changed.
+            if refresh_long_term(log, long_term.as_deref()) {
+                self.event_sink.emit(Event::LogLine {
+                    level: "INFO".into(),
+                    message: "long-term memory snapshot updated".into(),
                 });
             }
             append_runtime_context(log, &client.model, perm_mode, turn_plan_active);
@@ -2802,7 +2902,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
         tokio::spawn(async move {
             let mut hops: u8 = 0;
             // A reply shaped like a tool call that the parser rejects buys one
-            // `SYNTAX_CORRECTION` round per turn, as in the subagent runner;
+            // `syntax_correction` round per turn, as in the subagent runner;
             // a second miscall is accepted as the (unverified) answer.
             let mut syntax_nudged = false;
             // Retry budget for the *current* step; reset once a step lands.
@@ -2963,6 +3063,9 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     )
                     .await
                 {
+                    // The fold took the memory snapshots with it; put them
+                    // back before the history is rebuilt.
+                    reattach_after_compaction(&sessions_map, session_id, &hub.memory, &event_sink).await;
                     wh = match build_history(
                         &sessions_map, session_id, &skills, tool_mode, &model_name,
                         if plans.lock().await.get(&session_id).copied().unwrap_or(false) {
@@ -3150,6 +3253,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             &compact_policy, &wh, native_tools, &cancel,
                         )
                         .await;
+                        if compacted {
+                            reattach_after_compaction(&sessions_map, session_id, &hub.memory, &event_sink)
+                                .await;
+                        }
                         let msg = format!(
                             "context: the server rejected the prompt as too long — {how}; {} \
                              and retrying ({overflow_retries}/{MAX_OVERFLOW_RETRIES})",
@@ -3452,7 +3559,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             append_event(&sessions_map, session_id, EventKind::ContextInjected {
                                 surface: SurfaceOp::Append,
                                 source:  ContextSource::ToolNotice,
-                                content: agents::runner::SYNTAX_CORRECTION.to_string(),
+                                content: agents::runner::syntax_correction(&reason),
                             })
                             .await;
                             continue;
@@ -3529,7 +3636,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                             )
                             .await;
                         conclude_turn = conclude;
-                        (outcome, true)
+                        (outcome, agents::control::control_trusted(skill.name()))
                     }
                     Some((skill, args)) => {
                         let sub = control
@@ -3754,8 +3861,11 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 };
                 if mine && matches!(next, Next::Idle) {
                     guard.remove(&session_id);
-                    // Starts the end-of-session clock (idealist tickets).
+                    // Starts the end-of-session clock (idealist tickets),
+                    // and the shorter one that brings the session's memory
+                    // up to date while nobody needs the model.
                     crate::investigate::session_idle(session_id);
+                    crate::memory_keeper::session_idle(session_id);
                 }
                 next
             };
@@ -4807,6 +4917,298 @@ impl ControlState {
     }
 }
 
+impl ControlState {
+    /// The bodies of the three memory tools (`agents::remember`).
+    ///
+    /// `remember … session` is a key fact for this session's own memory: it
+    /// lands as a new `SessionMemory` row carrying the whole memory, like
+    /// every other write, so the background keeper reads it as part of the
+    /// memory it is updating rather than as a competing copy. Every other
+    /// scope — and `forget` — goes to the long-term store.
+    async fn memory_control(
+        &self,
+        sessions: &Sessions,
+        name: &str,
+        args: &serde_json::Value,
+        session_id: u64,
+    ) -> agents::SkillOutcome {
+        use agents::long_term::Added;
+        use agents::remember::{RememberScope, FORGET_NAME, RECALL_NAME};
+
+        let fail = |summary: String| agents::SkillOutcome { ok: false, summary };
+        let cwd = session_cwd(sessions, session_id).await;
+        if name == RECALL_NAME {
+            let query = ["query", "q", "text"]
+                .iter()
+                .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let memories = self.memory.list();
+            // Every other session's memory, archived ones included — an
+            // archived session's decisions are still decisions. Collected
+            // owned under the lock, ranked after it is released.
+            let others: Vec<(u64, String, Option<PathBuf>, sica_core::project::SessionMemory)> = {
+                let g = sessions.lock().await;
+                g.values()
+                    .filter(|log| log.id != session_id)
+                    .filter_map(|log| {
+                        sica_core::project::session_memory(&log.events)
+                            .map(|m| (log.id, log.title(), log.cwd(), m))
+                    })
+                    .collect()
+            };
+            let candidates: Vec<agents::remember::SessionCandidate<'_>> = others
+                .iter()
+                .map(|(id, title, cwd, m)| agents::remember::SessionCandidate {
+                    id:     *id,
+                    title:  title.as_str(),
+                    cwd:    cwd.as_deref(),
+                    memory: m,
+                })
+                .collect();
+            let text = agents::remember::recall_text(
+                &query,
+                &memories,
+                &candidates,
+                &cwd,
+                chrono::Utc::now().timestamp_millis(),
+            );
+            return agents::SkillOutcome { ok: true, summary: text };
+        }
+        if name == FORGET_NAME {
+            let arg = ["id", "memory", "text", "fact"]
+                .iter()
+                .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+                .unwrap_or("");
+            // Only what this session can see: forgetting another project's
+            // fact from here would be reaching into a folder it is not in.
+            let visible = self.memory.for_folder(&cwd);
+            let target = match agents::remember::resolve_forget(arg, &visible) {
+                Ok(m) => m.id.clone(),
+                Err(e) => return fail(e),
+            };
+            return match self.memory.delete(&target) {
+                Ok(m) => {
+                    self.publish_memories();
+                    self.events.emit(Event::LogLine {
+                        level:   "INFO".into(),
+                        message: format!("memory: the model forgot [{}]: {}", m.id, m.text),
+                    });
+                    agents::SkillOutcome { ok: true, summary: format!("forgot [{}]: {}", m.id, m.text) }
+                }
+                Err(e) => fail(e),
+            };
+        }
+        // remember
+        let fact = match agents::remember::fact_arg(args) {
+            Ok(f) => f,
+            Err(e) => return fail(e),
+        };
+        let scope = match agents::remember::parse_scope(args.get("scope")) {
+            Ok(s) => s,
+            Err(e) => return fail(e),
+        };
+        if scope == RememberScope::Session {
+            let memory = {
+                let mut g = sessions.lock().await;
+                let Some(log) = g.get_mut(&session_id) else {
+                    return fail(format!("session {session_id} vanished"));
+                };
+                let prev = sica_core::project::latest_session_memory(&log.events);
+                let (summary, mut facts, through_seq) = match prev {
+                    Some(p) => (p.summary, p.facts, p.through_seq),
+                    None => (String::new(), Vec::new(), 0),
+                };
+                match agents::session_memory::add_fact(&mut facts, &fact) {
+                    Err(e) => return fail(e),
+                    Ok(false) => {
+                        return agents::SkillOutcome {
+                            ok: true,
+                            summary: "already in this session's memory".into(),
+                        }
+                    }
+                    Ok(true) => {}
+                }
+                log.append(EventKind::SessionMemory {
+                    summary,
+                    facts,
+                    through_seq,
+                    author: "model".into(),
+                });
+                if let Err(e) = sessions_store::flush(log) {
+                    warn!(error = %e, session_id, "flush session (after remember) failed");
+                }
+                sica_core::project::session_memory(&log.events).map(|m| session_memory_dump(&m))
+            };
+            self.events.emit(Event::SessionMemoryChanged { session_id, memory });
+            return agents::SkillOutcome {
+                ok: true,
+                summary: format!("remembered for this session: {fact}"),
+            };
+        }
+        let project = (scope == RememberScope::Project).then_some(cwd.as_path());
+        match self.memory.add(&fact, project, "model", Some(session_id)) {
+            Ok(Added::New(m)) => {
+                self.publish_memories();
+                // Every later session will read this, so the operator gets
+                // to see it land — not only as a row in this transcript.
+                self.events.emit(Event::LogLine {
+                    level:   "INFO".into(),
+                    message: format!("memory: the model remembered ({}) [{}]: {}", scope.label(), m.id, m.text),
+                });
+                agents::SkillOutcome {
+                    ok: true,
+                    summary: format!("remembered ({}) as [{}]: {}", scope.label(), m.id, m.text),
+                }
+            }
+            Ok(Added::Duplicate(m)) => agents::SkillOutcome {
+                ok: true,
+                summary: format!("already remembered as [{}]: {}", m.id, m.text),
+            },
+            Err(e) => fail(e),
+        }
+    }
+
+    /// Push the whole long-term store to the frontend.
+    fn publish_memories(&self) {
+        let memories = self.memory.list().iter().map(|m| m.to_dump()).collect();
+        self.events.emit(Event::MemoriesChanged { memories });
+    }
+}
+
+/// A session memory on the wire.
+pub(crate) fn session_memory_dump(m: &sica_core::project::SessionMemory) -> protocol::SessionMemoryDump {
+    protocol::SessionMemoryDump {
+        summary:     m.summary.clone(),
+        facts:       m.facts.clone(),
+        author:      m.author.clone(),
+        updated_at:  m.ts,
+        through_seq: m.through_seq,
+    }
+}
+
+/// The long-term snapshot a session in `cwd` should see, or `None` when
+/// nothing applies — or when `memory.toml` turned injection off.
+pub(crate) fn long_term_block(store: &agents::long_term::Store, cwd: &Path) -> Option<String> {
+    let cfg = agents::long_term::MemoryConfig::current();
+    if !cfg.inject {
+        return None;
+    }
+    agents::long_term::render_block(&store.for_folder(cwd), cfg.prompt_items, cfg.prompt_chars)
+}
+
+/// Reconcile the long-term snapshot with the store, the way
+/// [`refresh_instructions`] reconciles workspace instructions: append a
+/// replacement only when the content changed, shadowing the predecessor
+/// if it is still on the surface. Returns `true` when a snapshot landed.
+///
+/// Changes are rare — a `remember`, a promotion, an edit in Settings — so
+/// most turns append nothing and the prefix before the tail stays put.
+fn refresh_long_term(log: &mut SessionLog, block: Option<&str>) -> bool {
+    let entries = log.derive_surface();
+    let prev = entries
+        .iter()
+        .rev()
+        .find(|e| matches!(e.context, Some(ContextSource::LongTermMemory)))
+        .map(|e| e.seq);
+    let content = match block {
+        Some(b) => b.to_string(),
+        None => {
+            // Only supersede when there is something to supersede.
+            if prev.is_none() {
+                return false;
+            }
+            "<long-term-memory>\nNo long-term memories apply to this session any more — \
+             disregard the ones listed earlier.\n</long-term-memory>"
+                .to_string()
+        }
+    };
+    if prev.and_then(|seq| context_content(log, seq)).as_deref() == Some(content.as_str()) {
+        return false;
+    }
+    log.append(EventKind::ContextInjected {
+        surface: match prev {
+            Some(seq) => SurfaceOp::Replace { start_seq: seq, end_seq: seq },
+            None => SurfaceOp::Append,
+        },
+        source: ContextSource::LongTermMemory,
+        content,
+    });
+    true
+}
+
+/// The content of the `ContextInjected` row at `seq`.
+fn context_content(log: &SessionLog, seq: u64) -> Option<String> {
+    log.events.iter().find_map(|ev| match &ev.kind {
+        EventKind::ContextInjected { content, .. } if ev.seq == seq => Some(content.clone()),
+        _ => None,
+    })
+}
+
+/// Put both memories back in front of the model after a compaction folded
+/// them away with the rest of the older history.
+///
+/// The session memory is attached only once something has actually been
+/// folded — until then the conversation it summarises is still on the
+/// surface verbatim — and only when there is one. It lands at the tail,
+/// like every other mid-turn context, which keeps the prefix the summary
+/// just established intact. Returns whether anything was appended.
+fn reattach_memory(log: &mut SessionLog, long_term: Option<&str>) -> bool {
+    let mut changed = false;
+    let entries = log.derive_surface();
+    let folded = entries.iter().any(|e| {
+        e.message.role == Role::System
+            && e.message.content.starts_with(protocol::CONTEXT_SUMMARY_PREFIX)
+    });
+    if folded {
+        if let Some(m) = sica_core::project::session_memory(&log.events) {
+            let content = agents::session_memory::snapshot(&m.summary, &m.facts);
+            let prev = entries
+                .iter()
+                .rev()
+                .find(|e| matches!(e.context, Some(ContextSource::SessionMemory)))
+                .map(|e| e.seq);
+            if prev.and_then(|seq| context_content(log, seq)).as_deref() != Some(content.as_str()) {
+                log.append(EventKind::ContextInjected {
+                    surface: match prev {
+                        Some(seq) => SurfaceOp::Replace { start_seq: seq, end_seq: seq },
+                        None => SurfaceOp::Append,
+                    },
+                    source: ContextSource::SessionMemory,
+                    content,
+                });
+                changed = true;
+            }
+        }
+    }
+    changed | refresh_long_term(log, long_term)
+}
+
+/// [`reattach_memory`] for a live session, after `compact_session`
+/// reported progress.
+async fn reattach_after_compaction(
+    sessions: &Sessions,
+    session_id: u64,
+    store: &agents::long_term::Store,
+    events: &Arc<dyn EventSink>,
+) {
+    let cwd = session_cwd(sessions, session_id).await;
+    let block = long_term_block(store, &cwd);
+    let mut g = sessions.lock().await;
+    let Some(log) = g.get_mut(&session_id) else { return };
+    if !reattach_memory(log, block.as_deref()) {
+        return;
+    }
+    if let Err(e) = sessions_store::flush(log) {
+        warn!(error = %e, session_id, "flush session (after memory re-attach) failed");
+    }
+    drop(g);
+    events.emit(Event::LogLine {
+        level:   "INFO".into(),
+        message: "context: memory re-attached after compaction".into(),
+    });
+}
+
 fn schedule_dump(r: &sica_core::project::ScheduleRecord) -> protocol::ScheduleDump {
     protocol::ScheduleDump {
         id: r.id.clone(),
@@ -5779,8 +6181,23 @@ mod tests {
             runs: Arc::new(NoRuns),
             schedules: Arc::new(Mutex::new(HashMap::new())),
             approval_never: Arc::new(Mutex::new(HashSet::new())),
+            memory: Arc::new(agents::long_term::Store::at(scratch_store("control"))),
         };
         (cs, Arc::new(Mutex::new(HashMap::new())), cap)
+    }
+
+    /// A long-term store of the test's own, so no run touches the real one.
+    fn scratch_store(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sica-chat-memory-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("long-term.json")
     }
 
     /// A notifier that drops every edge — these tests drive the control
@@ -5912,6 +6329,205 @@ mod tests {
         let g = sessions.lock().await;
         let todos = g[&1].events.iter().filter(|e| matches!(e.kind, EventKind::TodoWrite { .. })).count();
         assert_eq!(todos, 1);
+    }
+
+    // ---- Memory (v32) ----
+
+    async fn memory_call(
+        cs: &ControlState,
+        sessions: &Sessions,
+        name: &str,
+        args: serde_json::Value,
+        session_id: u64,
+    ) -> agents::SkillOutcome {
+        let cancel = CancellationToken::new();
+        cs.handle_control(sessions, name, &args, name, "", session_id, 0, &cancel).await.0
+    }
+
+    #[tokio::test]
+    async fn remember_saves_long_term_by_scope_and_refuses_repeats() {
+        let (cs, sessions, cap) = control();
+        with_log(&sessions, 1).await;
+        let global = serde_json::json!({"fact": "The user prefers PowerShell", "scope": "global"});
+        let out = memory_call(&cs, &sessions, "remember", global, 1).await;
+        assert!(out.ok && out.summary.contains("remembered (global)"), "{}", out.summary);
+        // No scope is this project — the session's own folder.
+        let out = memory_call(&cs, &sessions, "remember", serde_json::json!({"fact": "Build with run.ps1"}), 1).await;
+        assert!(out.ok && out.summary.contains("remembered (project)"), "{}", out.summary);
+        let again = serde_json::json!({"fact": "the user prefers powershell!", "scope": "user"});
+        let out = memory_call(&cs, &sessions, "remember", again, 1).await;
+        assert!(out.ok && out.summary.starts_with("already remembered as [m-"), "{}", out.summary);
+
+        let all = cs.memory.list();
+        assert_eq!(all.len(), 2);
+        let project = all.iter().find(|m| !m.is_global()).expect("the project fact");
+        assert!(project.applies_to(&session_cwd(&sessions, 1).await));
+        assert_eq!((project.source.as_str(), project.session), ("model", Some(1)));
+        assert!(cap.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            Event::MemoriesChanged { memories } if memories.len() == 2
+        )));
+
+        let out = memory_call(&cs, &sessions, "remember", serde_json::json!({"fact": " "}), 1).await;
+        assert!(!out.ok);
+        let bad = serde_json::json!({"fact": "x", "scope": "forever"});
+        assert!(!memory_call(&cs, &sessions, "remember", bad, 1).await.ok);
+    }
+
+    #[tokio::test]
+    async fn remember_for_the_session_adds_a_fact_and_keeps_the_summary() {
+        let (cs, sessions, cap) = control();
+        with_log(&sessions, 1).await;
+        append_event(&sessions, 1, EventKind::SessionMemory {
+            summary: "Porting the parser".into(),
+            facts: vec!["a".into()],
+            through_seq: 1,
+            author: "auto".into(),
+        })
+        .await;
+        let args = serde_json::json!({"fact": "the tests live in tests/", "scope": "session"});
+        let out = memory_call(&cs, &sessions, "remember", args.clone(), 1).await;
+        assert!(out.ok && out.summary.contains("for this session"), "{}", out.summary);
+        let dup = memory_call(&cs, &sessions, "remember", args, 1).await;
+        assert!(dup.ok && dup.summary.contains("already"), "{}", dup.summary);
+
+        let g = sessions.lock().await;
+        let m = sica_core::project::session_memory(&g[&1].events).expect("a memory");
+        assert_eq!(m.summary, "Porting the parser", "a note never rewrites the summary");
+        assert_eq!(m.facts, vec!["a".to_string(), "the tests live in tests/".to_string()]);
+        assert_eq!((m.author.as_str(), m.through_seq), ("model", 1));
+        drop(g);
+        assert!(cs.memory.list().is_empty(), "a session note is not a long-term memory");
+        assert!(cap.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            Event::SessionMemoryChanged { session_id: 1, memory: Some(_) }
+        )));
+    }
+
+    #[tokio::test]
+    async fn recall_searches_the_other_sessions_and_is_framed_as_data() {
+        let (cs, sessions, _) = control();
+        with_log(&sessions, 1).await;
+        with_log(&sessions, 2).await;
+        for (id, summary) in [(2, "Fixed the flaky websocket reconnect."), (1, "More websocket work.")] {
+            append_event(&sessions, id, EventKind::SessionMemory {
+                summary: summary.into(),
+                facts: vec!["backoff is 250ms".into()],
+                through_seq: 1,
+                author: "auto".into(),
+            })
+            .await;
+        }
+        cs.memory.add("The user deploys on Fridays", None, "user", None).unwrap();
+        let out = memory_call(&cs, &sessions, "recall", serde_json::json!({"query": "websocket backoff"}), 1).await;
+        assert!(out.ok);
+        assert!(out.summary.contains("session 2"), "{}", out.summary);
+        assert!(out.summary.contains("· backoff is 250ms"), "{}", out.summary);
+        assert!(!out.summary.contains("session 1 "), "a session is never its own result: {}", out.summary);
+        let out = memory_call(&cs, &sessions, "recall", serde_json::json!({"query": "deploys"}), 1).await;
+        assert!(out.summary.contains("deploys on Fridays"), "{}", out.summary);
+        // What earlier sessions wrote is data, like a file the model read.
+        assert!(!agents::control::control_trusted("recall"));
+        assert!(agents::control::control_trusted("remember"));
+    }
+
+    #[tokio::test]
+    async fn forget_takes_an_id_or_a_phrase_but_only_from_this_folder() {
+        let (cs, sessions, cap) = control();
+        with_log(&sessions, 1).await;
+        let m = cs.memory.add("The user prefers tabs", None, "user", None).unwrap().memory().clone();
+        let out = memory_call(&cs, &sessions, "forget", serde_json::json!({"id": m.id}), 1).await;
+        assert!(out.ok && out.summary.contains(&m.id), "{}", out.summary);
+        assert!(cs.memory.list().is_empty());
+        assert!(cap.0.lock().unwrap().iter().any(|e| matches!(e, Event::MemoriesChanged { memories } if memories.is_empty())));
+        assert!(!memory_call(&cs, &sessions, "forget", serde_json::json!({"id": "m-nope"}), 1).await.ok);
+
+        let elsewhere = scratch_store("elsewhere");
+        let elsewhere = elsewhere.parent().unwrap();
+        cs.memory.add("A fact about another project", Some(elsewhere), "user", None).unwrap();
+        let out = memory_call(&cs, &sessions, "forget", serde_json::json!({"id": "another project"}), 1).await;
+        assert!(!out.ok, "{}", out.summary);
+        assert_eq!(cs.memory.list().len(), 1);
+    }
+
+    #[test]
+    fn the_long_term_snapshot_lands_once_and_is_replaced_only_on_change() {
+        let mut log = SessionLog::new(1, "t");
+        assert!(!refresh_long_term(&mut log, None), "nothing to say and nothing to supersede");
+        assert!(refresh_long_term(&mut log, Some("A")));
+        assert!(!refresh_long_term(&mut log, Some("A")), "unchanged: no new row");
+        assert!(refresh_long_term(&mut log, Some("B")));
+        let snaps = |log: &SessionLog| -> Vec<String> {
+            log.derive_surface()
+                .into_iter()
+                .filter(|e| matches!(e.context, Some(ContextSource::LongTermMemory)))
+                .map(|e| e.message.content)
+                .collect()
+        };
+        assert_eq!(snaps(&log), vec!["B".to_string()], "the new snapshot shadows the old one");
+        assert!(refresh_long_term(&mut log, None), "an emptied store supersedes what was shown");
+        let now = snaps(&log);
+        assert_eq!(now.len(), 1);
+        assert!(now[0].contains("No long-term memories apply"), "{}", now[0]);
+    }
+
+    #[test]
+    fn memory_is_reattached_after_a_fold_and_only_then() {
+        let mut log = SessionLog::new(1, "t");
+        let u = log.append(EventKind::UserMessage {
+            surface: SurfaceOp::Append,
+            content: "hi".into(),
+            images: Vec::new(),
+        });
+        log.append(EventKind::SessionMemory {
+            summary: "S".into(),
+            facts: vec!["F".into()],
+            through_seq: u,
+            author: "auto".into(),
+        });
+        assert!(!reattach_memory(&mut log, None), "nothing folded: the conversation is still there");
+
+        log.append(EventKind::CompactionSummary {
+            surface: SurfaceOp::Replace { start_seq: u, end_seq: u },
+            content: agents::compact::summary_message("sum"),
+            summary: "sum".into(),
+            folded: 1,
+            before_tokens: 10,
+            after_tokens: 5,
+        });
+        assert!(reattach_memory(&mut log, Some("LT")));
+        let entries = log.derive_surface();
+        assert!(entries.iter().any(|e| {
+            matches!(e.context, Some(ContextSource::SessionMemory)) && e.message.content.contains("Summary:\nS")
+        }));
+        assert!(entries.iter().any(|e| matches!(e.context, Some(ContextSource::LongTermMemory))));
+        assert!(!reattach_memory(&mut log, Some("LT")), "already attached and unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_person_s_edit_replaces_the_memory_and_reaches_the_dump() {
+        let (hub, _rx) = hub();
+        let hub = hub.with_memory_store(Arc::new(agents::long_term::Store::at(scratch_store("hub"))));
+        let id = hub.create_session(None).await;
+        hub.set_session_memory(id, " What we did ", &["- one".into(), "one".into(), "two".into()])
+            .await
+            .unwrap();
+        let dump = hub.dump_session(id).await.unwrap().memory.expect("the memory rides the dump");
+        assert_eq!(dump.summary, "What we did");
+        assert_eq!(dump.facts, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(dump.author, "user");
+        // Clearing it reads as no memory at all.
+        hub.set_session_memory(id, "", &[]).await.unwrap();
+        assert!(hub.dump_session(id).await.unwrap().memory.is_none());
+        assert!(hub.set_session_memory(987_654, "x", &[]).await.is_err());
+
+        hub.save_memory(None, "A person's fact", None).unwrap();
+        assert!(hub.save_memory(None, "a person's fact", None).is_err(), "a repeat is refused");
+        let id = hub.memory_dumps()[0].id.clone();
+        hub.save_memory(Some(&id), "A corrected fact", None).unwrap();
+        assert_eq!(hub.memory_dumps()[0].text, "A corrected fact");
+        hub.delete_memory(&id).unwrap();
+        assert!(hub.memory_dumps().is_empty());
     }
 
     #[tokio::test]

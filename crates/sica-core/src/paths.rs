@@ -100,6 +100,29 @@ pub fn memory_file() -> PathBuf {
     workspace_root().join("memory.md")
 }
 
+/// Long-term memory: facts that outlive a session, as one JSON document
+/// (`agents::long_term`). A folder of its own beside `sessions/` rather
+/// than a file in `sica-settings/` because it is data the agent writes,
+/// not configuration — and it is personal, so it is `.gitignore`d.
+///
+/// Not to be confused with [`memory_file`]: `memory.md` is the standing
+/// *instruction* brief, this is what the agent has learned.
+pub fn memories_dir() -> PathBuf {
+    workspace_root().join("memories")
+}
+
+/// The long-term memory store itself.
+pub fn long_term_memory_file() -> PathBuf {
+    memories_dir().join("long-term.json")
+}
+
+/// Optional knobs for both memories (`agents::long_term::MemoryConfig`):
+/// the background session summary, promotion into long-term memory, and
+/// how much of it reaches a prompt. Absent means the defaults.
+pub fn memory_config_file() -> PathBuf {
+    settings_dir().join("memory.toml")
+}
+
 /// Environment variable overriding [`workspace_root`]. Exists for the replay
 /// driver, which needs a run's own state to land in a scratch tree.
 pub const WORKSPACE_ROOT_ENV: &str = "SICA_WORKSPACE_ROOT";

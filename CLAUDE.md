@@ -56,15 +56,15 @@ Seven crates, dependency direction strictly downward. Details in
 | `protocol` | Wire types only + `PROTOCOL_VERSION`. Shared by both binaries. |
 | `sica-core` | Shared utilities: `paths`, `event` (session log + `derive_surface`), `retain`, `message`/`session`, `build_id`, `theme`. |
 | `llm` | HTTP client for OpenAI-compatible `/v1/chat/completions`, SSE streaming, connection state, token counting. |
-| `agents` | Agent runtime: turns, skills, prompt assembly, compaction, delegation, jobs, goals, evals. |
+| `agents` | Agent runtime: turns, skills, prompt assembly, compaction, delegation, jobs, goals, evals, memory (`long_term`, `session_memory`, `remember`). |
 | `idealist` | Classifies failures, writes improvement tickets to `idealist_workspace/`. |
-| `backend` | Long-lived binary: dispatcher, `ChatHub` agent loop, legacy demo state. |
+| `backend` | Long-lived binary: dispatcher, `ChatHub` agent loop, the memory keeper, legacy demo state. |
 | `frontend` | egui GUI: supervisor (BE child + IPC + watcher), `app.rs` state, `ui/` surfaces. |
 
 ## Reference docs
 
 - **[docs/architecture.md](docs/architecture.md)** — the crate graph, the wire
-  protocol (framing, `PROTOCOL_VERSION` history v17–v31), every on-disk surface,
+  protocol (framing, `PROTOCOL_VERSION` history v17–v32), every on-disk surface,
   how to add a new request, and the conventions to respect when editing.
 - **[docs/agent-loop.md](docs/agent-loop.md)** — one turn end to end: history
   derivation, prune/compact/trim, retry classification, the two tool-calling
@@ -97,8 +97,19 @@ Seven crates, dependency direction strictly downward. Details in
   malformed: `.sica/hooks.json` in the working directory (user hooks, §13.1),
   `sica-settings/mcp/*.toml` (one MCP server each, §13.2), `sica-settings/web.toml`
   (the `web-search` provider key, §13.3), `sica-settings/idealist.toml` (the
-  end-of-session investigator's knobs). Each reports what it could not load as a
-  `LogLine` rather than failing startup.
+  end-of-session investigator's knobs), `sica-settings/memory.toml` (the memory
+  knobs — re-read per use, so Settings › Memory applies without a restart). Each
+  reports what it could not load as a `LogLine` rather than failing startup.
+- Memory (v32) comes in two parts. **Session memory** is `EventKind::SessionMemory`
+  rows in a session's log, kept up to date by `backend::memory_keeper` while the
+  model is idle and re-attached after compactions. **Long-term memory** is
+  `memories/long-term.json` (`.gitignore`d), injected at turn start. The
+  `remember` / `recall` / `forget` tools are seeded **on** (`skills/memory.md`)
+  and cost ~170 tokens per request; renaming the doc to `.md.off` removes them.
+  A change to the prompt's size shifts every replay recording's `token_usage`
+  counts, so re-bless (`--bless`) in the same commit and check that only those
+  counts moved. See
+  [docs/notes/2026-09-27-session-and-long-term-memory.md](docs/notes/2026-09-27-session-and-long-term-memory.md).
 - Report a new failure path through `backend::incident` (not only a `LogLine`),
   so it becomes an idealist ticket the end-of-session investigator can read.
   See [docs/notes/2026-09-26-idealist-investigator.md](docs/notes/2026-09-26-idealist-investigator.md).

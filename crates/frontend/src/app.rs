@@ -25,6 +25,7 @@ pub enum SettingsTab {
     Models,
     Skills,
     Agents,
+    Memory,
     Integrations,
     Diagnostics,
 }
@@ -308,6 +309,15 @@ pub struct App {
     /// Active reminders of the active session (harness §12.8) — the
     /// header's schedule popover. Replaced wholesale on every change.
     pub schedules: Vec<protocol::ScheduleDump>,
+    /// The active session's own memory (v32): its running summary and key
+    /// facts, what the header's Memory panel shows. Replaced wholesale.
+    pub session_memory: Option<protocol::SessionMemoryDump>,
+    /// The Memory panel and Settings › Memory: open flags, drafts, and the
+    /// keeper's state for the active session.
+    pub memory_ui: MemoryUi,
+    /// Long-term memories, all scopes. `None` until Settings › Memory or
+    /// the panel first asks; then kept current by `MemoriesChanged`.
+    pub memories: Option<Vec<protocol::MemoryDump>>,
     /// Backend warnings about MCP servers, in arrival order (§7.2): the
     /// Integrations tab shows the newest one that names a server as that
     /// server's Failed reason.
@@ -356,6 +366,26 @@ pub struct App {
     /// The OS light/dark preference eframe reported at startup; what
     /// `ThemeMode::System` resolves to.
     pub system_dark: bool,
+}
+
+/// UI state around the two memories (v32).
+#[derive(Default)]
+pub struct MemoryUi {
+    /// The session-memory panel is open.
+    pub open: bool,
+    /// A keeper pass is running on the active session.
+    pub updating: bool,
+    /// Why the last pass on the active session produced nothing.
+    pub error: Option<String>,
+    /// `Some` while the panel is being edited: the summary, and the key
+    /// facts one per line.
+    pub draft: Option<(String, String)>,
+    /// Settings › Memory: the memory being added, and whether it is global
+    /// rather than about the active session's folder.
+    pub new_text: String,
+    pub new_global: bool,
+    /// Settings › Memory: the memory being rewritten — its id and draft.
+    pub editing: Option<(String, String)>,
 }
 
 /// Which composer / header menu is open. Only one at a time — egui has no
@@ -1377,6 +1407,9 @@ impl App {
             jobs: Vec::new(),
             goal: None,
             schedules: Vec::new(),
+            session_memory: None,
+            memory_ui: MemoryUi::default(),
+            memories: None,
             mcp_notes: Vec::new(),
             goal_edit: None,
             permission_mode: protocol::PermissionMode::default(),
@@ -2621,6 +2654,12 @@ impl App {
                 // An objective half-edited in the session being left must not
                 // be committed against the one being opened.
                 self.goal_edit = None;
+                // Nor may a memory draft, and the keeper's state belonged to
+                // the session being left.
+                self.session_memory = session.memory;
+                self.memory_ui.draft = None;
+                self.memory_ui.updating = false;
+                self.memory_ui.error = None;
             }
             UiEvent::SessionStats { session_id, stats, outline, through_seq } => {
                 self.stats.loading = false;
@@ -2752,6 +2791,23 @@ impl App {
                 if session_id == self.chat.session_id {
                     self.schedules = rows;
                 }
+            }
+            UiEvent::SessionMemoryChanged { session_id, memory } => {
+                if session_id == self.chat.session_id {
+                    self.session_memory = memory;
+                    self.memory_ui.error = None;
+                }
+            }
+            UiEvent::SessionMemoryUpdate { session_id, running, error } => {
+                if session_id == self.chat.session_id {
+                    self.memory_ui.updating = running;
+                    if !running {
+                        self.memory_ui.error = error;
+                    }
+                }
+            }
+            UiEvent::MemoriesChanged { memories } => {
+                self.memories = Some(memories);
             }
             UiEvent::InboxChanged { session_id, queued, accepted } => {
                 if session_id == self.chat.session_id {

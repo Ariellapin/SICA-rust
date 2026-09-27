@@ -19,5 +19,8 @@ sessions/*.*
 # Oversized tool outputs the sub-agent spilled to disk (see agents::spill).
 spill/
 
+# Long-term memory (agents::long_term) — personal facts the agent learned.
+memories/
+
 # model-eval reports — regenerated on every run.
 evals/reports/

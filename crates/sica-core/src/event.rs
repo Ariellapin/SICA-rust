@@ -388,6 +388,28 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// The session's short-term memory changed: a running summary of what
+    /// the session is about and has done, and the important things worth
+    /// keeping verbatim for the rest of it (decisions, paths, commands that
+    /// worked, the user's stated constraints). Every row is the whole
+    /// memory — latest wins, like `TodoWrite`.
+    ///
+    /// **Not a surface event.** The conversation itself is still in front
+    /// of the model until a compaction folds it, and that is when the
+    /// memory is re-attached, as a `ContextInjected { SessionMemory }`
+    /// snapshot. Written by the background keeper (`author: auto`), by the
+    /// model's `remember` tool (`model`), or by a person in the UI (`user`).
+    SessionMemory {
+        summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        facts: Vec<String>,
+        /// The newest log seq the writer had read. The keeper summarises
+        /// only what came after it, so each pass is incremental.
+        #[serde(default)]
+        through_seq: u64,
+        /// `auto` | `model` | `user`.
+        author: String,
+    },
     /// Something went wrong here and the idealist filed it (ticket
     /// `ticket_id` under `idealist_workspace/tickets/`). Logged once per
     /// ticket per session, at its first failure — later repeats only bump
@@ -478,6 +500,13 @@ pub enum ContextSource {
     Injected,
     /// Volatile facts (time, permission mode) snapshotted for this step.
     RuntimeContext,
+    /// The session's own memory (`EventKind::SessionMemory`), re-attached
+    /// after a compaction folded the conversation it summarises.
+    SessionMemory,
+    /// The long-term memories that apply to this session's folder — facts
+    /// that outlive a session. Refreshed at turn start like `Instructions`:
+    /// a new snapshot lands only when the store changed.
+    LongTermMemory,
 }
 
 impl ContextSource {
@@ -493,6 +522,8 @@ impl ContextSource {
             ContextSource::GoalRound => "goal round".into(),
             ContextSource::Injected => "injected".into(),
             ContextSource::RuntimeContext => "runtime context".into(),
+            ContextSource::SessionMemory => "session memory".into(),
+            ContextSource::LongTermMemory => "long-term memory".into(),
         }
     }
 }
