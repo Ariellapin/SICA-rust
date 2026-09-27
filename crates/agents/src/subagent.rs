@@ -175,6 +175,13 @@ pub struct ToolSubAgent {
     /// call and for any sub-agent running outside a session — neither is
     /// written to a session log, so neither has a seq to give.
     pub log_seq:       Option<u64>,
+    /// Seq of the durable `ToolCall` whose skill *body* this sub-agent
+    /// serves — `child()` takes it from the dispatcher's `log_seq`. It is
+    /// what the rows of a run started from that body name as their
+    /// `call_seq` (§6.11): `log_seq` is `None` inside a body, whose own
+    /// calls are never logged, so the rows said `0` and no tool row could
+    /// find its run (`sessions/96`).
+    pub run_seq:       Option<u64>,
     /// The session's approval policy is `never` (guide §10.2): an `Ask`
     /// from any policy is refused outright instead of reaching the broker.
     /// Deterministic denial for unattended runs; inherited by children.
@@ -200,6 +207,7 @@ impl ToolSubAgent {
             runs:         None,
             cwd:          None,
             log_seq:      None,
+            run_seq:      None,
             ask_denied:   false,
         }
     }
@@ -229,7 +237,7 @@ impl ToolSubAgent {
         };
         runs.edge(session_id, RunEdge {
             run_id,
-            call_seq: self.log_seq.unwrap_or(0),
+            call_seq: self.run_seq.or(self.log_seq).unwrap_or(0),
             phase: phase.filter(|p| !p.is_empty()).map(str::to_string),
             member: member.map(|(_, l)| l.to_string()),
             member_id: member.map(|(id, _)| id),
@@ -341,6 +349,10 @@ impl ToolSubAgent {
             // A nested call is a live event only — it never reaches the
             // session log, so it inherits no seq.
             log_seq:      None,
+            // …but the body it runs in belongs to this call's row. Only one
+            // level down: a run started deeper than a logged call's own body
+            // has no row of its own to hang under.
+            run_seq:      self.log_seq,
             ask_denied:   self.ask_denied,
         }
     }
@@ -1269,6 +1281,45 @@ mod tests {
         let cut = ui_output(&long);
         assert!(cut.len() < long.len());
         assert!(cut.contains("omitted"), "the cut must announce itself: {}", &cut[..200]);
+    }
+
+    struct CaptureRuns(Mutex<Vec<RunEdge>>);
+    impl RunNotifier for CaptureRuns {
+        fn edge(&self, _session_id: u64, edge: RunEdge) {
+            self.0.lock().unwrap().push(edge);
+        }
+    }
+
+    /// What `agent-team`, `ralph` and `workflow` do: report a run from
+    /// inside their own body. Then once more from a call the body makes,
+    /// which is never logged and so has no row of its own.
+    struct Orchestrator;
+    #[async_trait]
+    impl Skill for Orchestrator {
+        fn name(&self) -> &str { "orchestrate" }
+        async fn run(&self, _args: Value, ctx: SkillContext) -> SkillOutcome {
+            ctx.sub.run_edge(7, None, None, sica_core::event::RunState::Started);
+            ctx.sub.child(99).run_edge(8, None, None, sica_core::event::RunState::Started);
+            SkillOutcome { ok: true, summary: "ran".into() }
+        }
+    }
+
+    /// `sessions/96`: every row of an `agent-team` run said `call_seq: 0`,
+    /// so its tool row (seq 29) never found the run, and the tree was drawn
+    /// under the teammates' nested rows (seq 0) instead.
+    #[tokio::test]
+    async fn a_run_started_in_a_logged_calls_body_names_that_call() {
+        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let runs = Arc::new(CaptureRuns(Mutex::new(Vec::new())));
+        let root = ToolSubAgent::root(cap)
+            .with_session(1)
+            .with_runs(runs.clone())
+            .with_log_seq(29);
+        assert!(root.run(inv(&Orchestrator)).await.ok);
+        let edges = runs.0.lock().unwrap();
+        let seq_of = |run_id: u64| edges.iter().find(|e| e.run_id == run_id).map(|e| e.call_seq);
+        assert_eq!(seq_of(7), Some(29), "the body's run belongs to the call that ran it");
+        assert_eq!(seq_of(8), Some(0), "a run further down has no row of its own");
     }
 
     #[tokio::test]

@@ -656,7 +656,7 @@ pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<S
         }
         // Without one of these the line is prose that merely happens to open
         // with a skill name.
-        if !rest.contains('\'') && !rest.contains('"') && !rest.contains('>') {
+        if !has_call_marks(rest) {
             continue;
         }
         let rest = rest.trim_start();
@@ -692,6 +692,39 @@ pub fn rejected_attempt(text: &str, is_known: impl Fn(&str) -> bool) -> Option<S
         );
     }
     None
+}
+
+/// Whether the rest of a line that opens with a skill name has the marks of
+/// a call: a quote, or a ` > ` separator. Prose that merely opens with a
+/// skill name has look-alikes that are neither — an apostrophe between two
+/// letters ("grep didn't match"), an example set in a `code span` ("glob
+/// takes a pattern, e.g. `glob 'src/*.rs'`"), an arrow — and reading them as
+/// a miscall rejected a finished answer, then ended the turn `bad-call` when
+/// the model gave the same answer again.
+fn has_call_marks(rest: &str) -> bool {
+    let chars: Vec<char> = rest.chars().collect();
+    let mut in_code = false;
+    for (i, &c) in chars.iter().enumerate() {
+        let before = i.checked_sub(1).map(|j| chars[j]);
+        let after = chars.get(i + 1).copied();
+        match c {
+            '`' => in_code = !in_code,
+            _ if in_code => {}
+            '"' => return true,
+            '\'' if !(before.is_some_and(char::is_alphanumeric)
+                && after.is_some_and(char::is_alphanumeric)) =>
+            {
+                return true
+            }
+            '>' if before.map_or(true, char::is_whitespace)
+                && after.map_or(true, char::is_whitespace) =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Scan `text` for the first ```tool_call``` fenced block and parse its body
@@ -1488,6 +1521,16 @@ mod tests {
         assert!(rejected_attempt("The workspace has seven crates.", known).is_none());
         // Shaped like a call, but for a skill nobody registered.
         assert!(rejected_attempt("frobnicate 'a.md'", known).is_none());
+        // Look-alikes of a call's marks in a finished answer: an
+        // apostrophe, an example set in a code span, an arrow.
+        assert!(rejected_attempt("read-file didn't find the file.", known).is_none());
+        assert!(
+            rejected_attempt("read-file takes a path, e.g. `read-file 'src/main.rs'`.", known).is_none()
+        );
+        assert!(rejected_attempt("read-file -> numbered lines", known).is_none());
+        // …while a real quote or separator still marks an attempt.
+        assert!(rejected_attempt("read-file src/main.rs > what it does", known).is_some());
+        assert!(rejected_attempt("read-file don't.txt' > what it says", known).is_some());
     }
 
     #[test]

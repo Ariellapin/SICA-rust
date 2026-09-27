@@ -15,6 +15,8 @@ Examples:
 
 Behaviour:
 - `**` matches any number of directories; `*` matches within one path
-  segment. Patterns are relative to the workspace root.
+  segment. Patterns are relative to the working directory.
+- A `skills/…` pattern that matches nothing there lists the app's own skill
+  docs instead, as absolute paths.
 - Returns at most **100** paths, most recently modified first, one per line.
 - Use `grep` to search file *contents*.

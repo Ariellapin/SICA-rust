@@ -192,6 +192,8 @@ Examples:
 
 Behaviour:
 - Relative paths resolve against the working directory.
+- A `skills/<name>.md` the working directory does not have is read from the
+  app's own `skills/` folder, so a skill's contract opens from any project.
 - Relative paths may not escape the workspace via `..`.
 - Files larger than **1 MiB** are rejected.
 - Optional named args `start` / `end` (1-based, inclusive) select a line
@@ -272,6 +274,8 @@ Examples:
 Behaviour:
 - `**` matches any number of directories; `*` matches within one path
   segment. Patterns are relative to the working directory.
+- A `skills/…` pattern that matches nothing there lists the app's own skill
+  docs instead, as absolute paths.
 - Returns at most **100** paths, most recently modified first, one per line.
 - Use `grep` to search file *contents*.
 "#;
@@ -545,10 +549,19 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 
 pub struct ReadFile {
     pub root: PathBuf,
+    /// The app's own skill folder, where a `skills/…` path the working
+    /// directory has no file for is read from ([`resolve_read`]).
+    pub skills: PathBuf,
 }
 
 impl ReadFile {
-    pub fn new(root: PathBuf) -> Self { Self { root } }
+    pub fn new(root: PathBuf) -> Self { Self { root, skills: sica_core::paths::skills_dir() } }
+
+    /// Look up `skills/…` fallbacks in `dir` instead of the app's folder.
+    pub fn with_skills_dir(mut self, dir: PathBuf) -> Self {
+        self.skills = dir;
+        self
+    }
 }
 
 #[async_trait]
@@ -567,16 +580,18 @@ impl Skill for ReadFile {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `path` arg"),
         };
-        let resolved = match resolve(&root, path) {
+        let (resolved, app_doc) = match resolve_read(&root, &self.skills, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
         };
         let meta = match fs::metadata(&resolved) {
             Ok(m)  => m,
+            // "Workspace root" is what this used to say, and it is the app's
+            // folder, not the one relative paths resolve against.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return err(&format!(
-                    "no such file: {} — check the path is relative to the workspace root, \
-                     or find it with `{GLOB_NAME}`",
+                    "no such file: {} — relative paths resolve against the working \
+                     directory; find the file with `{GLOB_NAME}`, or give its absolute path",
                     resolved.display()
                 ))
             }
@@ -598,9 +613,16 @@ impl Skill for ReadFile {
         // numeric strings (the text protocol only carries strings).
         let start = parse_line_arg(args.get("start"));
         let end = parse_line_arg(args.get("end"));
+        let page = numbered_page(&text, start, end, path, READ_FILE_MAX_BYTES);
         SkillOutcome {
             ok:      true,
-            summary: numbered_page(&text, start, end, path, READ_FILE_MAX_BYTES),
+            // The model asked for a file in its working directory and is
+            // reading one from somewhere else: say where.
+            summary: if app_doc {
+                format!("[read from the app's skill folder: {}]\n{page}", resolved.display())
+            } else {
+                page
+            },
         }
     }
 }
@@ -881,10 +903,53 @@ impl Skill for EditFile {
 
 pub struct Glob {
     pub root: PathBuf,
+    /// The app's own skill folder, searched when a `skills/…` pattern
+    /// matches nothing in the working directory.
+    pub skills: PathBuf,
 }
 
 impl Glob {
-    pub fn new(root: PathBuf) -> Self { Self { root } }
+    pub fn new(root: PathBuf) -> Self { Self { root, skills: sica_core::paths::skills_dir() } }
+
+    /// Look up `skills/…` fallbacks in `dir` instead of the app's folder.
+    pub fn with_skills_dir(mut self, dir: PathBuf) -> Self {
+        self.skills = dir;
+        self
+    }
+}
+
+/// Files under `from` matching `pattern`, which is anchored at `base` the
+/// way a `.gitignore` line is.
+fn glob_walk(base: &Path, from: &Path, pattern: &str) -> Result<Vec<(std::time::SystemTime, PathBuf)>, String> {
+    // gitignore-style overrides give us `**` semantics without a second
+    // glob dialect — and the walker already honours .gitignore.
+    let overrides = ignore::overrides::OverrideBuilder::new(base)
+        .add(pattern)
+        .and_then(|b| b.build())
+        .map_err(|e| format!("bad glob pattern {pattern:?}: {e}"))?;
+
+    let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in ignore::WalkBuilder::new(from).build().flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        // Override semantics are include-flavoured: a path matching the
+        // pattern reports `Whitelist`, everything else `Ignore`.
+        match overrides.matched(entry.path(), false) {
+            ignore::Match::Whitelist(_) => {
+                hits.push((
+                    entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(std::time::UNIX_EPOCH),
+                    entry.path().to_path_buf(),
+                ));
+            }
+            ignore::Match::Ignore(_) | ignore::Match::None => {}
+        }
+    }
+    Ok(hits)
 }
 
 #[async_trait]
@@ -899,35 +964,21 @@ impl Skill for Glob {
             Some(p) if !p.is_empty() => p,
             _ => return err("missing or empty `pattern` arg"),
         };
-        // gitignore-style overrides give us `**` semantics without a second
-        // glob dialect — and the walker already honours .gitignore.
-        let overrides = match ignore::overrides::OverrideBuilder::new(&root)
-            .add(pattern)
-            .and_then(|b| b.build())
-        {
-            Ok(o) => o,
-            Err(e) => return err(&format!("bad glob pattern {pattern:?}: {e}")),
+        let mut hits = match glob_walk(&root, &root, pattern) {
+            Ok(h)  => h,
+            Err(e) => return err(&e),
         };
-
-        let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        for entry in ignore::WalkBuilder::new(&root).build().flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            // Override semantics are include-flavoured: a path matching the
-            // pattern reports `Whitelist`, everything else `Ignore`.
-            match overrides.matched(entry.path(), false) {
-                ignore::Match::Whitelist(_) => {
-                    hits.push((
-                        entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::UNIX_EPOCH),
-                        entry.path().to_path_buf(),
-                    ));
+        // A `skills/…` pattern with nothing to show for it here is after the
+        // app's skill docs, which live in the app's folder — the same
+        // fallback `read-file` makes (`resolve_read`). The hits print as
+        // absolute paths, since they are not under the working directory.
+        let mut from_app = false;
+        if hits.is_empty() && names_skill_docs(pattern) {
+            if let Some(app) = self.skills.parent() {
+                if let Ok(found) = glob_walk(app, &self.skills, pattern) {
+                    from_app = !found.is_empty();
+                    hits = found;
                 }
-                ignore::Match::Ignore(_) | ignore::Match::None => {}
             }
         }
         hits.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
@@ -940,6 +991,12 @@ impl Skill for Glob {
             };
         }
         let mut out = String::new();
+        if from_app {
+            out.push_str(&format!(
+                "[nothing in the working directory matches — these are the app's own skill docs in {}]\n",
+                self.skills.display()
+            ));
+        }
         if total > hits.len() {
             out.push_str(&format!(
                 "[showing the {} most recently modified of {total} matches]\n",
@@ -957,10 +1014,19 @@ impl Skill for Glob {
 
 pub struct Grep {
     pub root: PathBuf,
+    /// The app's own skill folder, searched for a `skills/…` path the
+    /// working directory does not have ([`resolve_read`]).
+    pub skills: PathBuf,
 }
 
 impl Grep {
-    pub fn new(root: PathBuf) -> Self { Self { root } }
+    pub fn new(root: PathBuf) -> Self { Self { root, skills: sica_core::paths::skills_dir() } }
+
+    /// Look up `skills/…` fallbacks in `dir` instead of the app's folder.
+    pub fn with_skills_dir(mut self, dir: PathBuf) -> Self {
+        self.skills = dir;
+        self
+    }
 }
 
 #[async_trait]
@@ -984,7 +1050,7 @@ impl Skill for Grep {
             Ok(r)  => r,
             Err(e) => return err(&format!("bad regex {pattern:?}: {e}")),
         };
-        let start = match resolve(&root, path) {
+        let (start, _) = match resolve_read(&root, &self.skills, path) {
             Ok(p)  => p,
             Err(e) => return err(&e),
         };
@@ -1152,7 +1218,7 @@ impl Skill for AskUser {
     }
 }
 
-/// Display a path relative to the workspace root when it is under it —
+/// Display a path relative to the working directory when it is under it —
 /// relative paths are what the model should hand back to other skills.
 fn display_relative(root: &Path, p: &Path) -> String {
     p.strip_prefix(root)
@@ -1223,6 +1289,61 @@ pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(root.join(candidate))
+}
+
+/// First segment of the path every prompt gives for a skill's contract —
+/// `read-file 'skills/<name>.md'` in `memory.md`, the `read-file` doc and
+/// the idealist's tickets.
+const SKILL_DOCS_DIR: &str = "skills";
+
+/// Where a *read* of `path` lands, and whether that is the app's own skill
+/// doc rather than a file in the working directory.
+///
+/// The working directory first, as for any call. A relative `skills/…`
+/// path with nothing there is then looked up in the app's `skills/` folder:
+/// the prompt says a skill's contract is at `skills/<name>.md`, which is
+/// only true of the app's folder, and since sessions got folders of their
+/// own (guide §3.9) the working directory is usually a project elsewhere —
+/// a session opened on one could not open a single contract (`sessions/96`).
+/// Reads only: a write to `skills/…` still lands in the working directory,
+/// where the permission policy checks it.
+pub(crate) fn resolve_read(root: &Path, skills: &Path, path: &str) -> Result<(PathBuf, bool), String> {
+    let resolved = resolve(root, path)?;
+    if !resolved.exists() {
+        if let Some(doc) = skill_doc_path(skills, path) {
+            return Ok((doc, true));
+        }
+    }
+    Ok((resolved, false))
+}
+
+/// `path` inside the app's `skills` folder, when it is a relative
+/// `skills/…` path naming something there. Every segment after the first
+/// has to be a plain name, so `skills/../sica-settings/.env` is not a way
+/// out of the folder.
+fn skill_doc_path(skills: &Path, path: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut parts = Path::new(path).components().filter(|c| !matches!(c, Component::CurDir));
+    match parts.next() {
+        Some(Component::Normal(first))
+            if first.to_str().is_some_and(|f| f.eq_ignore_ascii_case(SKILL_DOCS_DIR)) => {}
+        _ => return None,
+    }
+    let mut doc = skills.to_path_buf();
+    for part in parts {
+        match part {
+            Component::Normal(name) => doc.push(name),
+            _ => return None,
+        }
+    }
+    doc.exists().then_some(doc)
+}
+
+/// Whether a glob pattern is after the skill docs: its first segment is
+/// `skills`.
+fn names_skill_docs(pattern: &str) -> bool {
+    let p = pattern.trim_start_matches("./").trim_start_matches('/');
+    p.split(['/', '\\']).next().is_some_and(|s| s.eq_ignore_ascii_case(SKILL_DOCS_DIR))
 }
 
 /// Cap one output stream at `limit` bytes, keeping the head. The omission
@@ -1408,6 +1529,86 @@ mod tests {
         assert!(!out.ok);
         assert!(out.summary.starts_with("no such file: "), "{}", out.summary);
         assert!(out.summary.contains("glob"), "{}", out.summary);
+    }
+
+    /// An app folder holding one skill doc, and an empty project folder
+    /// beside it: a session opened on a project elsewhere (§3.9).
+    fn app_and_project() -> (PathBuf, PathBuf) {
+        let base = tempdir();
+        let skills = base.join("app").join("skills");
+        let work = base.join("project");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(skills.join("agent-team.md"), "---\nname: agent-team\n---\nTEAM CONTRACT\n").unwrap();
+        std::fs::write(base.join("app").join("secret.txt"), "SECRET").unwrap();
+        (skills, work)
+    }
+
+    /// `sessions/96`: the prompt says a skill's contract is at
+    /// `skills/<name>.md`, and a session working in another folder got
+    /// `no such file` for every one of them.
+    #[tokio::test]
+    async fn a_skill_doc_opens_from_any_working_directory() {
+        let (skills, work) = app_and_project();
+        let r = ReadFile::new(work.clone()).with_skills_dir(skills.clone());
+        let out = r.run(json!({ "path": "skills/agent-team.md" }), ctx()).await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("TEAM CONTRACT"), "{}", out.summary);
+        // It says where the file really is.
+        let first = out.summary.lines().next().unwrap();
+        assert!(first.starts_with("[read from the app's skill folder: "), "{first}");
+        assert!(first.contains(&skills.join("agent-team.md").display().to_string()), "{first}");
+
+        // A project's own `skills/` file of that name is the one it means.
+        std::fs::create_dir_all(work.join("skills")).unwrap();
+        std::fs::write(work.join("skills").join("agent-team.md"), "PROJECT COPY").unwrap();
+        let out = r.run(json!({ "path": "skills/agent-team.md" }), ctx()).await;
+        assert_eq!(out.summary, "    1\tPROJECT COPY");
+
+        // Neither has it: the error names the working directory — not the
+        // "workspace root" it used to, which is the app's folder.
+        let out = r.run(json!({ "path": "skills/nope.md" }), ctx()).await;
+        assert!(!out.ok);
+        assert!(out.summary.starts_with("no such file: "), "{}", out.summary);
+        assert!(out.summary.contains("working directory"), "{}", out.summary);
+    }
+
+    /// Only a plain `skills/<name>` reaches the fallback: a `..` must not
+    /// make it a way into the rest of the app's folder.
+    #[test]
+    fn the_skill_doc_fallback_stays_inside_the_folder() {
+        let (skills, _work) = app_and_project();
+        let doc = skills.join("agent-team.md");
+        assert_eq!(skill_doc_path(&skills, "skills/agent-team.md"), Some(doc.clone()));
+        assert_eq!(skill_doc_path(&skills, "./skills/agent-team.md"), Some(doc.clone()));
+        assert_eq!(skill_doc_path(&skills, "Skills/agent-team.md"), Some(doc.clone()));
+        assert_eq!(skill_doc_path(&skills, "skills/../secret.txt"), None);
+        assert_eq!(skill_doc_path(&skills, "skills/missing.md"), None);
+        assert_eq!(skill_doc_path(&skills, "docs/agent-team.md"), None);
+        assert_eq!(skill_doc_path(&skills, &doc.display().to_string()), None);
+    }
+
+    /// `glob 'skills/*.md'` was the model's next move in `sessions/96`, and
+    /// it matched nothing for the same reason; `grep` follows `read-file`.
+    #[tokio::test]
+    async fn a_skills_glob_or_grep_falls_back_to_the_app_folder() {
+        let (skills, work) = app_and_project();
+        let g = Glob::new(work.clone()).with_skills_dir(skills.clone());
+        let out = g.run(json!({ "pattern": "skills/*.md" }), ctx()).await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(
+            out.summary.starts_with("[nothing in the working directory matches"),
+            "{}",
+            out.summary
+        );
+        assert!(out.summary.contains(&skills.join("agent-team.md").display().to_string()), "{}", out.summary);
+        // Any other pattern is the working directory's business alone.
+        let out = g.run(json!({ "pattern": "**/*.md" }), ctx()).await;
+        assert!(out.summary.contains("no files match"), "{}", out.summary);
+
+        let gr = Grep::new(work).with_skills_dir(skills);
+        let out = gr.run(json!({ "pattern": "TEAM", "path": "skills" }), ctx()).await;
+        assert!(out.summary.contains("TEAM CONTRACT"), "{}", out.summary);
     }
 
     #[tokio::test]

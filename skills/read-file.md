@@ -20,7 +20,9 @@ Natural-language form reads the whole file:
     read-file 'skills/run-cli.md' > what positional args does run-cli accept
 
 Behaviour:
-- Relative paths resolve against the workspace root.
+- Relative paths resolve against the working directory.
+- A `skills/<name>.md` the working directory does not have is read from the
+  app's own `skills/` folder, so a skill's contract opens from any project.
 - Relative paths may not escape the workspace via `..`.
 - Files larger than **1 MiB** are rejected.
 - `start` / `end` are named args. In the one-line form put them after the

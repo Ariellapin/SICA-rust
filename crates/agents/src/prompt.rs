@@ -282,12 +282,15 @@ pub fn for_main_agent(
         a.section(Section::new("plan-policy", order::PLAN_POLICY, policy));
     }
     // One guidance section per skill that has any, all in the SKILL_GUIDANCE
-    // slot — ties break by (section) name, i.e. the skill name.
+    // slot — ties break by (section) name, i.e. the skill name. Siblings
+    // share a sentence (`run-cli`/`run-pwsh`, `subagent`/`subagent-fork`),
+    // and it is said once: the first name in that order keeps it.
     let mut names: Vec<&str> = registry.by_name.keys().map(String::as_str).collect();
     names.sort_unstable();
+    let mut said: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for name in names {
         let Some(skill) = registry.by_name.get(name) else { continue };
-        if let Some(guidance) = skill.prompt_guidance() {
+        if let Some(guidance) = skill.prompt_guidance().filter(|g| said.insert(*g)) {
             a.section(Section::new(format!("guidance:{name}"), order::SKILL_GUIDANCE, guidance));
         }
     }
@@ -467,6 +470,21 @@ mod tests {
         assert!(ctx.contains("Local time:"));
         assert!(ctx.contains("Working directory:"));
         assert!(ctx.contains("Model: m"));
+    }
+
+    /// `run-cli` and `run-pwsh` hand over one sentence between them, as do
+    /// `subagent` and `subagent-fork`, and every prompt carried each twice.
+    #[test]
+    fn a_sentence_two_skills_share_is_said_once() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Arc::new(crate::builtins::RunCli(None)));
+        reg.register(Arc::new(crate::builtins::RunPwsh(None)));
+        reg.register(Arc::new(crate::delegate::Subagent::fresh()));
+        reg.register(Arc::new(crate::delegate::Subagent::forking()));
+        let vars = standard_vars("m");
+        let sys = for_main_agent("MEM", &reg, ToolMode::Text, &vars, None, None).unwrap().system;
+        assert_eq!(sys.matches(crate::builtins::SHELL_PROMPT_GUIDANCE).count(), 1, "{sys}");
+        assert_eq!(sys.matches("Delegate a self-contained investigation").count(), 1, "{sys}");
     }
 
     #[test]

@@ -122,8 +122,12 @@ fn draw_one(
         let chip = chip.clone();
         // The run this row is, when it is one (§6.11). Keyed by the
         // durable `ToolCall` seq, which is what the backend stamps on
-        // every row of the run.
-        let run = app.runs.get(&chip.log_seq).cloned();
+        // every row of the run. A nested row has seq 0, and so do the
+        // rows of a run no logged call owns (logs written before
+        // `ToolSubAgent::run_seq`) — which is no reason to pair them.
+        let run = (chip.log_seq != 0)
+            .then(|| app.runs.get(&chip.log_seq).cloned())
+            .flatten();
         let mut action = None;
         indented(ui, 22.0, &t, |ui| {
             body(ui, &chip, state, run.as_ref());

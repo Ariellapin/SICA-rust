@@ -11,9 +11,9 @@ use std::path::Path;
 pub const SEED: &str = r#"# Sica memory
 
 You are running inside the **sica-rust** desktop app. The backend exposes a
-small set of built-in skills you can invoke. Each skill has its own
-markdown file under `skills/` with the full contract — open it to see the
-positional arguments it accepts.
+small set of built-in skills you can invoke. Most skills have a markdown
+file with the full contract in the app's own `skills/` folder —
+`read-file 'skills/<name>.md'` opens it from any working directory.
 
 ## Skills
 

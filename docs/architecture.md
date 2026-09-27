@@ -211,6 +211,12 @@ makes for background jobs. Each edge is appended and the whole run is
 pushed as `Event::WorkflowRunChanged`, rebuilt from the log by
 `sica_core::project::workflow_runs`; `SessionDump.runs` carries the same
 fold on reload, so the live tree and the reloaded one cannot drift.
+A row's `call_seq` is the seq of the `ToolCall` whose body started the
+run: `ToolSubAgent::run_seq`, which `child()` takes from the dispatcher's
+`log_seq` (inside a body `log_seq` is `None`, and until 2026-09-27 every
+row said `0` — the FE keys runs by that seq, so no tool row found its
+tree). A run started any deeper has no logged row of its own and says
+`0`, which the FE never pairs with a row.
 
 v28 adds **content-addressed attachments** (harness §9.6). An image is
 stored once under `sessions/<id>/attachments/<sha256>.<ext>` and

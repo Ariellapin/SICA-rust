@@ -1,0 +1,2 @@
+description = "a skill's contract opens by the skills/<name>.md path the prompt gives it, from a session whose working folder has no skills/ of its own"
+window = 32768
