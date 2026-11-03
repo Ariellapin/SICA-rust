@@ -64,6 +64,15 @@ pub fn is_caller_error(t: &Trigger) -> bool {
     if lower.starts_with("missing or empty `") || lower.starts_with("missing `") {
         return true;
     }
+    // A shell failure the tool recognised ends with the fix it handed the
+    // model (`agents::shell::failure_hint`: a PowerShell `$i:`, a doubled
+    // quote, `;` under cmd.exe, …). Those are the model's own syntax, and
+    // the result already says how to recover. A failure it did not
+    // recognise has no hint and is still filed — that is how the cmd.exe
+    // quoting bug surfaced.
+    if matches!(skill, "run-cli" | "run-pwsh") && t.message.contains("\n--- hint ---\n") {
+        return true;
+    }
     let not_found = lower.starts_with("no such file")
         || lower.contains("(os error 2)")
         || lower.contains("cannot find the file");
@@ -110,14 +119,13 @@ fn propose_fix_for_tool(
         // its own resolver and reports the same situation as
         // "is not recognized as the name of a cmdlet".
         "run-cli" if host_os == Some("windows") && looks_like_cmd_lookup_failure(lower) => (
-            format!(
-                "On Windows, `cmd.exe` couldn't resolve the command. \
-                 Retry with the `run-pwsh` skill — PowerShell uses a \
-                 different PATH/alias resolver and is the wrapper-script \
-                 shell the project targets (see CLAUDE.md). \
-                 Failing summary: {}",
-                short(&t.message)
-            ),
+            // The message itself is the ticket's `## Message`: repeating it
+            // here buried the advice under it on every listing.
+            "On Windows, `cmd.exe` couldn't resolve the command. \
+             Retry with the `run-pwsh` skill — PowerShell uses a \
+             different PATH/alias resolver and is the wrapper-script \
+             shell the project targets (see CLAUDE.md)."
+                .into(),
             Some("run-pwsh".into()),
         ),
         "run-cli" if looks_like_timeout(lower) => (
@@ -161,10 +169,9 @@ fn propose_fix_for_tool(
         ),
         _ => (
             format!(
-                "Sub-agent tool `{skill}` returned an error: {}. \
+                "Sub-agent tool `{skill}` returned an error (see the message). \
                  Investigate the args and retry; consider whether a \
-                 different skill is a better fit for this environment.",
-                short(&t.message)
+                 different skill is a better fit for this environment."
             ),
             None,
         ),
@@ -208,19 +215,6 @@ fn parse_host_os(traceback: &Option<String>) -> Option<&'static str> {
     None
 }
 
-fn short(s: &str) -> String {
-    const CAP: usize = 240;
-    if s.len() <= CAP {
-        return s.to_string();
-    }
-    let mut end = CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = s[..end].to_string();
-    out.push_str("…");
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -303,6 +297,10 @@ mod tests {
             ("edit-file", "old text matches 3 times — include more surrounding lines"),
             ("edit-file", "no such file: x.txt — edit-file only edits existing files"),
             ("run-cli", "missing or empty `command` arg"),
+            (
+                "run-pwsh",
+                "exit=1\n--- stdout ---\n\n--- stderr ---\nInvalidVariableReferenceWithDrive\n--- hint ---\nwrite `${name}:`",
+            ),
         ] {
             let m = format!("agents::tool::{skill}");
             assert!(is_caller_error(&t(&m, msg, tb)), "{skill}: {msg}");
@@ -315,6 +313,13 @@ mod tests {
         assert!(!is_caller_error(&t("agents::tool::run-pwsh", "timeout after 30s", tb)));
         assert!(!is_caller_error(&t("agents::tool::write-file", "write x: Access is denied. (os error 5)", tb)));
         assert!(!is_caller_error(&t("agents::tool::read-file", "x too large (2000000 bytes, max 1048576)", tb)));
+        // A shell failure with no recognised cause, or only a routing note.
+        assert!(!is_caller_error(&t("agents::tool::run-cli", "exit=1\n--- stderr ---\nThe string is missing the terminator", tb)));
+        assert!(!is_caller_error(&t(
+            "agents::tool::run-cli",
+            "exit=1\n--- stderr ---\nboom\n--- note ---\nran in PowerShell",
+            tb
+        )));
         // Not a tool trigger at all.
         assert!(!is_caller_error(&t("backend::dispatcher", "old text not found", tb)));
     }

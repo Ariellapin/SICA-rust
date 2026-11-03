@@ -179,7 +179,15 @@ pub fn install_panic_hook() {
             .unwrap_or_else(|| ("unknown".into(), 0));
         let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
-        let traceback = format!("at {file}:{line} (thread {thread})\n\n{backtrace}");
+        // A panic inside a dependency is located in the cargo registry; the
+        // ticket names the first frame in our own crates instead.
+        let own = sica_core::crash::own_frame(&backtrace, file!());
+        let mut traceback = format!("at {file}:{line} (thread {thread})\n");
+        if let Some(own) = &own {
+            traceback.push_str(&format!("first frame in sica-rust: {own}\n"));
+        }
+        traceback.push_str(&format!("\n{backtrace}"));
+        let file = sica_core::crash::own_file(&backtrace, file!()).unwrap_or(file);
 
         let dir = sica_core::paths::idealist_workspace();
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");

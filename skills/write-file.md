@@ -22,6 +22,9 @@ Behaviour:
 - Parent directories are created automatically.
 - Relative paths may not escape the workspace via `..`.
 - Returns the number of bytes written in the outcome summary.
+- A PowerShell file (`.ps1`, `.psm1`, `.psd1`) with any non-ASCII text is
+  saved with a UTF-8 byte-order mark, which Windows PowerShell needs to read
+  it; the summary says so.
 - **Large files: write them in parts.** One reply can only hold so much,
   and a call cut off mid-body never runs. Write the first part, then add
   each further part with `'append=true'`:

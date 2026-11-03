@@ -94,18 +94,14 @@ pub fn install_panic_hook() {
         let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
         // A panic inside a dependency (an egui assertion) is located in the
-        // cargo registry — machine-specific, and not where the fix goes.
-        // The first frame in this workspace's own crates is.
-        let own = own_frame(&backtrace);
+        // cargo registry; the ticket names our own first frame instead.
+        let own = sica_core::crash::own_frame(&backtrace, file!());
         let mut traceback = format!("at {file}:{line} (thread {thread})\n");
         if let Some(own) = &own {
             traceback.push_str(&format!("first frame in sica-rust: {own}\n"));
         }
         traceback.push_str(&format!("\n{backtrace}"));
-        let file = own
-            .as_deref()
-            .map(|f| f.split(':').next().unwrap_or(f).to_string())
-            .unwrap_or(file);
+        let file = sica_core::crash::own_file(&backtrace, file!()).unwrap_or(file);
 
         let dir = sica_core::paths::idealist_workspace();
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -121,53 +117,9 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// The first backtrace frame in this workspace's `crates/`, as
-/// `crates/<crate>/src/<file>:<line>` — skipping this module's own hook
-/// frame and anything under the cargo registry.
-fn own_frame(backtrace: &str) -> Option<String> {
-    backtrace.lines().find_map(|l| {
-        let path = l.trim().strip_prefix("at ")?.replace('\\', "/");
-        if path.contains("/registry/") || path.contains("/rustc/") {
-            return None;
-        }
-        let at = if path.starts_with("crates/") {
-            0
-        } else if path.starts_with("./crates/") {
-            2
-        } else {
-            path.find("/crates/")? + 1
-        };
-        let rel = &path[at..];
-        if rel.starts_with("crates/frontend/src/fe_incident.rs") {
-            return None;
-        }
-        // `file:line:col` → `file:line`.
-        let mut parts = rel.rsplitn(3, ':').collect::<Vec<_>>();
-        parts.reverse();
-        Some(match parts.as_slice() {
-            [file, line, _col] => format!("{file}:{line}"),
-            _ => rel.to_string(),
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn own_frame_skips_the_hook_and_the_registry() {
-        let bt = "   2: frontend::fe_incident::install_panic_hook::{{closure}}\n\
-                  \x20            at .\\crates\\frontend\\src\\fe_incident.rs:95:25\n\
-                  \x20 29: ecolor::color32::Color32::linear_multiply\n\
-                  \x20            at C:\\Users\\U\\.cargo\\registry\\src\\index.crates.io-1949\\ecolor-0.28.1\\src\\color32.rs:220:9\n\
-                  \x20 31: frontend::ui::issues::sidebar_chip\n\
-                  \x20            at .\\crates\\frontend\\src\\ui\\issues.rs:260:53\n";
-        assert_eq!(own_frame(bt).as_deref(), Some("crates/frontend/src/ui/issues.rs:260"));
-        let absolute = "  at C:\\work\\sica-rust\\crates\\backend\\src\\chat.rs:10:5\n";
-        assert_eq!(own_frame(absolute).as_deref(), Some("crates/backend/src/chat.rs:10"));
-        assert_eq!(own_frame("  at /rustc/abc/library/std/src/panicking.rs:1:1\n"), None);
-    }
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(

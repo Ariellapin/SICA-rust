@@ -649,7 +649,7 @@ fn source_hint(module: &str) -> String {
              (built-in tool bodies); `crates/agents/src/subagent.rs` runs every tool call"
         );
     }
-    if let Some(file) = module.strip_prefix("backend::panic::") {
+    if let Some((_, file)) = panic_file(module) {
         return format!("`{file}` (where it panicked)");
     }
     if module.starts_with("backend::turn::") {
@@ -704,7 +704,9 @@ fn task_text(session_id: u64, ticket: &Ticket, window: &str, prior: &[String]) -
 /// FE puts the draft in the composer.
 pub async fn start_fix_session(hub: &ChatHub, ticket_id: &str) -> Result<(u64, String), String> {
     let store = TicketStore::open_default();
-    if !store.path(ticket_id).is_file() {
+    // The id is checked before it becomes a path (`TicketStore::load` would
+    // refuse it too, but only after this probe).
+    if !TicketStore::is_ticket_id(ticket_id) || !store.path(ticket_id).is_file() {
         return Err(format!("no ticket `{ticket_id}` in {}", store.dir().display()));
     }
     let ticket = store.load(ticket_id).map_err(|e| format!("ticket {ticket_id}: {e}"))?;
@@ -794,15 +796,25 @@ fn crate_of(module: &str) -> String {
     if module.starts_with("agents::tool::") {
         return "agents".into();
     }
-    if let Some(file) = module.strip_prefix("backend::panic::") {
+    if let Some((process, file)) = panic_file(module) {
         if let Some(rest) = file.strip_prefix("crates/") {
             if let Some(k) = rest.split('/').next() {
                 return k.to_string();
             }
         }
-        return "backend".into();
+        return process.into();
     }
     module.split("::").next().filter(|k| !k.is_empty()).unwrap_or("backend").replace('_', "-")
+}
+
+/// The process and source file a panic ticket's module names —
+/// `backend::panic::<file>` or `frontend::panic::<file>`, from the two
+/// panic hooks.
+fn panic_file(module: &str) -> Option<(&'static str, &str)> {
+    module
+        .strip_prefix("backend::panic::")
+        .map(|f| ("backend", f))
+        .or_else(|| module.strip_prefix("frontend::panic::").map(|f| ("frontend", f)))
 }
 
 fn render_finding(f: &Finding, verified: bool, calls: &[String]) -> String {
@@ -911,6 +923,8 @@ mod tests {
         assert!(source_hint("agents::tool::run-cli").contains("skills/run-cli.md"));
         assert!(source_hint("backend::turn::prompt").contains("chat.rs"));
         assert!(source_hint("backend::panic::crates/agents/src/turn.rs").contains("crates/agents/src/turn.rs"));
+        assert!(source_hint("frontend::panic::crates/frontend/src/ui/issues.rs")
+            .contains("`crates/frontend/src/ui/issues.rs` (where it panicked)"));
         assert_eq!(source_hint("sica_core::event"), "`crates/sica-core/src/event.rs`");
     }
 
@@ -964,6 +978,8 @@ mod tests {
         assert_eq!(crate_of("sica_core::event"), "sica-core");
         assert_eq!(crate_of("backend::panic::crates/llm/src/client.rs"), "llm");
         assert_eq!(crate_of("backend::panic::src/x.rs"), "backend");
+        assert_eq!(crate_of("frontend::panic::crates/frontend/src/ui/issues.rs"), "frontend");
+        assert_eq!(crate_of("frontend::supervisor::start_be"), "frontend");
     }
 
     #[test]
@@ -992,13 +1008,16 @@ mod tests {
         ));
         let store = TicketStore::at(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Ids are hex like real ones (`TicketStore::load` refuses others):
+        // a0001 a warning, e0001 / e0005 errors, d0000 already diagnosed,
+        // b0000 recovered in its turn, c0000 a config ticket.
         let save = |t: Ticket| std::fs::write(store.path(&t.meta.id), t.render().unwrap()).unwrap();
-        save(ticket("warn1", "Warning", 9, TicketStatus::Open));
-        save(ticket("err1", "Error", 1, TicketStatus::Open));
-        save(ticket("err5", "Error", 5, TicketStatus::InvestigationFailed));
-        save(ticket("done", "Error", 5, TicketStatus::Diagnosed));
-        save(ticket("rec", "Error", 1, TicketStatus::Open));
-        save(ticket("cfg", "Error", 1, TicketStatus::Open));
+        save(ticket("a0001", "Warning", 9, TicketStatus::Open));
+        save(ticket("e0001", "Error", 1, TicketStatus::Open));
+        save(ticket("e0005", "Error", 5, TicketStatus::InvestigationFailed));
+        save(ticket("d0000", "Error", 5, TicketStatus::Diagnosed));
+        save(ticket("b0000", "Error", 1, TicketStatus::Open));
+        save(ticket("c0000", "Error", 1, TicketStatus::Open));
         let entry = |id: &str, origin: TriggerOrigin, recovered: bool| LedgerEntry {
             ticket_id: id.into(),
             origin,
@@ -1012,16 +1031,16 @@ mod tests {
             turns: Vec::new(),
         };
         let entries = vec![
-            entry("warn1", TriggerOrigin::TurnError, false),
-            entry("err1", TriggerOrigin::TurnError, false),
-            entry("err5", TriggerOrigin::TurnError, false),
-            entry("done", TriggerOrigin::TurnError, false),
-            entry("rec", TriggerOrigin::ToolCall, true),
-            entry("cfg", TriggerOrigin::Config, false),
+            entry("a0001", TriggerOrigin::TurnError, false),
+            entry("e0001", TriggerOrigin::TurnError, false),
+            entry("e0005", TriggerOrigin::TurnError, false),
+            entry("d0000", TriggerOrigin::TurnError, false),
+            entry("b0000", TriggerOrigin::ToolCall, true),
+            entry("c0000", TriggerOrigin::Config, false),
         ];
         let got: Vec<String> =
             pick(entries.iter().collect(), &store, 5).into_iter().map(|(_, t)| t.meta.id).collect();
-        assert_eq!(got, vec!["err5", "err1", "warn1"]);
+        assert_eq!(got, vec!["e0005", "e0001", "a0001"]);
         let capped = pick(entries.iter().collect(), &store, 1);
         assert_eq!(capped.len(), 1);
     }

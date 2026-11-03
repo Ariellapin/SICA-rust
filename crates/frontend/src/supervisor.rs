@@ -350,6 +350,29 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
                     }
                 }
             }
+            // The backend ended by itself: a crash its panic hook could not
+            // record (an abort, a stack overflow), or a kill from outside.
+            // Before this branch the dead child stayed `running` and the
+            // window only saw the pipe go quiet; now it is stopped, logged,
+            // and — unless it exited cleanly — reported at the next connect.
+            code = backend_exit(&mut running) => {
+                if let Some(r) = running.take() {
+                    let _ = r.ipc_kill.send(());
+                }
+                bridge.send(UiEvent::BeStopped { code });
+                let shown = code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
+                bridge.send(UiEvent::Log(format!("backend exited by itself (exit code {shown})")));
+                if code != Some(0) {
+                    crate::fe_incident::queue(
+                        "frontend::supervisor::be_exit",
+                        format!(
+                            "the backend exited by itself with exit code {shown}; a panic \
+                             also leaves idealist_workspace/crash-<time>.md"
+                        ),
+                        None,
+                    );
+                }
+            }
             Some(paths) = fs_rx.recv() => {
                 bridge.send(UiEvent::FsEvent(paths.clone()));
                 if auto_watch {
@@ -525,6 +548,17 @@ async fn start_be_with_profile(bridge: &Arc<UiBridge>, release: bool) -> anyhow:
         started_at: Instant::now(),
         consecutive_crashes: 0,
     })
+}
+
+/// Resolves with the exit code when the running backend's process ends;
+/// never while there is none. Every path that stops the backend on purpose
+/// takes it out of `running` first, so this only fires for an exit nobody
+/// asked for.
+async fn backend_exit(running: &mut Option<Running>) -> Option<i32> {
+    match running.as_mut() {
+        Some(r) => r.child.wait().await.ok().and_then(|s| s.code()),
+        None => std::future::pending().await,
+    }
 }
 
 async fn stop_be(running: Running, bridge: &Arc<UiBridge>) {

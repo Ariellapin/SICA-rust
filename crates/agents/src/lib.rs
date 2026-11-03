@@ -32,6 +32,7 @@ pub mod runner;
 pub mod schedule;
 pub mod script;
 pub mod session_memory;
+pub mod shell;
 pub mod skill;
 pub mod skill_creator;
 pub mod spill;

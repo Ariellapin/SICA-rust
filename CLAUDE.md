@@ -117,6 +117,10 @@ Seven crates, dependency direction strictly downward. Details in
   `ReportFrontendError` at the next connect). Tickets surface as the issue
   count under the sidebar's Settings and in Settings › Issues (v33). See
   [docs/notes/2026-11-03-issues-surface.md](docs/notes/2026-11-03-issues-surface.md).
+- Run a shell command line through `agents::shell::shell_command`, never
+  `Command::new("cmd").args(["/C", line])`: Rust quotes the line for the MSVC
+  rules, turning inner `"` into `\"`, which cmd.exe does not read. See
+  [docs/notes/2026-11-03-shell-quoting-and-ticket-fixes.md](docs/notes/2026-11-03-shell-quoting-and-ticket-fixes.md).
 - Three skills are off until a doc turns them on: `skills/agent-team.md` registers
   `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5), and
   `skills/schedule.md` registers the three reminder tools (§12.8; seeded as

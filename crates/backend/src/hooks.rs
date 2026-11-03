@@ -52,7 +52,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use sica_core::event::EventKind;
 
@@ -415,15 +414,9 @@ pub async fn run_all(hooks: &[&Hook], payload: &Value, cwd: &Path) -> Merged {
 }
 
 async fn run_one(hook: &Hook, stdin_body: &str, cwd: &Path) -> HookAnswer {
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", &hook.command]);
-        c
-    } else {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", &hook.command]);
-        c
-    };
+    // The host shell with the line as typed — quotes in a hook command
+    // reach cmd.exe as written (`agents::shell`).
+    let mut cmd = agents::shell::shell_command(&hook.command);
     cmd.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

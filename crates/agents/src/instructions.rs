@@ -227,9 +227,9 @@ mod tests {
         let root = tempdir("budget");
         let sub = root.join("deep");
         fs::create_dir_all(&sub).unwrap();
-        fs::write(root.join("AGENTS.md"), "b".repeat(60));
-        fs::write(root.join("CLAUDE.md"), "c".repeat(60));
-        fs::write(sub.join("AGENTS.md"), "s".repeat(60));
+        fs::write(root.join("AGENTS.md"), "b".repeat(60)).unwrap();
+        fs::write(root.join("CLAUDE.md"), "c".repeat(60)).unwrap();
+        fs::write(sub.join("AGENTS.md"), "s".repeat(60)).unwrap();
         let b = load(&root, &sub, 120);
         // Two of three fit; the broadest file (CLAUDE.md at root, added
         // after AGENTS.md in the same dir — the *last* added) goes first.
@@ -242,7 +242,7 @@ mod tests {
     fn single_oversized_file_is_truncated_on_char_boundary() {
         let root = tempdir("truncate");
         // Multi-byte chars so the boundary matters.
-        fs::write(root.join("AGENTS.md"), "é".repeat(100)); // 200 bytes
+        fs::write(root.join("AGENTS.md"), "é".repeat(100)).unwrap(); // 200 bytes
         let b = load(&root, &root, 101);
         assert_eq!(b.files.len(), 1);
         assert!(b.files[0].truncated);

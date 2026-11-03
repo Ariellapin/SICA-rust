@@ -405,7 +405,18 @@ impl TicketStore {
         self.dir.join(format!("{id}.md"))
     }
 
+    /// Whether `id` could name a ticket: hex, as [`ticket_id`] makes them.
+    /// An id arrives from the frontend and becomes a file name, so anything
+    /// else (`../sica-settings`) is refused before it is joined to a path.
+    pub fn is_ticket_id(id: &str) -> bool {
+        !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Every read and write of one ticket goes through here.
     pub fn load(&self, id: &str) -> Result<Ticket> {
+        if !Self::is_ticket_id(id) {
+            return Err(anyhow!("`{id}` is not a ticket id"));
+        }
         let path = self.path(id);
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         Ticket::parse(&text).with_context(|| format!("ticket {}", path.display()))
@@ -787,6 +798,19 @@ pub(crate) mod tests {
         assert!(d.hint.len() <= DIGEST_CAP + '…'.len_utf8());
         assert!(d.hint.ends_with('…'));
         assert!(!d.hint.contains("## Next"));
+    }
+
+    #[test]
+    fn only_hex_ids_reach_the_file_system() {
+        let store = TicketStore::at(scratch("ids"));
+        for bad in ["", "../sica-settings", "..\\x", "abc/def", "not-hex", "a.md"] {
+            let e = store.load(bad).unwrap_err().to_string();
+            assert!(e.contains("not a ticket id"), "{bad}: {e}");
+            assert!(store.set_status(bad, TicketStatus::Resolved).is_err(), "{bad}");
+        }
+        let a = file(&store, &trig(TriggerOrigin::Other, "m", "x", None));
+        assert!(TicketStore::is_ticket_id(&a.id));
+        assert!(store.load(&a.id).is_ok());
     }
 
     #[test]

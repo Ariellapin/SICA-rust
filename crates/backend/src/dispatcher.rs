@@ -286,12 +286,9 @@ pub async fn handle(
         },
         Request::ListTickets => tickets_response(),
         Request::GetTicket { ticket_id } => {
+            // `load` refuses an id that is not one of ours before it
+            // becomes a path, for this request and every other.
             let store = idealist::TicketStore::open_default();
-            // The id names a file: refuse anything that is not one of ours
-            // rather than let `../` walk out of the ticket folder.
-            if ticket_id.is_empty() || !ticket_id.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Response::Error { message: format!("`{ticket_id}` is not a ticket id") };
-            }
             match store.load(&ticket_id) {
                 Ok(t) => Response::TicketDetail {
                     ticket: idealist::summary(&t, &store),

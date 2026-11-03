@@ -551,15 +551,7 @@ mod tests {
     use super::*;
 
     fn shell(command: &str) -> Command {
-        let mut c = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        } else {
-            let mut c = Command::new("/bin/sh");
-            c.args(["-c", command]);
-            c
-        };
+        let mut c = crate::shell::shell_command(command);
         c.kill_on_drop(true);
         c
     }

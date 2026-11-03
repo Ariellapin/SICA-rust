@@ -19,12 +19,18 @@ quotes, backslashes and inner quotes included:
 
     run-cli 'git status' > what changed
 
-On Windows this is `cmd.exe`: PowerShell cmdlets (`Get-Content`, …) are not
-found there — call `run-pwsh` for those instead of wrapping them in
-`powershell -Command "…"`.
+On Windows this is `cmd.exe`, and the line reaches it exactly as typed —
+`type "C:\My Files\a.md"` and `findstr /C:"two words" f.txt` work as they
+would at a prompt. cmd has no `;`: chain commands with `&` (or `&&` to stop
+at the first failure). A line that starts with a PowerShell cmdlet
+(`Get-ChildItem …`) or a `$variable` runs in PowerShell instead, and the
+result says so in a `--- note ---` section — call `run-pwsh` for PowerShell
+rather than wrapping it in `powershell -Command "…"`.
 
 Behaviour:
-- Windows: invokes `cmd /C <command>`. Other OSes: `/bin/sh -c <command>`.
+- Windows: invokes `cmd /S /C "<command>"`. Other OSes: `/bin/sh -c <command>`.
+- A failure with a known cause ends with a `--- hint ---` section saying how
+  to fix it.
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok).

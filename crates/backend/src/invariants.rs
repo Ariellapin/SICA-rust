@@ -502,7 +502,7 @@ mod tests {
         // Not `enable()` here — that would leak into the other tests in this
         // binary, which is exactly the kind of shared-state bug the flag
         // being a global invites.
-        assert!(!enabled() || cfg!(feature = "never"));
+        assert!(!enabled());
     }
 
     #[test]

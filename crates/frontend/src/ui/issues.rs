@@ -141,6 +141,7 @@ pub fn headline(t: &TicketSummary) -> String {
         }
         "frontend" if m == "frontend::supervisor::start_be" => "The backend would not start".into(),
         "frontend" if m == "frontend::supervisor::respawn" => "The backend would not restart".into(),
+        "frontend" if m == "frontend::supervisor::be_exit" => "The backend stopped unexpectedly".into(),
         "frontend" => "The app window hit an error".into(),
         "config" => format!("A configuration file could not be loaded ({m})"),
         _ if !t.title.trim().is_empty() => kit::one_line(&t.title, 90),
@@ -405,6 +406,7 @@ mod tests {
             "The app window crashed in app.rs"
         );
         assert_eq!(headline(&tk("frontend", "frontend::supervisor::start_be")), "The backend would not start");
+        assert_eq!(headline(&tk("frontend", "frontend::supervisor::be_exit")), "The backend stopped unexpectedly");
         assert!(headline(&tk("invariant", "backend::invariants::turn_error_ticketed")).contains("turn error ticketed"));
         assert_eq!(headline(&tk("other", "x::y")), "the analyzer's title");
     }

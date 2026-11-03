@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::shell::{self, Shell};
 use crate::skill::{Concurrency, Skill, SkillContext, SkillOutcome};
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,8 +99,15 @@ Example:
 
     run-cli 'cargo --version' > confirm cargo is installed and report the version
 
+On Windows the line reaches `cmd.exe` exactly as typed, quotes included.
+cmd has no `;`: chain commands with `&` (or `&&`). A line that starts with a
+PowerShell cmdlet (`Get-ChildItem …`) or a `$variable` runs in PowerShell
+instead, and the result says so in a `--- note ---` section.
+
 Behaviour:
-- Windows: invokes `cmd /C <command>`. Other OSes: `/bin/sh -c <command>`.
+- Windows: invokes `cmd /S /C "<command>"`. Other OSes: `/bin/sh -c <command>`.
+- A failure with a known cause ends with a `--- hint ---` section saying how
+  to fix it.
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok), reported as the
@@ -163,6 +171,10 @@ Behaviour:
 - Windows: invokes `powershell -NoLogo -NoProfile -NonInteractive -Command <command>`.
   Falls back to `pwsh` (PowerShell Core) if `powershell.exe` is missing.
 - Non-Windows: invokes `pwsh -NoLogo -NoProfile -NonInteractive -Command <command>`.
+- The command is passed as written: do not double (`''`) or backslash-escape
+  (`\"`) the quotes inside it.
+- A failure with a known cause ends with a `--- hint ---` section saying how
+  to fix it.
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok).
@@ -225,6 +237,9 @@ Behaviour:
 - Relative paths may not escape the workspace via `..`.
 - Use `\n`, `\t`, `\\`, `\'`, `\"` escapes inside the quoted content to
   embed newlines or quote characters.
+- A PowerShell file (`.ps1`, `.psm1`, `.psd1`) with any non-ASCII text is
+  saved with a UTF-8 byte-order mark, which Windows PowerShell needs to read
+  it; the summary says so.
 - Optional named arg `append`: `'append=true'` adds the content to the end
   of the file instead of replacing it. Write a large file in parts — one
   reply can only hold so much, and a call cut off mid-body never runs:
@@ -332,21 +347,35 @@ impl Skill for RunCli {
         };
         let cwd = shell_cwd(&args, &ctx);
 
-        let mut cmd = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.args(["/C", &command]);
-            c
-        } else {
-            let mut c = Command::new("/bin/sh");
-            c.args(["-c", &command]);
-            c
+        let routed = shell::powershell_route(&command, &cwd);
+        let (mut cmd, exe, kind) = match &routed {
+            Some(_) => {
+                let (c, exe) = shell::pwsh_command(&command);
+                (c, exe, Shell::PowerShell)
+            }
+            None => (shell::shell_command(&command), "cmd", Shell::Cmd),
         };
         cmd.current_dir(&cwd);
         if wants_background(&args) {
             return start_background(&self.0, "cli", &command, cmd, &ctx);
         }
-        run_shell(cmd, "cmd", &ctx, shell_timeout(&args, self.timeout())).await
+        let note = routed.map(|why| {
+            format!("ran in PowerShell — {why}, which cmd.exe does not have; call run-pwsh for PowerShell")
+        });
+        let run = ShellRun { exe, shell: kind, command: &command, note };
+        run_shell(cmd, run, &ctx, shell_timeout(&args, self.timeout())).await
     }
+}
+
+/// What [`run_shell`] needs besides the process: names for messages, and
+/// the command and shell a failure hint is matched against.
+struct ShellRun<'a> {
+    exe:     &'a str,
+    shell:   Shell,
+    command: &'a str,
+    /// A line the result carries whatever the outcome (why `run-cli` ran
+    /// PowerShell).
+    note:    Option<String>,
 }
 
 /// Directory a shell call runs in: the `cwd` arg when it has one (a relative
@@ -435,10 +464,11 @@ fn shell_timeout(args: &Value, skill_timeout: Duration) -> Duration {
 /// `SICA_SESSION_ID` is set for scripts that want to know their caller.
 async fn run_shell(
     mut cmd: Command,
-    exe: &str,
+    run: ShellRun<'_>,
     ctx: &SkillContext,
     limit: Duration,
 ) -> SkillOutcome {
+    let exe = run.exe;
     if let Some(session) = &ctx.sub.spill_label {
         cmd.env("SICA_SESSION_ID", session);
     }
@@ -462,18 +492,23 @@ async fn run_shell(
 
     let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let ok = output.status.success();
+    // Matched against the whole stream, before the cap can cut it.
+    let hint = (!ok).then(|| shell::failure_hint(run.shell, run.command, &stderr)).flatten();
     // Over the cap the stream is kept whole on disk (guide §6.9) and the
     // model gets the head plus a pointer — the same spill seam every other
     // oversized output goes through, instead of the tail being discarded.
     cap_stream(&mut stdout, "stdout", exe, ctx);
     cap_stream(&mut stderr, "stderr", exe, ctx);
     let code = output.status.code().unwrap_or(-1);
-    SkillOutcome {
-        ok: output.status.success(),
-        summary: format!(
-            "exit={code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-        ),
+    let mut summary = format!("exit={code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+    if let Some(note) = run.note {
+        summary.push_str(&format!("\n--- note ---\n{note}"));
     }
+    if let Some(hint) = hint {
+        summary.push_str(&format!("\n--- hint ---\n{hint}"));
+    }
+    SkillOutcome { ok, summary }
 }
 
 /// `run-pwsh`. See [`RunCli`] for the job registry.
@@ -503,48 +538,14 @@ impl Skill for RunPwsh {
             _ => return err("missing or empty `command` arg"),
         };
         let cwd = shell_cwd(&args, &ctx);
-
-        // On Windows prefer the system `powershell.exe`; everywhere else
-        // (including the rare case where `powershell.exe` is missing on
-        // Windows) reach for `pwsh` (PowerShell Core).
-        let exe = if cfg!(windows) {
-            if which_in_path("powershell.exe").is_some() {
-                "powershell"
-            } else {
-                "pwsh"
-            }
-        } else {
-            "pwsh"
-        };
-
-        let mut cmd = Command::new(exe);
-        cmd.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &command,
-        ]);
+        let (mut cmd, exe) = shell::pwsh_command(&command);
         cmd.current_dir(&cwd);
         if wants_background(&args) {
             return start_background(&self.0, "pwsh", &command, cmd, &ctx);
         }
-        run_shell(cmd, exe, &ctx, shell_timeout(&args, self.timeout())).await
+        let run = ShellRun { exe, shell: Shell::PowerShell, command: &command, note: None };
+        run_shell(cmd, run, &ctx, shell_timeout(&args, self.timeout())).await
     }
-}
-
-/// Minimal PATH lookup used only by `RunPwsh` so we can fall back to `pwsh`
-/// when `powershell.exe` is absent. We deliberately avoid pulling in an
-/// extra crate for this — the agents crate stays leaf-level.
-fn which_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 pub struct ReadFile {
@@ -788,17 +789,13 @@ impl Skill for WriteFile {
             fs::metadata(&resolved).ok().filter(|m| m.is_file()).map_or(0, |m| m.len())
         };
         let result = if append {
-            use std::io::Write;
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&resolved)
-                .and_then(|mut f| f.write_all(content.as_bytes()))
+            append_text(&resolved, &content)
         } else {
-            fs::write(&resolved, content.as_bytes())
+            let (stored, bom) = with_script_bom(&resolved, &content);
+            fs::write(&resolved, stored.as_bytes()).map(|()| bom)
         };
         match result {
-            Ok(()) => {
+            Ok(bom) => {
                 let mut summary = format!(
                     "{} {} bytes to {}",
                     if append { "appended" } else { "wrote" },
@@ -810,11 +807,70 @@ impl Skill for WriteFile {
                         " — replaced the {replaced} bytes it held; 'append=true' adds to the end instead"
                     ));
                 }
+                if bom {
+                    summary.push_str(BOM_NOTE);
+                }
                 SkillOutcome { ok: true, summary }
             }
             Err(e) => err(&format!("write {}: {e}", resolved.display())),
         }
     }
+}
+
+/// UTF-8's byte-order mark, as text.
+const UTF8_BOM: &str = "\u{feff}";
+
+/// Said when [`with_script_bom`] added the mark.
+const BOM_NOTE: &str =
+    " — saved with a UTF-8 byte-order mark so Windows PowerShell reads its non-ASCII text";
+
+/// PowerShell's own files: scripts, modules, manifests.
+fn is_powershell_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["ps1", "psm1", "psd1"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// `text` as it should be stored at `path`, and whether the byte-order mark
+/// was added. Windows PowerShell 5.1 reads a script without the mark in the
+/// ANSI code page, so UTF-8 text in it is misread — the last byte of an em
+/// dash is `”`, which PowerShell takes for a closing quote. `sessions/102`
+/// wrote a `.ps1` with an em dash inside a string, then lost four minutes
+/// to "the string is missing the terminator" on a line that had one. A
+/// PowerShell file with any non-ASCII text gets the mark; an ASCII one, and
+/// every other file, is written as given.
+fn with_script_bom<'a>(path: &Path, text: &'a str) -> (std::borrow::Cow<'a, str>, bool) {
+    if is_powershell_file(path) && !text.is_ascii() && !text.starts_with(UTF8_BOM) {
+        (std::borrow::Cow::Owned(format!("{UTF8_BOM}{text}")), true)
+    } else {
+        (std::borrow::Cow::Borrowed(text), false)
+    }
+}
+
+/// `write-file`'s append. A PowerShell file that gains non-ASCII text and
+/// has no byte-order mark yet is rewritten whole with one — the mark only
+/// works at the start. Returns whether it was added.
+fn append_text(path: &Path, content: &str) -> std::io::Result<bool> {
+    if is_powershell_file(path) && !content.is_ascii() {
+        let existing = match fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+            // Not UTF-8: leave its bytes alone and append as asked.
+            Err(_) => None,
+        };
+        if let Some(existing) = existing.filter(|t| !t.starts_with(UTF8_BOM)) {
+            let whole = format!("{existing}{content}");
+            let (stored, bom) = with_script_bom(path, &whole);
+            return fs::write(path, stored.as_bytes()).map(|()| bom);
+        }
+    }
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(content.as_bytes()))
+        .map(|()| false)
 }
 
 pub struct EditFile {
@@ -888,7 +944,8 @@ impl Skill for EditFile {
 
         let at = text.find(&old).expect("counted one match");
         let updated = format!("{}{}{}", &text[..at], new, &text[at + old.len()..]);
-        if let Err(e) = fs::write(&resolved, updated.as_bytes()) {
+        let (stored, bom) = with_script_bom(&resolved, &updated);
+        if let Err(e) = fs::write(&resolved, stored.as_bytes()) {
             return err(&format!("write {}: {e}", resolved.display()));
         }
 
@@ -904,10 +961,11 @@ impl Skill for EditFile {
         SkillOutcome {
             ok: true,
             summary: format!(
-                "replaced {} bytes with {} bytes in {}\n{}",
+                "replaced {} bytes with {} bytes in {}{}\n{}",
                 old.len(),
                 new.len(),
                 resolved.display(),
+                if bom { BOM_NOTE } else { "" },
                 numbered_range(&updated, Some(from), Some(to)),
             ),
         }
@@ -1281,7 +1339,21 @@ pub(crate) fn call_root(fallback: Option<&Path>, ctx: &SkillContext) -> PathBuf 
     })
 }
 
+/// `path` with the control characters an escape decoder made of it put
+/// back. A call's later arguments have `\n`, `\t` and `\r` decoded, so a
+/// Windows path written with single backslashes as `write-file`'s first
+/// argument lost one: `…\Wildcards\transform.ps1` became `…\Wildcards`,
+/// a TAB, `ransform.ps1` (os error 123). No path means a control
+/// character, so each is read back as the escape it was decoded from.
+pub(crate) fn restore_path_escapes(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains(['\t', '\n', '\r']) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(path.replace('\t', "\\t").replace('\n', "\\n").replace('\r', "\\r"))
+}
+
 pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let path = &*restore_path_escapes(path);
     let candidate = Path::new(path);
     if candidate.is_absolute() {
         return Ok(candidate.to_path_buf());
@@ -1809,5 +1881,151 @@ mod tests {
         assert!(out.summary.contains(crate::jobs::JOB_OUTPUT_NAME));
         assert_eq!(jobs.list(7).len(), 1);
         jobs.clear(7);
+    }
+
+    // --- Regression tests for the idealist tickets of 2026-11-03 ---------
+
+    /// d2c6930a8645: `write-file`'s path is its first of two arguments, so
+    /// the call parser decodes escapes in it, and a single-backslash
+    /// Windows path lost its `\t` to a TAB.
+    #[test]
+    fn a_decoded_escape_in_a_path_is_read_back() {
+        let call = crate::parse_tool_call::extract(
+            r"write-file 'C:\\work\\Wildcards\transform.ps1' 'x' > write it",
+        )
+        .unwrap();
+        assert!(call.raw_args[0].contains('\t'), "the decoder still makes a TAB of it");
+        assert_eq!(restore_path_escapes(&call.raw_args[0]), r"C:\work\Wildcards\transform.ps1");
+        assert_eq!(restore_path_escapes("a\nb\rc"), r"a\nb\rc");
+        assert!(matches!(restore_path_escapes("plain/path.txt"), std::borrow::Cow::Borrowed(_)));
+        let root = PathBuf::from("/work");
+        assert_eq!(resolve(&root, "dir\tfile").unwrap(), root.join(r"dir\tfile"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn write_file_lands_where_a_tab_mangled_path_meant() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let w = WriteFile::new(dir.clone());
+        let mangled = format!("{}\\sub\transform.txt", dir.display());
+        let out = w.run(json!({ "path": mangled, "content": "ok" }), ctx()).await;
+        assert!(out.ok, "{}", out.summary);
+        assert_eq!(std::fs::read_to_string(dir.join("sub").join("transform.txt")).unwrap(), "ok");
+    }
+
+    fn has_bom(path: &Path) -> bool {
+        std::fs::read(path).unwrap().starts_with(&[0xEF, 0xBB, 0xBF])
+    }
+
+    /// 7706070d9498: a `.ps1` with an em dash inside a string, saved
+    /// without a byte-order mark, does not parse in Windows PowerShell.
+    #[tokio::test]
+    async fn powershell_files_with_non_ascii_get_a_bom() {
+        let dir = tempdir();
+        let w = WriteFile::new(dir.clone());
+        let dash = "Write-Output \"one \u{2014} two\"\n";
+
+        let out = w.run(json!({ "path": "s.ps1", "content": dash }), ctx()).await;
+        assert!(out.ok && out.summary.contains("byte-order mark"), "{}", out.summary);
+        assert!(has_bom(&dir.join("s.ps1")));
+        // Written again, the mark is not doubled.
+        w.run(json!({ "path": "s.ps1", "content": dash }), ctx()).await;
+        assert_eq!(std::fs::read_to_string(dir.join("s.ps1")).unwrap().matches(UTF8_BOM).count(), 1);
+
+        // ASCII scripts and other files are written byte for byte.
+        w.run(json!({ "path": "plain.ps1", "content": "Write-Output 1\n" }), ctx()).await;
+        assert!(!has_bom(&dir.join("plain.ps1")));
+        w.run(json!({ "path": "notes.txt", "content": dash }), ctx()).await;
+        assert!(!has_bom(&dir.join("notes.txt")));
+
+        // An append that brings the first non-ASCII text adds the mark at
+        // the start; one to a file that has it adds no second.
+        let out = w
+            .run(json!({ "path": "plain.ps1", "content": dash, "append": true }), ctx())
+            .await;
+        assert!(out.ok, "{}", out.summary);
+        let text = std::fs::read_to_string(dir.join("plain.ps1")).unwrap();
+        assert_eq!(text, format!("{UTF8_BOM}Write-Output 1\n{dash}"));
+        w.run(json!({ "path": "plain.ps1", "content": dash, "append": true }), ctx()).await;
+        assert_eq!(std::fs::read_to_string(dir.join("plain.ps1")).unwrap().matches(UTF8_BOM).count(), 1);
+
+        // So does an edit that brings it.
+        std::fs::write(dir.join("e.ps1"), "Write-Output \"a - b\"\n").unwrap();
+        let e = EditFile::new(dir.clone());
+        let out = e
+            .run(json!({ "path": "e.ps1", "old": "a - b", "new": "a \u{2014} b" }), ctx())
+            .await;
+        assert!(out.ok && out.summary.contains("byte-order mark"), "{}", out.summary);
+        assert!(has_bom(&dir.join("e.ps1")));
+    }
+
+    /// The same ticket, end to end: Windows PowerShell runs the script.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_runs_a_script_write_file_saved() {
+        if crate::shell::which_in_path("powershell.exe").is_none() {
+            return;
+        }
+        let dir = tempdir();
+        let w = WriteFile::new(dir.clone());
+        let script = "$n = 2\nWrite-Output \"count: $n \u{2014} done\"\nWrite-Output \"end\"\n";
+        assert!(w.run(json!({ "path": "t.ps1", "content": script }), ctx()).await.ok);
+        let out = RunPwsh(None)
+            .run(
+                json!({
+                    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File t.ps1",
+                    "cwd": dir.display().to_string(),
+                }),
+                ctx(),
+            )
+            .await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("count: 2") && out.summary.contains("end"), "{}", out.summary);
+    }
+
+    /// d0d7dd031b68: a cmdlet sent to `run-cli` runs in PowerShell.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_cli_runs_a_cmdlet_in_powershell() {
+        let dir = tempdir();
+        std::fs::write(dir.join("poses_a.txt"), "x").unwrap();
+        let out = RunCli(None)
+            .run(
+                json!({
+                    "command": "Get-ChildItem poses_*.txt | Select-Object -ExpandProperty Name",
+                    "cwd": dir.display().to_string(),
+                }),
+                ctx(),
+            )
+            .await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("poses_a.txt"), "{}", out.summary);
+        assert!(out.summary.contains("ran in PowerShell"), "{}", out.summary);
+    }
+
+    /// 7514f52b417c / 708173c0efeb, through the skill: a quoted path with
+    /// spaces reaches cmd.exe as typed.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_cli_keeps_quotes_as_typed() {
+        let dir = tempdir().join("with space");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("athletic notes.md"), "peach fuzz\r\n").unwrap();
+        let out = RunCli(None)
+            .run(json!({ "command": format!("type \"{}\"", dir.join("athletic notes.md").display()) }), ctx())
+            .await;
+        assert!(out.ok, "{}", out.summary);
+        assert!(out.summary.contains("peach fuzz"));
+        assert!(!out.summary.contains("--- note ---"), "a cmd line is not routed");
+    }
+
+    /// 48f29b2a614d: a PowerShell failure the model can fix carries the fix.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_pwsh_failure_carries_a_hint() {
+        let out = RunPwsh(None).run(json!({ "command": "$i = 1; \"L$i: x\"" }), ctx()).await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("--- hint ---") && out.summary.contains("${name}:"), "{}", out.summary);
     }
 }

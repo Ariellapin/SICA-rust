@@ -3,6 +3,7 @@
 pub mod atomic;
 pub mod attachments;
 pub mod build_id;
+pub mod crash;
 pub mod creds;
 pub mod event;
 pub mod message;

@@ -22,8 +22,13 @@ One-line form:
 
 The command reaches PowerShell exactly as written between the outer quotes:
 backslashes are literal (`C:\new\raw` stays a path, `\s+` stays a regex),
-and quotes inside it are fine (`-ne ' '`, `"it's"`). Put the
+and quotes inside it are fine (`-ne ' '`, `"it's"`). So do not double
+(`''`) or backslash-escape (`\"`) the quotes inside it. Put the
 ` > <expectation>` straight after the closing quote.
+
+In a double-quoted string, `"$i:"` reads as a drive-qualified variable —
+write `"${i}:"`. A script with non-ASCII text needs a UTF-8 byte-order mark
+for Windows PowerShell to read it; `write-file` adds one to `.ps1` files.
 
 Behaviour:
 - Windows: invokes `powershell -NoLogo -NoProfile -NonInteractive -Command <command>`.
@@ -32,3 +37,5 @@ Behaviour:
 - Stdout and stderr are each capped to **32 KiB** before being returned.
 - A timeout of **30 seconds** kills the child and reports an error outcome.
 - The outcome `ok` mirrors the child exit code (0 = ok).
+- A failure with a known cause ends with a `--- hint ---` section saying how
+  to fix it.
