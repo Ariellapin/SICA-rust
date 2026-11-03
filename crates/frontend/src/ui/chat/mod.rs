@@ -13,7 +13,7 @@ mod composer;
 mod control;
 pub mod details;
 mod dock;
-mod md_blocks;
+pub(crate) mod md_blocks;
 mod memory;
 mod messages;
 mod meter;

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Default prompt-budget occupancy (percent) at which the backend folds older
 /// history into an LLM-written summary instead of letting the trimmer amputate
@@ -483,6 +483,9 @@ pub enum Request {
     /// ticket (v31). Answers `FixSession`; the draft is *not* sent — the
     /// FE puts it in the composer for a person to review.
     StartFixSession { ticket_id: String },
+    /// One ticket with its whole markdown body (v33), for reading it in the
+    /// app. Answers `TicketDetail`, or `Error` for an unknown id.
+    GetTicket { ticket_id: String },
 
     // Memory (v32). Two memories: a session's own (a running summary and
     // the important things, in its log) and long-term memory (facts that
@@ -556,6 +559,9 @@ pub enum Response {
     /// `StartFixSession`: the session to switch to and the prompt to put in
     /// its composer.
     FixSession { session_id: u64, ticket_id: String, draft: String },
+    /// `GetTicket` (v33): the summary again (it may have moved on since the
+    /// list) and the ticket file's markdown body, front-matter stripped.
+    TicketDetail { ticket: TicketSummary, body: String },
     /// Every long-term memory (v32), global ones first, then by folder,
     /// oldest first within each.
     Memories { memories: Vec<MemoryDump> },
@@ -597,6 +603,16 @@ pub struct SessionMemoryDump {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TicketSummary {
     pub id:           String,
+    /// The ticket's heading: what failed, in one line (v33).
+    pub title:        String,
+    /// The heuristic analysis written when the ticket was opened — what to
+    /// try before anyone has investigated (v33). May be empty.
+    pub hint:         String,
+    /// The latest investigation's root cause and proposed fix, and the files
+    /// it names (v33). Capped; the ticket file has the full text.
+    pub root_cause:   Option<String>,
+    pub fix:          Option<String>,
+    pub files:        Vec<String>,
     /// `open` · `investigating` · `diagnosed` · `investigation_failed` ·
     /// `resolved` · `wontfix` · `noise`.
     pub status:       String,

@@ -5,8 +5,9 @@
 //! Sections: **General** (applies live — dsh has no Apply button there),
 //! **Models** (one card per provider, Connect / Apply per card), **Skills**
 //! (the catalogue the `/` palette lists, plus the folders behind it) and
-//! **Diagnostics** (the old Communication tab: connection, demo requests and
-//! the log panel, which now keeps its level).
+//! **Issues** (the idealist's improvement tickets: what failed, why, and the
+//! fix — `tickets`) and **Diagnostics** (the old Communication tab:
+//! connection, demo requests and the log panel, which now keeps its level).
 
 mod diagnostics;
 mod general;
@@ -28,13 +29,14 @@ use crate::ui::kit::{self, Elevation, Level, Weight};
 const NAV_W: f32 = 188.0;
 const PANEL_W: f32 = 800.0;
 
-const SECTIONS: [(SettingsTab, &str, Icon); 7] = [
+const SECTIONS: [(SettingsTab, &str, Icon); 8] = [
     (SettingsTab::General, "General", Icon::Gear),
     (SettingsTab::Models, "Models", Icon::Model),
     (SettingsTab::Skills, "Skills", Icon::Sparkle),
     (SettingsTab::Agents, "Agents", Icon::Think),
     (SettingsTab::Memory, "Memory", Icon::Memory),
     (SettingsTab::Integrations, "Integrations", Icon::Shield),
+    (SettingsTab::Issues, "Issues", Icon::Warning),
     (SettingsTab::Diagnostics, "Diagnostics", Icon::Job),
 ];
 
@@ -122,6 +124,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                                             SettingsTab::Agents => agents::draw(app, ui),
                                             SettingsTab::Memory => memory::draw(app, ui),
                                             SettingsTab::Integrations => integrations::draw(app, ui),
+                                            SettingsTab::Issues => tickets::draw(app, ui),
                                             SettingsTab::Diagnostics => diagnostics::draw(app, ui),
                                         });
                                 });
@@ -232,6 +235,30 @@ fn nav_cell(app: &mut App, ui: &mut egui::Ui, tab: SettingsTab, label: &str, ico
                 t.alias.label[1]
             }),
         );
+        // Issues carries its open count, so the tab says there is
+        // something to look at before it is opened.
+        let open = if tab == SettingsTab::Issues {
+            crate::ui::issues::active(app).len()
+        } else {
+            0
+        };
+        if open > 0 {
+            let text = open.to_string();
+            let font = kit::font(11.0, Weight::Medium);
+            let galley = ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), kit::col(t.alias.error)));
+            let w = (galley.size().x + 12.0).max(20.0);
+            let badge = Rect::from_center_size(
+                egui::pos2(rect.max.x - 10.0 - w / 2.0, rect.center().y),
+                Vec2::new(w, 18.0),
+            );
+            ui.painter().rect_filled(
+                badge,
+                Rounding::same(9.0),
+                kit::col(t.alias.error).linear_multiply(if t.dark { 0.35 } else { 0.14 }),
+            );
+            ui.painter()
+                .text(badge.center(), Align2::CENTER_CENTER, text, font, kit::col(t.alias.error));
+        }
         if resp.clicked() {
             app.settings_tab = tab;
         }

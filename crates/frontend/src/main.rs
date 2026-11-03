@@ -1,6 +1,7 @@
 mod app;
 mod builder;
 mod child;
+mod fe_incident;
 mod icon;
 mod ipc_client;
 mod llm_providers;
@@ -17,6 +18,8 @@ fn main() -> eframe::Result<()> {
         )
         .with_target(false)
         .init();
+    // A GUI panic becomes an idealist ticket, sent at the next connect.
+    fe_incident::install_panic_hook();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

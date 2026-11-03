@@ -346,16 +346,20 @@ async fn main() -> Result<()> {
     println!("smoke: workspace delete -> session {ws_session} still loads");
     let _ = std::fs::remove_dir_all(&ws_dir);
 
-    // Idealist tickets (v30/v31). The list answers whatever is on disk; the
-    // two requests about things that do not exist must be refused with a
-    // reason, not crash the dispatcher or hang.
-    let mut idealist_steps = vec![
+    // Idealist tickets (v30/v31/v33). The list answers whatever is on disk;
+    // the requests about things that do not exist — and an id that tries to
+    // walk out of the ticket folder — must be refused with a reason, not
+    // crash the dispatcher or hang. A ticket that is on disk reads back
+    // whole (v33).
+    let mut idealist_steps: std::collections::VecDeque<(u64, Request)> = vec![
         (15, Request::ListTickets),
         (16, Request::StartFixSession { ticket_id: "000000000000".into() }),
         (17, Request::InvestigateSession { session_id: ws_session }),
+        (24, Request::GetTicket { ticket_id: "000000000000".into() }),
+        (25, Request::GetTicket { ticket_id: "../sica-settings".into() }),
     ]
-    .into_iter();
-    while let Some((id, req)) = idealist_steps.next() {
+    .into();
+    while let Some((id, req)) = idealist_steps.pop_front() {
         writer.send(Frame::request(id, req).encode()?.into()).await?;
         let resp = loop {
             let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
@@ -368,9 +372,17 @@ async fn main() -> Result<()> {
         match (id, &resp) {
             (15, Response::Tickets { tickets }) => {
                 println!("smoke: tickets -> {} on disk", tickets.len());
+                if let Some(t) = tickets.first() {
+                    idealist_steps.push_back((26, Request::GetTicket { ticket_id: t.id.clone() }));
+                }
             }
-            (16 | 17, Response::Error { message }) => {
+            (16 | 17 | 24 | 25, Response::Error { message }) => {
                 println!("smoke: idealist request {id} refused -> {message}");
+            }
+            (26, Response::TicketDetail { ticket, body }) => {
+                anyhow::ensure!(!body.trim().is_empty(), "ticket {} read back empty", ticket.id);
+                anyhow::ensure!(!body.starts_with("+++"), "ticket {} body kept its front-matter", ticket.id);
+                println!("smoke: ticket {} -> {} bytes, \"{}\"", ticket.id, body.len(), ticket.title);
             }
             _ => anyhow::bail!("idealist request {id}: unexpected {resp:?}"),
         }

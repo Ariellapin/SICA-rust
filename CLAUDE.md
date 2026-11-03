@@ -113,6 +113,10 @@ Seven crates, dependency direction strictly downward. Details in
 - Report a new failure path through `backend::incident` (not only a `LogLine`),
   so it becomes an idealist ticket the end-of-session investigator can read.
   See [docs/notes/2026-09-26-idealist-investigator.md](docs/notes/2026-09-26-idealist-investigator.md).
+  A failure the **frontend** sees goes through `fe_incident::queue` (sent as
+  `ReportFrontendError` at the next connect). Tickets surface as the issue
+  count under the sidebar's Settings and in Settings › Issues (v33). See
+  [docs/notes/2026-11-03-issues-surface.md](docs/notes/2026-11-03-issues-surface.md).
 - Three skills are off until a doc turns them on: `skills/agent-team.md` registers
   `agent-team` (§12.7), `skills/workflow.md` registers `workflow` (§12.5), and
   `skills/schedule.md` registers the three reminder tools (§12.8; seeded as

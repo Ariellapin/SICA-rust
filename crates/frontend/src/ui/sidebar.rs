@@ -1678,6 +1678,10 @@ fn foot(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         });
     }
 
+    // What the idealist has filed and nobody has closed yet: a count under
+    // the Settings trigger that opens Settings › Issues.
+    crate::ui::issues::sidebar_chip(app, ui, collapsed);
+
     // sica's own affordance: source drift / protocol mismatch. Not in dsh —
     // and deliberately kept, because the rebuild loop is the point of the app.
     restart_chip(app, ui, collapsed);

@@ -1773,6 +1773,7 @@ a 188 px nav and a content column. Sections:
 | **Skills** (replaces dsh Plugins) | tab **Catalogue**: the `ListCatalog` entries grouped Commands / Skills / Agents with descriptions and source paths, search, "Open folder" per kind, skill-creator template button; tab **Harness**: shell timeout (`Skill::timeout`), output caps, `MAX_TOOL_HOPS`, parallel pool cap, compaction thresholds — **read-only until those are settings** (today they are constants); tab **Delegation**: `agent-team.md` on/off switch (rename to `.md.off`), child-excluded list | `agents` constants → later a `harness.toml` |
 | **Agents** (dsh Agent presets) — **done** | roster cards from `agents/*.md` (harness §5.2): name · description · `skills:` count · **In use** when the current session runs it · **Set as default** (a `default_agent` setting the FE applies through `SetSessionAgent` right after `SessionCreated`) · **Show location** (`open_in_explorer`) · **Duplicate** (dialog "Copy preset · copied from {name}": *Identifier* → the new filename, placeholder `my-agent`, "Identifier is required / invalid / taken"; *Name*; Create) · **Delete** with a confirmation naming the preset; a file that fails to parse renders as a marked card with the reason as tooltip and only Show location / Delete live. Plus the **new-session chip** on the hero ("Agent preset for the session you are about to start", opens on the default, spent by the next session) and a read-only **header label** ("fixed when it started"). dsh's read-only shipped presets and its Creator-mode add-card have no counterpart: every sica preset is a file the user owns | `agents/*.md` + `settings_store.default_agent` — **S–M** |
 | **Integrations** (dsh Plugins › Plugin configuration) — **done** | one card per optional integration, each read from its file and reporting what the BE said at startup: **MCP servers** (`sica-settings/mcp/*.toml`: name, command, an `enabled` toggle that rewrites the TOML, status Started / Failed with the `LogLine` reason, tool count from the catalogue) · **Hooks** (`.sica/hooks.json` under the session's cwd: the matched events, read-only, "Open file") · **Web search** (`web.toml`: provider select, key field **write-only** — shows "configured" after save, harness §14.6) · **Workflow / Agent team** switches (rename `skills/{workflow,agent-team}.md` ⇄ `.md.off`). dsh's "Overridden / Reset to default" pair has no meaning here: a card *is* its file | the files named — **S–M**; an MCP change needs the BE restarted, which the row's `applies: restart` badge says |
+| **Issues** (v33) — **done** | the idealist's tickets, one card per kind of failure: a plain headline (`ui::issues::headline`), state pill and count, the module / id / when / sessions line in mono, then **What happened** (the last message), **Why** (the investigator's root cause with its category in words and its confidence, or that nobody has looked yet) and **How to fix** (its proposed fix, else the heuristic hint, plus per-category advice and the files it names); actions *Fix with agent* (`StartFixSession`, any open ticket), *Investigate* (`InvestigateSession` for the session it last happened in), *Go to session*, *Copy report* (markdown to the clipboard), *Full ticket* (`GetTicket`, rendered inline), *Open file*, and *Mark as* Resolved / Noise / Won't fix / Reopen; filters *This session only* and *Closed*. The nav cell carries the open count | `idealist_workspace/tickets/` via `ListTickets` / `GetTicket` |
 | **Diagnostics** (new home for Communication) | connection card (BE pid / IPC / protocol version / build id, Start / Stop / Rebuild & Restart, auto-watch, release profile), the log panel with a level filter, the demo request row | `controls.rs`, `log_panel.rs` |
 
 The "Open configuration file" header action opens `sica-settings.json` in
@@ -1830,6 +1831,25 @@ around: a session's preset is fixed once it has produced anything
 is exactly when it can still be set. The header label is deliberately
 not a control: it names what the session is fixed on, and a control
 there would fail on click.
+
+**Issues, as shipped (v33).** The tickets used to be the fourth block of
+Diagnostics, under the demo requests, where nobody went looking; they are a
+section of their own now, and the sidebar foot says when it has something in
+it: a tinted pill under the Settings trigger, *N open issues* (red while
+anything waits for a first look or has regressed, amber once everything open
+is diagnosed; collapsed, just the count). Its hover lists up to six open
+tickets — headline, last message, what is known about why — and a click opens
+Settings › Issues. Nothing shows while there are no open tickets. The list is
+asked for on every connect and refreshed, debounced, on every ticket event; a
+ticket that is new or reopened also raises a toast naming it. The card leads
+with words rather than identifiers because the identifiers are for the
+investigator: the module path stays, one line down, in mono. *Fix with
+agent* is offered on every open ticket, not only on a diagnosed harness bug —
+the fix prompt's working step follows the category
+(`backend::investigate::fix_step`), so an environment or config ticket gets a session that names the
+change instead of one that edits code. The full ticket renders inline with
+code blocks capped at 40 lines; a scroll area inside the settings scroller
+took the wheel and came out a sliver tall.
 
 Not shipped from this section: General's Working-directory relabel
 (harness §3.9's leftover — it needs a request that sets the default on a

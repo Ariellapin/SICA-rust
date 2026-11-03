@@ -11,6 +11,7 @@ mod chat;
 mod controls;
 pub mod fonts;
 pub mod icons;
+pub mod issues;
 pub mod kit;
 pub mod log_panel;
 mod onboarding;

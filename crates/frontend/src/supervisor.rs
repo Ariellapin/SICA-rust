@@ -206,13 +206,21 @@ pub enum UiEvent {
 
     // Idealist signals.
     IdealistStatus { activity: String, severity: Severity, last_ticket: Option<String> },
-    IdealistTicketWritten { path: String, kind: TicketKind, ticket_id: String, reopened: bool },
+    IdealistTicketWritten {
+        path:        String,
+        kind:        TicketKind,
+        ticket_id:   String,
+        occurrences: u32,
+        reopened:    bool,
+    },
     /// The end-of-session investigator finished one ticket.
     IdealistInvestigated { ticket_id: String, ok: bool, summary: String },
     /// `Response::Tickets` — the whole ticket list.
     Tickets { tickets: Vec<protocol::TicketSummary> },
     /// `Response::FixSession` — switch there, draft in the composer.
     FixSession { session_id: u64, ticket_id: String, draft: String },
+    /// `Response::TicketDetail` — one ticket's whole body (v33).
+    TicketDetail { ticket: protocol::TicketSummary, body: String },
     /// `auto_fix_session` opened one; its draft waits until it is opened.
     FixSessionReady { session_id: u64, ticket_id: String, draft: String },
 }
@@ -277,7 +285,14 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
                         } else {
                             match start_be(&bridge).await {
                                 Ok(r) => running = Some(r),
-                                Err(e) => bridge.send(UiEvent::Log(format!("start BE failed: {e}"))),
+                                Err(e) => {
+                                    bridge.send(UiEvent::Log(format!("start BE failed: {e}")));
+                                    crate::fe_incident::queue(
+                                        "frontend::supervisor::start_be",
+                                        format!("start BE failed: {e:#}"),
+                                        None,
+                                    );
+                                }
                             }
                         }
                     }
@@ -301,7 +316,14 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
                         if do_build(release, &bridge).await {
                             match start_be_with_profile(&bridge, release).await {
                                 Ok(r) => running = Some(r),
-                                Err(e) => bridge.send(UiEvent::Log(format!("respawn failed: {e}"))),
+                                Err(e) => {
+                                    bridge.send(UiEvent::Log(format!("respawn failed: {e}")));
+                                    crate::fe_incident::queue(
+                                        "frontend::supervisor::respawn",
+                                        format!("respawn failed: {e:#}"),
+                                        None,
+                                    );
+                                }
                             }
                         }
                         while fs_rx.try_recv().is_ok() {}
@@ -338,7 +360,14 @@ async fn run(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, bridge: Arc<UiBridg
                     if do_build(false, &bridge).await {
                         match start_be_with_profile(&bridge, false).await {
                             Ok(r) => running = Some(r),
-                            Err(e) => bridge.send(UiEvent::Log(format!("respawn failed: {e}"))),
+                            Err(e) => {
+                                bridge.send(UiEvent::Log(format!("respawn failed: {e}")));
+                                crate::fe_incident::queue(
+                                    "frontend::supervisor::respawn",
+                                    format!("respawn failed: {e:#}"),
+                                    None,
+                                );
+                            }
                         }
                     }
                     while fs_rx.try_recv().is_ok() {}
@@ -451,8 +480,8 @@ pub fn forward_event(bridge: &Arc<UiBridge>, ev: Event) {
         Event::IdealistStatus { activity, severity, last_ticket } => {
             UiEvent::IdealistStatus { activity, severity, last_ticket }
         }
-        Event::IdealistTicketWritten { path, kind, ticket_id, reopened, .. } => {
-            UiEvent::IdealistTicketWritten { path, kind, ticket_id, reopened }
+        Event::IdealistTicketWritten { path, kind, ticket_id, occurrences, reopened } => {
+            UiEvent::IdealistTicketWritten { path, kind, ticket_id, occurrences, reopened }
         }
         Event::IdealistInvestigated { ticket_id, ok, summary, .. } => {
             UiEvent::IdealistInvestigated { ticket_id, ok, summary }

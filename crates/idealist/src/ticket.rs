@@ -137,7 +137,112 @@ pub struct Ticket {
     pub body: String,
 }
 
+/// The parts of a ticket's body a person needs to understand it, pulled out
+/// so a listing can show them without the whole markdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TicketDigest {
+    /// The body's `# ` heading — the analyzer's one-line summary.
+    pub title:      String,
+    /// `## Heuristic analysis`, plus the skill-swap line when there is one.
+    pub hint:       String,
+    /// The latest investigation's `### Root cause`.
+    pub root_cause: Option<String>,
+    /// The latest investigation's `### Proposed fix`.
+    pub fix:        Option<String>,
+    /// The latest investigation's `### Files to touch`, bare paths.
+    pub files:      Vec<String>,
+}
+
+/// Cap on each digest field: a listing carries every ticket, so one long
+/// root cause must not make it heavy. The file has the rest.
+const DIGEST_CAP: usize = 600;
+
+/// The text under `heading` (an exact `## `/`### ` line) up to the next
+/// heading of the same or a higher level, trimmed. `None` when absent or
+/// empty.
+fn section_in<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    let level = heading.chars().take_while(|c| *c == '#').count();
+    let mut start = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end();
+        if let Some(s) = start {
+            let hashes = bare.chars().take_while(|c| *c == '#').count();
+            if hashes > 0 && hashes <= level && bare[hashes..].starts_with(' ') {
+                let body = text[s..offset].trim();
+                return (!body.is_empty()).then_some(body);
+            }
+        } else if bare == heading {
+            start = Some(offset + line.len());
+        }
+        offset += line.len();
+    }
+    let body = text[start?..].trim();
+    (!body.is_empty()).then_some(body)
+}
+
+/// The analyzer's hint repeats the failing message (`… returned an error:
+/// <message>. Investigate …`, `… Failing summary: <message>`). A listing
+/// shows the message on its own line already, so the digest keeps only the
+/// advice; the ticket file keeps the full text for the investigator.
+fn tidy_hint(hint: &str) -> String {
+    let mut h = hint;
+    if let Some(at) = h.find("Failing summary:") {
+        h = &h[..at];
+    }
+    if h.starts_with("Sub-agent tool `") {
+        if let Some(at) = h.rfind(". Investigate the args") {
+            h = &h[at + 2..];
+        }
+    }
+    h.trim().to_string()
+}
+
+fn cap(s: &str) -> String {
+    if s.len() <= DIGEST_CAP {
+        return s.to_string();
+    }
+    let mut end = DIGEST_CAP;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", s[..end].trim_end())
+}
+
 impl Ticket {
+    /// What the ticket says, for a person: see [`TicketDigest`].
+    pub fn digest(&self) -> TicketDigest {
+        let title = self
+            .body
+            .lines()
+            .find_map(|l| l.strip_prefix("# "))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let mut hint = tidy_hint(section_in(&self.body, "## Heuristic analysis").unwrap_or(""));
+        if let Some(swap) = self.body.lines().find(|l| l.starts_with("**Suggested skill swap:**")) {
+            if !hint.contains(swap) {
+                hint = format!("{hint}\n\n{swap}").trim().to_string();
+            }
+        }
+        let latest = TicketStore::investigations(self).pop().unwrap_or_default();
+        let files = section_in(&latest, "### Files to touch")
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| l.trim().strip_prefix("- "))
+                    .map(|p| p.trim().trim_matches('`').to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        TicketDigest {
+            title,
+            hint: cap(&hint),
+            root_cause: section_in(&latest, "### Root cause").map(cap),
+            fix: section_in(&latest, "### Proposed fix").map(cap),
+            files,
+        }
+    }
+
     pub fn render(&self) -> Result<String> {
         let front = toml::to_string(&self.meta).context("serialise ticket front-matter")?;
         Ok(format!("+++\n{front}+++\n\n{}", self.body.trim_start()))
@@ -625,6 +730,63 @@ pub(crate) mod tests {
         assert_eq!(failed.meta.status, TicketStatus::InvestigationFailed);
         assert!(failed.meta.diagnosis.is_some(), "an earlier diagnosis is kept");
         assert_eq!(TicketStore::investigations(&failed).len(), 2);
+    }
+
+    #[test]
+    fn digest_reads_heuristic_then_latest_investigation() {
+        let store = TicketStore::at(scratch("digest"));
+        let mut t = trig(
+            TriggerOrigin::ToolCall,
+            "agents::tool::run-cli",
+            "exit=1\n'rg' is not recognized as an internal or external command",
+            Some(4),
+        );
+        t.traceback = Some("host_os=windows\n".into());
+        let a = file(&store, &t);
+        let fresh = store.load(&a.id).unwrap().digest();
+        assert!(fresh.title.contains("'rg' is not recognized"), "{fresh:?}");
+        assert!(!fresh.hint.is_empty(), "the heuristic analysis is the hint");
+        assert!(fresh.hint.contains("run-pwsh"), "the skill swap rides along: {}", fresh.hint);
+        assert!(!fresh.hint.contains("Failing summary"), "the message is not repeated: {}", fresh.hint);
+        assert_eq!(fresh.root_cause, None);
+        assert_eq!(fresh.fix, None);
+
+        let first = "**Category:** `environment` · **Confidence:** `high`\n\n\
+                     ### Root cause\n\nold cause\n\n### Proposed fix\n\nold fix\n";
+        let second = "**Category:** `environment` · **Confidence:** `high`\n\n\
+                      ### Root cause\n\nrg is not on PATH for cmd.exe\n\n\
+                      ### Evidence\n\n- crates/agents/src/builtins.rs:10\n\n\
+                      ### Proposed fix\n\nUse run-pwsh for rg.\n\n\
+                      ### Files to touch\n\n- `skills/run-cli.md`\n- `crates/agents/src/builtins.rs`\n\n\
+                      ### Lesson\n\nOn this machine use run-pwsh for rg.\n";
+        store.append_investigation(&a.id, 4, first, None).unwrap();
+        store.append_investigation(&a.id, 5, second, None).unwrap();
+        let d = store.load(&a.id).unwrap().digest();
+        assert_eq!(d.root_cause.as_deref(), Some("rg is not on PATH for cmd.exe"));
+        assert_eq!(d.fix.as_deref(), Some("Use run-pwsh for rg."));
+        assert_eq!(d.files, vec!["skills/run-cli.md", "crates/agents/src/builtins.rs"]);
+    }
+
+    #[test]
+    fn digest_hint_drops_the_repeated_message() {
+        let store = TicketStore::at(scratch("tidy"));
+        let msg = "exit=1\n--- stderr ---\nThe string is missing the terminator: \".";
+        let a = file(&store, &trig(TriggerOrigin::ToolCall, "agents::tool::run-cli", msg, Some(1)));
+        let d = store.load(&a.id).unwrap().digest();
+        assert!(d.hint.starts_with("Investigate the args"), "{}", d.hint);
+        assert!(!d.hint.contains("terminator"), "{}", d.hint);
+    }
+
+    #[test]
+    fn digest_caps_long_sections() {
+        let store = TicketStore::at(scratch("cap"));
+        let a = file(&store, &trig(TriggerOrigin::Other, "m", "x", None));
+        let mut t = store.load(&a.id).unwrap();
+        t.body = format!("# t\n\n## Heuristic analysis\n\n{}\n\n## Next\n\nx\n", "é".repeat(2_000));
+        let d = t.digest();
+        assert!(d.hint.len() <= DIGEST_CAP + '…'.len_utf8());
+        assert!(d.hint.ends_with('…'));
+        assert!(!d.hint.contains("## Next"));
     }
 
     #[test]

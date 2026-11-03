@@ -27,6 +27,8 @@ pub enum SettingsTab {
     Agents,
     Memory,
     Integrations,
+    /// The idealist's improvement tickets: what failed, why, and the fix.
+    Issues,
     Diagnostics,
 }
 
@@ -1051,12 +1053,25 @@ pub struct IdealistUiState {
     pub activity:    String,
     pub last_ticket: Option<String>,
     pub severity:    Option<Severity>,
-    /// Settings › Diagnostics › Improvement tickets. `None` until the first
-    /// `ListTickets` answer; refreshed whenever a ticket is written or
-    /// investigated.
+    /// Every improvement ticket — the sidebar's issue count and Settings ›
+    /// Issues. Asked for on every connect; `None` until the first answer.
     pub tickets:     Option<Vec<protocol::TicketSummary>>,
     /// Show resolved / wontfix / noise tickets too.
     pub show_closed: bool,
+    /// Settings › Issues: only the tickets the open session raised.
+    pub this_session_only: bool,
+    /// When to ask for the list again. Ticket events come in bursts (a
+    /// looping tool bumps one ticket per call), so they set this rather
+    /// than each sending a request.
+    pub refresh_at:  Option<Instant>,
+    /// Ticket bodies asked for with `GetTicket`, by id — the expanded
+    /// "Full ticket" view. Dropped when the ticket changes.
+    pub bodies:      std::collections::HashMap<String, String>,
+    /// Ticket cards whose full body is open.
+    pub expanded:    std::collections::HashSet<String>,
+    /// Tickets just opened or reopened, toasted by title once the list
+    /// that names them arrives.
+    pub announce:    std::collections::HashSet<String>,
     /// Fix prompts for sessions `auto_fix_session` opened, keyed by session.
     /// Put in the composer when the person opens that session — never sent.
     pub pending_drafts: std::collections::HashMap<u64, String>,
@@ -1853,10 +1868,65 @@ impl App {
         }
     }
 
-    /// Ask for the ticket list again — only once the Diagnostics panel has
-    /// loaded it, so a session nobody is looking at costs no requests.
+    /// Ask for the ticket list again, soon. The sidebar's issue count reads
+    /// it all the time, so this no longer waits for Settings to be open;
+    /// a burst of ticket events costs one request.
     pub fn refresh_tickets(&mut self) {
-        if self.chat.idealist.tickets.is_some() {
+        if self.chat.idealist.refresh_at.is_none() {
+            self.chat.idealist.refresh_at = Some(Instant::now() + Duration::from_millis(400));
+        }
+    }
+
+    /// Take a new ticket list. A ticket that moved on since its body was
+    /// read loses the cached body (and an open card asks again); a ticket
+    /// just opened or reopened gets a toast naming what failed.
+    fn adopt_tickets(&mut self, tickets: Vec<protocol::TicketSummary>) {
+        let st = &mut self.chat.idealist;
+        let mut reread = Vec::new();
+        if let Some(old) = &st.tickets {
+            for t in &tickets {
+                let changed = old.iter().find(|o| o.id == t.id).is_some_and(|o| {
+                    o.last_seen != t.last_seen || o.status != t.status || o.root_cause != t.root_cause
+                });
+                if changed && st.bodies.remove(&t.id).is_some() && st.expanded.contains(&t.id) {
+                    reread.push(t.id.clone());
+                }
+            }
+        }
+        let fresh: Vec<String> = tickets
+            .iter()
+            .filter(|t| st.announce.remove(&t.id))
+            .map(crate::ui::issues::headline)
+            .collect();
+        st.tickets = Some(tickets);
+        for ticket_id in reread {
+            self.send(UiCommand::SendRequest(Request::GetTicket { ticket_id }));
+        }
+        match fresh.as_slice() {
+            [] => {}
+            [one] => self.show_toast(
+                crate::ui::icons::Icon::Warning,
+                format!("Issue logged: {one} — see Settings › Issues"),
+                5000,
+            ),
+            many => self.show_toast(
+                crate::ui::icons::Icon::Warning,
+                format!("{} issues logged — see Settings › Issues", many.len()),
+                5000,
+            ),
+        }
+    }
+
+    /// Send the ticket-list request once its debounce has run out.
+    fn tick_ticket_refresh(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.chat.idealist.refresh_at else { return };
+        let now = Instant::now();
+        if now < at {
+            ctx.request_repaint_after(at - now);
+            return;
+        }
+        self.chat.idealist.refresh_at = None;
+        if self.ipc_state.connected {
             self.send(UiCommand::SendRequest(Request::ListTickets));
         }
     }
@@ -2159,6 +2229,18 @@ impl App {
                 // by the BE at startup, so a reconnect is exactly when the
                 // catalogue can have changed.
                 self.send(UiCommand::SendRequest(Request::ListCatalog));
+                // The idealist's tickets, for the issue count under Settings.
+                self.send(UiCommand::SendRequest(Request::ListTickets));
+                // What went wrong on this side while nobody could hear it —
+                // a GUI panic last run, a backend that would not start.
+                for r in crate::fe_incident::drain() {
+                    self.push_log(LogKind::Event, format!("reporting frontend failure: {}", r.module));
+                    self.send(UiCommand::SendRequest(Request::ReportFrontendError {
+                        module:    r.module,
+                        message:   r.message,
+                        traceback: r.traceback,
+                    }));
+                }
             }
             UiEvent::IpcDisconnected { error } => {
                 self.had_outage = true;
@@ -2502,7 +2584,10 @@ impl App {
                     self.chat.idealist.last_ticket = last_ticket;
                 }
             }
-            UiEvent::IdealistTicketWritten { path, kind, ticket_id, reopened } => {
+            UiEvent::IdealistTicketWritten { path, kind, ticket_id, occurrences, reopened } => {
+                if occurrences == 1 || reopened {
+                    self.chat.idealist.announce.insert(ticket_id.clone());
+                }
                 self.push_log(
                     LogKind::Event,
                     format!(
@@ -2524,7 +2609,15 @@ impl App {
                 self.refresh_tickets();
             }
             UiEvent::Tickets { tickets } => {
-                self.chat.idealist.tickets = Some(tickets);
+                self.adopt_tickets(tickets);
+            }
+            UiEvent::TicketDetail { ticket, body } => {
+                self.chat.idealist.bodies.insert(ticket.id.clone(), body);
+                if let Some(list) = self.chat.idealist.tickets.as_mut() {
+                    if let Some(slot) = list.iter_mut().find(|t| t.id == ticket.id) {
+                        *slot = ticket;
+                    }
+                }
             }
             UiEvent::FixSession { session_id, ticket_id, draft } => {
                 self.push_log(
@@ -2534,6 +2627,8 @@ impl App {
                 self.adopt_session(session_id);
                 self.switch_session(session_id);
                 self.chat.draft = draft;
+                // The fix prompt waits in the composer: show it.
+                self.settings_open = false;
                 self.send(UiCommand::SendRequest(Request::ListSessions));
                 self.refresh_tickets();
             }
@@ -3013,6 +3108,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
         self.tick_heartbeat_watchdog();
+        self.tick_ticket_refresh(ctx);
         ui::draw(self, ctx);
         self.take_file_link(ctx);
         if self.build_state.in_flight {

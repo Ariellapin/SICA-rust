@@ -33,7 +33,7 @@ Seven crates, dependency direction strictly downward:
 - Framing: length-delimited (`tokio_util::codec::LengthDelimitedCodec`).
 - Payload: `bincode`-encoded `protocol::Frame`.
 - Full duplex over one connection: requests, responses, and pushed events all multiplex. Each `Frame` carries a correlation ID; unsolicited events use ID 0.
-- `PROTOCOL_VERSION` (currently 32) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
+- `PROTOCOL_VERSION` (currently 33) is exchanged via `ClientHello`/`ServerHello`; a mismatch raises a rebuild banner in the FE. **Bump it whenever `Request`/`Response`/`Event` change shape.**
 
 Requests are split between the legacy demo set (`GetCounter`/`IncrementCounter`/`ResetCounter`/`ComputeFib`/`EchoText`, still exercised by `smoke` and the Settings → Communication tab) and the real surface (`SendUserMessage`, `InterruptTurn`, session CRUD, `ConnectLlm`/`DisconnectLlm`, `ReportFrontendError`, plus the Wave-3 control set: `RunCommand` (`compact`/`plan`/`permission`/`job-kill`/`goal`), `SetPermissionMode`, `SetPlanMode`, `ResolveApproval`, `AnswerQuestion`, the Wave-4 inbox pair `SteerTurn`/`InjectContext` plus the queue verbs `EditQueued`/`RemoveQueued`/`SteerQueued` the dock addresses rows with, and the UI-4 session verbs `RenameSession`/`ForkSession`/`ArchiveSession`/`SearchSessions` plus `ListModels`, and the UI-5 ledger request `LoadSessionEvents`, and the v23 projection request `SessionStats`, and the v24 agent-preset
   request `SetSessionAgent`).
@@ -282,6 +282,19 @@ session memory in the header's Memory panel and the store in
 Settings › Memory. See
 [notes/2026-09-27-session-and-long-term-memory.md](notes/2026-09-27-session-and-long-term-memory.md).
 
+v33 (the Issues surface) makes the idealist's tickets readable in the app.
+`TicketSummary` gains a digest of the ticket body — `title`, `hint` (the
+heuristic analysis, minus its copy of the message), and the latest
+investigation's `root_cause`, `fix` and `files` — so a listing can say what
+failed, why and how to fix it without the markdown
+(`idealist::ticket::Ticket::digest`). `GetTicket { ticket_id }` answers
+`TicketDetail { ticket, body }`, the whole body for the in-app view. The frontend now asks for the
+list on every connect (the issue count under Settings) and finally sends
+`ReportFrontendError`, from a queue file, for its own panics and for a
+backend that would not start; the dispatcher files those as `fe_panic` or
+`fe_error`. See
+[notes/2026-11-03-issues-surface.md](notes/2026-11-03-issues-surface.md).
+
 ## On-disk surfaces (all at workspace root)
 
 `sica_core::paths::workspace_root()` walks up from the running executable looking for `Cargo.toml`, so in dev everything below resolves against the repo root:
@@ -305,6 +318,8 @@ Settings › Memory. See
 | `sica-settings/memory.toml` | `agents::long_term::MemoryConfig` | Optional: `session_summary` (true), `idle_seconds` (45), `min_new_chars` (400), `auto_remember` (true), `inject` (true), `prompt_items` (40), `prompt_chars` (4000), `timeout_secs` (180). Re-read per use, so Settings › Memory applies without a restart; a malformed file is a `LogLine` at startup and the defaults. |
 | `skills/memory.md` | `agents::remember` | Seeded **on** (unlike `schedule.md.off`): its presence registers `remember` / `recall` / `forget` at BE start. Renaming it to `.md.off` removes the tools; remembered facts still reach the prompt unless `inject = false`. |
 | `idealist_workspace/crash-<ts>.md` | `backend::incident` | Written synchronously by the panic hook, before anything else can fail. |
+| `idealist_workspace/fe-crash-<ts>.md` | `frontend::fe_incident` | The GUI's panic hook writes it the same way; the report itself goes to `fe-pending.jsonl`. |
+| `idealist_workspace/fe-pending.jsonl` | `frontend::fe_incident` | Frontend failures waiting for a backend to hear them — one JSON `ReportFrontendError` per line, sent and deleted at the next `IpcConnected`, identical lines collapsed. Stops growing at 256 KiB. |
 | `sica-settings/idealist.toml` | `idealist::config` | Optional: `investigate`, `idle_minutes` (10), `max_per_session` (5), `max_hops` (12), `timeout_secs` (300), `lessons_in_prompt` (false), `auto_fix_session` (false). Absent means those defaults; malformed is a `LogLine` and the defaults. Read at BE start. |
 | `evals/*.toml` | `agents::model_eval` | One prompt suite per file; `default.toml` seeded once at BE start, user-owned after. Read per run, so edits need no restart. |
 | `evals/reports/<suite>-<ts>.{md,json}` | `agents::model_eval` | Report + machine-readable baseline the next run of that suite diffs against. `.gitignore`d. |

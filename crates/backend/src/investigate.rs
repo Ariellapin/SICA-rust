@@ -740,12 +740,12 @@ fn fix_prompt(ticket: &Ticket, path: &std::path::Path) -> String {
         .map(|s| format!("\n\nThe latest investigation:\n\n{}", clip(s.trim(), 3_000)))
         .unwrap_or_default();
     let krate = crate_of(&m.module);
+    let step = fix_step(m.diagnosis.as_ref().map(|d| d.category.as_str()));
     format!(
         "Fix idealist ticket `{id}` (`{module}`, {occ} occurrence(s)). {diagnosed} \
          The ticket is at {path}.{latest}\n\n\
          1. Read the ticket and check the diagnosis against the code before changing anything.\n\
-         2. Make the smallest change that removes the root cause, and add or adjust a unit test \
-         that fails without it.\n\
+         2. {step}\n\
          3. Run the tests: `.\\run.ps1 test -p {krate}`.\n\
          4. Summarise what you changed and why. The ticket stays open until a person marks it \
          resolved.",
@@ -754,6 +754,39 @@ fn fix_prompt(ticket: &Ticket, path: &std::path::Path) -> String {
         occ = m.occurrences,
         path = path.display(),
     )
+}
+
+/// The fix prompt's second step. A fix session can be opened for any
+/// ticket, and only a harness bug is fixed by changing the code that
+/// failed: the others are fixed where their category says the cause is.
+fn fix_step(category: Option<&str>) -> &'static str {
+    match category {
+        Some("model_mistake") => {
+            "The harness behaved correctly and the model called the tool wrongly. Make a repeat \
+             less likely: sharpen the tool's description under `skills/` or its error message so \
+             it says how to recover. Add or adjust a test for any code you change."
+        }
+        Some("environment") => {
+            "The cause is this machine (a missing program, a shell difference, permissions, a \
+             server that was down). Change code only if the harness can route around it or name \
+             the fix in its error; otherwise write the steps the operator should take and change \
+             nothing."
+        }
+        Some("config") => {
+            "The cause is a configuration file (`sica-settings/`, `agents/*.md`, \
+             `.sica/hooks.json`, an MCP or provider TOML). Name the file and the change it needs; \
+             change code only if the harness should have reported the problem more clearly."
+        }
+        Some("external") => {
+            "The cause is outside this machine (the LLM server or a remote service). Check that \
+             the harness handles it well — a retry, a clear message — and change code only where \
+             it does not."
+        }
+        _ => {
+            "Make the smallest change that removes the root cause, and add or adjust a unit test \
+             that fails without it."
+        }
+    }
 }
 
 /// The crate a module path lives in, for the test command.
@@ -896,6 +929,32 @@ mod tests {
         assert!(p.contains("`abc123`") && p.contains("harness_bug") && p.contains("root cause: quoting"));
         assert!(p.contains("run.ps1 test -p agents"), "{p}");
         assert!(p.contains("tickets/abc123.md"));
+        assert!(p.contains("smallest change"), "a harness bug is fixed in code: {p}");
+    }
+
+    #[test]
+    fn fix_prompt_follows_the_category() {
+        let path = std::path::Path::new("t.md");
+        let mut t = ticket("def456", "Error", 1, TicketStatus::Diagnosed);
+        t.meta.module = "agents::tool::run-cli".into();
+        let mut with = |category: &str| {
+            t.meta.diagnosis = Some(Diagnosis {
+                category: category.into(),
+                confidence: "high".into(),
+                at: "2026-11-03T00:00:00Z".into(),
+                lesson: None,
+            });
+            fix_prompt(&t, path)
+        };
+        assert!(with("model_mistake").contains("skills/"));
+        assert!(with("environment").contains("steps the operator"));
+        assert!(with("config").contains("sica-settings/"));
+        assert!(with("external").contains("outside this machine"));
+        // Not diagnosed yet: the generic code-fix step.
+        let mut fresh = ticket("0a0a0a", "Error", 1, TicketStatus::Open);
+        fresh.meta.module = "backend::turn::llm_request".into();
+        let p = fix_prompt(&fresh, path);
+        assert!(p.contains("not been diagnosed") && p.contains("smallest change"), "{p}");
     }
 
     #[test]

@@ -267,8 +267,11 @@ pub async fn handle(
         Request::ReportFrontendError { module, message, traceback } => {
             // Straight to the bus: the FE has no session context to give,
             // and `incident` is for failures the backend itself observed.
+            // A panic is reported as `frontend::panic::<file>`; anything else
+            // the FE saw (a backend that would not start) is an error.
+            let kind = if module.starts_with("frontend::panic") { "fe_panic" } else { "fe_error" };
             idealist_bus.publish(idealist::Trigger {
-                kind: "fe_panic".into(),
+                kind: kind.into(),
                 module,
                 message,
                 traceback,
@@ -282,6 +285,21 @@ pub async fn handle(
             Err(message) => Response::Error { message },
         },
         Request::ListTickets => tickets_response(),
+        Request::GetTicket { ticket_id } => {
+            let store = idealist::TicketStore::open_default();
+            // The id names a file: refuse anything that is not one of ours
+            // rather than let `../` walk out of the ticket folder.
+            if ticket_id.is_empty() || !ticket_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Response::Error { message: format!("`{ticket_id}` is not a ticket id") };
+            }
+            match store.load(&ticket_id) {
+                Ok(t) => Response::TicketDetail {
+                    ticket: idealist::summary(&t, &store),
+                    body:   t.body,
+                },
+                Err(e) => Response::Error { message: format!("ticket {ticket_id}: {e}") },
+            }
+        }
         Request::StartFixSession { ticket_id } => {
             match crate::investigate::start_fix_session(chat, &ticket_id).await {
                 Ok((session_id, draft)) => Response::FixSession { session_id, ticket_id, draft },

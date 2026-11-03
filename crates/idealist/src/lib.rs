@@ -55,7 +55,13 @@ pub struct Idealist {
 /// The wire shape of a ticket.
 pub fn summary(t: &Ticket, store: &TicketStore) -> TicketSummary {
     let m = &t.meta;
+    let d = t.digest();
     TicketSummary {
+        title:        d.title,
+        hint:         d.hint,
+        root_cause:   d.root_cause,
+        fix:          d.fix,
+        files:        d.files,
         id:           m.id.clone(),
         status:       m.status.as_str().into(),
         origin:       m.origin.as_str().into(),
