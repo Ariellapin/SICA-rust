@@ -354,12 +354,12 @@ fn verbatim_tokens(s: &str) -> Option<Vec<String>> {
 }
 
 /// `s` as one quoted span whose inside may hold quotes of its own, with
-/// trailing `'key=value'` tokens peeled off as extras. `None` unless `s`
+/// trailing `key=value` tokens, quoted or not, peeled off as extras. `None` unless `s`
 /// (after the peel) opens and closes with the same quote.
 fn single_span(s: &str) -> Option<Vec<String>> {
     let mut s = s.trim();
     let mut extras: Vec<String> = Vec::new();
-    while let Some((rest, kv)) = peel_kv_token(s) {
+    while let Some((rest, kv)) = peel_kv_token(s).or_else(|| peel_bare_kv(s)) {
         extras.insert(0, kv);
         s = rest;
     }
@@ -391,6 +391,19 @@ fn peel_kv_token(s: &str) -> Option<(&str, String)> {
         return None;
     }
     Some((rest, inner.to_string()))
+}
+
+/// Peel one trailing unquoted `key=value` word off `s` — the optional args
+/// of `read-file 'C:\…\test.txt' start=16 end=59` (`sessions/102`). Left in,
+/// they sent the call down the escape-processing tokenizer, where the
+/// path's `\t` became a tab.
+fn peel_bare_kv(s: &str) -> Option<(&str, String)> {
+    let (before, word) = s.rsplit_once(char::is_whitespace)?;
+    let (key, _) = word.split_once('=')?;
+    if !is_arg_name(key) || word.contains(['\'', '"']) {
+        return None;
+    }
+    Some((before.trim_end(), word.to_string()))
 }
 
 /// A token worth keeping apart from a one-argument skill's argument: a
@@ -989,8 +1002,20 @@ fn xml_tag_at(text: &str, at: usize) -> Option<(XmlTag<'_>, usize)> {
     if name.is_empty() {
         return None;
     }
-    let r = after_eq[name_end..].trim_start().strip_prefix('>')?;
-    Some((XmlTag::FunctionOpen(name), consumed(r)))
+    let after_name = &after_eq[name_end..];
+    if let Some(r) = after_name.trim_start().strip_prefix('>') {
+        return Some((XmlTag::FunctionOpen(name), consumed(r)));
+    }
+    // `<function=run-pwsh '(Get-Content a.txt).Count' > the count`: the
+    // whole call line inside the opener, its ` > ` taken for the tag's
+    // close. `sessions/102` was refused on this shape twenty times and
+    // ended seventeen turns `bad-call`. The opener ends at the name, so the
+    // quoted arguments after it read as the rest of the call's line.
+    let args = after_name.trim_start_matches([' ', '\t']);
+    if args.len() < after_name.len() && args.starts_with(['\'', '"']) {
+        return Some((XmlTag::FunctionOpen(name), consumed(after_name)));
+    }
+    None
 }
 
 /// True when `text` carries the `<tool_call>` envelope or a
@@ -1801,6 +1826,46 @@ mod tests {
         assert_eq!(tc.raw_args, vec!["$a = Get-Content wk.txt\n$a.Count".to_string()]);
         // A tag named in passing, never closed, is prose.
         assert!(extract_for("I would use <function=read-file> for that", arity).is_none());
+    }
+
+    /// `sessions/102`: the call's whole line inside the opener, its ` > `
+    /// read by the model as the tag's close. Refused twenty times; seventeen
+    /// turns ended `bad-call`, the last three in a row.
+    #[test]
+    fn a_call_line_inside_the_function_opener() {
+        let s = "The second write may have overwritten the first. Checking.\n\n<tool_call>\n<function=run-pwsh '(Get-Content main_prompts.txt).Count' > count lines in main_prompts.txt\n</function>\n</tool_call>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.skill, "run-pwsh");
+        assert_eq!(tc.raw_args, vec!["(Get-Content main_prompts.txt).Count".to_string()]);
+        assert_eq!(tc.expectation, "count lines in main_prompts.txt");
+        // The strict entry point reads it too: it is the contract's line.
+        assert_eq!(extract_known(s, |n| arity(n).is_some()).unwrap(), tc);
+
+        // Inner double quotes and a `2>nul` stay part of the command.
+        let s = r#"<tool_call>
+<function=run-cli 'dir /b "C:\Data\Wildcards\poses_*.txt" 2>nul' > list existing pose files
+</function>
+</tool_call>"#;
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(tc.raw_args, vec![r#"dir /b "C:\Data\Wildcards\poses_*.txt" 2>nul"#.to_string()]);
+        assert_eq!(tc.expectation, "list existing pose files");
+
+        // Unquoted optional args after the path bind, and the path keeps
+        // its `\t` rather than growing a tab.
+        let s = "<tool_call>\n<function=read-file 'C:\\Data\\Wildcards\\test_main_prompts.txt' start=16 end=59 > the pose rules\n</function>\n</tool_call>";
+        let tc = extract_for(s, arity).unwrap();
+        assert_eq!(
+            tc.raw_args,
+            vec![r"C:\Data\Wildcards\test_main_prompts.txt".to_string(), "start=16".into(), "end=59".into()]
+        );
+        assert_eq!(tc.expectation, "the pose rules");
+
+        // Prose that names a tag still is not a call, nor an attempt at one.
+        let s = "An opener like <function=name> is what Qwen writes.";
+        assert!(extract_for(s, arity).is_none());
+        let s = "I would write <function=read-file and stop there.";
+        assert!(!has_xml_wrapper(s));
+        assert!(extract_for(s, arity).is_none());
     }
 
     #[test]

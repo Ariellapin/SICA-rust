@@ -779,6 +779,14 @@ impl Skill for WriteFile {
                 return err(&format!("create dir {}: {e}", parent.display()));
             }
         }
+        // A file written in parts loses every earlier part when a later one
+        // leaves out `append`, and a bare "wrote N bytes" does not show it
+        // (`sessions/102` overwrote three files that way, seven times).
+        let replaced = if append {
+            0
+        } else {
+            fs::metadata(&resolved).ok().filter(|m| m.is_file()).map_or(0, |m| m.len())
+        };
         let result = if append {
             use std::io::Write;
             std::fs::OpenOptions::new()
@@ -790,15 +798,20 @@ impl Skill for WriteFile {
             fs::write(&resolved, content.as_bytes())
         };
         match result {
-            Ok(()) => SkillOutcome {
-                ok: true,
-                summary: format!(
+            Ok(()) => {
+                let mut summary = format!(
                     "{} {} bytes to {}",
                     if append { "appended" } else { "wrote" },
                     content.len(),
                     resolved.display()
-                ),
-            },
+                );
+                if replaced > 0 {
+                    summary.push_str(&format!(
+                        " — replaced the {replaced} bytes it held; 'append=true' adds to the end instead"
+                    ));
+                }
+                SkillOutcome { ok: true, summary }
+            }
             Err(e) => err(&format!("write {}: {e}", resolved.display())),
         }
     }
@@ -1479,6 +1492,22 @@ mod tests {
         assert!(out.summary.starts_with("appended 1 bytes"), "{}", out.summary);
         assert_eq!(std::fs::read_to_string(dir.join("log.txt")).unwrap(), "ab");
         assert_eq!(WriteFile::new(dir).optional_args(), vec!["append".to_string()]);
+    }
+
+    /// `sessions/102`: part two of a file written in parts, sent without
+    /// `append`, replaced part one under a plain "wrote N bytes".
+    #[tokio::test]
+    async fn an_overwrite_says_what_it_replaced() {
+        let dir = tempdir();
+        let w = WriteFile::new(dir.clone());
+        let out = w.run(json!({ "path": "p.txt", "content": "part one\n" }), ctx()).await;
+        assert!(!out.summary.contains("replaced"), "a new file replaces nothing: {}", out.summary);
+        let out = w.run(json!({ "path": "p.txt", "content": "part two\n" }), ctx()).await;
+        assert!(out.ok);
+        assert!(out.summary.contains("replaced the 9 bytes it held"), "{}", out.summary);
+        assert!(out.summary.contains("'append=true'"), "{}", out.summary);
+        let out = w.run(json!({ "path": "p.txt", "content": "three", "append": "true" }), ctx()).await;
+        assert!(!out.summary.contains("replaced"), "{}", out.summary);
     }
 
     /// `sessions/95`: a 325 KB file came back whole and overflowed the

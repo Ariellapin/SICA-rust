@@ -1,0 +1,1 @@
+description = "a Qwen-style wrapped call whose opener holds the whole call line, quoted argument and expectation included, still runs instead of being refused until the turn ends"
