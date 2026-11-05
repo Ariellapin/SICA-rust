@@ -188,6 +188,17 @@ pub fn failure_hint(shell: Shell, command: &str, stderr: &str) -> Option<&'stati
                      (like `$env:PATH`) — write `${name}:` or `$($name):`.",
                 );
             }
+            // `[int]"abc"` fails with these same ids, so the command has to
+            // hold a `+` for this to be about `+`. A loop's `$i++` is not one.
+            let string_to_number = stderr.contains("InvalidCastFromStringToInteger")
+                || stderr.contains("InvalidCastFromStringToDoubleOrSingle");
+            if string_to_number && command.replace("++", "").contains('+') {
+                return Some(
+                    "`+` takes its type from the value on its left, so a number there tries \
+                     to read the string on its right as a number — write the number inside \
+                     the string instead, e.g. `\"$($i+1): text\"`.",
+                );
+            }
             let parse_error = stderr.contains("ParserError");
             if parse_error && (command.contains("\\\"") || has_doubled_quote(command)) {
                 return Some(
@@ -299,6 +310,21 @@ mod tests {
         )
         .unwrap()
         .contains("byte-order mark"));
+        // 2abbd0a970d2
+        assert!(failure_hint(
+            ps,
+            "for($i=34;$i -lt 45;$i++){ Write-Output (($i+1) + \": \" + $c[$i]) }",
+            "+ FullyQualifiedErrorId : InvalidCastFromStringToInteger"
+        )
+        .unwrap()
+        .contains("$($i+1)"));
+        assert!(failure_hint(ps, "$x = 1.5; $x + \"a\"", "InvalidCastFromStringToDoubleOrSingle").is_some());
+        // The same id from a cast has no `+` to blame, and `$i++` is not one.
+        assert_eq!(failure_hint(ps, "[int]\"abc\"", "InvalidCastFromStringToInteger"), None);
+        assert_eq!(
+            failure_hint(ps, "for($i=0;$i -lt 2;$i++){ [int]\"abc\" }", "InvalidCastFromStringToInteger"),
+            None
+        );
         // An empty string, and PowerShell's own escape, are not doubled quotes.
         assert_eq!(failure_hint(ps, "$_.Trim() -ne ''", "ParserError"), None);
         assert_eq!(failure_hint(ps, "Write-Output 'it''s'", "ParserError"), None);

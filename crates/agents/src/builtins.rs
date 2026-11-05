@@ -2028,4 +2028,15 @@ mod tests {
         assert!(!out.ok);
         assert!(out.summary.contains("--- hint ---") && out.summary.contains("${name}:"), "{}", out.summary);
     }
+
+    /// 2abbd0a970d2: a number plus a string, with PowerShell's real error text.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_pwsh_hints_at_a_number_plus_a_string() {
+        let out = RunPwsh(None)
+            .run(json!({ "command": "$i = 1; Write-Output (($i+1) + \": x\")" }), ctx())
+            .await;
+        assert!(!out.ok);
+        assert!(out.summary.contains("--- hint ---") && out.summary.contains("$($i+1)"), "{}", out.summary);
+    }
 }

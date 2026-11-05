@@ -27,8 +27,10 @@ and quotes inside it are fine (`-ne ' '`, `"it's"`). So do not double
 ` > <expectation>` straight after the closing quote.
 
 In a double-quoted string, `"$i:"` reads as a drive-qualified variable —
-write `"${i}:"`. A script with non-ASCII text needs a UTF-8 byte-order mark
-for Windows PowerShell to read it; `write-file` adds one to `.ps1` files.
+write `"${i}:"`. `+` takes its type from the value on its left, so
+`($i+1) + ": "` tries to read `": "` as a number — write `"$($i+1): "`. A
+script with non-ASCII text needs a UTF-8 byte-order mark for Windows
+PowerShell to read it; `write-file` adds one to `.ps1` files.
 
 Behaviour:
 - Windows: invokes `powershell -NoLogo -NoProfile -NonInteractive -Command <command>`.
