@@ -829,6 +829,23 @@ armed Delete, and — UI-9 — **Export log…** in the ⋯ menu, an OS save dia
 copying the session's JSONL (harness §3.5). Rows also carry the alarm glyph
 of §6.10 when the session holds a reminder.
 
+**Selecting rows.** A row's status slot shows a checkbox on hover. Once any
+row is ticked, every row shows one, a plain click ticks instead of opening,
+Shift+click ticks a range (in the order the list shows) and Ctrl+click starts
+a selection from nothing. The status dot moves to the row's end meanwhile, so
+a running session is not ticked unnoticed. The **selection bar** sits over the
+foot: `[×] 3 selected … [Archive] [Delete]`, sending one `ArchiveSession` or
+`DeleteSession` per row. Archive loses nothing and asks nothing, like the row
+menu's. Delete keeps the armed two-step, with the bar as the question. Esc
+steps back one level (the armed Delete, then the selection) and is consumed,
+so it cannot also interrupt the running turn.
+
+The selection only holds rows the list is drawing: one the search filters out
+or a group folds away is unticked, so nothing is deleted out of sight. Taking
+the open session opens the first one left. Taking every session asks for a
+new one first, because the app always has a session open. The collapsed rail
+has no checkboxes.
+
 UI-4 shipped the **flat list, Last updated**, sorted by the newest event;
 grouping by workspace is §4.3, on the harness registry (guide §3.9). Row chrome per above.
 `SessionMeta` needs `updated_at`, `running`, `pending: Option<PendingKind>`

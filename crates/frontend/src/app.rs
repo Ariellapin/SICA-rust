@@ -868,6 +868,8 @@ pub struct ChatState {
     /// row (one row at a time); the inline "Delete? / Keep" affordance then
     /// commits or cancels. Keeps an accidental click from dropping a session.
     pub pending_delete: Option<u64>,
+    /// The rows ticked for the sidebar's selection bar.
+    pub selection: crate::ui::sidebar::Selection,
     /// `true` once the user has opted out of follow-the-stream autoscroll
     /// (by clicking into the transcript or scrolling up). While paused, new
     /// content no longer snaps the viewport to the bottom; a floating
@@ -1301,18 +1303,10 @@ impl App {
         let cmd_tx = supervisor::spawn(&rt, cc.egui_ctx.clone(), ui_tx);
 
         let settings = settings_store::load();
-        let theme_mode = ThemeMode::parse(&settings.theme_mode);
-        let content_px = settings
-            .content_px
-            .clamp(tokens::CONTENT_MIN_PX, tokens::CONTENT_MAX_PX);
         let system_dark = !matches!(
             cc.integration_info.system_theme,
             Some(eframe::Theme::Light)
         );
-        let dark = theme_mode.is_dark(system_dark);
-        let theme = Theme { content_px, ..Theme::of(dark) };
-        crate::ui::fonts::install(&cc.egui_ctx);
-        Self::apply_visuals(&cc.egui_ctx, &theme);
 
         // Make sure the providers folder has at least the seed files so the
         // LLM tab is non-empty on first launch.
@@ -1320,10 +1314,6 @@ impl App {
             tracing::warn!(error = %e, "seeding default LLM providers failed");
         }
         let providers = crate::llm_providers::load_all();
-        let active_provider_id = settings
-            .last_active_provider
-            .clone()
-            .filter(|id| providers.iter().any(|p| &p.id == id));
 
         // The working directory has to be live *before* the BE child is
         // spawned: `child::spawn` passes it down in the environment, and the
@@ -1333,14 +1323,44 @@ impl App {
             .as_deref()
             .map(PathBuf::from)
             .filter(|p| p.is_dir());
-        let recent_working_dirs: Vec<PathBuf> =
-            settings.recent_working_dirs.iter().map(PathBuf::from).collect();
         sica_core::paths::set_working_dir(working_dir.as_deref());
 
-        let auto_start_be = settings.auto_start_be;
-        if auto_start_be {
+        if settings.auto_start_be {
             let _ = cmd_tx.send(UiCommand::StartBe);
         }
+
+        Self::assemble(&cc.egui_ctx, rt, cmd_tx, ui_rx, settings, providers, working_dir, system_dark)
+    }
+
+    /// The state itself, from what `new` read and started. Touches neither
+    /// the disk nor a process, so a test can draw a real frame with it.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        ctx: &egui::Context,
+        rt: Arc<tokio::runtime::Runtime>,
+        cmd_tx: UnboundedSender<UiCommand>,
+        ui_rx: std::sync::mpsc::Receiver<UiEvent>,
+        settings: Settings,
+        providers: Vec<crate::llm_providers::ProviderConfig>,
+        working_dir: Option<PathBuf>,
+        system_dark: bool,
+    ) -> Self {
+        let theme_mode = ThemeMode::parse(&settings.theme_mode);
+        let content_px = settings
+            .content_px
+            .clamp(tokens::CONTENT_MIN_PX, tokens::CONTENT_MAX_PX);
+        let dark = theme_mode.is_dark(system_dark);
+        let theme = Theme { content_px, ..Theme::of(dark) };
+        crate::ui::fonts::install(ctx);
+        Self::apply_visuals(ctx, &theme);
+
+        let active_provider_id = settings
+            .last_active_provider
+            .clone()
+            .filter(|id| providers.iter().any(|p| &p.id == id));
+        let recent_working_dirs: Vec<PathBuf> =
+            settings.recent_working_dirs.iter().map(PathBuf::from).collect();
+        let auto_start_be = settings.auto_start_be;
 
         Self {
             rt,
@@ -2106,11 +2126,30 @@ impl App {
         if self.chat.sessions.len() <= 1 {
             return;
         }
-        self.send(UiCommand::SendRequest(Request::DeleteSession { session_id: id }));
-        self.chat.sessions.retain(|s| s.id != id);
-        if self.chat.session_id == id {
-            if let Some(first) = self.chat.sessions.first() {
-                let next = first.id;
+        self.remove_sessions(&[id], |session_id| Request::DeleteSession { session_id });
+    }
+
+    /// Take `ids` off the list, with `request` telling the backend how
+    /// (archive or delete), and leave the open session if it is one of them.
+    ///
+    /// The app always has a session open, so taking the last ones asks for a
+    /// replacement. That request goes first: the backend runs requests in
+    /// order, so its list is never empty, which would make the `SessionList`
+    /// handler ask for a second one.
+    pub fn remove_sessions(&mut self, ids: &[u64], request: fn(u64) -> Request) {
+        self.chat.pending_delete = None;
+        self.chat.row_menu = None;
+        if self.chat.sessions.iter().all(|s| ids.contains(&s.id)) {
+            self.send(UiCommand::SendRequest(Request::NewSession {
+                workspace_id: self.workspaces.of_session(self.chat.session_id),
+            }));
+        }
+        for id in ids {
+            self.send(UiCommand::SendRequest(request(*id)));
+        }
+        self.chat.sessions.retain(|s| !ids.contains(&s.id));
+        if ids.contains(&self.chat.session_id) {
+            if let Some(next) = self.chat.sessions.first().map(|s| s.id) {
                 self.switch_session(next);
             }
         }
@@ -3123,6 +3162,22 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.cmd_tx.send(UiCommand::Quit);
         std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// An `App` with no supervisor behind it and nothing read from disk, for
+    /// drawing real frames in a test. The receiver holds what it asked the
+    /// supervisor to do.
+    pub fn for_test(ctx: &egui::Context) -> (Self, tokio::sync::mpsc::UnboundedReceiver<UiCommand>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let app = Self::assemble(ctx, Arc::new(rt), cmd_tx, ui_rx, Settings::default(), Vec::new(), None, true);
+        (app, cmd_rx)
     }
 }
 

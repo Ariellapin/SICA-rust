@@ -21,6 +21,32 @@ fn backend_exe() -> std::path::PathBuf {
     root.join("target").join("debug").join(format!("backend{ext}"))
 }
 
+/// Send `steps` in one go, the way the GUI sends a batch, and collect the
+/// answers in the order they arrive.
+async fn exchange<W, R>(
+    writer: &mut FramedWrite<W, LengthDelimitedCodec>,
+    reader: &mut FramedRead<R, LengthDelimitedCodec>,
+    steps: Vec<(u64, Request)>,
+) -> Result<Vec<(u64, Response)>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let expected = steps.len();
+    for (id, req) in steps {
+        writer.send(Frame::request(id, req).encode()?.into()).await?;
+    }
+    let mut answers = Vec::with_capacity(expected);
+    while answers.len() < expected {
+        let bytes = reader.next().await.ok_or_else(|| anyhow::anyhow!("eof"))??;
+        let frame = Frame::decode(&bytes)?;
+        if let Payload::Response(r) = frame.payload {
+            answers.push((frame.id, r));
+        }
+    }
+    Ok(answers)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let exe = backend_exe();
@@ -446,6 +472,54 @@ async fn main() -> Result<()> {
     assert!(!memories.iter().any(|m| m.id == added), "the deleted memory is gone");
     assert_eq!(memories.len(), before);
     println!("smoke: memory deleted -> {added}");
+
+    // The sidebar's selection bar: what it sends when it takes every row, in
+    // one go — the replacement first, then one request per row. Answered in
+    // order, so the backend's list is never empty. An archived session still
+    // loads; a deleted one does not.
+    let new_session = || Request::NewSession { workspace_id: None };
+    let made = exchange(&mut writer, &mut reader, vec![(900, new_session()), (901, new_session())]).await?;
+    let [(_, Response::SessionCreated { id: archived }), (_, Response::SessionCreated { id: deleted })] = made[..]
+    else {
+        anyhow::bail!("expected two SessionCreated, got {made:?}");
+    };
+    let bar = exchange(
+        &mut writer,
+        &mut reader,
+        vec![
+            (902, new_session()),
+            (903, Request::ArchiveSession { session_id: archived }),
+            (904, Request::DeleteSession { session_id: deleted }),
+        ],
+    )
+    .await?;
+    let [(902, Response::SessionCreated { id: fresh }), (903, Response::Ok), (904, Response::Ok)] = bar[..] else {
+        anyhow::bail!("expected the bar's requests answered in order, got {bar:?}");
+    };
+    let after = exchange(
+        &mut writer,
+        &mut reader,
+        vec![
+            (905, Request::ListSessions),
+            (906, Request::LoadSession { session_id: archived }),
+            (907, Request::LoadSession { session_id: deleted }),
+            // Leave nothing behind.
+            (908, Request::DeleteSession { session_id: archived }),
+            (909, Request::DeleteSession { session_id: fresh }),
+        ],
+    )
+    .await?;
+    let Response::SessionList { sessions } = &after[0].1 else {
+        anyhow::bail!("expected SessionList, got {after:?}");
+    };
+    assert!(sessions.iter().any(|s| s.id == fresh), "the replacement is listed");
+    assert!(
+        !sessions.iter().any(|s| s.id == archived || s.id == deleted),
+        "archived and deleted sessions leave the list: {sessions:?}"
+    );
+    assert!(matches!(after[1].1, Response::SessionLoaded { .. }), "an archived session still loads");
+    assert!(matches!(after[2].1, Response::Error { .. }), "a deleted session does not");
+    println!("smoke: selection bar -> archived {archived}, deleted {deleted}, replaced by {fresh}");
 
     // Shutdown
     writer.send(Frame::request(4, Request::Shutdown).encode()?.into()).await?;

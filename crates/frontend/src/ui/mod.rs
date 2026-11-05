@@ -16,7 +16,7 @@ pub mod kit;
 pub mod log_panel;
 mod onboarding;
 mod settings;
-mod sidebar;
+pub mod sidebar;
 pub mod strings;
 
 pub use onboarding::wanted as onboarding_wanted;

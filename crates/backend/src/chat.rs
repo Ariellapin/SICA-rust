@@ -1616,6 +1616,9 @@ impl ChatHub {
     }
 
     pub async fn delete_session(&self, id: u64) -> bool {
+        // A turn still running has no log left to write to, and would go on
+        // spending the model on a session nobody can open.
+        self.interrupt_session(id).await;
         let removed = self.sessions.lock().await.remove(&id).is_some();
         if removed {
             sessions_store::delete(id);
@@ -6975,6 +6978,18 @@ BE A REVIEWER
         let listed: Vec<u64> = hub.list_sessions().await.iter().map(|s| s.id).collect();
         assert!(listed.contains(&101));
         assert!(!listed.contains(&102), "archived session must leave the list");
+    }
+
+    /// A deleted session's running turn stops: it has no log left to write
+    /// to, and nobody can open the session to see it.
+    #[tokio::test]
+    async fn deleting_a_session_cancels_its_running_turn() {
+        let (hub, _) = hub();
+        let id = hub.create_session(None).await;
+        let token = CancellationToken::new();
+        hub.active_turns.lock().await.insert(id, (1, token.clone()));
+        assert!(hub.delete_session(id).await);
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]

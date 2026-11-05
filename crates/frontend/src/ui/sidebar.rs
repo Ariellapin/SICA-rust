@@ -5,8 +5,10 @@
 //!    button, and a panel-toggle circle on the right.
 //! 2. **New Session** (h=38, r=12, elevated fill, hairline).
 //! 3. **Session region** — one row per session: status dot, title, relative
-//!    time, and a `⋯` menu on hover.
-//! 4. **Foot** — the Settings trigger with the connection indicator inline,
+//!    time, and on hover a checkbox and a `⋯` menu.
+//! 4. **Selection bar** — while any row is ticked: the count, Archive and
+//!    Delete (UI §4.2).
+//! 5. **Foot** — the Settings trigger with the connection indicator inline,
 //!    plus sica's own "Rebuild & restart" chip when the source has drifted
 //!    (dsh has no equivalent; the hot-reload loop is the app's core feature
 //!    and must not hide).
@@ -64,10 +66,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // by whatever the region above it did.
     let top = ui.cursor().top();
     let bottom = ui.clip_rect().max.y;
-    let region_h = (bottom - foot_h - top).max(60.0);
+    let bar_h = if !collapsed && !app.chat.selection.is_empty() { SELECTION_BAR_H + 6.0 } else { 0.0 };
+    let region_h = (bottom - foot_h - bar_h - top).max(60.0);
     ui.allocate_ui(Vec2::new(ui.available_width(), region_h), |ui| {
         session_region(app, ui, collapsed);
     });
+    if !collapsed && !app.chat.selection.is_empty() {
+        let bar_rect = Rect::from_min_max(
+            egui::pos2(ui.max_rect().min.x, bottom - foot_h - SELECTION_BAR_H),
+            egui::pos2(ui.max_rect().max.x, bottom - foot_h),
+        );
+        let mut bar_ui = ui.child_ui(bar_rect, Layout::left_to_right(Align::Center), None);
+        selection_bar(app, &mut bar_ui, bar_rect);
+    }
     let foot_rect = Rect::from_min_max(
         egui::pos2(ui.max_rect().min.x, bottom - foot_h),
         egui::pos2(ui.max_rect().max.x, bottom),
@@ -273,10 +284,191 @@ enum RowAction {
     RenameCancel,
     Fork(u64),
     Archive(u64),
+    /// Tick or untick this row.
+    Toggle(u64),
+    /// Shift+click: tick every row between the last one touched and this one.
+    Extend(u64),
+}
+
+/// Height of the selection bar: a 28 px button with 8 px above and below.
+const SELECTION_BAR_H: f32 = 44.0;
+
+/// The rows ticked for the selection bar.
+#[derive(Default)]
+pub struct Selection {
+    ids: std::collections::BTreeSet<u64>,
+    /// Where a Shift+click ranges from: the last row ticked or unticked.
+    anchor: Option<u64>,
+    /// The bar is asking "Delete N sessions?".
+    armed: bool,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn toggle(&mut self, id: u64) {
+        if !self.ids.remove(&id) {
+            self.ids.insert(id);
+        }
+        self.anchor = Some(id);
+        self.armed = false;
+    }
+
+    /// Tick everything from the anchor to `id`, in the order the list shows.
+    /// With no anchor on the list, this is a plain tick.
+    fn extend_to(&mut self, id: u64, order: &[u64]) {
+        self.armed = false;
+        let at = |target: Option<u64>| order.iter().position(|x| Some(*x) == target);
+        match (at(self.anchor), at(Some(id))) {
+            (Some(a), Some(b)) => self.ids.extend(&order[a.min(b)..=a.max(b)]),
+            _ => {
+                self.ids.insert(id);
+                self.anchor = Some(id);
+            }
+        }
+    }
+
+    /// Drop what the list no longer shows. A row the search filtered out or a
+    /// group folded away must not be deleted out of sight, and a number the
+    /// user already agreed to must not change under an armed Delete.
+    fn retain_listed(&mut self, listed: &[u64]) {
+        let before = self.ids.len();
+        self.ids.retain(|id| listed.contains(id));
+        if self.ids.len() != before {
+            self.armed = false;
+        }
+    }
+
+    /// Esc steps back one level: an armed Delete, then the selection.
+    fn escape(&mut self) {
+        if self.armed {
+            self.armed = false;
+        } else {
+            *self = Self::default();
+        }
+    }
+
+    fn take(&mut self) -> Vec<u64> {
+        let ids = self.ids.iter().copied().collect();
+        *self = Self::default();
+        ids
+    }
+}
+
+/// `"1 session"`, `"3 sessions"`.
+fn sessions_word(n: usize) -> String {
+    format!("{n} session{}", if n == 1 { "" } else { "s" })
+}
+
+/// The bar over the foot while any row is ticked: `[×] 3 selected … [Archive]
+/// [Delete]`. Delete keeps the rows' two-step: the bar itself becomes the
+/// question. Archive loses nothing, so it asks nothing, like the row menu's.
+fn selection_bar(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
+    let t = app.theme;
+    let n = app.chat.selection.len();
+    ui.painter().rect(
+        rect,
+        egui::Rounding::same(RADIUS_CARD),
+        kit::col(t.alias.elevated_fill),
+        egui::Stroke::new(sica_core::theme::tokens::HAIRLINE, Level::L3.color(&t)),
+    );
+
+    let mut remove: Option<fn(u64) -> Request> = None;
+    let inner = rect.shrink2(Vec2::new(8.0, 8.0));
+    let y = inner.center().y;
+    if app.chat.selection.armed {
+        let keep = word_button(ui, inner.max.x, y, "Keep", false, &t);
+        let del = word_button(ui, keep.0.min.x - 6.0, y, "Delete", true, &t);
+        ui.interact(del.0, ui.id().with("selection_del_tip"), Sense::hover())
+            .on_hover_text("Removes the session logs from disk. This cannot be undone.");
+        let font = kit::font(13.0, Weight::Regular);
+        let question = format!("Delete {}?", sessions_word(n));
+        let shown = kit::elide(ui, &question, &font, del.0.min.x - 8.0 - inner.min.x);
+        ui.painter().text(
+            egui::pos2(inner.min.x + 2.0, y),
+            Align2::LEFT_CENTER,
+            shown,
+            font,
+            kit::col(t.alias.label[0]),
+        );
+        if del.1 {
+            remove = Some(|session_id| Request::DeleteSession { session_id });
+        } else if keep.1 {
+            app.chat.selection.escape();
+        }
+    } else {
+        let mut row = ui.child_ui(inner, Layout::right_to_left(Align::Center), None);
+        row.spacing_mut().item_spacing.x = 6.0;
+        if kit::button(&mut row, "Delete", kit::Variant::Danger, kit::Size::Sm)
+            .on_hover_text("Asks first, then removes the session logs from disk")
+            .clicked()
+        {
+            app.chat.selection.armed = true;
+        }
+        if kit::button(&mut row, "Archive", kit::Variant::Outline, kit::Size::Sm)
+            .on_hover_text("Hides them from the list; the logs stay on disk")
+            .clicked()
+        {
+            remove = Some(|session_id| Request::ArchiveSession { session_id });
+        }
+        // What is left of the row, so a long count elides rather than running
+        // under the buttons.
+        row.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if kit::icon_button(ui, Icon::Close, 24.0)
+                .on_hover_text("Clear selection (Esc)")
+                .clicked()
+            {
+                app.chat.selection = Selection::default();
+            }
+            let font = kit::font(12.0, Weight::Medium);
+            let shown = kit::elide(ui, &format!("{n} selected"), &font, ui.available_width());
+            kit::label(ui, kit::txt(shown, 12.0, Weight::Medium, kit::col(t.alias.label[1])));
+        });
+    }
+
+    if let Some(request) = remove {
+        let ids = app.chat.selection.take();
+        app.remove_sessions(&ids, request);
+    }
+}
+
+/// A row's status dot, centred on `center`.
+fn paint_row_dot(ui: &egui::Ui, state: DotState, center: egui::Pos2, t: &sica_core::theme::Theme) {
+    kit::paint_state_dot(
+        ui.painter(),
+        Rect::from_center_size(center, Vec2::splat(10.0)),
+        state,
+        t,
+        ui.input(|i| i.time) as f32,
+    );
+    if state == DotState::Ongoing {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(120));
+    }
 }
 
 fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
     let t = app.theme;
+    // Consumed, and ahead of the search field: the same Esc must not also
+    // close the search, or interrupt the turn further down the frame.
+    if !collapsed
+        && !app.settings_open
+        && !app.chat.selection.is_empty()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        app.chat.selection.escape();
+    }
     if collapsed {
         // Collapsed rail: one dot per session, active one ringed.
         egui::ScrollArea::vertical()
@@ -413,6 +605,7 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
     search_tick(app);
 
     if app.chat.sessions.is_empty() {
+        app.chat.selection = Selection::default();
         kit::label(
             ui,
             kit::txt(
@@ -461,6 +654,9 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
     let pending = app.chat.pending_delete;
     let allow_delete = rows.len() > 1;
     let mut action: Option<RowAction> = None;
+    // The rows actually drawn, top to bottom: what a Shift+click ranges over
+    // and what the selection may hold.
+    let mut listed: Vec<u64> = Vec::new();
 
     let scroll_rect = ui.available_rect_before_wrap();
     egui::ScrollArea::vertical()
@@ -483,8 +679,10 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
             let session_row = |app: &mut App,
                                    ui: &mut egui::Ui,
                                    row: &(u64, String, i64, String),
+                                   listed: &mut Vec<u64>,
                                    action: &mut Option<RowAction>| {
                 let (id, title, updated, snippet) = row;
+                listed.push(*id);
                 let dot = row_dot(app, *id);
                 if app.chat.renaming == Some(*id) {
                     rename_row(app, ui, *id, &mut |a| *action = Some(a));
@@ -587,7 +785,7 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
                         ui.indent(("ws_group", group.id), |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             for row in &members[..visible] {
-                                session_row(app, ui, row, &mut action);
+                                session_row(app, ui, row, &mut listed, &mut action);
                             }
                             if let Some(id) = group.id {
                                 if members.len() > visible {
@@ -606,11 +804,12 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
                 }
             } else {
                 for row in &rows {
-                    session_row(app, ui, row, &mut action);
+                    session_row(app, ui, row, &mut listed, &mut action);
                 }
             }
             ui.add_space(20.0);
         });
+    app.chat.selection.retain_listed(&listed);
 
     // 24 px bottom fade to `sidebar_fill`, so rows dissolve rather than clip.
     fade(ui, scroll_rect, kit::col(t.alias.sidebar_fill));
@@ -811,16 +1010,20 @@ fn session_region(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
             app.send(UiCommand::SendRequest(protocol::Request::ListSessions));
         }
         Some(RowAction::Archive(id)) => {
+            app.remove_sessions(&[id], |session_id| Request::ArchiveSession { session_id });
+        }
+        Some(RowAction::Toggle(id)) => {
             app.chat.row_menu = None;
-            app.chat.sessions.retain(|s| s.id != id);
-            app.send(UiCommand::SendRequest(protocol::Request::ArchiveSession {
-                session_id: id,
-            }));
-            if app.chat.session_id == id {
-                if let Some(next) = app.chat.sessions.first().map(|s| s.id) {
-                    app.switch_session(next);
-                }
-            }
+            app.chat.pending_delete = None;
+            app.chat.selection.toggle(id);
+            // The list was laid out without the bar this frame.
+            ui.ctx().request_repaint();
+        }
+        Some(RowAction::Extend(id)) => {
+            app.chat.row_menu = None;
+            app.chat.pending_delete = None;
+            app.chat.selection.extend_to(id, &listed);
+            ui.ctx().request_repaint();
         }
         None => {}
     }
@@ -1409,8 +1612,17 @@ fn draw_row(
     if !ui.is_rect_visible(rect) {
         return;
     }
+    let selecting = !app.chat.selection.is_empty();
+    let ticked = app.chat.selection.contains(id);
+    let modifiers = ui.input(|i| i.modifiers);
     let painter = ui.painter();
-    if is_active {
+    if ticked {
+        painter.rect_filled(
+            rect,
+            egui::Rounding::same(RADIUS_INPUT),
+            kit::col(t.alias.business_tertiary),
+        );
+    } else if is_active {
         painter.rect_filled(
             rect,
             egui::Rounding::same(RADIUS_INPUT),
@@ -1424,22 +1636,29 @@ fn draw_row(
         );
     }
 
-    // 16 px status slot.
-    if let Some(state) = dot {
-        kit::paint_state_dot(
-            painter,
-            Rect::from_center_size(
-                egui::pos2(rect.min.x + 16.0, rect.center().y),
-                Vec2::splat(10.0),
-            ),
-            state,
-            &t,
-            ui.input(|i| i.time) as f32,
+    // 16 px status slot: the dot, or the checkbox on hover and while anything
+    // is ticked.
+    if !is_pending && (selecting || hovered) {
+        // 3 px left of the dot's centre: a box is wider than a dot, and it
+        // needs the same air before the title.
+        let slot = Rect::from_center_size(
+            egui::pos2(rect.min.x + 13.0, rect.center().y),
+            Vec2::splat(24.0),
         );
-        if state == DotState::Ongoing {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(120));
+        let check = ui.interact(slot, ui.id().with(("row_check", id)), Sense::click());
+        kit::paint_checkbox(
+            ui.painter(),
+            Rect::from_center_size(slot.center(), Vec2::splat(13.0)),
+            ticked,
+            check.hovered(),
+            &t,
+        );
+        if check.on_hover_text("Select (Shift+click selects a range)").clicked() {
+            on_action(if modifiers.shift { RowAction::Extend(id) } else { RowAction::Toggle(id) });
+            return;
         }
+    } else if let Some(state) = dot {
+        paint_row_dot(ui, state, egui::pos2(rect.min.x + 16.0, rect.center().y), &t);
     }
 
     if is_pending {
@@ -1473,7 +1692,11 @@ fn draw_row(
         .fonts(|f| f.layout_no_wrap(time_text.clone(), time_font.clone(), egui::Color32::WHITE))
         .size()
         .x;
-    let trailing = if hovered && allow_delete { 28.0 } else { time_w + 10.0 };
+    let show_menu = hovered && allow_delete && !selecting;
+    // The checkbox took the status slot, so the dot moves to the row's end:
+    // a running session must not get ticked and deleted unnoticed.
+    let trailing_dot = dot.filter(|_| selecting);
+    let trailing = if show_menu || trailing_dot.is_some() { 28.0 } else { time_w + 10.0 };
     let title_font = kit::font(14.0, Weight::Regular);
     let title_max = (rect.width() - 26.0 - trailing - 8.0).max(20.0);
     let shown = kit::elide(ui, title, &title_font, title_max);
@@ -1489,7 +1712,9 @@ fn draw_row(
         },
     );
 
-    if hovered && allow_delete {
+    if let Some(state) = trailing_dot {
+        paint_row_dot(ui, state, egui::pos2(rect.max.x - 16.0, rect.center().y), &t);
+    } else if show_menu {
         // Hover swaps the timestamp for the ⋯ menu, exactly like dsh.
         let dots = Rect::from_center_size(
             egui::pos2(rect.max.x - 16.0, rect.center().y),
@@ -1535,7 +1760,13 @@ fn draw_row(
     }
 
     if resp.clicked() {
-        on_action(RowAction::Switch(id));
+        on_action(if modifiers.shift {
+            RowAction::Extend(id)
+        } else if selecting || modifiers.command {
+            RowAction::Toggle(id)
+        } else {
+            RowAction::Switch(id)
+        });
     }
 }
 
@@ -1780,4 +2011,406 @@ fn restart_chip(app: &mut App, ui: &mut egui::Ui, collapsed: bool) {
         });
     }
     ui.add_space(4.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, FullOutput, Modifiers, PointerButton, Pos2, RawInput, Shape};
+    use protocol::SessionMeta;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// A real `App` drawn by real frames with real pointer events. What it
+    /// asks the backend for lands in `cmds`.
+    struct Harness {
+        ctx:       egui::Context,
+        app:       App,
+        cmds:      UnboundedReceiver<UiCommand>,
+        modifiers: Modifiers,
+        time:      f64,
+        last:      FullOutput,
+    }
+
+    impl Harness {
+        fn new(titles: &[&str]) -> Self {
+            let ctx = egui::Context::default();
+            let (mut app, cmds) = App::for_test(&ctx);
+            app.ipc_state.connected = true;
+            app.onboarding_open = false;
+            app.chat.session_id = 1;
+            app.chat.sessions = titles
+                .iter()
+                .enumerate()
+                .map(|(i, title)| SessionMeta {
+                    id: i as u64 + 1,
+                    title: (*title).into(),
+                    created_at: 0,
+                    updated_at: 0,
+                    cwd: None,
+                    scheduled: false,
+                })
+                .collect();
+            let mut h = Self {
+                ctx,
+                app,
+                cmds,
+                modifiers: Modifiers::NONE,
+                time: 0.0,
+                last: FullOutput::default(),
+            };
+            h.frame(Vec::new());
+            h.frame(Vec::new());
+            h
+        }
+
+        fn frame(&mut self, events: Vec<Event>) {
+            self.time += 0.1;
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 720.0))),
+                time: Some(self.time),
+                modifiers: self.modifiers,
+                events,
+                ..Default::default()
+            };
+            let ctx = self.ctx.clone();
+            self.last = ctx.run(input, |c| crate::ui::draw(&mut self.app, c));
+        }
+
+        fn hover(&mut self, at: Pos2) {
+            self.frame(vec![Event::PointerMoved(at)]);
+        }
+
+        fn click(&mut self, at: Pos2) {
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: self.modifiers,
+            };
+            let (down, up) = (button(true), button(false));
+            self.hover(at);
+            self.frame(vec![down]);
+            self.frame(vec![up]);
+            // Move away, so no row stays hovered, and draw the result.
+            self.frame(vec![Event::PointerMoved(egui::pos2(700.0, 300.0))]);
+            self.frame(Vec::new());
+        }
+
+        fn escape(&mut self) {
+            self.frame(vec![Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(Vec::new());
+        }
+
+        /// Where `text` was painted in the last frame.
+        fn find(&self, text: &str) -> Option<Rect> {
+            fn walk(shape: &Shape, text: &str) -> Option<Rect> {
+                match shape {
+                    Shape::Text(s) if s.galley.text() == text => {
+                        Some(s.galley.rect.translate(s.pos.to_vec2()))
+                    }
+                    Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
+                    _ => None,
+                }
+            }
+            self.last.shapes.iter().find_map(|c| walk(&c.shape, text))
+        }
+
+        fn text(&self, text: &str) -> Rect {
+            self.find(text).unwrap_or_else(|| panic!("{text:?} was not painted"))
+        }
+
+        /// Tick a row through its checkbox, which is there only on hover and
+        /// lies in the slot left of the title.
+        fn tick(&mut self, title: &str) {
+            let row = self.text(title);
+            let check = row.left_center() - Vec2::new(10.0, 0.0);
+            self.hover(check);
+            self.click(check);
+        }
+
+        fn click_text(&mut self, text: &str) {
+            let at = self.text(text).center();
+            self.click(at);
+        }
+
+        fn selected(&self) -> Vec<u64> {
+            self.app.chat.selection.ids.iter().copied().collect()
+        }
+
+        fn listed(&self) -> Vec<u64> {
+            self.app.chat.sessions.iter().map(|s| s.id).collect()
+        }
+
+        /// The session-changing requests sent since the last call.
+        fn requests(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(cmd) = self.cmds.try_recv() {
+                if let UiCommand::SendRequest(r) = cmd {
+                    let r = format!("{r:?}");
+                    let wanted = ["NewSession", "ArchiveSession", "DeleteSession", "LoadSession", "InterruptTurn"];
+                    if wanted.iter().any(|w| r.starts_with(w)) {
+                        out.push(r);
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn the_checkbox_starts_a_selection_and_archive_takes_it() {
+        let mut h = Harness::new(&["alpha", "beta", "gamma"]);
+        h.requests();
+        assert!(h.find("1 selected").is_none());
+
+        h.tick("beta");
+        assert_eq!(h.selected(), [2]);
+        assert_eq!(h.app.chat.session_id, 1, "ticking a row does not open it");
+        assert!(h.find("1 selected").is_some());
+
+        // Once anything is ticked, a click on a row ticks instead of opening.
+        h.click_text("gamma");
+        assert_eq!(h.selected(), [2, 3]);
+        assert_eq!(h.app.chat.session_id, 1);
+        assert!(h.find("2 selected").is_some());
+
+        h.click_text("Archive");
+        assert_eq!(
+            h.requests(),
+            ["ArchiveSession { session_id: 2 }", "ArchiveSession { session_id: 3 }"]
+        );
+        assert_eq!(h.listed(), [1]);
+        assert!(h.selected().is_empty());
+        assert!(h.find("Archive").is_none(), "the bar leaves with the selection");
+    }
+
+    #[test]
+    fn delete_asks_first_and_keep_goes_back() {
+        let mut h = Harness::new(&["alpha", "beta", "gamma"]);
+        h.requests();
+        h.tick("beta");
+        h.click_text("gamma");
+
+        h.click_text("Delete");
+        assert!(h.requests().is_empty(), "the first click only asks");
+        assert!(h.find("Delete 2 sessions?").is_some());
+
+        h.click_text("Keep");
+        assert!(h.requests().is_empty());
+        assert_eq!(h.selected(), [2, 3], "Keep leaves the selection alone");
+        assert!(h.find("2 selected").is_some());
+
+        h.click_text("Delete");
+        h.click_text("Delete");
+        assert_eq!(
+            h.requests(),
+            ["DeleteSession { session_id: 2 }", "DeleteSession { session_id: 3 }"]
+        );
+        assert_eq!(h.listed(), [1]);
+        assert!(h.selected().is_empty());
+    }
+
+    #[test]
+    fn taking_the_open_session_opens_the_next_one() {
+        let mut h = Harness::new(&["alpha", "beta", "gamma"]);
+        h.requests();
+        h.tick("alpha");
+        h.click_text("beta");
+        h.click_text("Archive");
+        assert_eq!(
+            h.requests(),
+            [
+                "ArchiveSession { session_id: 1 }",
+                "ArchiveSession { session_id: 2 }",
+                "LoadSession { session_id: 3 }",
+            ]
+        );
+        assert_eq!(h.app.chat.session_id, 3);
+    }
+
+    /// The replacement goes first, so the backend's list is never empty.
+    #[test]
+    fn taking_every_session_asks_for_a_new_one_first() {
+        let mut h = Harness::new(&["alpha", "beta"]);
+        h.requests();
+        h.tick("alpha");
+        h.click_text("beta");
+        h.click_text("Delete");
+        h.click_text("Delete");
+        assert_eq!(
+            h.requests(),
+            [
+                "NewSession { workspace_id: None }",
+                "DeleteSession { session_id: 1 }",
+                "DeleteSession { session_id: 2 }",
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_ticks_a_row_and_shift_ticks_a_range() {
+        let mut h = Harness::new(&["alpha", "beta", "gamma", "delta"]);
+        h.modifiers = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        h.click_text("beta");
+        assert_eq!(h.selected(), [2]);
+        assert_eq!(h.app.chat.session_id, 1, "Ctrl+click does not open the row");
+        h.modifiers = Modifiers { shift: true, ..Modifiers::NONE };
+        h.click_text("delta");
+        assert_eq!(h.selected(), [2, 3, 4]);
+    }
+
+    /// Esc is consumed: it clears the selection, and the running turn the
+    /// composer would have interrupted keeps going. The third Esc shows that
+    /// the composer was listening.
+    #[test]
+    fn esc_clears_the_selection_and_nothing_else() {
+        let mut h = Harness::new(&["alpha", "beta"]);
+        h.app.chat.running_sessions.insert(1);
+        h.tick("beta");
+        h.requests();
+
+        h.click_text("Delete");
+        h.escape();
+        assert_eq!(h.selected(), [2], "the first Esc only takes back the armed Delete");
+        assert!(h.find("1 selected").is_some());
+        h.escape();
+        assert!(h.selected().is_empty());
+        assert!(h.requests().is_empty(), "no turn was interrupted");
+
+        h.escape();
+        assert_eq!(h.requests(), ["InterruptTurn { session_id: 1 }"]);
+    }
+
+    /// Nothing can be deleted out of sight.
+    #[test]
+    fn a_row_the_list_stops_showing_leaves_the_selection() {
+        let mut h = Harness::new(&["alpha", "beta", "gamma"]);
+        h.tick("alpha");
+        h.click_text("beta");
+        h.app.chat.search_query = "alpha".into();
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        assert_eq!(h.selected(), [1]);
+        assert!(h.find("1 selected").is_some());
+        h.app.chat.search_query.clear();
+        h.frame(Vec::new());
+
+        // A folded workspace takes its ticks with it.
+        h.app.workspaces.grouped = true;
+        h.app.workspaces.rows = vec![protocol::WorkspaceDump {
+            id: 9,
+            path: "C:/w".into(),
+            title: "work".into(),
+            created_at: 0,
+            updated_at: 0,
+            sessions: vec![1, 2, 3],
+            missing: false,
+        }];
+        h.frame(Vec::new());
+        assert_eq!(h.selected(), [1], "still listed inside the open group");
+        h.app.workspaces.collapsed.insert(9);
+        h.frame(Vec::new());
+        assert!(h.selected().is_empty());
+    }
+
+    /// The bar and the foot both stay on screen and clear of each other, in
+    /// the narrowest column the sidebar can be.
+    #[test]
+    fn the_bar_fits_the_narrowest_sidebar() {
+        let mut h = Harness::new(&["alpha", "beta"]);
+        h.app.layout.sidebar_w = sica_core::theme::tokens::SIDEBAR_MIN;
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        h.app.chat.selection.ids = (1..=2).collect();
+        h.frame(Vec::new());
+
+        let count = h.text("2 selected");
+        let archive = h.text("Archive");
+        let delete = h.text("Delete");
+        let settings = h.text("Settings");
+        assert!(count.max.x < archive.min.x, "{count:?} runs into {archive:?}");
+        assert!(archive.max.x < delete.min.x);
+        assert!(delete.max.x < sica_core::theme::tokens::SIDEBAR_MIN);
+        assert!(delete.max.y < settings.min.y, "{delete:?} sits on {settings:?}");
+        assert!(settings.max.y < 720.0, "the foot was pushed off screen");
+        assert!(h.text("beta").max.y < delete.min.y, "the bar covers the list");
+
+        h.click_text("Delete");
+        let question = h.text("Delete 2 sessions?");
+        assert!(question.max.x < h.text("Delete").min.x, "{question:?}");
+    }
+
+    /// A long list stops above the bar, so no row can paint or take a click
+    /// underneath it.
+    #[test]
+    fn a_long_list_stops_above_the_bar() {
+        let titles: Vec<String> = (0..40).map(|i| format!("session {i}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let mut h = Harness::new(&titles);
+        h.tick("session 0");
+        let clip = h
+            .last
+            .shapes
+            .iter()
+            .find(|c| matches!(&c.shape, Shape::Text(s) if s.galley.text() == "session 0"))
+            .expect("the first row")
+            .clip_rect;
+        let top = h.text("Archive").center().y - SELECTION_BAR_H / 2.0;
+        assert!(clip.max.y <= top, "the list is clipped at {} and the bar starts at {top}", clip.max.y);
+    }
+
+    #[test]
+    fn selection_toggles_ranges_and_steps_back() {
+        let order = [10, 20, 30, 40, 50];
+        let mut s = Selection::default();
+        assert!(s.is_empty());
+
+        // With nothing to range from, Shift+click is a plain tick.
+        s.extend_to(40, &order);
+        assert_eq!(s.ids.iter().copied().collect::<Vec<_>>(), [40]);
+        // Ranges run either way, and keep what was already ticked.
+        s.toggle(20);
+        s.extend_to(10, &order);
+        assert_eq!(s.ids.iter().copied().collect::<Vec<_>>(), [10, 20, 40]);
+        s.extend_to(30, &order);
+        assert_eq!(s.ids.iter().copied().collect::<Vec<_>>(), [10, 20, 30, 40]);
+        // Unticking moves the anchor too.
+        s.toggle(30);
+        assert!(!s.contains(30));
+        assert_eq!(s.len(), 3);
+
+        // An anchor the list no longer shows is a plain tick again.
+        s.extend_to(50, &[10, 50]);
+        assert!(s.contains(50) && !s.contains(30));
+
+        s.armed = true;
+        s.retain_listed(&[10, 20, 40, 50]);
+        assert!(s.armed, "the same rows: the number the user agreed to stands");
+        s.retain_listed(&[10, 20]);
+        assert!(!s.armed, "fewer rows: ask again");
+        assert_eq!(s.len(), 2);
+
+        s.armed = true;
+        s.escape();
+        assert_eq!(s.len(), 2);
+        s.escape();
+        assert!(s.is_empty());
+
+        s.toggle(1);
+        s.toggle(2);
+        assert_eq!(s.take(), [1, 2]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn the_word_agrees_with_the_count() {
+        assert_eq!(sessions_word(1), "1 session");
+        assert_eq!(sessions_word(3), "3 sessions");
+    }
 }

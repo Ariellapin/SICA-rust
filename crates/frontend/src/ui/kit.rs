@@ -502,6 +502,19 @@ pub fn state_dot(ui: &mut Ui, state: DotState, px: f32) -> Response {
     resp
 }
 
+/// A square checkbox: a stroked box, or an ink fill with an inverted tick.
+pub fn paint_checkbox(painter: &egui::Painter, rect: Rect, ticked: bool, hovered: bool, t: &Theme) {
+    let a = &t.alias;
+    let rounding = Rounding::same(4.0);
+    if ticked {
+        painter.rect_filled(rect, rounding, col(a.primary_fill));
+        icons::paint(painter, rect.shrink(1.5), Icon::Check, col(a.label_inverted));
+    } else {
+        let stroke = col(a.label[if hovered { 1 } else { 2 }]);
+        painter.rect_stroke(rect, rounding, Stroke::new(1.0, stroke));
+    }
+}
+
 pub fn paint_state_dot(
     painter: &egui::Painter,
     rect: Rect,
