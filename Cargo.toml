@@ -9,6 +9,8 @@ members  = [
     "crates/backend",
     "crates/frontend",
 ]
+# Patched third-party crates (see [patch.crates-io] at the bottom).
+exclude  = ["vendor"]
 
 [workspace.package]
 edition      = "2021"
@@ -68,3 +70,11 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 strip         = "symbols"
+
+# epaint 0.28.1 with one line added in `text_layout::line_break`: wrapped text
+# in a wrapping layout (every markdown paragraph) drifted left past the column
+# once a row had nothing to break on. Still unfixed upstream; drop this when an
+# egui upgrade carries the fix.
+# See docs/notes/2026-10-10-epaint-wrap-drift.md.
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }

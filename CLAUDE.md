@@ -88,6 +88,11 @@ Seven crates, dependency direction strictly downward. Details in
 
 - The workspace deliberately avoids MSVC. Don't switch the toolchain unless asked.
 - Common dependency versions live in `[workspace.dependencies]` in the root [Cargo.toml](Cargo.toml).
+- `vendor/epaint` is epaint 0.28.1 with one line added, swapped in through
+  `[patch.crates-io]`. Without it, wrapped markdown with a long path pushes the
+  transcript off the left edge. The bug is still in upstream egui, so an egui
+  upgrade must carry the same line. See
+  [docs/notes/2026-10-10-epaint-wrap-drift.md](docs/notes/2026-10-10-epaint-wrap-drift.md).
 - Three serialization formats coexist by design: `bincode` over the pipe (externally-tagged enums only), JSONL for session logs, `toml` for configs, `serde_json` for the LLM wire.
 - Changing `Request`/`Response`/`Event` means bumping `PROTOCOL_VERSION` and rebuilding **both** binaries.
 - Nothing is ever removed from a session event log; compaction and rewind shadow spans in the derived view.

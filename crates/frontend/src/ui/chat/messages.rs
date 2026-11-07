@@ -1430,4 +1430,34 @@ mod tests {
         assert_eq!(history_image_size(Vec2::ZERO, true), Vec2::splat(240.0));
         assert_eq!(history_image_size(Vec2::ZERO, false), Vec2::splat(64.0));
     }
+
+    /// A label that starts mid-row in a wrapping layout — every markdown
+    /// paragraph — and later meets a run with nothing to break on (a long
+    /// Windows path) must stay inside its column. epaint 0.28.1 shifted the
+    /// rows after such a run left by the first row's indentation; the label
+    /// allocated them, the next label started from the widened edge, and
+    /// the transcript drifted off-screen. `vendor/epaint` carries the fix
+    /// (docs/notes/2026-10-10-epaint-wrap-drift.md).
+    #[test]
+    fn wrapped_text_with_an_unbreakable_run_stays_in_its_column() {
+        let ctx = egui::Context::default();
+        let mut edges = (0.0, 0.0);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let column = ui.max_rect().min.x;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("run-pwsh");
+                    ui.label(format!("{} C:{}", "word ".repeat(20), r"\Packages".repeat(12)));
+                    ui.label("after");
+                });
+                edges = (column, ui.min_rect().min.x);
+            });
+        });
+        let (column, content) = edges;
+        assert!(content >= column - 0.5, "content starts at {content}, column at {column}");
+    }
 }
