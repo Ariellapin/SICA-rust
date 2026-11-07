@@ -48,6 +48,40 @@ const MAX_EMPTY_NUDGES: u8 = 2;
 /// when no drafted call was found in it.
 const REASONING_TAIL_BYTES: usize = 1200;
 
+/// Nudges spent on the reasoning-only stall in progress.
+///
+/// [`MAX_EMPTY_NUDGES`] is a budget per *stall*, not per turn: it guards
+/// against a model that answers the nudge with another reasoning-only
+/// reply, not against a long turn that stalls more than twice with real
+/// work in between. `sessions/112` spent both nudges on two stalls it
+/// recovered from in full — text, a tool call, an outcome — and then
+/// ended its turn on a third with nothing left to send, so the operator
+/// read "still replied with reasoning only after 2 request(s) to act"
+/// about a model that had complied with both.
+#[derive(Default)]
+struct EmptyReplyBudget {
+    spent: u8,
+}
+
+impl EmptyReplyBudget {
+    /// A reasoning-only reply arrived. `Some(n)` is the nudge to send, the
+    /// `n`th of [`MAX_EMPTY_NUDGES`] for this stall; `None` means the stall
+    /// has already been answered that many times and the turn ends.
+    fn nudge(&mut self) -> Option<u8> {
+        if self.spent >= MAX_EMPTY_NUDGES {
+            return None;
+        }
+        self.spent += 1;
+        Some(self.spent)
+    }
+
+    /// A reply that said or called something: the stall is over, and a
+    /// later one in the same turn starts from the full budget.
+    fn recovered(&mut self) {
+        self.spent = 0;
+    }
+}
+
 /// Largest resolved-argument blob recorded on a durable `ToolCall`. Past it
 /// the field is omitted and a rebuilt row falls back to `args_preview`; the
 /// whole log is parsed at every backend start, so a megabyte of `write-file`
@@ -2923,10 +2957,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
             // a second miscall ends the turn as `bad-call`, which the
             // completion check then reads.
             let mut syntax_nudged = false;
-            // Reasoning-only replies answered so far this turn, and whether
-            // the next request goes out with thinking off (the retry after
-            // one — see `MAX_EMPTY_NUDGES`).
-            let mut empty_nudges: u8 = 0;
+            // Nudges spent on the reasoning-only stall in progress, and
+            // whether the next request goes out with thinking off (the retry
+            // after one — see `EmptyReplyBudget`).
+            let mut empty_nudges = EmptyReplyBudget::default();
             let mut think_off = false;
             // Retry budget for the *current* step; reset once a step lands.
             let mut retries: u32 = 0;
@@ -3538,11 +3572,11 @@ available: {}  (`/agent off` clears)", names.join(", "))
                 // the session went idle with the work undone. Its reasoning
                 // never reaches the next request, so hand back the call it
                 // drafted (or the end of its thinking) and take the next
-                // step with thinking off; past `MAX_EMPTY_NUDGES` the turn
-                // ends as `empty` and the completion check decides.
+                // step with thinking off; past `MAX_EMPTY_NUDGES` of them in
+                // a row the turn ends as `empty` and the completion check
+                // decides.
                 if out.content.trim().is_empty() && out.tool_calls.is_empty() {
-                    if empty_nudges < MAX_EMPTY_NUDGES {
-                        empty_nudges += 1;
+                    if let Some(nth) = empty_nudges.nudge() {
                         think_off = true;
                         let drafted = agents::parse_tool_call::last_drafted_call(
                             &out.reasoning,
@@ -3555,7 +3589,7 @@ available: {}  (`/agent off` clears)", names.join(", "))
                         };
                         let msg = format!(
                             "assistant replied with reasoning only ({} bytes, no text, no tool \
-                             call) — {}, next step with thinking off ({empty_nudges}/{MAX_EMPTY_NUDGES})",
+                             call) — {}, next step with thinking off ({nth}/{MAX_EMPTY_NUDGES})",
                             out.reasoning.len(),
                             if drafted.is_some() {
                                 "handing back the call it drafted"
@@ -3583,6 +3617,10 @@ available: {}  (`/agent off` clears)", names.join(", "))
                     finish = "empty";
                     break;
                 }
+                // This reply said or called something, so whatever stall
+                // preceded it is over: a later one gets the whole nudge
+                // budget rather than what this turn has left of it.
+                empty_nudges.recovered();
 
                 // Native tool-calling path: dispatch every call the model
                 // emitted, answer each `tool_call_id`, and loop for the
@@ -5939,6 +5977,30 @@ mod tests {
         // Large windows do not overflow the arithmetic.
         assert!(at_ceiling(u32::MAX - 1, u32::MAX));
         assert!(!at_ceiling(1_000_000, 1_048_576 * 4));
+    }
+
+    #[test]
+    fn the_nudge_budget_counts_one_stall_not_a_whole_turn() {
+        // Consecutive reasoning-only replies: two are answered, the third
+        // ends the turn.
+        let mut budget = EmptyReplyBudget::default();
+        assert_eq!(budget.nudge(), Some(1));
+        assert_eq!(budget.nudge(), Some(2));
+        assert_eq!(budget.nudge(), None);
+
+        // A stall the model recovered from must not count against a later
+        // one. `sessions/112` stalled three times in one turn with a real
+        // tool call after each of the first two, and the cumulative counter
+        // ended the turn on the third without sending a single nudge for it.
+        let mut budget = EmptyReplyBudget::default();
+        for _ in 0..3 {
+            assert_eq!(budget.nudge(), Some(1));
+            budget.recovered();
+        }
+        // Recovery restores the whole budget, not just one nudge.
+        assert_eq!(budget.nudge(), Some(1));
+        assert_eq!(budget.nudge(), Some(2));
+        assert_eq!(budget.nudge(), None);
     }
 
     /// The budget is the window minus the reply reserve, scaled down by
